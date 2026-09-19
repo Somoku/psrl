@@ -20,6 +20,7 @@ from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
 from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
 from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
+from verl.plugin.platform import get_platform
 from verl.single_controller.ray import RayWorkerGroup
 from verl.utils.device import get_resource_name
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -27,24 +28,18 @@ from verl.utils.net_utils import is_valid_ipv6_address
 from verl.utils.profiler import build_vllm_profiler_args
 from verl.workers.config import HFModelConfig
 from verl.workers.rollout.replica import RolloutMode
-from verl.workers.rollout.utils import qwen2_5_vl_dedup_image_tokens
+from verl.workers.rollout.utils import get_vision_placeholder_token_ids
 from verl.workers.rollout.vllm_rollout.utils import (
-    VLLM_LORA_INT_ID,
-    VLLM_LORA_NAME,
-    VLLM_LORA_PATH,
     build_cli_args_from_config,
+    build_mtp_speculative_config,
     get_vllm_max_lora_rank,
 )
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (
     vLLMHttpServer,
     vLLMReplica,
 )
-from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
-from vllm.inputs import TokensPrompt
-from vllm.lora.request import LoRARequest
-from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -58,20 +53,17 @@ from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
     get_worker_info,
-    log_begin_event,
     log_dual_events,
-    log_end_event,
-    log_single_event,
 )
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
 from psrl.workers.gen.smg_adapter import build_worker_registration_payload, cfg_get, is_cache_aware_method
 from psrl.workers.gen.stats_collector import DPLBStatCollector
-from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, TokenOutput
+from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT
 from psrl.workers.gen.zmq_queue import ZMQPushQueue
-from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
-get_encoding()
+if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
+    get_encoding()
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -123,21 +115,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         self.stat_collector = None
         self.curr_rollout_instance_model_version = None
-
-        if self.psrl_config.rollout_coordination.redundant_rollout.enable:
-            self.avg_max_active_tasks_len = (
-                self.psrl_config.rollout_coordination.redundant_rollout.redundant_global_batch_size
-                * self.psrl_config.rollout_coordination.redundant_rollout.redundant_rollout_n
-                // self.psrl_config.deployment.n_rollout_instances
-            )
-        else:
-            self.avg_max_active_tasks_len = (
-                self.psrl_config.staleness_buffer_entries
-                * self.psrl_config.rollout_n
-                // self.psrl_config.deployment.n_rollout_instances
-            )
-        self.log_active_tasks_interval = max(self.avg_max_active_tasks_len // 8, 1)
-        self.active_task_num = {}
 
         # Async event management
         self._is_init_model = asyncio.Event()
@@ -288,7 +265,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
     async def launch_server(
         self, master_address: str | None = None, master_port: int | None = None, dp_rpc_port: int | None = None
     ):
-        """Launch the vLLM HTTP server with PSRL-specific setup.
+        """Launch the vLLM gRPC server with PSRL-specific setup.
 
         AGENT(verl): This method is adapted from the original vLLMHttpServer.launch_server in verl.
         The main differences are:
@@ -339,7 +316,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             )
             compilation_config["cudagraph_mode"] = "PIECEWISE"
         if self.config.cudagraph_capture_sizes:
-            engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
+            compilation_config["cudagraph_capture_sizes"] = self.config.cudagraph_capture_sizes
 
         compilation_config = json.dumps(compilation_config)
         args = {
@@ -395,13 +372,13 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                     served_model_name = served_model_name.split("/")[-1]
                 args["served_model_name"] = served_model_name
 
-        # MTP applies only to LLM models, not diffusion models.
+        # MTP is only available for LLM rollout models.
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
-            speculative_config = {
-                "method": self.config.mtp.method,
-                "num_speculative_tokens": self.config.mtp.num_speculative_tokens,
-            }
-            args["speculative_config"] = speculative_config
+            args["speculative_config"] = build_mtp_speculative_config(
+                self.config.mtp.method,
+                self.config.mtp.num_speculative_tokens,
+                args.get("speculative_config"),
+            )
 
         # Always report data_parallel_size so SMG's DP discovery step can find it
         # in the gRPC server_info response (required for worker registration).
@@ -458,7 +435,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 lora_args["fully_sharded_loras"] = True
             args.update(lora_args)
 
-        # Routing Replay
+        # Routing replay needs vLLM's fixed hybrid-attention routed-expert capture path.
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
 
@@ -554,7 +531,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
         await engine_client.collective_rpc(
-            method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
+            method="monkey_patch_model",
+            kwargs={
+                "vocab_size": len(self.model_config.tokenizer),
+                "banned_token_ids": get_vision_placeholder_token_ids(self.model_config.processor),
+            },
         )
 
         if self.replica_rank == 0 and self.node_rank == 0:
@@ -719,6 +700,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     async def sleep(self, level: int):
         await self.engine.sleep(level)
+        await self.engine.reset_encoder_cache()
         if self.psrl_config.tms.range in ["rollout", "all"]:
             # NOTE(linsh): TMS requires an explicit aggressive cache clear.
             aggressive_empty_cache(force_sync=True)
@@ -827,7 +809,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         return self.engine.engine_core.num_engines
 
     def get_active_task_num(self, data_parallel_rank: int) -> int:
-        return self.active_task_num.get(data_parallel_rank, 0)
+        # The servicer owns in-flight accounting and tracks admissions across all DP engines.
+        return self.grpc_servicer.active_generate_admissions
 
     async def register_rollout_instances_to_ps(self):
         if self.gen_interface.ps_manager_handle is None:
@@ -897,343 +880,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             )
             raise
 
-    def log_active_tasks(self, data_parallel_rank: int, task_added: bool = False, task_done: bool = False):
-        """
-        Log the active tasks.
-        """
-        assert task_added ^ task_done, "Exactly one of task_added or task_done must be True"
-        psrl_logger.debug(f"Active tasks: {self.active_task_num[data_parallel_rank]}")
-        if task_added and self.active_task_num[data_parallel_rank] == 0:
-            self.active_tasks_start_time = time.time()
-            log_begin_event(
-                f"Generate with model version {self.curr_rollout_instance_model_version[data_parallel_rank]}",
-                psrl_logger,
-                event_type=EventType.GEN,
-            )
-        if task_done and self.active_task_num[data_parallel_rank] == 1:
-            duration = time.time() - self.active_tasks_start_time
-            log_end_event(
-                f"Generate with model version {self.curr_rollout_instance_model_version[data_parallel_rank]}",
-                psrl_logger,
-                event_type=EventType.GEN,
-                duration=duration,
-            )
-        if self.active_task_num[data_parallel_rank] % self.log_active_tasks_interval == 0:
-            log_single_event(
-                f"Active tasks: {self.active_task_num[data_parallel_rank]} "
-                f"({self.active_task_num[data_parallel_rank] / self.avg_max_active_tasks_len * 100:.2f}%)",
-                psrl_logger,
-                event_type=EventType.OTHER,
-            )
-
-    async def generate(
-        self,
-        prompt_ids: list[int],
-        sampling_params: dict[str, Any],
-        request_id: str,
-        image_data: list[Any] | None = None,
-        video_data: list[Any] | None = None,
-        audio_data: list[Any] | None = None,
-        priority: int = 0,
-        data_parallel_rank: int = 0,
-        version_tag: int | None = None,
-        is_validate: bool = False,
-    ) -> TokenOutput | None:
-        """Generate sequence with token-in-token-out."""
-        # NOTE(linsh): Route pooling models through the encoding path.
-        if self.is_pooling_model:
-            return await self._encode_internal(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                image_data=image_data,
-                video_data=video_data,
-                audio_data=audio_data,
-                data_parallel_rank=data_parallel_rank,
-                version_tag=version_tag,
-                is_validate=is_validate,
-            )
-
-        curr_rollout_instance_model_version = self.curr_rollout_instance_model_version[data_parallel_rank]
-        # The router should guarantee the request is assigned to a rollout instance
-        # that can directly generate with the needed model version.
-        assert version_tag <= curr_rollout_instance_model_version, (
-            f"Model version requirement exceeds rollout version: required={version_tag}, "
-            f"current={curr_rollout_instance_model_version}."
-        )
-
-        # All the partial rollout requests (with version tag less than the current rollout
-        # instance model version) should be updated to the current rollout instance model version
-        if version_tag < curr_rollout_instance_model_version:
-            psrl_logger.debug(
-                f"Updating request model version: request_id={request_id!r}, "
-                f"required={version_tag}, current={curr_rollout_instance_model_version}."
-            )
-            version_tag = curr_rollout_instance_model_version
-            # Update version tag in staleness inventory
-            if self.gen_interface.ps_manager_handle is not None:
-                await self.gen_interface.ps_manager_handle.update_request_version_tag.remote(
-                    request_id, version_tag, is_validate
-                )
-
-        rollout_instance_id = (self.base_worker_id, data_parallel_rank)
-        # Update the request status to ROLLOUT_RUNNING.
-        # Reward model path (ps_manager_handle is None): skip status tracking and always continue.
-        if self.gen_interface.ps_manager_handle is not None:
-            update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
-                request_id,
-                PSRL_RequestStatus.ROLLOUT_RUNNING,
-                rollout_instance_id=rollout_instance_id,
-                model_version=version_tag,
-                is_validate=is_validate,
-            )
-
-            if not update_status_success:
-                return None
-
-        # Calculate the maximum possible new tokens based on available context space
-        # This serves as a safety upper bound
-        max_possible_tokens = self.config.max_model_len - len(prompt_ids)
-        if max_possible_tokens < 0:
-            raise ValueError(
-                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
-                f"({self.config.max_model_len})."
-            )
-
-        # Determine max_tokens from sampling_params or use configured response_length as default
-        if "max_tokens" in sampling_params:
-            max_tokens = sampling_params.pop("max_tokens")
-        elif "max_new_tokens" in sampling_params:
-            # support sglang-style 'max_new_tokens' param
-            max_tokens = sampling_params.pop("max_new_tokens")
-        else:
-            # Default to a calculation that considers configured lengths
-            max_tokens = min(
-                self.config.response_length, self.config.response_length + self.config.prompt_length - len(prompt_ids)
-            )
-
-        # Clamp max_tokens to the valid range [0, max_possible_tokens]
-        max_tokens = max(0, min(max_tokens, max_possible_tokens))
-
-        assert max_tokens <= max_possible_tokens, (
-            f"max_tokens={max_tokens} exceeds available context space={max_possible_tokens}."
-        )
-        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
-        multi_modal_data = {}
-        if image_data is not None:
-            multi_modal_data["image"] = image_data
-        if video_data is not None:
-            multi_modal_data["video"] = video_data
-        if audio_data is not None:
-            multi_modal_data["audio"] = audio_data
-
-        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
-        prompt = TokensPrompt(**prompt_kwargs)
-
-        # Add lora request
-        lora_request = None
-        if self.lora_as_adapter:
-            # Make sure we also check that the lora is already loaded in the engine
-            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
-            if lora_loaded:
-                lora_request = LoRARequest(
-                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
-                )
-
-        #### Generation ####
-
-        generator = self.engine.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            lora_request=lora_request,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-        )
-        if data_parallel_rank not in self.active_task_num:
-            self.active_task_num[data_parallel_rank] = 0
-        self.active_task_num[data_parallel_rank] += 1
-        self.log_active_tasks(data_parallel_rank, task_added=True)
-
-        #### Post processing after generation ####
-
-        # Get final response
-        final_res: RequestOutput | None = None
-        async for output in generator:
-            final_res = output
-        assert final_res is not None, "Generation completed without a final response."
-
-        token_ids = final_res.outputs[0].token_ids
-        log_probs = None
-        if sampling_params.logprobs is not None:
-            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
-
-        routed_experts = None
-        if self.config.enable_rollout_routing_replay:
-            routed_experts = final_res.outputs[0].routed_experts
-
-        # Determine stop reason from finish_reason
-        interrupted = False
-        finish_reason = final_res.outputs[0].finish_reason
-        if finish_reason == "abort":
-            stop_reason = "aborted"
-            interrupted = True
-        elif finish_reason in ("stop", "length"):
-            stop_reason = "completed"
-        else:
-            stop_reason = finish_reason  # for more stop reason in the future
-
-        # Update the request status
-        if interrupted:
-            update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED
-        else:
-            update_status = PSRL_RequestStatus.ROLLOUT_COMPLETED
-
-        if self.gen_interface.ps_manager_handle is not None:
-            update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
-                request_id,
-                update_status,
-                is_validate=is_validate,
-            )
-            if not update_status_success:
-                return None
-
-        num_preempted = None
-
-        if hasattr(final_res.outputs[0], "num_preempted"):
-            num_preempted = final_res.outputs[0].num_preempted
-
-        self.active_task_num[data_parallel_rank] -= 1
-        self.log_active_tasks(data_parallel_rank, task_done=True)
-
-        multi_modal_data = {
-            k: v for k, v in (("images", image_data), ("videos", video_data), ("audios", audio_data)) if v is not None
-        }
-        if not multi_modal_data:
-            multi_modal_data = None
-
-        return TokenOutput(
-            prompt_ids=prompt_ids,
-            response_ids=token_ids,
-            response_mask=[1] * len(token_ids),
-            response_log_probs=log_probs,
-            routed_experts=routed_experts,
-            multi_modal_data=multi_modal_data,
-            stop_reason=stop_reason,
-            num_preempted=num_preempted,
-            interrupted=interrupted,
-            update_status=update_status,
-            rollout_instance_id=rollout_instance_id,
-        )
-
-    async def _encode_internal(
-        self,
-        prompt_ids: list[int],
-        request_id: str,
-        image_data: list[Any] | None = None,
-        video_data: list[Any] | None = None,
-        audio_data: list[Any] | None = None,
-        data_parallel_rank: int = 0,
-        version_tag: int | None = None,
-        is_validate: bool = False,
-    ) -> TokenOutput | None:
-        """
-        Run pooling inference and return its output.
-
-        Pooling completes in one forward pass, so it cannot be preempted and
-        always returns `interrupted=False`.
-
-        Args:
-            prompt_ids (list[int]): Input token IDs.
-            request_id (str): Unique request identifier.
-            data_parallel_rank (int): DP rank to route the request to.
-            version_tag (int | None): Model version required for this request.
-            is_validate (bool): Whether this request is for validation.
-
-        Returns:
-            TokenOutput | None: Pooling result, or None if the request was aborted
-            by the PS manager before processing.
-        """
-        assert self.is_pooling_model, "_encode_internal must only be called when is_pooling_model is True."
-        assert self.pooling_params is not None, (
-            "pooling_params must be initialized before calling _encode_internal. Ensure run_server() has completed."
-        )
-
-        rollout_instance_id = (self.base_worker_id, data_parallel_rank)
-        # Update the request status to ROLLOUT_RUNNING.
-        if self.gen_interface.ps_manager_handle is not None:
-            update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
-                request_id,
-                PSRL_RequestStatus.ROLLOUT_RUNNING,
-                rollout_instance_id=rollout_instance_id,
-                model_version=version_tag,
-                is_validate=is_validate,
-            )
-            if not update_status_success:
-                return None
-
-        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
-        multi_modal_data = {}
-        if image_data is not None:
-            multi_modal_data["image"] = image_data
-        if video_data is not None:
-            multi_modal_data["video"] = video_data
-        if audio_data is not None:
-            multi_modal_data["audio"] = audio_data
-
-        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
-        prompt = TokensPrompt(**prompt_kwargs)
-
-        if data_parallel_rank not in self.active_task_num:
-            self.active_task_num[data_parallel_rank] = 0
-        self.active_task_num[data_parallel_rank] += 1
-        self.log_active_tasks(data_parallel_rank, task_added=True)
-
-        # Run the pooling forward pass.
-        generator = self.engine.encode(
-            prompt=prompt,
-            pooling_params=self.pooling_params,
-            request_id=request_id,
-            data_parallel_rank=data_parallel_rank,
-        )
-        final_res: PoolingRequestOutput | None = None
-        async for output in generator:
-            final_res = output
-        assert final_res is not None, f"Pooling engine returned no output for request {request_id}."
-
-        pooling_output = final_res.outputs.data  # torch.Tensor
-
-        # Pooling requests are non-interruptible by design.
-        update_status = PSRL_RequestStatus.ROLLOUT_COMPLETED
-        if self.gen_interface.ps_manager_handle is not None:
-            update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
-                request_id,
-                update_status,
-                is_validate=is_validate,
-            )
-            if not update_status_success:
-                return None
-
-        self.active_task_num[data_parallel_rank] -= 1
-        self.log_active_tasks(data_parallel_rank, task_done=True)
-
-        multi_modal_data = {
-            k: v for k, v in (("images", image_data), ("videos", video_data), ("audios", audio_data)) if v is not None
-        }
-        if not multi_modal_data:
-            multi_modal_data = None
-
-        return TokenOutput(
-            prompt_ids=prompt_ids,
-            response_ids=[],
-            response_mask=[],
-            pooling_output=pooling_output,
-            multi_modal_data=multi_modal_data,
-            stop_reason="completed",
-            interrupted=False,
-            update_status=update_status,
-            rollout_instance_id=rollout_instance_id,
-        )
+    async def generate(self, *args, **kwargs):
+        """Reject veRL's direct generation path because SMG owns all inference through gRPC."""
+        raise RuntimeError("Direct generation is disabled. Send inference requests through the SMG gRPC gateway.")
 
     ###### NIXL Integration ######
 
@@ -1522,6 +1171,15 @@ class PSRL_vLLMReplica(vLLMReplica):
             ),
         )
 
+    def _get_server_env_vars(self) -> dict[str, str]:
+        """Return the platform rollout environment with PSRL overrides applied."""
+        return {
+            **{var: "1" for var in get_platform().ray_noset_envvars()},
+            **get_platform().rollout_env_vars(),
+            "NCCL_CUMEM_ENABLE": "0",
+            "VLLM_DISABLE_ATTN": "1" if self.config.disable_attn else "0",
+        }
+
     async def init_model(self, worker_group: RayWorkerGroup):
         """Init model by launching vLLM server in each node.
 
@@ -1540,8 +1198,6 @@ class PSRL_vLLMReplica(vLLMReplica):
         assert len(self.workers) == self.world_size, (
             f"Worker count mismatch: workers={len(self.workers)}, world_size={self.world_size}."
         )
-
-        self._validate_launch_requirements()
 
         # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
         worker_infos = await asyncio.gather(
@@ -1576,14 +1232,8 @@ class PSRL_vLLMReplica(vLLMReplica):
             else:
                 name = f"{prefix}server_{self.tag}_{self.replica_rank}_{node_rank}"
 
-            # AGENT(VERL): PSRL-specific environment variables.
-            env_vars = {
-                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-                "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-                # Disaggregated weight synchronization requires disabling NCCL cuMem.
-                "NCCL_CUMEM_ENABLE": "0",
-                "VLLM_DISABLE_ATTN": "1" if self.config.disable_attn else "0",
-            }
+            # Preserve platform-specific rollout environment while applying PSRL overrides.
+            env_vars = self._get_server_env_vars()
             if self.psrl_config.tms.range == "all" or self.psrl_config.tms.enable_nixl:
                 # add tms config to rollout workers
                 import torch_memory_saver  # noqa: F401

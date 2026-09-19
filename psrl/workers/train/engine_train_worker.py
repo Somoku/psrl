@@ -16,10 +16,11 @@ from verl.single_controller.base.decorator import (
 )
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, is_cuda_available
+from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.fs import copy_to_local
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.workers.config import DistillationConfig
-from verl.workers.engine_workers import ActorRolloutRefWorker
+from verl.workers.config import DistillationConfig, TrainingWorkerConfig
+from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.converter import create_parameter_mapping
@@ -63,6 +64,19 @@ except ImportError:
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+class PSRL_CriticTrainWorker(TrainingWorker):
+    """
+    Critic worker that initializes the global process group before constructing its engine.
+
+    veRL's `TrainingWorker` builds the engine in `__init__`, so the process group must exist
+    before the base constructor runs.
+    """
+
+    def __init__(self, config: TrainingWorkerConfig) -> None:
+        initialize_global_process_group_ray(timeout_second=36000)
+        super().__init__(config)
 
 
 class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):

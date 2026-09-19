@@ -13,8 +13,8 @@ import torch
 from PIL import Image
 from tensordict import NonTensorData, NonTensorStack, TensorDict
 from verl.utils import tensordict_utils as tu
-from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
+from verl.utils.tokenizer.chat_template import apply_chat_template, initialize_system_prompt
 
 from psrl.utils.common.http_io_thread import get_http_io_thread
 from psrl.utils.common.http_utils import (
@@ -310,6 +310,7 @@ class AgentLoopBase(ABC):
             "request_id": str(request_input.request_id),
             "input_ids": request_input.input_ids,
             "sampling_params": payload_sampling_params,
+            "priority": request_input.priority,
             "stream": False,
             "return_logprob": sampling_params.get("logprobs") is not None,
         }
@@ -494,6 +495,7 @@ class AgentLoopBase(ABC):
             raw_prompt=messages,
             is_validate=is_validate,
             stop_token_ids=request.get("stop_token_ids", None),
+            priority=request.get("priority", 0),
         )
 
     def _get_sampling_params(self, request: TokenInput):
@@ -654,6 +656,7 @@ class AgentLoopBase(ABC):
             "uid",
             "parent_id",
             "validate",
+            "priority",
             "rollout_instance_id",
             # prompt
             "raw_prompt_ids",

@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.device import auto_set_device, is_cuda_available
+from verl.utils.logging_utils import configure_verl_logging
 
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.utils import PSRL_Role
@@ -20,6 +21,38 @@ from psrl.workers.config.reward_model import resolve_active_managers
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+def _configure_runtime_env_flags(config) -> None:
+    """
+    Propagate config-derived flags before Ray snapshots the driver environment.
+
+    veRL's runtime environment forwards these variables at call time, so they must be set on
+    `os.environ` before `ray.init`.
+
+    Args:
+        config: Hydra training configuration.
+    """
+    rollout_config = config.gen_actor_rollout_ref.rollout
+    deterministic = rollout_config.full_determinism
+
+    reward_config = OmegaConf.select(config, "reward", default=None)
+    if reward_config is not None:
+        deterministic = deterministic or any(
+            bool(OmegaConf.select(manager, "rollout.full_determinism", default=False))
+            for manager in resolve_active_managers(reward_config)
+            if OmegaConf.select(manager, "reward_loop_type", default=None) == "gen"
+        )
+
+    if deterministic:
+        os.environ["VERL_FULL_DETERMINISM"] = "1"
+        os.environ["VLLM_BATCH_INVARIANT"] = "1"
+        os.environ["PYTHONHASHSEED"] = str(rollout_config.seed)
+
+    trainer_logger = config.trainer.get("logger", [])
+    logger_backends = [trainer_logger] if isinstance(trainer_logger, str) else trainer_logger or []
+    if "rl_insight" in logger_backends:
+        os.environ["VERL_RL_INSIGHT_ENABLE"] = "1"
 
 
 def seed_everything(seed: int):
@@ -132,8 +165,10 @@ def run_ppo(config, task_runner_class=None) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    _configure_runtime_env_flags(config)
+
     if not ray.is_initialized():
-        default_runtime_env = get_ppo_ray_runtime_env()
+        default_runtime_env = get_ppo_ray_runtime_env(config)
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
 
@@ -210,11 +245,13 @@ class TaskRunner:
         self.mapping[PSRL_Role.Actor] = ["train_pool"]
 
     def add_critic_worker(self, config):
-        """Add critic worker using verl's unified engine TrainingWorker."""
-        from verl.workers.engine_workers import TrainingWorker
+        """
+        Add a critic worker backed by veRL's unified training engine.
+        """
+        from psrl.workers.train.engine_train_worker import PSRL_CriticTrainWorker
 
         if need_critic(config):
-            self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(TrainingWorker)
+            self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(PSRL_CriticTrainWorker)
             self.mapping[PSRL_Role.Critic] = ["train_pool"]
 
     def add_ref_policy_worker(self, config):
@@ -377,6 +414,8 @@ class TaskRunner:
             config: Training configuration object containing all parameters needed
                    for setting up and running the PPO training process.
         """
+        configure_verl_logging()
+
         # Print the initial configuration. `resolve=True` will evaluate symbolic values.
         from pprint import pprint
 

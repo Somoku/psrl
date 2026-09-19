@@ -27,18 +27,22 @@ _PSRL = os.path.join(_HERE, "../psrl")
 if "psrl.utils.logger" not in sys.modules:
     sys.modules["psrl.utils.logger"] = MagicMock()
 
-# Load the real `gen.utils` so CPU-only tests can import its dataclasses and the
-# `RolloutInstanceId` alias. Stub torch for the load, then restore `sys.modules`.
+# Load the real `gen.utils` for its dataclasses and `RolloutInstanceId` alias. Torch is stubbed
+# only for that load, and modules that captured the stub are evicted afterwards.
 _previous_torch = sys.modules.get("torch")
+_modules_before_stub = set(sys.modules)
 sys.modules["torch"] = MagicMock()
 _gen_utils = _load_module_direct(
     "psrl.workers.gen.utils",
     os.path.join(_PSRL, "workers/gen/utils.py"),
 )
+_stub_bound_modules = [name for name in sys.modules if name.startswith("psrl.") and name not in _modules_before_stub]
 if _previous_torch is None:
     sys.modules.pop("torch", None)
 else:
     sys.modules["torch"] = _previous_torch
+for _name in _stub_bound_modules:
+    sys.modules.pop(_name, None)
 RolloutInstanceId = _gen_utils.RolloutInstanceId
 
 # Load staleness_controller directly (avoids ray via ps/__init__.py)

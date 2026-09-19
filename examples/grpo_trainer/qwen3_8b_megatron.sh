@@ -124,7 +124,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.actor.megatron.expert_model_parallel_size=$EP \
     train_actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=$ETP \
     train_actor_rollout_ref.actor.megatron.use_mbridge=True \
-    train_actor_rollout_ref.actor.megatron.vanilla_mbridge=True \
+    train_actor_rollout_ref.actor.megatron.vanilla_mbridge=False \
     train_actor_rollout_ref.actor.megatron.use_remove_padding=True \
     \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \

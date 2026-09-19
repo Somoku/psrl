@@ -33,7 +33,13 @@ class GenerateAgentLoop(AgentLoopBase):
         if output.response_log_probs is not None:
             output.response_log_probs = output.response_log_probs[: self.response_length]
         if output.routed_experts is not None:
-            output.routed_experts = output.routed_experts[: len(output.prompt_ids) + self.response_length]
+            expected_rows = len(output.prompt_ids) + len(output.response_ids) - 1
+            if output.routed_experts.shape[0] < expected_rows:
+                raise ValueError(
+                    "routed_experts became shorter than the truncated sequence: "
+                    f"got {output.routed_experts.shape[0]} rows, expected at least {expected_rows}."
+                )
+            output.routed_experts = output.routed_experts[:expected_rows]
         output.num_turns = 2
 
         kwargs = {

@@ -12,31 +12,54 @@ import logging
 import os
 
 import numpy as np
+import torch
+
+from psrl.utils.routed_experts import canonicalize_routed_experts, validate_routed_experts_array
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-def _assemble_routed_experts(records: list[dict], total_len: int) -> np.ndarray | None:
-    """Assemble per-turn routed-experts blobs into one position-indexed tensor."""
-    blobs = []
-    for record in records:
-        re = record.get("routed_experts")
-        if not re:
-            continue
-        arr = np.load(io.BytesIO(base64.b64decode(re["data"])))
-        blobs.append((int(re["prompt_start"]), arr))
-
-    if not blobs:
+def _assemble_routed_experts(
+    records: list[dict],
+    prompt_length: int,
+    response_length: int,
+) -> torch.Tensor | None:
+    """Concatenate per-turn routed-expert segments into the canonical int16 tensor."""
+    if not any(record.get("routed_experts") is not None for record in records):
         return None
 
-    _, sample = blobs[0]
-    routed_experts = np.zeros((max(total_len, 0), *sample.shape[1:]), dtype=sample.dtype)
-    for prompt_start, arr in blobs:
-        end = min(prompt_start + arr.shape[0], total_len)
-        if end > prompt_start:
-            routed_experts[prompt_start:end] = arr[: end - prompt_start]
-    return routed_experts
+    expected_shape: tuple[int, ...] | None = None
+    expected_dtype: np.dtype | None = None
+    segments: list[np.ndarray] = []
+    for turn_index, record in enumerate(records):
+        routed_experts = record.get("routed_experts")
+        if routed_experts is None:
+            raise ValueError(f"Missing routed_experts segment at TITO turn {turn_index}.")
+        array = np.load(io.BytesIO(base64.b64decode(routed_experts["data"])))
+        array = validate_routed_experts_array(array)
+
+        metadata_shape = (int(routed_experts["num_layers"]), int(routed_experts["top_k"]))
+        metadata_dtype = np.dtype(routed_experts["dtype"])
+        if metadata_shape != array.shape[1:] or metadata_dtype != array.dtype:
+            raise ValueError(
+                f"routed_experts metadata mismatch at TITO turn {turn_index}, "
+                f"metadata shape/dtype={metadata_shape!r}/{metadata_dtype!r}, "
+                f"array shape/dtype={array.shape[1:]!r}/{array.dtype!r}."
+            )
+        if expected_shape is None:
+            expected_shape = array.shape[1:]
+            expected_dtype = array.dtype
+        elif array.shape[1:] != expected_shape or array.dtype != expected_dtype:
+            raise ValueError(
+                f"routed_experts shape or dtype changed at TITO turn {turn_index}, "
+                f"expected {expected_shape!r}/{expected_dtype!r}, "
+                f"got {array.shape[1:]!r}/{array.dtype!r}."
+            )
+        segments.append(array)
+
+    compact = np.concatenate(segments, axis=0)
+    return canonicalize_routed_experts(compact, prompt_length, response_length)
 
 
 def build_training_data(
@@ -53,11 +76,11 @@ def build_training_data(
             - prompt_token_count: int
             - output_logprobs: list of [logprob, token_id] pairs (or None)
             - finish_reason: str
-        max_trim_tokens: Maximum number of trailing boundary tokens allowed to be trimmed
-            on non-last turns. Final-turn boundary tokens are retained. Sourced from
-            the SMG GET endpoint ``max_trim_tokens`` field. A ``ValueError`` is raised
-            if the actual trim count exceeds this limit, which indicates a TITO merge
-            bug rather than a normal boundary-token situation.
+        max_trim_tokens: Maximum number of trailing boundary tokens tolerated on non-last turns.
+            A final turn must align with the accumulated stream exactly. Sourced from the SMG
+            session's ``max_trim_tokens`` field. A divergence beyond the ceiling raises
+            ``ValueError`` instead of being clamped, because it indicates a TITO merge bug rather
+            than a normal boundary-token situation.
         prompt_ids_override: Optional initial prompt token ids rendered by the Python/verl
             path. When provided, these ids are used as ``prompt_ids`` instead of slicing
             TITO ``accumulated_token_ids`` by the first record's ``prompt_token_count``.
@@ -101,95 +124,60 @@ def build_training_data(
                 str(env_ids[:5]),
             )
 
-        # Assistant output tokens
+        # Assistant output tokens. `output_logprobs` is the only source of the sampled tokens, so
+        # a turn with accumulated tokens beyond its prompt but no logprobs cannot be reconstructed.
         output_ids = [int(pair[1]) for pair in raw_lps]
         output_logprobs = [float(pair[0]) for pair in raw_lps]
-
-        # Recover token IDs from TITO when log probabilities are unavailable.
-        # Zero log probabilities preserve positional alignment.
-        if not output_ids and prompt_len < total_acc_len:
-            is_last = i == len(records) - 1
-            if is_last:
-                end = total_acc_len
-            else:
-                end = records[i + 1]["prompt_token_count"]
-            if end > prompt_len:
-                output_ids = list(accumulated_token_ids[prompt_len:end])
-                output_logprobs = [0.0] * len(output_ids)
-                psrl_logger.warning(
-                    "[TITO turn %d] output_logprobs missing, recovered %d tokens from accumulated_token_ids",
-                    i,
-                    len(output_ids),
-                )
-
-        # Trailing trim for non-last turns: greedy match against accumulated.
-        # The last turn never trims -- boundary tokens are part of the final output.
         is_last = i == len(records) - 1
-        if not is_last and output_ids:
-            matched = 0
-            for j, tid in enumerate(output_ids):
-                pos = prompt_len + j
-                if pos < len(accumulated_token_ids) and tid == accumulated_token_ids[pos]:
-                    matched += 1
-                else:
-                    break
-            trim_count = len(output_ids) - matched
+        if not output_ids and prompt_len < total_acc_len:
+            raise ValueError(f"Missing output_logprobs at TITO turn {i}.")
 
+        # Greedy match the sampled output against the authoritative stream. The divergent suffix is
+        # the boundary tokens the template re-renders as the next turn's prefix, so it must be trimmed.
+        matched = 0
+        for j, token_id in enumerate(output_ids):
+            position = prompt_len + j
+            if position < total_acc_len and token_id == accumulated_token_ids[position]:
+                matched += 1
+            else:
+                break
+        trim_count = len(output_ids) - matched
+        allowed = 0 if is_last else max_trim_tokens
+        if trim_count > allowed:
+            raise ValueError(
+                f"TITO output tokens diverge at turn {i}: trim_count={trim_count} exceeds "
+                f"allowed={allowed} (is_last={is_last}, max_trim_tokens={max_trim_tokens}). "
+                f"output_ids[-3:]={output_ids[-3:]}, "
+                f"accumulated[{prompt_len + matched}:{prompt_len + matched + 3}]="
+                f"{accumulated_token_ids[prompt_len + matched : prompt_len + matched + 3]}"
+            )
+        if trim_count > 0:
+            output_ids = output_ids[:matched]
+            output_logprobs = output_logprobs[:matched]
             psrl_logger.debug(
-                "[TITO turn %d] trim analysis: is_last=%s, matched=%d, "
-                "trim_count=%d, allowed=%d, prompt_len=%d, "
-                "output_len=%d, total_acc_len=%d",
+                "[TITO turn %d] trimmed %d trailing boundary tokens, remaining output_len=%d",
                 i,
-                is_last,
-                matched,
                 trim_count,
-                max_trim_tokens,
-                prompt_len,
                 len(output_ids),
-                total_acc_len,
             )
 
-            # Non-final turns may trim only the model-specific boundary-token allowance.
-            allowed = max_trim_tokens  # is_last already guarded above
-            if trim_count > allowed:
-                # A boundary divergence beyond the model's ceiling is a diagnostic condition, not
-                # a reason to discard the trajectory, so clamp the trim and carry on.
-                psrl_logger.warning(
-                    "[TITO turn %d] trailing trim overflow: trim_count=%d exceeds "
-                    "allowed=%d (max_trim_tokens=%d). Clamping trim to %d. "
-                    "output_ids[-3:]=%s, accumulated[%d:%d]=%s",
-                    i,
-                    trim_count,
-                    allowed,
-                    max_trim_tokens,
-                    allowed,
-                    str(output_ids[-3:]),
-                    prompt_len + matched,
-                    prompt_len + matched + 3,
-                    str(accumulated_token_ids[prompt_len + matched : prompt_len + matched + 3]),
-                )
-                trim_count = allowed
-
-            if trim_count > 0:
-                output_ids = output_ids[: len(output_ids) - trim_count]
-                output_logprobs = output_logprobs[: len(output_logprobs) - trim_count]
-                psrl_logger.debug(
-                    "[TITO turn %d] trimmed %d tokens, remaining output_len=%d",
-                    i,
-                    trim_count,
-                    len(output_ids),
-                )
         all_response_ids.extend(output_ids)
         all_response_mask.extend([1] * len(output_ids))
         all_logprobs.extend(output_logprobs)
 
         cursor = prompt_len + len(output_ids)
 
+    if cursor != total_acc_len:
+        raise ValueError(
+            "TITO reconstruction did not consume the accumulated token stream: "
+            f"cursor={cursor}, accumulated_length={total_acc_len}."
+        )
+
     first_prompt_len = records[0]["prompt_token_count"]
     prompt_ids = (
         list(prompt_ids_override) if prompt_ids_override is not None else accumulated_token_ids[:first_prompt_len]
     )
-    routed_experts = _assemble_routed_experts(records, len(prompt_ids) + len(all_response_ids) - 1)
+    routed_experts = _assemble_routed_experts(records, len(prompt_ids), len(all_response_ids))
 
     # These fields are extended together and indexed interchangeably downstream.
     if not (len(all_response_ids) == len(all_response_mask) == len(all_logprobs)):

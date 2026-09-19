@@ -1,20 +1,17 @@
-import json
 import os
 
-from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env as get_verl_ppo_ray_runtime_env
 
-PPO_RAY_RUNTIME_ENV = {
-    "env_vars": {
-        "TOKENIZERS_PARALLELISM": "false",
-        "NCCL_DEBUG": "VERSION",
-        "VLLM_LOGGING_LEVEL": "WARN",
-        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
-        "VLLM_SKIP_P2P_CHECK": "1",  # Avoid the startup cost of the vLLM P2P probe.
-        "VERL_DATAPROTO_SERIALIZATION_METHOD": "numpy",
-        "PSRL_LOGGING_LEVEL": "INFO",
-        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "NCCL_CUMEM_ENABLE": "0",
-    },
+# Defaults for the SMG and NIXL data path. veRL owns platform and engine sensitive policy, so
+# PSRL only overlays its own values here.
+PSRL_RAY_ENV_DEFAULTS = {
+    "TOKENIZERS_PARALLELISM": "false",
+    "NCCL_DEBUG": "VERSION",
+    "VLLM_LOGGING_LEVEL": "WARN",
+    "VLLM_SKIP_P2P_CHECK": "1",  # Avoid the startup cost of the vLLM P2P probe.
+    "VERL_DATAPROTO_SERIALIZATION_METHOD": "numpy",
+    "PSRL_LOGGING_LEVEL": "INFO",
+    "NCCL_CUMEM_ENABLE": "0",
 }
 
 _HOST_RUNTIME_ENV_KEYS = (
@@ -30,22 +27,26 @@ _HOST_RUNTIME_ENV_KEYS = (
 )
 
 
-def get_ppo_ray_runtime_env():
+def get_ppo_ray_runtime_env(config=None):
     """
-    A filter function to return the PPO Ray runtime environment.
-    To avoid repeat of some environment variables that are already set.
-    """
-    working_dir = (
-        json.loads(os.environ.get(RAY_JOB_CONFIG_JSON_ENV_VAR, "{}")).get("runtime_env", {}).get("working_dir", None)
-    )
+    Build the veRL runtime environment with PSRL-specific defaults.
 
-    runtime_env = {
-        "env_vars": PPO_RAY_RUNTIME_ENV["env_vars"].copy(),
-        **({"working_dir": None} if working_dir is None else {}),
-    }
-    for key in list(runtime_env["env_vars"].keys()):
-        if os.environ.get(key) is not None:
-            runtime_env["env_vars"].pop(key, None)
+    An environment value already present in the launcher's environment always wins, so a
+    resolved config can still be overridden from the shell.
+
+    Args:
+        config: Optional resolved or unresolved training configuration. Forwarded to veRL so
+            it can apply engine and platform sensitive settings.
+
+    Returns:
+        dict: Ray runtime environment suitable for `ray.init`.
+    """
+    runtime_env = get_verl_ppo_ray_runtime_env(config)
+    runtime_env.setdefault("env_vars", {})
+
+    for key, value in PSRL_RAY_ENV_DEFAULTS.items():
+        if os.environ.get(key) is None:
+            runtime_env["env_vars"][key] = value
 
     for key in ("PYTHONPATH", "PYTHONPYCACHEPREFIX"):
         val = os.environ.get(key)

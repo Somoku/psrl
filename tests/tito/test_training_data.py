@@ -4,6 +4,7 @@ import base64
 import io
 
 import numpy as np
+import pytest
 from psrl.utils.tito.training_data import build_training_data
 
 
@@ -80,8 +81,12 @@ def test_empty_records():
     assert result["num_turns"] == 0
 
 
-def test_no_logprobs():
-    """Records without logprobs recover token IDs and use neutral logprobs."""
+def test_turn_without_logprobs_raises():
+    """A turn that owns accumulated tokens but reports no logprobs is a gateway bug.
+
+    Recovering the tokens and zero-filling their logprobs would keep the positions
+    trainable with fabricated values, corrupting the rollout log-prob correction.
+    """
     accumulated = [1, 2, 3]
     records = [
         {
@@ -90,11 +95,29 @@ def test_no_logprobs():
             "finish_reason": "stop",
         }
     ]
+    with pytest.raises(ValueError, match="carries no output_logprobs"):
+        build_training_data(accumulated, records)
+
+
+def test_turn_without_tokens_needs_no_logprobs():
+    """A turn that produced no assistant tokens owns nothing to log-prob."""
+    accumulated = [1, 2, 10, 11, 12]
+    records = [
+        {
+            "prompt_token_count": 2,
+            "output_logprobs": [],
+            "finish_reason": "stop",
+        },
+        {
+            "prompt_token_count": 2,
+            "output_logprobs": [[-0.5, 10], [-0.3, 11], [-0.1, 12]],
+            "finish_reason": "stop",
+        },
+    ]
     result = build_training_data(accumulated, records)
-    assert result["prompt_ids"] == [1, 2]
-    assert result["response_ids"] == [3]
-    assert result["response_mask"] == [1]
-    assert result["logprobs"] == [0.0]
+    assert result["response_ids"] == [10, 11, 12]
+    assert result["response_mask"] == [1, 1, 1]
+    assert result["logprobs"] == [-0.5, -0.3, -0.1]
 
 
 def test_routed_experts_none_when_absent():

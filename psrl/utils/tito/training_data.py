@@ -64,6 +64,11 @@ def build_training_data(
 
     Returns:
         Dict with keys: prompt_ids, response_ids, response_mask, logprobs, num_turns.
+
+    Raises:
+        ValueError: If a turn contributed tokens to ``accumulated_token_ids`` but its
+            record carries no ``output_logprobs``, or if the fields appended per turn
+            drift apart. Both indicate a gateway/TITO contract violation.
     """
     if not records:
         return {
@@ -105,21 +110,19 @@ def build_training_data(
         output_ids = [int(pair[1]) for pair in raw_lps]
         output_logprobs = [float(pair[0]) for pair in raw_lps]
 
-        # Recover token IDs from TITO when log probabilities are unavailable.
-        # Zero log probabilities preserve positional alignment.
-        if not output_ids and prompt_len < total_acc_len:
-            is_last = i == len(records) - 1
-            if is_last:
-                end = total_acc_len
-            else:
-                end = records[i + 1]["prompt_token_count"]
-            if end > prompt_len:
-                output_ids = list(accumulated_token_ids[prompt_len:end])
-                output_logprobs = [0.0] * len(output_ids)
-                psrl_logger.warning(
-                    "[TITO turn %d] output_logprobs missing, recovered %d tokens from accumulated_token_ids",
-                    i,
-                    len(output_ids),
+        if not raw_lps:
+            # The turn owns no tokens only when the next turn's prompt stops where this
+            # one did (or, on the final turn, the accumulated sequence ends at its prompt).
+            turn_end = total_acc_len if i == len(records) - 1 else records[i + 1]["prompt_token_count"]
+            if turn_end > prompt_len:
+                raise ValueError(
+                    f"[TITO build_training_data] turn {i}/{len(records)} owns "
+                    f"{turn_end - prompt_len} token(s) in accumulated_token_ids "
+                    f"(prompt_token_count={prompt_len}, end={turn_end}, "
+                    f"total_acc_len={total_acc_len}) but its record carries no "
+                    f"output_logprobs (finish_reason={record.get('finish_reason')!r}). "
+                    "TITO training turns always request logprobs, so the gateway dropped "
+                    "them; check the SMG logs for the partial-rollout log-prob merge."
                 )
 
         # Trailing trim for non-last turns: greedy match against accumulated.

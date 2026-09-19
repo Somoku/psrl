@@ -1,10 +1,12 @@
 # veRL Upgrade and Rebase Guide
 
-This directory holds one patch per supported veRL revision. This document is the source of truth
-for moving PSRL onto a new revision.
+This directory holds the patch for the veRL revision PSRL is pinned to. This document is the source
+of truth for moving PSRL onto a new revision.
 
-`patch/apply_patch.sh verl` selects the patch by the installed veRL commit, then by version, then
-by the most recently modified file. Keep old commit-named patches. Do not apply two in sequence.
+`patch/apply_patch.sh verl` selects the patch by the installed veRL commit, then by version, then by
+the most recently modified file. Keep only the pinned revision: when the pin moves, delete the
+superseded patch in the same change. `git log -- patch/verl` retains the older ones for a rebase that
+needs to look back.
 
 ## 1. Supported architecture and version boundary
 
@@ -179,7 +181,7 @@ Patch maintenance rules:
 2. Re-implement each requirement against the new upstream structure. Do not blindly apply the
    previous diff.
 3. Keep PSRL imports inside the patch minimal.
-4. Export one patch named after the commit.
+4. Export one patch named after the commit and delete the superseded patch.
 5. Copy the same bytes to `docker/patch/verl.patch` and verify they are identical.
 6. Validate with `git apply --check` against a clean checkout of the exact commit.
 

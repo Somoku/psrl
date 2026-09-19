@@ -428,7 +428,6 @@ class TrainClientActor:
                     ps_client_name,
                     key,
                     "train_push",
-                    merge_and_cache_xfer=False,
                 )
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, ps_client_name, shards_to_transfer))
@@ -446,7 +445,6 @@ class TrainClientActor:
                     )
                 )
         ray.get(futures)
-        # self.client.merge_and_finish_cached_xfer()
 
     def shutdown(self):
         self.client.shutdown()
@@ -631,13 +629,11 @@ class GenClientActor:
                     ps_client_name,
                     key,
                     "gen_pull",
-                    merge_and_cache_xfer=False,
                 )
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, ps_client_name, shards_to_transfer))
         for key, ps_client_name, shards_to_transfer in wait_operations:
             self.client.wait(key, "gen_pull", "READ", target_client=ps_client_name)
-        self.client.merge_and_finish_cached_xfer()
         total_end_time = time.time()
         # torch.cuda.synchronize()
         self.print(f"Total pull from ps done: {total_end_time - total_start_time}s")
@@ -728,6 +724,10 @@ def test_nixl_e2e(cfg: DictConfig):
                 "server_port": cfg.nixl.server_port,
                 "max_pinned_temp_memory_slots": cfg.nixl.max_pinned_temp_memory_slots,
                 "enable_tms_for_temp_buffers": cfg.nixl.enable_tms_for_temp_buffers,
+                "merge_contiguous_xfer": cfg.nixl.merge_contiguous_xfer,
+                "enable_prepared_dlist": cfg.nixl.enable_prepared_dlist,
+                "capture_telemetry": cfg.nixl.capture_telemetry,
+                "enable_nixl_telemetry": cfg.nixl.enable_nixl_telemetry,
             },
             "ps_mode": cfg.ps.mode,
         }

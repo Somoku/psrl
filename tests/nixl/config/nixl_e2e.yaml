@@ -56,6 +56,10 @@ nixl:
   server_port: ${network.listen_port}
   max_pinned_temp_memory_slots: 4
   enable_tms_for_temp_buffers: False # TMS (torch_memory_saver) is not used in unit tests
+  merge_contiguous_xfer: True # merge contiguous shards into one NIXL request per (op, target, key)
+  enable_prepared_dlist: True # opt-in prepared descriptor-list caching
+  capture_telemetry: False # requires NIXL_TELEMETRY_ENABLE=true
+  enable_nixl_telemetry: False # log per-transfer telemetry on completion
 
 # PS configuration
 ps:

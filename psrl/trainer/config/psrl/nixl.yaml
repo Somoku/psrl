@@ -11,3 +11,17 @@ max_pinned_temp_memory_slots: 16
 
 # Enable TMS management for NIXL temp buffers
 enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
+
+# Merge all contiguous shards of a key into a single NIXL request per (op, target, key).
+# Disable to fall back to one NIXL request per shard.
+merge_contiguous_xfer: true
+
+# Cache prepared descriptor lists (`prep_xfer_dlist` + `make_prepped_xfer`) to avoid
+# re-preparing unchanged descriptors on every transfer.
+enable_prepared_dlist: true
+
+# Capture NIXL agent telemetry. Requires NIXL_TELEMETRY_ENABLE=true in the environment.
+capture_telemetry: false
+
+# Log per-transfer NIXL telemetry (bytes, post/xfer durations) on completion.
+enable_nixl_telemetry: false

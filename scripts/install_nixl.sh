@@ -5,7 +5,11 @@ trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
 CUDA_PATH=${CUDA_PATH:-"/usr/local/cuda"}
 MAX_JOBS=${MAX_JOBS:-32}
-REQUIRED_UCX_VERSION="1.20.0"
+# NIXL v1.4.1 is tested against UCX v1.22.x. UCX_REF is the git ref to build
+# when the detected UCX is older than REQUIRED_UCX_VERSION.
+UCX_REF="v1.22.x"
+REQUIRED_UCX_VERSION="1.22.0"
+NIXL_REF="v1.4.1"
 UCX_PREFIX="/usr"
 INSTALL_UCX=true
 
@@ -39,7 +43,7 @@ if $INSTALL_UCX; then
     UCX_PREFIX="$THIRD_PARTY_PATH/ucx"
     mkdir -p $THIRD_PARTY_PATH/ucx_src
     pushd $THIRD_PARTY_PATH/ucx_src
-    git clone -b $REQUIRED_UCX_VERSION https://github.com/openucx/ucx.git
+    git clone -b $UCX_REF https://github.com/openucx/ucx.git
     cd ucx
 
     # Checking Mellanox NICs
@@ -74,17 +78,20 @@ else
     echo "1. Skip UCX installation"
 fi
 
-# Recommend to use gcc 11.x.x, gcc-toolset-13 may have error with nixl
+# NIXL v1.4.1 requires a C++20 compiler (GCC >= 11 or Clang >= 14).
+if ! echo 'int main(){return 0;}' | ${CXX:-g++} -std=c++20 -x c++ - -o /dev/null 2>/dev/null; then
+    echo "[ERROR] NIXL v1.4.1 requires a C++20 compiler (GCC >= 11 or Clang >= 14);" \
+         "${CXX:-g++} does not support -std=c++20." >&2
+    exit 1
+fi
+
 echo "2. Install nixl"
 mkdir -p $THIRD_PARTY_PATH/nixl_src
 pushd $THIRD_PARTY_PATH/nixl_src
-git clone -b v1.2.0 https://github.com/ai-dynamo/nixl.git
+git clone -b $NIXL_REF https://github.com/ai-dynamo/nixl.git
 cd nixl
 mkdir -p build
-# Disable obj backend
-sed -i "s/subdir('obj')/# subdir('obj')/" "$THIRD_PARTY_PATH/nixl_src/nixl/src/plugins/meson.build"
-# Disable err handling for ucp (will make NIXL READ slower 10x!)
-echo "Applying nixl patch..."
+# PSRL only uses the UCX backend. Build no other plugins.
 meson setup build \
     --prefix=$THIRD_PARTY_PATH/nixl \
     -Dbuild_docs=false \

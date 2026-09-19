@@ -356,7 +356,6 @@ class PSRL_BaseTrainWorker:
             self.nixl_storage_client.wait(
                 key, f"train_pull_{self.pull_times}", "READ", target_client=target_client_name
             )
-        self.nixl_storage_client.merge_and_finish_cached_xfer()
         torch.cuda.synchronize()
         self.nixl_storage_client.clear_intermediate_cached_data()
         psrl_logger.info(

@@ -21,8 +21,8 @@ ARG INSTALL_FLASH_ATTN_3=1
 # Source revisions are build arguments so downstream releases can update one
 # component without rewriting the installation graph. Patch compatibility must
 # be revalidated whenever one of these defaults changes.
-ARG UCX_REF=v1.20.0
-ARG NIXL_REF=v1.2.0
+ARG UCX_REF=v1.22.x
+ARG NIXL_REF=v1.4.1
 ARG VLLM_REF=v0.29.0
 ARG VERL_REF=e5ca4acb
 ARG TRANSFER_QUEUE_REF=434f8c476b4be24bc087e6e95070e64efcc739f9
@@ -237,8 +237,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 # a revision drifts away from its PSRL patch.
 COPY docker/patch/ ${PSRL_PATCH_DIR}/
 
-# UCX and NIXL provide the PSRL model-transfer data plane. NIXL v1.2.0 follows
-# the upstream CUDA 13 source-packaging flow without the legacy PSRL patch.
+# UCX and NIXL provide the PSRL model-transfer data plane. NIXL v1.4.1 follows
+# the upstream CUDA 13 source-packaging flow without the legacy PSRL patch and
+# is built with only the UCX and POSIX plugins, which are the backends PSRL uses.
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/openucx/ucx.git /root/ucx-source && \
     git -C /root/ucx-source checkout ${UCX_REF} && \

@@ -238,7 +238,6 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
                 "READ",
                 target_client=target_client_name,
             )
-        self.nixl_storage_client.merge_and_finish_cached_xfer()
         self.cuda_synchronize()
         self.nixl_storage_client.clear_intermediate_cached_data()
         time_end = time.time()

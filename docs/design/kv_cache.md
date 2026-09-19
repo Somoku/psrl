@@ -179,9 +179,11 @@ P2P transfer uses the NIXL transport, so `psrl.ps_mode` must be `nixl_cpu` or
 Config: `psrl.lmcache.enable_kv_events`
 
 With cache-aware routing, `lmcache_overlap_weight` scores the off-GPU tier. That
-score is built from the cache events an MP server publishes for external
-consumers. Enabling it implies `coordinator_event_reporting`, and the server's
-publisher endpoint is registered with the coordinator so routers can discover it.
+score is built from the cache events an MP server publishes. Enabling it implies
+`coordinator_event_reporting` and turns on the server's event stream at
+`/cache/events/stream`, which emits newline delimited JSON. The stream URL is
+registered with the coordinator, so routers discover it from the instance
+registry instead of being configured per instance.
 
 ## Gotchas
 

@@ -690,64 +690,101 @@ index 1bd26022..1f4544e1 100644
          self, keys: list[ObjectKey]
      ) -> tuple[list[ObjectKey], list[MemoryObj]]:
 diff --git a/lmcache/v1/mp_coordinator/cache_events.py b/lmcache/v1/mp_coordinator/cache_events.py
-index 409b887b..801c3072 100644
+index 409b887b..bb7a824f 100644
 --- a/lmcache/v1/mp_coordinator/cache_events.py
 +++ b/lmcache/v1/mp_coordinator/cache_events.py
-@@ -120,6 +120,94 @@ class HttpCacheEventSink(CacheEventSink):
+@@ -15,6 +15,8 @@ emission thread or task. See
+ from abc import ABC, abstractmethod
+ from collections import OrderedDict
+ from dataclasses import dataclass
++import queue
++import threading
+ import time
+ 
+ # Third Party
+@@ -120,6 +122,122 @@ class HttpCacheEventSink(CacheEventSink):
          self._client.close()
  
  
-+class ZmqCacheEventSink(CacheEventSink):
-+    """Sink that publishes batches on a ZMQ PUB socket.
++class CacheEventStream:
++    """In-process fan-out of cache-event batches to streaming subscribers.
 +
-+    Feeds an external consumer (for example a router that scores the off-GPU
-+    cache tier) from the same batching pass the coordinator sees. Payloads are
-+    JSON because the batches already have a JSON projection for the HTTP
-+    transport, so no second schema has to be maintained.
-+
-+    PUB drops messages while no subscriber is connected and does not block on a
-+    slow one; this is a best-effort stream by design.
++    The observability bus's drain thread publishes from a worker thread while
++    FastAPI's SSE handlers consume from the event loop, so each subscriber gets
++    its own bounded queue and a slow consumer drops batches rather than blocking
++    the drain thread. Losing batches on a slow consumer is acceptable because a
++    router treats this stream as advisory cache state.
 +
 +    Args:
-+        publish_url: ZMQ endpoint to bind, e.g. ``tcp://0.0.0.0:9400``.
++        maxsize: Per-subscriber queue capacity.
 +    """
 +
-+    def __init__(self, publish_url: str) -> None:
-+        # Third Party
-+        import zmq
++    def __init__(self, maxsize: int = 1024) -> None:
++        self._lock = threading.Lock()
++        self._subscribers: set[queue.Queue] = set()
++        self._maxsize = maxsize
 +
-+        self._zmq = zmq
-+        self._publish_url = publish_url
-+        self._context = zmq.Context.instance()
-+        self._socket = self._context.socket(zmq.PUB)
-+        # Never hold the drain thread on shutdown waiting for a slow peer.
-+        self._socket.setsockopt(zmq.LINGER, 0)
-+        self._socket.bind(publish_url)
-+        logger.info("Cache-event ZMQ publisher bound to %s", publish_url)
++    def subscribe(self) -> "queue.Queue[bytes]":
++        """Register a subscriber.
++
++        Returns:
++            queue.Queue: The queue this subscriber drains. Pass it back to
++            :meth:`unsubscribe` when the stream ends.
++        """
++        subscriber: "queue.Queue[bytes]" = queue.Queue(maxsize=self._maxsize)
++        with self._lock:
++            self._subscribers.add(subscriber)
++        return subscriber
++
++    def unsubscribe(self, subscriber: "queue.Queue[bytes]") -> None:
++        """Deregister a subscriber.
++
++        Args:
++            subscriber: The queue returned by :meth:`subscribe`.
++        """
++        with self._lock:
++            self._subscribers.discard(subscriber)
++
++    def publish(self, payload: bytes) -> None:
++        """Offer one encoded payload to every subscriber, dropping on overflow.
++
++        Args:
++            payload: The encoded batch payload.
++        """
++        with self._lock:
++            subscribers = list(self._subscribers)
++        for subscriber in subscribers:
++            try:
++                subscriber.put_nowait(payload)
++            except queue.Full:
++                logger.warning(
++                    "Dropping a cache-event payload for a slow stream subscriber"
++                )
++
++
++class StreamCacheEventSink(CacheEventSink):
++    """Sink that fans batches out to in-process stream subscribers.
++
++    Serves an HTTP streaming route on the MP server, so routers can follow the
++    off-GPU cache state without taking a dependency on the coordinator.
++
++    Args:
++        stream: The hub to publish into.
++    """
++
++    def __init__(self, stream: CacheEventStream) -> None:
++        self._stream = stream
 +
 +    def publish(self, batches: list[CacheEventBatch]) -> None:
-+        """Publish ``batches`` as one JSON frame.
++        """Publish ``batches`` as one newline-delimited JSON payload.
 +
 +        Args:
 +            batches: The batches to publish, in list order.
-+
-+        Raises:
-+            CacheEventPublishError: If the socket rejected the frame.
 +        """
 +        if not batches:
 +            return
 +        payload = CacheEventsRequest(batches=batches).model_dump_json()
-+        try:
-+            self._socket.send(payload.encode("utf-8"))
-+        except self._zmq.ZMQError as e:
-+            raise CacheEventPublishError(
-+                f"failed to publish {len(batches)} cache-event batches to "
-+                f"{self._publish_url}: {e}"
-+            ) from e
-+
-+    def close(self) -> None:
-+        """Close the PUB socket."""
-+        self._socket.close(linger=0)
++        self._stream.publish(payload.encode("utf-8") + b"\n")
 +
 +
 +class FanoutCacheEventSink(CacheEventSink):
@@ -1188,22 +1225,22 @@ index 692922da..c7b23786 100644
          except ValueError as exc:
              raise InvalidRequest(str(exc)) from None
 diff --git a/lmcache/v1/multiprocess/config.py b/lmcache/v1/multiprocess/config.py
-index 396f24d9..00cf95c8 100644
+index 396f24d9..6d604b25 100644
 --- a/lmcache/v1/multiprocess/config.py
 +++ b/lmcache/v1/multiprocess/config.py
 @@ -242,6 +242,16 @@ class CoordinatorConfig:
      event_flush_interval: float = 1.0
      """Seconds between cache-event flush attempts to the coordinator."""
  
-+    event_publish_url: str = ""
-+    """ZMQ endpoint this server binds to publish cache events for external
-+    consumers, in addition to sending them to the coordinator. Empty disables
-+    the extra publisher. Requires ``event_reporting``."""
++    event_stream_enable: bool = False
++    """When ``True``, additionally expose the cache-event stream over the
++    server's HTTP API so external consumers can follow the off-GPU tier.
++    Requires ``event_reporting``."""
 +
 +    metadata: dict[str, str] = field(default_factory=dict)
 +    """Free-form key/value pairs registered with the coordinator so other
 +    components can discover how to reach this server. Conventionally carries
-+    ``event_publish_url`` when the cache-event publisher is enabled."""
++    ``event_stream_url`` when the cache-event stream is enabled."""
 +
      blend_timeout: float = 1.0
      """Seconds a fleet CacheBlend lookup may take: both the per-request HTTP
@@ -1213,13 +1250,13 @@ index 396f24d9..00cf95c8 100644
          "Defaults to LMCACHE_COORDINATOR_EVENT_FLUSH_INTERVAL, then 1.0.",
      )
 +    group.add_argument(
-+        "--coordinator-event-publish-url",
-+        type=str,
++        "--coordinator-event-stream-enable",
++        action="store_true",
 +        default=None,
-+        help="ZMQ endpoint to bind for publishing cache events to external "
-+        "consumers, in addition to the coordinator. Requires "
++        help="Also expose cache events over the server's HTTP stream so "
++        "external consumers can follow the off-GPU tier. Requires "
 +        "--coordinator-event-reporting. Defaults to "
-+        "LMCACHE_COORDINATOR_EVENT_PUBLISH_URL; unset disables.",
++        "LMCACHE_COORDINATOR_EVENT_STREAM_ENABLE; unset disables.",
 +    )
 +    group.add_argument(
 +        "--coordinator-metadata",
@@ -1232,17 +1269,20 @@ index 396f24d9..00cf95c8 100644
      group.add_argument(
          "--coordinator-blend-timeout",
          type=float,
-@@ -804,6 +831,34 @@ def parse_args_to_coordinator_config(
+@@ -804,6 +831,37 @@ def parse_args_to_coordinator_config(
              "got %s" % event_flush_interval
          )
  
-+    event_publish_url = args.coordinator_event_publish_url
-+    if event_publish_url is None:
-+        event_publish_url = os.getenv("LMCACHE_COORDINATOR_EVENT_PUBLISH_URL", "")
-+    if event_publish_url and not event_reporting:
++    if args.coordinator_event_stream_enable is not None:
++        event_stream_enable = args.coordinator_event_stream_enable
++    else:
++        event_stream_enable = os.getenv(
++            "LMCACHE_COORDINATOR_EVENT_STREAM_ENABLE", ""
++        ).lower() in ("1", "true", "yes")
++    if event_stream_enable and not event_reporting:
 +        raise ValueError(
-+            "--coordinator-event-publish-url requires "
-+            "--coordinator-event-reporting (the publisher uses the same "
++            "--coordinator-event-stream-enable requires "
++            "--coordinator-event-reporting (the stream uses the same "
 +            "batching pass as the coordinator sink)."
 +        )
 +
@@ -1267,11 +1307,11 @@ index 396f24d9..00cf95c8 100644
      blend_timeout = args.coordinator_blend_timeout
      if not math.isfinite(blend_timeout) or blend_timeout <= 0:
          raise ValueError(
-@@ -823,6 +878,8 @@ def parse_args_to_coordinator_config(
+@@ -823,6 +881,8 @@ def parse_args_to_coordinator_config(
          heartbeat_interval=heartbeat_interval,
          event_reporting=event_reporting,
          event_flush_interval=event_flush_interval,
-+        event_publish_url=event_publish_url,
++        event_stream_enable=event_stream_enable,
 +        metadata=metadata,
          blend_timeout=blend_timeout,
          blend_match_concurrency=blend_match_concurrency,
@@ -1438,6 +1478,73 @@ index 25c95271..14e2fa95 100644
      )
  
  
+diff --git a/lmcache/v1/multiprocess/http_apis/events_api.py b/lmcache/v1/multiprocess/http_apis/events_api.py
+new file mode 100644
+index 00000000..7eee4030
+--- /dev/null
++++ b/lmcache/v1/multiprocess/http_apis/events_api.py
+@@ -0,0 +1,61 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Cache-event streaming endpoint on the MP server.
++
++Exposes the same cache-event batches the coordinator ingests, as newline
++delimited JSON, so an external consumer can follow the off-GPU tier without
++reading coordinator internals. Streams are advisory: a slow consumer drops
++batches rather than stalling the observability drain thread.
++
++Enable with ``--coordinator-event-stream-enable``. The stream is served from
++this node, so a consumer must be able to reach the server's HTTP port.
++"""
++
++# Standard
++import asyncio
++import queue
++
++# Third Party
++from fastapi import APIRouter, HTTPException, Request
++from fastapi.responses import StreamingResponse
++
++router = APIRouter()
++
++# Seconds without an event before the stream emits a keepalive newline.
++_KEEPALIVE_INTERVAL_S = 5.0
++
++
++@router.get("/cache/events/stream")
++async def stream_cache_events(request: Request) -> StreamingResponse:
++    """Stream cache events as newline delimited JSON.
++
++    Each line is one ``CacheEventsRequest`` payload, matching the coordinator's
++    ``POST /events`` body. Blank lines are keepalives and must be ignored.
++
++    Responses:
++        200: An open stream of JSON lines.
++        503: The stream is not enabled on this server.
++    """
++    stream = getattr(request.app.state, "event_stream", None)
++    if stream is None:
++        raise HTTPException(
++            status_code=503,
++            detail="cache event stream is not enabled on this server",
++        )
++    subscriber = stream.subscribe()
++
++    async def event_source():
++        """Yield queued payloads until the client disconnects."""
++        try:
++            while not await request.is_disconnected():
++                try:
++                    payload = await asyncio.to_thread(
++                        subscriber.get, True, _KEEPALIVE_INTERVAL_S
++                    )
++                except queue.Empty:
++                    yield b"\n"
++                    continue
++                yield payload
++        finally:
++            stream.unsubscribe(subscriber)
++
++    return StreamingResponse(event_source(), media_type="application/x-ndjson")
 diff --git a/lmcache/v1/multiprocess/http_apis/schemas.py b/lmcache/v1/multiprocess/http_apis/schemas.py
 index 4595884c..9b8a228d 100644
 --- a/lmcache/v1/multiprocess/http_apis/schemas.py
@@ -1478,22 +1585,23 @@ index 4595884c..9b8a228d 100644
  @dataclass(frozen=True)
  class ClearRequest:
 diff --git a/lmcache/v1/multiprocess/http_server.py b/lmcache/v1/multiprocess/http_server.py
-index ed6f9b84..f7be6221 100644
+index ed6f9b84..7fc46a52 100644
 --- a/lmcache/v1/multiprocess/http_server.py
 +++ b/lmcache/v1/multiprocess/http_server.py
-@@ -21,8 +21,11 @@ from lmcache.v1.distributed.config import (
+@@ -21,8 +21,12 @@ from lmcache.v1.distributed.config import (
      parse_args_to_config,
  )
  from lmcache.v1.mp_coordinator.cache_events import (
 +    CacheEventSink,
++    CacheEventStream,
      CacheEventSubscriber,
 +    FanoutCacheEventSink,
      HttpCacheEventSink,
-+    ZmqCacheEventSink,
++    StreamCacheEventSink,
  )
  from lmcache.v1.mp_coordinator.registrar import keep_registered
  from lmcache.v1.mp_observability.config import (
-@@ -138,18 +141,31 @@ async def lifespan(app: FastAPI):
+@@ -138,18 +142,33 @@ async def lifespan(app: FastAPI):
                  heartbeat_interval=coordinator_config.heartbeat_interval,
                  p2p_advertised_url=mp_config.p2p_config.advertise_url,
                  mq_port=mp_config.port if mp_config.p2p_config.enabled else 0,
@@ -1506,19 +1614,21 @@ index ed6f9b84..f7be6221 100644
 -        coordinator_client is not None
 -        and coordinator_config.url
 -        and coordinator_config.event_reporting
-+    # Optionally report cache events to the coordinator and/or an external
-+    # ZMQ consumer. Both transports share one batching pass and sequence.
++    # Optionally report cache events to the coordinator and/or an HTTP stream
++    # consumer. Both transports share one batching pass and sequence.
 +    reports_to_coordinator = coordinator_client is not None and bool(
 +        coordinator_config.url
 +    )
++    if coordinator_config.event_stream_enable:
++        app.state.event_stream = CacheEventStream()
 +    if coordinator_config.event_reporting and (
-+        reports_to_coordinator or coordinator_config.event_publish_url
++        reports_to_coordinator or coordinator_config.event_stream_enable
      ):
 +        event_sinks: list[CacheEventSink] = []
 +        if reports_to_coordinator:
 +            event_sinks.append(HttpCacheEventSink(coordinator_config.url))
-+        if coordinator_config.event_publish_url:
-+            event_sinks.append(ZmqCacheEventSink(coordinator_config.event_publish_url))
++        if coordinator_config.event_stream_enable:
++            event_sinks.append(StreamCacheEventSink(app.state.event_stream))
 +        sink: CacheEventSink = (
 +            event_sinks[0]
 +            if len(event_sinks) == 1

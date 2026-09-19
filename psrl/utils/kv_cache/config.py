@@ -119,14 +119,6 @@ class LMCacheConfig:
     # views and for the LMCache-tier KV event stream.
     coordinator_event_reporting: bool = False
 
-    # ZMQ PUB port for the LMCache-tier KV event stream consumed by SMG.
-    # Zero means "allocate at launch".
-    event_publish_port: int = 0
-
-    # Host consumers use to reach the LMCache-tier event stream. Empty reuses
-    # the coordinator host.
-    event_publish_advertise_host: str = ""
-
     # --- Connector ---
 
     # Timeout in seconds for MP message-queue requests.
@@ -173,10 +165,9 @@ class LMCacheConfig:
         return f"http://{self.resolved_http_advertise_host}:{self.http_port}"
 
     @property
-    def event_publish_url(self) -> str:
+    def event_stream_url(self) -> str:
         """Endpoint consumers subscribe to for the LMCache-tier event stream."""
-        host = self.event_publish_advertise_host or self.p2p_advertise_host or self.server_host
-        return f"tcp://{host}:{self.event_publish_port}"
+        return f"{self.http_base_url}/cache/events/stream"
 
     def to_connector_extra_config(self) -> dict:
         """
@@ -305,12 +296,11 @@ class LMCacheConfig:
 
         if self.coordinator_event_reporting:
             argv += ["--coordinator-event-reporting"]
-            if self.event_publish_port > 0:
+            if self.enable_kv_events:
                 argv += [
-                    "--coordinator-event-publish-url",
-                    f"tcp://0.0.0.0:{self.event_publish_port}",
+                    "--coordinator-event-stream-enable",
                     "--coordinator-metadata",
-                    _to_json({"event_publish_url": self.event_publish_url}),
+                    _to_json({"event_stream_url": self.event_stream_url}),
                 ]
 
         return argv

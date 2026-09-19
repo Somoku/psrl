@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from psrl.utils.kv_cache.config import (
     MP_CONNECTOR_MODULE,
@@ -173,6 +175,22 @@ class TestKVCacheManager:
         manager = KVCacheManager(LMCacheConfig(enable=True, multi_version_kv=False))
         manager.set_parallel_geometry("org/model", 1)
         assert manager._l1_pin_body([1])["request_configs"] is None
+
+    def test_event_stream_url_is_served_from_the_management_port(self):
+        config = self._runtime_config(http_host="0.0.0.0", http_advertise_host="10.0.0.1")
+        assert config.event_stream_url == "http://10.0.0.1:8080/cache/events/stream"
+
+    def test_event_stream_flags(self):
+        argv = self._runtime_config(coordinator_event_reporting=True, enable_kv_events=True).to_server_argv()
+        assert "--coordinator-event-reporting" in argv
+        assert "--coordinator-event-stream-enable" in argv
+        metadata = json.loads(argv[argv.index("--coordinator-metadata") + 1])
+        assert metadata["event_stream_url"].endswith("/cache/events/stream")
+
+    def test_event_stream_disabled_without_kv_events(self):
+        argv = self._runtime_config(coordinator_event_reporting=True).to_server_argv()
+        assert "--coordinator-event-reporting" in argv
+        assert "--coordinator-event-stream-enable" not in argv
 
     def test_transfer_requires_p2p(self):
         import asyncio

@@ -288,7 +288,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         port_scanner = get_port_scanner(node_ip)
         # Always a message-queue and HTTP port, plus one per enabled feature.
         wants_events = lmcache_cfg.coordinator_event_reporting
-        num_ports = 2 + (1 if lmcache_cfg.enable_p2p else 0) + (1 if wants_events else 0)
+        # The event stream shares the management HTTP port, and consumers on
+        # other nodes must be able to reach it like a transfer destination.
+        routable_http = lmcache_cfg.enable_p2p or wants_events
+        num_ports = 2 + (1 if lmcache_cfg.enable_p2p else 0)
         ports = ray.get([port_scanner.find_free_port.remote() for _ in range(num_ports)])
 
         next_port = 0
@@ -297,18 +300,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         next_port += 1
         lmcache_cfg.http_port = ports[next_port]
         next_port += 1
-        if lmcache_cfg.enable_p2p:
-            # Cross-instance transfer is destination-initiated, so other nodes
-            # must be able to reach this server's management HTTP API.
+        if routable_http:
             lmcache_cfg.http_host = "0.0.0.0"
             lmcache_cfg.http_advertise_host = node_ip
+        if lmcache_cfg.enable_p2p:
             lmcache_cfg.p2p_advertise_host = node_ip
             lmcache_cfg.p2p_transfer_port = ports[next_port]
-            next_port += 1
-        if wants_events:
-            lmcache_cfg.event_publish_port = ports[next_port]
-            next_port += 1
-            lmcache_cfg.event_publish_advertise_host = node_ip
 
         log_path = os.path.join(
             str(self.psrl_config.logging_path),

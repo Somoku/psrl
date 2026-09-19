@@ -348,7 +348,7 @@ def validate_config(
         )
         assert not lmcache_cfg.get("clear_on_weight_update", True), (
             "psrl.lmcache.clear_on_weight_update must be False when psrl.lmcache.enable_p2p is True "
-            "(LMCache P2PBackend does not support clear. Stale entries cannot be flushed on weight update)."
+            "(the LMCache MP P2P tier cannot be flushed on weight update)."
         )
         assert lmcache_cfg.get("multi_version_kv", False), (
             "psrl.lmcache.multi_version_kv must be True when psrl.lmcache.enable_p2p is True "

@@ -12,7 +12,7 @@ import aiohttp
 import ray
 from ray.actor import ActorHandle
 
-from psrl.utils.common.http_utils import find_available_port, get_host_info
+from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.logger import DualOutputHandler
 from psrl.utils.server.command import CommandExtension
@@ -171,9 +171,9 @@ class RolloutCoordinator(
         self._thunder_scheduler = None
         self._session_client: aiohttp.ClientSession | None = None
 
-        # LMCache P2P Controller subprocess handle (started by init_lmcache_p2p, if enabled).
-        self._lmcache_controller_proc: subprocess.Popen | None = None
-        self._lmcache_controller_url: str | None = None
+        # LMCache MP coordinator subprocess handle (started before init_model, if enabled).
+        self._lmcache_coordinator_proc: subprocess.Popen | None = None
+        self._lmcache_coordinator_url: str | None = None
 
         # Route each loop logger to its configured file.
         self.log_prefix = "RolloutCoordinator"
@@ -591,179 +591,66 @@ class RolloutCoordinator(
         self.ready_buffers.add(ready_buffer)
         psrl_logger.info(f"Updated ready buffers to: {self.ready_buffers}")
 
-    # ------- FUNCTIONS FOR LMCACHE P2P -------
+    # ------- FUNCTIONS FOR LMCACHE MP -------
 
     async def init_lmcache_p2p(self) -> None:
         """
-        Broadcast the Controller URL to all rollout server actors.
+        Verify that node-local MP servers have registered with the coordinator.
 
-        Requires start_lmcache_controller() to have been called first.
-        Must be called after init_model() has completed on all instances.
+        MP servers self-register at startup and discover peers through the
+        coordinator, so this only confirms discovery is live. Must be called
+        after init_model() has completed on all instances.
         """
-        assert self._lmcache_controller_url is not None, (
-            "start_lmcache_controller() must be called before init_lmcache_p2p()"
+        from psrl.utils.common.http_utils import get, init_http_client
+
+        assert self._lmcache_coordinator_url is not None, (
+            "start_lmcache_coordinator() must be called before init_lmcache_p2p()"
         )
-        controller_url = self._lmcache_controller_url
 
-        server_items = self._get_ordered_server_items("all")
-        futures = [
-            server_handle.set_lmcache_controller_url.remote(controller_url) for _, _, server_handle in server_items
-        ]
-        await asyncio.gather(*futures)
-        psrl_logger.info(f"Broadcast LMCache P2P controller: url={controller_url!r}, replicas={len(server_items)}.")
-
-        # After Controller URL is set and Workers are registered, broadcast the
-        # peer registry so server actors can bypass the Controller for KV transfers.
-        await self._broadcast_peer_registry()
-
-    async def _broadcast_peer_registry(self) -> None:
-        """
-        Query the Controller for each replica's per-rank peer_init_url and worker ZMQ
-        URLs, then broadcast to all server actors for direct transfer bypass.
-
-        This enables `kv_transfer_direct()` on each server actor to send MoveWorkerMsg
-        directly to each local LMCacheWorker via ZMQ, eliminating the Controller as
-        a centralized bottleneck under burst transfer scenarios. KV is sharded per
-        rank (TP heads, PP layers), so the registry maps instance_id → rank-sorted
-        list of peer_init_url, and each replica is handed its own rank-sorted list of
-        local worker ZMQ URLs.
-        """
-        from psrl.utils.common.http_utils import init_http_client, post
-
-        controller_url = self._lmcache_controller_url
-        assert controller_url, "start_lmcache_controller() must be called first."
-
-        # Ensure HTTP client is initialized in the Coordinator process.
+        # Ensure the HTTP client is initialized in the Coordinator process.
         init_http_client(server_concurrency=4, rollout_engine_num=1)
 
-        server_items = self._get_ordered_server_items("all")
-
-        # Registry list indices must match global worker ranks.
-        peer_registry: dict[str, list[str]] = {}
-        per_replica_worker_zmq_urls: dict[int, list[str]] = {}
-
-        for replica_idx, _, _ in server_items:
-            instance_id = f"psrl_instance_{replica_idx}"
-            resp = await post(
-                f"{controller_url}/query_worker_info",
-                {"instance_id": instance_id},
-                max_retries=3,
-            )
-            assert resp and "worker_infos" in resp and resp["worker_infos"], (
-                f"[LMCache] query_worker_info returned empty for {instance_id!r}. "
-                f"Workers may not have registered yet. resp={resp!r}"
-            )
-            # Empty peer URLs mark ranks without a P2P endpoint.
-            infos = sorted(resp["worker_infos"], key=lambda wi: wi.get("worker_id", 0))
-            peer_registry[instance_id] = [wi.get("peer_init_url", "") for wi in infos]
-            per_replica_worker_zmq_urls[replica_idx] = [f"{wi.get('ip', '')}:{wi.get('port', 0)}" for wi in infos]
-
-        assert peer_registry, (
-            "[LMCache] Peer registry is empty after querying Controller. "
-            "No instances have peer_init_url. P2P is not configured correctly."
+        instances = await get(f"{self._lmcache_coordinator_url}/instances", max_retries=3)
+        if isinstance(instances, dict):
+            instances = instances.get("instances", [])
+        registered = {inst.get("instance_id") for inst in instances or []}
+        assert registered, (
+            "[LMCache] Coordinator reports no registered MP instances. MP servers may not have started correctly."
         )
+        psrl_logger.info(f"[LMCache] Coordinator registered instances: {sorted(i for i in registered if i)}.")
 
-        # Broadcast to each server actor with the full registry plus that replica's
-        # own rank-sorted worker ZMQ URL list.
-        futures = []
-        for replica_idx, _, server_handle in server_items:
-            zmq_urls = per_replica_worker_zmq_urls.get(replica_idx, [])
-            futures.append(server_handle.kv_set_peer_registry.remote(peer_registry, zmq_urls))
-        await asyncio.gather(*futures)
-
-        total_ranks = sum(len(v) for v in per_replica_worker_zmq_urls.values())
-        psrl_logger.info(
-            f"[LMCache] Peer registry broadcast: replicas={len(server_items)}, "
-            f"ranks={total_ranks}, peer_instances={len(peer_registry)}."
-        )
-
-    def start_lmcache_controller(self) -> str:
+    async def start_lmcache_coordinator(self) -> str:
         """
-        Start the LMCache Controller subprocess (synchronous, non-async).
+        Start the shared LMCache MP coordinator subprocess.
 
-        Must be called BEFORE init_model() so the Controller is already listening
-        when LMCache workers inside EngineCore try to register at startup.
+        Must be called BEFORE init_model() so the coordinator is listening when
+        each node's MP server registers at startup.
 
         Returns:
-            str: Base URL of the Controller, e.g. `"http://10.0.0.1:9042"`.
+            str: Base URL of the coordinator, e.g. `"http://10.0.0.1:9300"`.
         """
-        self._lmcache_controller_url = self._start_lmcache_controller()
-        return self._lmcache_controller_url
+        from psrl.utils.kv_cache.runtime import start_coordinator
 
-    def _start_lmcache_controller(self) -> str:
-        """
-        Start the `lmcache_controller` subprocess and poll until healthy.
-
-        The controller must become healthy within the configured timeout. Its
-        output is retained in `lmcache_controller.log` for failure diagnosis.
-
-        Returns:
-            str: Base URL of the Controller, e.g. `"http://10.0.0.1:9042"`.
-
-        Raises:
-            RuntimeError: If the Controller exits early or does not become healthy
-                within the configured timeout.
-        """
-        import requests as _requests
-
-        _, host = get_host_info()
-        port = find_available_port(self.config.psrl.lmcache.controller_base_port)
-        cmd = [
-            "lmcache_controller",
-            "--host",
-            host,
-            "--port",
-            str(port),
-        ]
-
-        # Redirect the controller's stdout/stderr to a log file so failures are
-        # visible after the fact (Popen without a pipe would otherwise drop them).
+        lmcache_cfg = self._build_lmcache_coordinator_config()
         log_dir = os.path.expanduser(self.config.psrl.logging_path)
-        os.makedirs(log_dir, exist_ok=True)
-        controller_log_path = os.path.join(log_dir, "lmcache_controller.log")
-        self._lmcache_controller_log_path = controller_log_path
-        controller_log_file = open(controller_log_path, "w")
+        log_path = os.path.join(log_dir, "lmcache_coordinator.log")
+        self._lmcache_coordinator_proc = await start_coordinator(lmcache_cfg, log_path)
+        self._lmcache_coordinator_url = f"http://{lmcache_cfg.coordinator_host}:{lmcache_cfg.coordinator_port}"
+        psrl_logger.info(f"[LMCache] Coordinator started at {self._lmcache_coordinator_url!r}.")
+        return self._lmcache_coordinator_url
 
-        psrl_logger.info(f"[LMCache] Starting shared Controller: {' '.join(cmd)}. Logging to {controller_log_path!r}.")
-        self._lmcache_controller_proc = subprocess.Popen(cmd, stdout=controller_log_file, stderr=subprocess.STDOUT)
-        controller_url = f"http://{host}:{port}"
+    def _build_lmcache_coordinator_config(self):
+        """
+        Build the LMCache config used to launch the cluster-wide coordinator.
 
-        def _tail_controller_log(num_lines: int = 40) -> str:
-            try:
-                with open(controller_log_path) as f:
-                    lines = f.readlines()
-                return "".join(lines[-num_lines:])
-            except Exception as e:
-                return f"<failed to read controller log {controller_log_path!r}: {e}>"
+        Returns:
+            LMCacheConfig: Configuration with the coordinator host resolved from
+                the PS manager IP and the port from the LMCache config.
+        """
+        from omegaconf import OmegaConf
 
-        # Poll GET /openapi.json (FastAPI built-in, always available once uvicorn binds).
-        # LMCache's /health is a POST endpoint requiring a body, so we use openapi.json instead.
-        health_url = f"{controller_url}/openapi.json"
-        max_attempts = int(self.config.psrl.lmcache.controller_health_timeout_s)
-        for attempt in range(max_attempts):
-            # A terminated process cannot become healthy within this attempt.
-            returncode = self._lmcache_controller_proc.poll()
-            if returncode is not None:
-                self._lmcache_controller_proc = None
-                raise RuntimeError(
-                    f"LMCache Controller process exited early with code {returncode} "
-                    f"before becoming healthy at {health_url!r}. "
-                    f"Controller log tail:\n{_tail_controller_log()}"
-                )
-            try:
-                resp = _requests.get(health_url, timeout=2)
-                if resp.status_code == 200:
-                    psrl_logger.info(
-                        f"[LMCache] Controller healthy: url={controller_url!r}, attempt={attempt + 1}/{max_attempts}."
-                    )
-                    return controller_url
-            except Exception:
-                pass
-            time.sleep(1)
+        from psrl.utils.kv_cache.config import LMCacheConfig
 
-        self._lmcache_controller_proc.kill()
-        self._lmcache_controller_proc = None
-        raise RuntimeError(
-            f"LMCache Controller did not become healthy at {health_url!r} within "
-            f"{max_attempts} s. Controller log tail:\n{_tail_controller_log()}"
-        )
+        raw = OmegaConf.to_container(self.config.psrl.get("lmcache", OmegaConf.create()), resolve=True) or {}
+        raw["coordinator_host"] = str(self.config.psrl.get("ps_manager_ip", "127.0.0.1"))
+        return LMCacheConfig(**raw)

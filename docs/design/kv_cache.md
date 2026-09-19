@@ -2,66 +2,81 @@
 
 ## Motivation
 
-In multi-turn agentic RL, each trajectory may accumulate **10,000+ tokens** across multiple turns. Each turn involves:
-1. Concatenating the full conversation history (prompt + all prior turns).
-2. Sending the full sequence to the rollout instance for the next generation step.
+In multi-turn agentic RL, a trajectory accumulates tens of thousands of tokens
+across its turns. Each turn concatenates the full history and sends it to a
+rollout instance for the next generation step.
 
-Without KV cache reuse, each turn requires **full re-prefill** of all prior tokens, a massive waste of GPU compute that grows quadratically with conversation length. For a 10-turn trajectory with 1k tokens per turn, this means re-computing ~55k tokens of prefill across the trajectory, when only ~10k tokens of new computation are actually needed.
+Without KV reuse, every turn re-prefills all prior tokens. A ten turn trajectory
+with roughly one thousand tokens per turn recomputes about 55k tokens of prefill
+to produce about 10k tokens of new state.
 
-PSRL integrates with [LMCache](https://github.com/LMCache/LMCache) to solve this problem, enabling KV cache offloading, prefix reuse, and cross-instance transfer.
-
----
+PSRL integrates with [LMCache](https://github.com/LMCache/LMCache) to offload KV
+cache, reuse prefixes across turns, and move prefixes between rollout instances.
 
 ## LMCache Integration
 
-**Config**: `psrl.lmcache.*`
+Config: `psrl.lmcache.*`
 
-LMCache operates as a secondary KV cache backend alongside vLLM's GPU-resident cache. When enabled:
+LMCache runs as a standalone multiprocess (MP) server, one per node. vLLM
+workers are clients of that server, and the server owns all cache state. Three
+tiers matter:
 
-1. **Offloading**: After prefill, KV blocks are copied to the offload backend (CPU memory by default). This frees GPU memory for new requests while preserving computed attention state.
+1. **L1** is the server's own memory pool, sized by `offload_size_gb`.
+2. **L2** is optional extra storage registered per server, for example a local
+   filesystem or an object store.
+3. **Peers** are other instances' servers, reachable over a P2P transfer channel.
 
-2. **Hash-based chunk indexing**: KV blocks are indexed by **token content hashes** in fixed-size chunks (default: 256 tokens). This means matching is content-based, not position-based: if two requests share the same prefix tokens, they share KV cache regardless of when they were computed.
-
-3. **Prefix retrieval**: On subsequent turns, the system checks the offload backend for matching prefix KV. Matching blocks are loaded back to GPU, and only the new (unmatched) tokens require fresh prefill computation.
-
-### How It Works
+Chunks are indexed by **token content hash** in fixed size chunks (`chunk_size`,
+default 256 tokens). Matching is content based, so two requests that share a
+prefix share KV regardless of when either was computed.
 
 ```{mermaid}
 sequenceDiagram
     participant AW as Agent Worker
     participant RI as Rollout Instance
-    participant LMC as LMCache (CPU)
+    participant LMC as MP server (L1)
 
     Note over AW,LMC: Turn 1
     AW->>RI: generate(prompt, turn_1_tokens)
     RI->>RI: Full prefill (no cache)
-    RI->>LMC: offload(KV blocks, hashes)
+    RI->>LMC: store(KV chunks, hashes)
     RI-->>AW: response_1
 
     Note over AW,LMC: Turn 2
     AW->>RI: generate(prompt + response_1 + turn_2_tokens)
-    RI->>LMC: lookup(prefix_hashes)
+    RI->>LMC: lookup(prefix hashes)
     LMC-->>RI: cached KV (prefix match)
     RI->>RI: Partial prefill (new tokens only)
-    RI->>LMC: offload(new KV blocks)
+    RI->>LMC: store(new KV chunks)
     RI-->>AW: response_2
 ```
-
----
 
 ## Configuration
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enable` | bool | `False` | Master switch for LMCache integration |
-| `offload_size_gb` | float | `100.0` | Total CPU memory budget for KV offloading (divided across TP ranks) |
-| `chunk_size` | int | `256` | Token chunk size for hash-based indexing |
-| `save_decode_cache` | bool | `True` | Also cache KV from decode steps (helps multi-turn reuse) |
-| `clear_on_weight_update` | bool | `False` | Invalidate the whole cache after model weight sync |
-| `multi_version_kv` | bool | `True` | Tag entries with the model version so stale-weight KV is skipped instead of cleared |
-| `enable_async_loading` | bool | `False` | Overlap KV retrieval with prefill computation (known bug, keep disabled) |
-| `cache_policy` | str | `LRU` | Cache eviction: `LRU` or `FIFO` |
-| `backend` | str | `cpu` | Storage backend: `cpu` (default), `disk`, `remote` (not yet implemented) |
+| `offload_size_gb` | float | `100.0` | L1 capacity of one node's MP server |
+| `chunk_size` | int | `256` | Token chunk size for hash based indexing |
+| `hash_algorithm` | str | `blake3` | Chunk hash algorithm, `blake3` or `sha256` |
+| `l1_align_bytes` | int | `4096` | L1 allocation alignment, raise to `65536` with P2P |
+| `eviction_policy` | str | `LRU` | `LRU`, `IsolatedLRU`, or `noop` |
+| `l2_adapters` | list | `[]` | L2 adapters as JSON objects, for example `{type: fs, path: /mnt/kv}` |
+| `l2_store_policy` | str | `default` | L2 store policy name |
+| `l2_prefetch_policy` | str | `default` | L2 prefetch policy name |
+| `clear_on_weight_update` | bool | `False` | Clear the server cache after a weight sync |
+| `multi_version_kv` | bool | `True` | Tag entries with the model version |
+| `enable_p2p` | bool | `False` | Enable cross-instance KV transfer |
+| `p2p_transfer_engine` | str | `nixl` | Transfer engine, `nixl` or `mooncake_te` |
+| `coordinator_host` | str | `${psrl.ps_manager_ip}` | Host of the shared MP coordinator |
+| `coordinator_port` | int | `9300` | Coordinator HTTP port |
+| `coordinator_event_reporting` | bool | `False` | Stream cache events to the coordinator |
+| `enable_kv_events` | bool | `False` | Publish the off-GPU tier to routing |
+| `mq_timeout_s` | int | `300` | Connector request timeout |
+| `gpu_pin_block_budget` | int | `0` | Max pinned GPU KV blocks, `0` disables the limit |
+
+Ports for the MP server, its management HTTP API, the P2P transfer channel, and
+the event publisher are allocated at launch. Do not set them by hand.
 
 ```yaml
 psrl:
@@ -69,115 +84,116 @@ psrl:
     enable: true
     offload_size_gb: 40.0
     chunk_size: 256
-    save_decode_cache: true
     clear_on_weight_update: false
     multi_version_kv: true
-    enable_async_loading: false
-    cache_policy: LRU
-    backend: cpu
+    enable_p2p: true
+    coordinator_host: ${psrl.ps_manager_ip}
 ```
 
-### Key Considerations
+### Version isolation
 
-:::{admonition} `clear_on_weight_update`
-:class: important
+When the rollout instance syncs to new weights, all cached KV becomes stale. It
+was computed with the old weights, and serving it silently degrades accuracy, so
+stale entries must not be reused.
 
-When the rollout instance syncs to a new model version, all cached KV becomes **stale**: it was computed with the old weights. Serving subsequent turns from stale-weight KV causes accuracy degradation that compounds on top of the staleness bound itself, so stale entries must not be reused.
+Run exactly one of these mechanisms:
 
-PSRL offers two mechanisms for this, and you should run exactly one of them:
+- `multi_version_kv: true` (the shipped default) stamps each request with
+  `lmcache.tag.model_version`, and that tag is part of the cache key. A lookup at
+  version *N* misses entries from earlier versions while KV from other still
+  valid versions survives.
+- `clear_on_weight_update: true` clears the whole server cache on every sync.
+  Correct but coarse, and it discards KV that is still valid.
 
-- `multi_version_kv: true` (the shipped default) tags each cached entry with the model version that produced it, so a lookup at version *N* simply misses entries from earlier versions. Nothing is thrown away, which means KV from other still-valid versions survives the sync.
-- `clear_on_weight_update: true` invalidates the entire cache on every sync. Correct, but coarse and expensive for multi-turn trajectories that span a version boundary.
+P2P forces the choice. `enable_p2p: true` requires `multi_version_kv: true` and
+`clear_on_weight_update: false`, because a peer's cache cannot be cleared
+remotely on weight sync.
 
-P2P transfer forces the choice: `enable_p2p: true` requires `multi_version_kv: true` and `clear_on_weight_update: false`, because the P2P backend does not implement clear-on-weight-sync.
-:::
+### Memory sizing
 
-:::{tip}
-**Memory sizing**: A rule of thumb for `offload_size_gb` is:
+A rule of thumb for `offload_size_gb`:
 
 $$
-\text{offload\_size\_gb} \approx \frac{\text{num\_layers} \times \text{hidden\_dim} \times \text{max\_concurrent\_seqs} \times \text{avg\_seq\_len} \times 2 \times 2}{10^9}
+\text{offload\_size\_gb} \approx \frac{\text{num\_layers} \times \text{hidden\_dim} \times \text{max\_concurrent\_seqs} \times \text{avg\_seq\_len} \times 4}{10^9}
 $$
 
-The factor of 2×2 accounts for key+value and fp16 storage. For a 7B model with 32 layers, 4096 hidden dim, 64 concurrent sequences at 4k average length: ~64 GB across all TP ranks.
-:::
+The factor of four covers key plus value in fp16. For a 7B model with 32 layers,
+4096 hidden dim, 64 concurrent sequences at 4k average length, this is about
+64 GB of L1.
 
----
+## Cross-instance transfer
 
-## P2P Cross-Instance Transfer
+Config: `psrl.lmcache.enable_p2p`
 
-**Config**: `psrl.lmcache.enable_p2p`
+When the router moves a request to another rollout instance, the accumulated KV
+for that request lives on the source. Without a transfer the destination
+re-prefills from scratch.
 
-When the Router moves a request to a different rollout instance (due to load balancing, migration, or sync-triggered re-routing), the accumulated KV cache for that request exists on the **source** instance. Without P2P transfer, the target instance must re-prefill from scratch.
-
-### Architecture
-
-- **LMCache Controller**: A shared process started by the Rollout Coordinator before
-  vLLM initialization. It maintains worker registration and answers peer-lookup
-  queries (`/query_worker_info`) so instances learn each other's transfer endpoints.
-  It is **not** on the KV data path.
-- **LMCache workers**: Source and destination workers perform the hot-path data move
-  directly, avoiding a controller bottleneck.
-- **Transport**: Transfer uses the NIXL library (same as PS weight transfer):
-  - `nixl`: UCX transport: auto-selects shared memory (same node), IPC (same machine), or RDMA (cross-node).
-  - `tcp`: Fallback TCP transport for environments without UCX/RDMA.
-
-### Transfer Flow
-
-A move is initiated on the **source** instance (triggered by the router/coordinator
-when a request is re-routed). The source GenWorker calls `transfer_direct()`, which
-sends a `MoveWorkerMsg` over a ZMQ REQ socket to its local LMCache worker, and the worker
-pushes the KV blocks to the destination's endpoint (`new_position`) over NIXL/TCP and
-replies with a `MoveWorkerRetMsg` carrying the number of tokens moved. The Controller
-is consulted only beforehand, to resolve the destination's peer endpoint.
+MP transfer is a **pull**. The destination's MP server warms its own L1 from
+whichever peer holds the prefix, so the source is never targeted and the request
+is retried from cache rather than pushed.
 
 ```{mermaid}
 sequenceDiagram
-    participant RC as Router / Coordinator
-    participant Src as Source GenWorker
-    participant SrcW as Source LMCache worker
-    participant Dst as Dest LMCache worker
+    participant RC as Router
+    participant Src as Source instance
+    participant DstS as Destination MP server
+    participant SrcS as Source MP server
 
     RC->>Src: transfer_direct(tokens, src, dst)
-    Src->>SrcW: MoveWorkerMsg (ZMQ REQ, new_position=dst endpoint)
-    SrcW->>Dst: push KV blocks (NIXL / TCP)
-    Dst-->>SrcW: blocks received
-    SrcW-->>Src: MoveWorkerRetMsg(num_tokens)
-    Src-->>RC: transfer result (bool)
+    Src->>DstS: POST /cache/prefetches
+    DstS->>SrcS: P2P lookup and lock
+    SrcS-->>DstS: remote addresses
+    DstS->>DstS: RDMA read into retained L1
+    SrcS-->>DstS: unlock
+    DstS-->>Src: found / total chunks
+    Src-->>RC: transfer result
 ```
 
-### Configuration
+- The destination must acquire **every** chunk. A partial result returns a
+  failure so the destination re-prefills the remainder.
+- `copy: false` deletes the prefix at the source after the destination confirms.
+  That delete is best effort and non-atomic, and it is refused while the source
+  prefix is pinned.
+- Instances discover each other through the shared MP coordinator. No
+  instance-to-instance configuration is required.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enable_p2p` | bool | `False` | Enable cross-instance KV transfer |
-| `p2p_transfer_channel` | str | `nixl` | Transport backend: `nixl` or `tcp` |
-| `controller_base_port` | int | `9000` | Base HTTP port for the LMCache Controller |
-| `controller_pull_port` | int | `8300` | ZMQ registration/heartbeat port |
-| `controller_reply_port` | int | `8400` | ZMQ task-dispatch port |
+### Routing modes
 
-```yaml
-psrl:
-  lmcache:
-    enable: true
-    enable_p2p: true
-    p2p_transfer_channel: nixl
-    controller_base_port: 9000
-```
+Transfer integrates with
+`psrl.rollout_coordination.routing_strategy.kv_transfer` (see
+{doc}`flexible_rollout`). The router decides whether to transfer, and LMCache
+decides how.
 
-### Integration with Routing
-
-P2P KV transfer integrates with the `psrl.rollout_coordination.routing_strategy.kv_transfer` configuration (see {doc}`flexible_rollout`). The Router decides **whether** to transfer, LMCache handles **how** the data moves.
-
-| `transfer_mode` | Behavior | Best For |
+| `transfer_mode` | Behavior | Best for |
 |-----------------|----------|----------|
-| `async` | Start transfer, begin generation immediately (re-prefill if KV arrives late) | Latency-sensitive, short prefixes |
-| `sync` | Wait for transfer, then begin generation (no re-prefill) | Long prefixes where re-prefill is expensive |
-| `pin_sync` | Pin source KV + wait + unpin | Maximum reliability, highest overhead |
+| `async` | Start transfer, begin generation immediately | Latency sensitive, short prefixes |
+| `sync` | Wait for the transfer, then begin generation | Long prefixes where re-prefill is expensive |
+| `pin_sync` | Pin source KV, transfer, then unpin | Maximum reliability, highest overhead |
 
----
+P2P transfer uses the NIXL transport, so `psrl.ps_mode` must be `nixl_cpu` or
+`nixl_gpu` when `enable_p2p` is on.
 
-:::{admonition} Active Development
-:class: warning
-The P2P KV cache migration feature is under active development. API and configuration may change.
-:::
+## Event stream
+
+Config: `psrl.lmcache.enable_kv_events`
+
+With cache-aware routing, `lmcache_overlap_weight` scores the off-GPU tier. That
+score is built from the cache events an MP server publishes for external
+consumers. Enabling it implies `coordinator_event_reporting`, and the server's
+publisher endpoint is registered with the coordinator so routers can discover it.
+
+## Gotchas
+
+- **L1 is shared by every local KV rank.** `offload_size_gb` is one server's
+  capacity, not per rank. Setting it to the per-rank value over-allocates by the
+  tensor parallel size.
+- **Multi-node instances must avoid pipeline parallelism.** The connector
+  rejects multi-server plus PP greater than one. Keep
+  `rollout_nnodes_per_instance: 1`, or use tensor parallelism only.
+- **P2P alignment.** Below `l1_align_bytes: 65536`, RDMA reads work but are less
+  efficient. Raise it when `enable_p2p` is on.
+- **Adding tags changes L2 key encoding.** An L2 cache written before this
+  version cannot be read back and must be invalidated.
+- **`clear_on_weight_update` also drops pins.** A forced clear discards client
+  pins, so re-pin after a weight sync if routing depends on them.

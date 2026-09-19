@@ -1898,10 +1898,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.init_rollout_coordinator()
         # Bind the coordinator before PS transfers so `push_model` can publish new versions.
         ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
-        # Start the LMCache Controller BEFORE init_model() so that LMCache workers
-        # inside EngineCore can register immediately when they start.
+        # Start the LMCache MP coordinator BEFORE init_model() so that each
+        # node's MP server can register immediately when it starts.
         if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
-            ray.get(self.rollout_coordinator.start_lmcache_controller.remote())
+            ray.get(self.rollout_coordinator.start_lmcache_coordinator.remote())
 
         # Rollout uses separate GPUs, so overlap its model loading with PS and actor initialization.
         rollout_init_executor = ThreadPoolExecutor(max_workers=1)

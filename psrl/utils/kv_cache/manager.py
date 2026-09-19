@@ -1,21 +1,35 @@
 import asyncio
 import logging
-import uuid
+import time
 from collections import deque
 
-import msgspec
+import aiohttp
 
 from psrl.utils.kv_cache.config import LMCacheConfig
+from psrl.utils.kv_cache.runtime import LMCacheMPRuntime
 
 psrl_logger = logging.getLogger(__file__)
+
+# Per-request timeout for management calls to the MP server.
+_MANAGEMENT_TIMEOUT_S = 30.0
+
+# How long a peer-registry snapshot is reused before re-querying the coordinator.
+_PEER_REGISTRY_TTL_S = 5.0
+
+# Destination-side warm-prefetch polling.
+_PREFETCH_POLL_INTERVAL_S = 0.2
+_PREFETCH_TIMEOUT_S = 60.0
+
+# Legacy in-process backend label SMG sends. MP transfer is tier-agnostic.
+_LEGACY_BACKEND = "LocalCPUBackend"
 
 
 class KVCacheManager:
     """
-    Manage PSRL KV cache operations across vLLM and LMCache.
+    Manage PSRL KV cache operations against the LMCache MP server.
 
-    Callers provide trajectory tokens, while this manager owns pin budgets and
-    peer metadata.
+    The MP server owns all cache state. This manager owns the node-local
+    server process, the management HTTP client, and the GPU pin budget.
     """
 
     def __init__(self, config: LMCacheConfig) -> None:
@@ -32,20 +46,26 @@ class KVCacheManager:
 
         self.current_version: int = 0
 
-        self._inference_engine = None
-        # The shared Controller is still used for LMCache worker registration and
-        # peer discovery. Data movement itself uses direct worker ZMQ messages.
-        self._controller_url: str | None = None
+        # Parallel geometry used when the server must resolve token sequences
+        # to the same per-rank keys the connector stored them under.
+        self.model_name: str = ""
+        self.kv_world_size: int = 1
 
-        # Rank ordered peer metadata lets each local shard target the matching remote rank.
+        # Token sequences pinned on the MP server, keyed by token tuple. The
+        # stored body lets unpin reuse the same identity tags the pin used.
+        self._pinned_backend: dict[tuple[int, ...], dict] = {}
+
+        self._inference_engine = None
+        self._runtime: LMCacheMPRuntime | None = None
+        self._http: aiohttp.ClientSession | None = None
+
+        # Maps a peer instance_id to its MP HTTP base URL. The list shape
+        # matches the peer-registry contract SMG already expects.
         self.peer_registry: dict[str, list[str]] = {}
-        # Rank ordered worker URLs support direct per shard transfers.
-        self._worker_zmq_urls: list[str] = []
-        # Each rank owns a lazily initialized direct transfer socket.
-        self._direct_zmq_sockets: dict[int, object] = {}
-        self._direct_zmq_context = None
-        # Per rank locks enforce strict REQ send and receive alternation.
-        self._direct_zmq_locks: dict[int, asyncio.Lock] = {}
+        self._peer_registry_refreshed_at: float = 0.0
+
+        # Last transfer failure reason, surfaced by the SMG servicer.
+        self._last_transfer_error: str = ""
 
         self._log_init_status()
 
@@ -60,20 +80,18 @@ class KVCacheManager:
             return
 
         psrl_logger.info("[LMCache] KV cache offloading is ENABLED with the following parameters:")
-        psrl_logger.info(f"backend = {self.config.backend!r}")
         psrl_logger.info(f"offload_size_gb = {self.config.offload_size_gb}")
         psrl_logger.info(f"chunk_size = {self.config.chunk_size}")
-        psrl_logger.info(f"cache_policy = {self.config.cache_policy!r}")
-        psrl_logger.info(f"save_decode_cache = {self.config.save_decode_cache}")
-        psrl_logger.info(f"save_unfull_chunk = {self.config.save_unfull_chunk}")
-        psrl_logger.info(f"enable_async_loading = {self.config.enable_async_loading}")
+        psrl_logger.info(f"hash_algorithm = {self.config.hash_algorithm!r}")
+        psrl_logger.info(f"eviction_policy = {self.config.eviction_policy!r}")
         psrl_logger.info(f"clear_on_weight_update = {self.config.clear_on_weight_update}")
+        psrl_logger.info(f"multi_version_kv = {self.config.multi_version_kv}")
         psrl_logger.info(f"gpu_pin_block_budget = {self.config.gpu_pin_block_budget}")
         if self.config.enable_p2p:
             psrl_logger.info(f"enable_p2p = {self.config.enable_p2p}")
-            psrl_logger.info(f"lmcache_instance_id = {self.config.lmcache_instance_id!r}")
-        if self.config.config_file:
-            psrl_logger.info(f"config_file = {self.config.config_file!r}")
+            psrl_logger.info(f"p2p_transfer_engine = {self.config.p2p_transfer_engine!r}")
+        if self.l2_adapters_enabled:
+            psrl_logger.info(f"l2_adapters = {len(self.config.l2_adapters)} configured")
         self._verify_lmcache_importable()
 
     def _verify_lmcache_importable(self) -> None:
@@ -92,97 +110,46 @@ class KVCacheManager:
                 "Run `bash scripts/install_lmcache.sh` to install it."
             )
 
-    # --- Engine attachment ---
+    @property
+    def l2_adapters_enabled(self) -> bool:
+        """Whether any L2 adapter is configured on the MP server."""
+        return bool(self.config.l2_adapters)
+
+    # --- Runtime attachment ---
+
+    def attach_runtime(self, runtime: LMCacheMPRuntime) -> None:
+        """
+        Attach the node-local MP server runtime.
+
+        Args:
+            runtime (LMCacheMPRuntime): The started server runtime whose
+                HTTP endpoint serves management calls.
+        """
+        self._runtime = runtime
+        psrl_logger.info(f"[LMCache] KVCacheManager: MP runtime attached at {runtime.base_url}.")
 
     def attach_engine(self, inference_engine) -> None:
         """
         Attach the vLLM AsyncLLM engine after it has been initialised.
 
-        Must be called before any async KV cache operation.
+        The engine is only needed for GPU block pinning, which runs in the
+        EngineCore process rather than on the MP server.
 
         Args:
             inference_engine: The `AsyncLLM` (or compatible) engine object whose
-                `collective_rpc` method dispatches to vLLM worker processes.
+                `engine_core.call_utility_async` dispatches to the scheduler.
         """
         self._inference_engine = inference_engine
         psrl_logger.info("[LMCache] KVCacheManager: Engine attached.")
-
-    def set_instance_id(self, instance_id: int) -> None:
-        """
-        Set the per-instance LMCache identifier.
-
-        Must be called once by the vLLM replica setup code after construction,
-        passing the numeric instance id assigned to this worker group. Sets
-        `lmcache_instance_id` to `"psrl_instance_{instance_id}"`, which the
-        LMCache Controller uses to identify KV transfer sources and destinations.
-
-        Args:
-            instance_id (int): Numeric identifier of this rollout instance.
-        """
-        self.config.lmcache_instance_id = f"psrl_instance_{instance_id}"
-        psrl_logger.info(f"[LMCache] Instance ID set to {self.config.lmcache_instance_id!r}.")
-
-    def set_controller_url(self, controller_url: str) -> None:
-        """
-        Set the shared LMCache Controller URL.
-
-        Called by the vLLM replica setup code after
-        `RolloutCoordinator.init_lmcache_p2p()` broadcasts the URL of the
-        single shared Controller subprocess to all vLLM instances.
-
-        Args:
-            controller_url (str): Base URL of the shared Controller, e.g.
-                `"http://10.0.0.1:9042"`.
-        """
-        self._controller_url = controller_url
-        psrl_logger.info(f"[LMCache] Controller URL set to {self._controller_url!r}.")
-
-    def set_peer_registry(
-        self,
-        registry: dict[str, list[str]],
-        worker_zmq_urls: list[str] | None = None,
-    ) -> None:
-        """
-        Set the peer registry and local worker ZMQ URLs for direct transfer bypass.
-
-        Maps each LMCache instance_id to its per-rank list of peer_init_url (NIXL
-        endpoints), indexed by global rank. When populated along with
-        `worker_zmq_urls`, `transfer_direct()` sends one MoveWorkerMsg per local
-        rank directly to that rank's LMCacheWorker via ZMQ, bypassing the Controller
-        HTTP round-trip. Because KV is sharded per rank (TP heads, PP layers), each
-        local rank targets the destination's same-rank endpoint.
-
-        Called by `PSRL_vLLMHttpServer.kv_set_peer_registry()` after
-        `RolloutCoordinator._broadcast_peer_registry()` completes.
-
-        Args:
-            registry (dict[str, list[str]]): Maps lmcache_instance_id (e.g.
-                "psrl_instance_0") to a rank-sorted list of peer_init_url
-                (e.g. ["10.0.0.1:18200", "10.0.0.1:18201"]).
-            worker_zmq_urls (list[str] | None): Rank-sorted ZMQ REP URLs of this
-                replica's local LMCacheWorkers (e.g. ["10.0.0.1:18100", ...]).
-                Supplied only by the authoritative broadcast/init path. When None
-                (e.g. the per-request servicer seed), this replica's own URLs and
-                live sockets are left untouched.
-        """
-        # Merge full broadcasts and incremental seeds without clobbering peers.
-        self.peer_registry.update(registry)
-        if worker_zmq_urls is not None:
-            # Reset sockets only when the authoritative worker URLs change.
-            self._worker_zmq_urls = worker_zmq_urls
-            self._reset_all_zmq_sockets()
-        psrl_logger.info(
-            f"[LMCache] Peer registry updated ({len(registry)} entries this call, "
-            f"{len(self.peer_registry)} total), worker_zmq_urls={self._worker_zmq_urls!r}."
-        )
 
     def set_current_version(self, version: int) -> None:
         """
         Set the current model version used to tag new KV cache entries.
 
         Called locally by the gen server after this replica completes a weight
-        pull and reads back its actual model version. Affects all subsequent KV
-        store and P2P transfer operations on this instance.
+        pull and reads back its actual model version. The version is stamped
+        onto each request's `lmcache.tag.model_version`, so it must be
+        committed only after this replica's weights are current.
 
         Args:
             version (int): The new model version number (monotonically increasing).
@@ -190,12 +157,29 @@ class KVCacheManager:
         self.current_version = version
         psrl_logger.info(f"[LMCache] current_version set to {version}.")
 
+    def set_parallel_geometry(self, model_name: str, kv_world_size: int) -> None:
+        """
+        Record the KV parallelism needed to address this replica's cached keys.
+
+        The MP server resolves token sequences to per-rank object keys, so
+        callers must supply the same rank fan-out the connector used. A wrong
+        value degrades to "no chunks found" (the pin or transfer is a no-op)
+        rather than corrupting cache state.
+
+        Args:
+            model_name (str): Model identifier used in cache keys.
+            kv_world_size (int): Number of KV pieces one token chunk's cache is
+                split into across this replica's MP servers.
+        """
+        assert kv_world_size >= 1, f"kv_world_size must be >= 1 (got {kv_world_size})."
+        self.model_name = model_name
+        self.kv_world_size = kv_world_size
+        psrl_logger.info(f"[LMCache] Parallel geometry set: model_name={model_name!r}, kv_world_size={kv_world_size}.")
+
     @property
     def is_attached(self) -> bool:
         """Whether the inference engine has been attached via `attach_engine`."""
         return self._inference_engine is not None
-
-    # --- Legacy Phase 1 helpers (still used for engine init) ---
 
     @property
     def enabled(self) -> bool:
@@ -204,25 +188,8 @@ class KVCacheManager:
 
     @property
     def should_clear_on_weight_update(self) -> bool:
-        """Whether to clear the LMCache KV cache on model weight updates from PS."""
+        """Whether to clear the LMCache backend on model weight updates from PS."""
         return self.config.enable and self.config.clear_on_weight_update
-
-    def apply_env_vars(self) -> None:
-        """
-        Set LMCache environment variables before vLLM engine initialization.
-
-        Must be called before `AsyncEngineArgs` / `AsyncLLM` creation.
-        """
-        import os
-
-        env_vars = self.config.to_env_vars()
-        if not env_vars:
-            psrl_logger.info("[LMCache] No environment variables to set (LMCache disabled).")
-            return
-        psrl_logger.info("[LMCache] Setting environment variables for LMCache...")
-        for key, value in env_vars.items():
-            os.environ[key] = value
-            psrl_logger.info(f"  {key}={value!r}")
 
     def get_engine_kwargs(self) -> dict:
         """
@@ -233,61 +200,152 @@ class KVCacheManager:
         """
         kwargs = self.config.to_engine_kwargs()
         if kwargs:
-            psrl_logger.info(f"[LMCache] Injecting engine kwargs into vLLM: {kwargs}.")
+            psrl_logger.info("[LMCache] Injecting engine kwargs into vLLM.")
         else:
             psrl_logger.info("[LMCache] No engine kwargs to inject (LMCache disabled).")
         return kwargs
 
-    # --- Private helpers ---
+    # --- HTTP plumbing ---
 
-    def _assert_engine(self) -> None:
-        assert self._inference_engine is not None, (
-            "KVCacheManager inference engine is not attached. Call attach_engine() after the rollout is initialised."
+    def _assert_runtime(self) -> LMCacheMPRuntime:
+        """
+        Return the attached runtime or fail loudly.
+
+        Returns:
+            LMCacheMPRuntime: The attached runtime.
+        """
+        assert self._runtime is not None, (
+            "LMCache MP runtime is not attached. Call attach_runtime() before cache operations."
+        )
+        return self._runtime
+
+    @property
+    def coordinator_url(self) -> str:
+        """Base URL of the shared MP coordinator."""
+        return f"http://{self.config.coordinator_host}:{self.config.coordinator_port}"
+
+    async def _session(self) -> aiohttp.ClientSession:
+        """
+        Return the lazily created HTTP client for management calls.
+
+        Returns:
+            aiohttp.ClientSession: Shared client session.
+        """
+        if self._http is None or self._http.closed:
+            timeout = aiohttp.ClientTimeout(total=_MANAGEMENT_TIMEOUT_S)
+            self._http = aiohttp.ClientSession(timeout=timeout)
+        return self._http
+
+    async def _request_url(self, method: str, url: str, payload: dict | None = None) -> dict:
+        """
+        Issue one management request to an absolute URL.
+
+        Args:
+            method (str): HTTP method.
+            url (str): Absolute URL including path.
+            payload (dict | None): JSON body, when the method accepts one.
+
+        Returns:
+            dict: Decoded JSON response, or an empty dict for empty bodies.
+
+        Raises:
+            aiohttp.ClientResponseError: If the server returned a non-2xx status.
+        """
+        session = await self._session()
+        async with session.request(method, url, json=payload) as resp:
+            resp.raise_for_status()
+            if resp.content_length == 0:
+                return {}
+            return await resp.json(content_type=None)
+
+    async def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        """
+        Issue one management request to this node's MP server.
+
+        Args:
+            method (str): HTTP method.
+            path (str): Path on the MP server, beginning with a slash.
+            payload (dict | None): JSON body, when the method accepts one.
+
+        Returns:
+            dict: Decoded JSON response, or an empty dict for empty bodies.
+        """
+        runtime = self._assert_runtime()
+        return await self._request_url(method, f"{runtime.base_url}{path}", payload)
+
+    async def close(self) -> None:
+        """Release the HTTP client and stop the node-local MP server."""
+        if self._http is not None and not self._http.closed:
+            await self._http.close()
+        self._http = None
+        if self._runtime is not None:
+            self._runtime.stop()
+            self._runtime = None
+
+    # --- Peer discovery ---
+
+    def set_peer_registry(self, registry: dict[str, list[str]]) -> None:
+        """
+        Merge peer entries into the local registry.
+
+        Kept for SMG's existing contract: it seeds a destination entry when the
+        destination is unknown, and the authoritative entries are refreshed
+        from the coordinator.
+
+        Args:
+            registry (dict[str, list[str]]): Maps instance_id to a list whose
+                first element is that instance's MP HTTP base URL.
+        """
+        self.peer_registry.update(registry)
+        psrl_logger.info(
+            f"[LMCache] Peer registry updated ({len(registry)} entries this call, {len(self.peer_registry)} total)."
         )
 
-    async def _rpc(self, method: str, args: tuple) -> object:
+    async def refresh_peer_registry(self, max_age_s: float = _PEER_REGISTRY_TTL_S) -> None:
         """
-        Call a `lmcache_*` method on all vLLM workers via `collective_rpc`.
-
-        `collective_rpc` returns a list with one result per TP rank. We take
-        the first element (rank-0), which is canonical for aggregate results.
+        Refresh instance endpoints from the coordinator's instance registry.
 
         Args:
-            method (str): The `vllm_extension.py` method name to call.
-            args (tuple): Positional arguments forwarded to the worker method.
-
-        Returns:
-            object: The result from rank-0 worker.
+            max_age_s (float): Reuse the cached registry when it was refreshed
+                more recently than this many seconds.
         """
-        results = await self._inference_engine.collective_rpc(method, args=args)
-        # `collective_rpc` returns a list, so use the rank zero value.
-        return results[0] if isinstance(results, list) else results
+        if not self.config.coordinator_host:
+            return
+        now = time.monotonic()
+        if self.peer_registry and now - self._peer_registry_refreshed_at < max_age_s:
+            return
+        try:
+            resp = await self._request_url("GET", f"{self.coordinator_url}/instances")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            psrl_logger.warning(f"[LMCache] Failed to refresh peer registry: {e}")
+            return
 
-    async def _utility(self, method: str, *args) -> object:
+        instances = resp.get("instances", []) if isinstance(resp, dict) else resp
+        refreshed: dict[str, list[str]] = {}
+        for instance in instances or []:
+            instance_id = instance.get("instance_id")
+            ip = instance.get("ip")
+            http_port = instance.get("http_port")
+            if instance_id and ip and http_port:
+                refreshed[instance_id] = [f"http://{ip}:{http_port}"]
+        if refreshed:
+            self.peer_registry.update(refreshed)
+        self._peer_registry_refreshed_at = now
+        psrl_logger.debug(f"[LMCache] Peer registry refreshed: {len(refreshed)} instances registered.")
+
+    # --- Cache operations ---
+
+    async def clear(self) -> None:
         """
-        Call a `psrl_*` method on the vLLM `EngineCore` via `call_utility_async`.
+        Clear all cached KV on this node's MP server.
 
-        Unlike `_rpc` (which dispatches to Worker processes via `collective_rpc`),
-        this routes directly to the `EngineCore` object in the engine-core process.
-        `EngineCore.scheduler` is the `RolloutScheduler` instance, so any method
-        defined on `RolloutScheduler` (and therefore on `EngineCore` via attribute
-        lookup) is reachable here.
-
-        Use this for GPU block-pool operations (`psrl_pin_gpu`,
-        `psrl_pin_gpu`, `psrl_unpin_gpu`) which must run in the same process
-        as `block_pool` in the EngineCore process. This is safe for TP>1 because
-        the state is never copied across process boundaries.
-
-        Args:
-            method (str): The `RolloutScheduler` method name to call on EngineCore.
-            *args: Positional arguments forwarded to the method.
-
-        Returns:
-            object: The return value of the called method.
+        Called after a model weight update to drop stale entries when
+        `clear_on_weight_update` is enabled.
         """
-        return await self._inference_engine.engine_core.call_utility_async(method, *args)
-
-    # --- Public KV cache operations ---
+        if not self.config.enable:
+            return
+        await self._request("POST", "/cache/clear")
+        psrl_logger.info("[LMCache] Cleared MP server cache for this node.")
 
     async def pin(self, tokens: list[int], targets: list[str]) -> bool:
         """
@@ -314,8 +372,7 @@ class KVCacheManager:
         if "gpu" in targets:
             ok = ok and await self._pin_gpu(tokens)
         if "backend" in targets:
-            pinned: int = await self._rpc("lmcache_pin_backend", (tokens,))
-            ok = ok and pinned >= 0
+            ok = ok and await self._pin_backend(tokens)
         return ok
 
     async def unpin(self, tokens: list[int], targets: list[str]) -> bool:
@@ -339,7 +396,7 @@ class KVCacheManager:
         if "gpu" in targets:
             ok = ok and await self._unpin_gpu(tokens)
         if "backend" in targets:
-            await self._rpc("lmcache_unpin_backend", (tokens,))
+            ok = ok and await self._unpin_backend(tokens)
         return ok
 
     async def transfer_direct(
@@ -351,230 +408,258 @@ class KVCacheManager:
         dst_model_version: int = -1,
     ) -> bool:
         """
-        Transfer KV cache by sending MoveWorkerMsg directly to local LMCacheWorker.
+        Transfer a cached prefix to another rollout instance.
 
-        Bypasses the centralized Controller HTTP endpoint by constructing the
-        same MoveWorkerMsg that the Controller's executor would send, and
-        dispatching it directly to the local LMCacheWorker's ZMQ socket.
-
-        This eliminates:
-        - HTTP JSON serialization of large token lists
-        - Controller single-process GIL bottleneck under burst
-        - Controller event loop contention
-
-        Each replica's manager sends to its OWN per-rank Workers, so N instances
-        under burst have zero cross-instance contention. KV is sharded per rank, so
-        this fans out one MoveWorkerMsg per local rank, each moving that rank's shard
-        to the destination's same-rank endpoint. Falls back to re-prefill on failure.
+        MP transfer is a pull: this method asks the destination's MP server to
+        warm its own L1 from whichever peer holds the prefix. The source is
+        therefore never targeted, and a partial result leaves the destination to
+        re-prefill the remainder.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
-            src (tuple[str, str]): Source `(lmcache_instance_id, backend_location)`.
-            dst (tuple[str, str]): Destination `(lmcache_instance_id, backend_location)`.
-            copy (bool): If True, keep the data at `src` as well.
-            dst_model_version (int): Model version to look up on the source when
-                multi_version_kv is enabled. -1 means version-agnostic (no tag).
+            src (tuple[str, str]): Source `(lmcache_instance_id, backend)`.
+            dst (tuple[str, str]): Destination `(lmcache_instance_id, backend)`.
+            copy (bool): If False, best-effort delete the prefix from the source
+                once the destination confirms it. The delete is refused while
+                the source prefix is pinned.
+            dst_model_version (int): Model version to resolve the prefix under at
+                the destination. -1 means version-agnostic (no tag).
 
         Returns:
-            bool: True if every local rank moved >0 tokens.
+            bool: True if the destination acquired the whole prefix.
         """
-        self._assert_engine()
-        assert tokens, "tokens must be a non-empty list."
+        self._last_transfer_error = ""
         if not self.config.enable_p2p:
+            self._last_transfer_error = "enable_p2p is False"
             psrl_logger.warning("[LMCache] transfer_direct() called but enable_p2p is False.")
             return False
-
-        # Missing prerequisites are errors because no safe fallback exists.
-        assert self.peer_registry, (
-            "[LMCache] transfer_direct() called but peer_registry is empty. Call set_peer_registry() after P2P init."
-        )
-        assert self._worker_zmq_urls, (
-            "[LMCache] transfer_direct() called but worker_zmq_urls is not set. "
-            "Call set_peer_registry(registry, worker_zmq_urls) after P2P init."
-        )
+        assert tokens, "tokens must be a non-empty list."
+        assert self.model_name, "LMCache model_name is unset. Call set_parallel_geometry() before transfers."
 
         dst_instance_id = dst[0]
+        await self.refresh_peer_registry()
         dst_urls = self.peer_registry.get(dst_instance_id)
-        # Rank pairing requires homogeneous layouts because LMCache cannot reshard KV data.
-        num_ranks = len(self._worker_zmq_urls)
-        if not dst_urls or len(dst_urls) != num_ranks:
-            psrl_logger.warning(
-                f"[LMCache] Destination {dst_instance_id!r} has "
-                f"{0 if not dst_urls else len(dst_urls)} ranks but this replica has "
-                f"{num_ranks}. The TP/PP layout is likely heterogeneous. Skipping direct "
-                "transfer, destination will re-prefill."
-            )
+        if not dst_urls or not dst_urls[0]:
+            self._last_transfer_error = f"no MP endpoint known for destination {dst_instance_id!r}"
+            psrl_logger.warning(f"[LMCache] {self._last_transfer_error}. The destination will re-prefill.")
             return False
 
-        # Fan out one MoveWorkerMsg per local rank, each to its own LMCacheWorker.
-        request_configs: dict | None = (
-            {"lmcache.tag.model_version": str(dst_model_version)} if dst_model_version >= 0 else None
-        )
+        for label, backend in (("src", src[1]), ("dst", dst[1])):
+            if backend and backend != _LEGACY_BACKEND:
+                psrl_logger.warning(f"[LMCache] Ignoring {label}_backend={backend!r}: MP transfer is tier-agnostic.")
 
-        async def _move_rank(rank: int) -> int:
-            dst_peer_init_url = dst_urls[rank]
-            if not dst_peer_init_url:
-                psrl_logger.warning(
-                    f"[LMCache] No same-rank peer_init_url for {dst_instance_id!r} "
-                    f"rank {rank}. Skipping that rank's shard."
-                )
+        body = {
+            "model_name": self.model_name,
+            "world_size": self.kv_world_size,
+            "token_ids": tokens,
+            "cache_salt": "",
+            "source_tier": "l2",
+            "target_tier": "l1",
+            "request_configs": (
+                {"lmcache.tag.model_version": str(dst_model_version)} if dst_model_version >= 0 else None
+            ),
+        }
+        dst_base = dst_urls[0]
+
+        try:
+            submitted = await self._request_url("POST", f"{dst_base}/cache/prefetches", body)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            self._last_transfer_error = f"destination prefetch submit failed: {e}"
+            psrl_logger.warning(f"[LMCache] {self._last_transfer_error}. The destination will re-prefill.")
+            return False
+
+        chunks = int(submitted.get("chunks", 0))
+        request_id = submitted.get("request_id")
+        if not request_id or chunks == 0:
+            self._last_transfer_error = "token sequence is shorter than one chunk"
+            return False
+
+        found = await self._await_prefetch(str(dst_base), str(request_id))
+        if found < chunks:
+            self._last_transfer_error = (
+                f"destination acquired {found}/{chunks} chunks. It will re-prefill the remainder"
+            )
+            psrl_logger.info(f"[LMCache] {self._last_transfer_error}")
+            return False
+
+        if not copy:
+            await self._delete_at_source(src[0], body)
+        psrl_logger.debug(f"[LMCache] Transferred {chunks} chunks to {dst_instance_id!r} (copy={copy}).")
+        return True
+
+    async def _await_prefetch(self, dst_base: str, request_id: str) -> int:
+        """
+        Poll a destination warm prefetch until it completes or times out.
+
+        Args:
+            dst_base (str): Destination MP server base URL.
+            request_id (str): Prefetch request id returned by the destination.
+
+        Returns:
+            int: Number of chunks loaded into the destination's L1, or 0 on
+            timeout or error.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _PREFETCH_TIMEOUT_S
+        while loop.time() < deadline:
+            try:
+                status = await self._request_url("GET", f"{dst_base}/cache/prefetches/{request_id}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                psrl_logger.warning(f"[LMCache] Destination prefetch poll failed: {e}")
                 return 0
-            return await self._send_move_worker_msg(
-                rank=rank,
-                tokens=tokens,
-                old_position=src[1],  # backend location string
-                new_position=(dst_peer_init_url, dst[1]),
-                copy=copy,
-                request_configs=request_configs,
-            )
+            state = status.get("status")
+            if state == "completed":
+                return int(status.get("found_keys", 0))
+            if state not in ("pending", "submitted"):
+                psrl_logger.warning(f"[LMCache] Unexpected prefetch status {state!r}.")
+                return 0
+            await asyncio.sleep(_PREFETCH_POLL_INTERVAL_S)
+        psrl_logger.warning(
+            f"[LMCache] Destination prefetch {request_id!r} timed out after {_PREFETCH_TIMEOUT_S:.0f}s."
+        )
+        return 0
 
-        per_rank_tokens = await asyncio.gather(*[_move_rank(r) for r in range(num_ranks)])
-        all_moved = all(n > 0 for n in per_rank_tokens)
-        if all_moved:
-            psrl_logger.debug(
-                f"[LMCache] Direct transfer succeeded on all {num_ranks} ranks "
-                f"from {src!r} to {dst!r} (per-rank tokens: {per_rank_tokens!r})."
-            )
-        else:
+    async def _delete_at_source(self, src_instance_id: str, body: dict) -> None:
+        """
+        Best-effort delete of a transferred prefix from the source instance.
+
+        The coordinator resolves the token sequence and forwards the delete to
+        the named instance. Pinned or locked keys are refused by the node, so a
+        source that is still pinned keeps its copy.
+
+        Args:
+            src_instance_id (str): Instance to delete from.
+            body (dict): Prefetch body whose identity fields are reused.
+        """
+        if not src_instance_id or not self.config.coordinator_host:
+            return
+        request = {
+            "instance_id": src_instance_id,
+            "model_name": body["model_name"],
+            "world_size": body["world_size"],
+            "token_ids": body["token_ids"],
+            "cache_salt": body["cache_salt"],
+            "request_configs": body["request_configs"],
+            "tier": "l1",
+            # Pins are an explicit client contract, so do not bypass them.
+            "force": False,
+        }
+        try:
+            result = await self._request_url("POST", f"{self.coordinator_url}/cache/delete", request)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            psrl_logger.warning(f"[LMCache] Source delete after transfer failed (best effort, non-atomic): {e}")
+            return
+        skipped = int(result.get("skipped", 0))
+        if skipped:
             psrl_logger.info(
-                f"[LMCache] Direct transfer moved 0 tokens on some rank for "
-                f"{src!r} → {dst!r} (per-rank: {per_rank_tokens!r}). Source may have "
-                "evicted or have a layout mismatch. The destination will re-prefill."
+                f"[LMCache] Source delete skipped {skipped} keys (locked or pinned). The source keeps its copy."
             )
-        return all_moved
 
-    async def _send_move_worker_msg(
-        self,
-        rank: int,
-        tokens: list[int],
-        old_position: str,
-        new_position: tuple[str, str],
-        copy: bool,
-        request_configs: dict | None = None,
-    ) -> int:
-        """
-        Construct and send MoveWorkerMsg directly to one local LMCacheWorker via ZMQ.
+    # --- Private helpers ---
 
-        Replicates what LMCacheClusterExecutor.move() does (executor.py:281-350)
-        but without the Controller intermediary. Uses async ZMQ for non-blocking I/O.
-
-        Args:
-            rank: Local rank whose LMCacheWorker (and dedicated ZMQ socket) to use.
-            tokens: Full token sequence.
-            old_position: Source backend location (e.g. "LocalCPUBackend").
-            new_position: Tuple of (dst_peer_init_url, dst_backend_location).
-            copy: Whether to keep data at source.
-            request_configs: Optional LMCache request config tags (e.g. model version
-                tag). Passed through to MoveWorkerMsg so the worker's lookup() uses
-                the matching version-specific key hash.
-
-        Returns:
-            int: Number of tokens transferred.
-        """
-        from lmcache.v1.cache_controller.message import (
-            MoveWorkerMsg,
-            Msg,
+    def _assert_engine(self) -> None:
+        assert self._inference_engine is not None, (
+            "KVCacheManager inference engine is not attached. Call attach_engine() after the rollout is initialised."
         )
 
-        worker_event_id = f"DirectMove_{uuid.uuid4().hex[:8]}"
-        msg = MoveWorkerMsg(
-            worker_event_id=worker_event_id,
-            old_position=old_position,
-            new_position=new_position,
-            tokens=tokens,
-            copy=copy,
-            request_configs=request_configs,
-        )
-
-        serialized_msg = msgspec.msgpack.encode(msg)
-        lock = self._direct_zmq_locks.setdefault(rank, asyncio.Lock())
-        # The per rank lock enforces strict ZMQ REQ send and receive alternation.
-        async with lock:
-            socket = self._get_or_create_zmq_socket(rank)
-            try:
-                await socket.send(serialized_msg)
-                serialized_resp = await socket.recv()
-            except Exception:
-                # A failed REQ exchange leaves the socket unusable, so rebuild it
-                # before the next call.
-                self._reset_zmq_socket(rank)
-                raise
-        resp = msgspec.msgpack.decode(serialized_resp, type=Msg)
-
-        if hasattr(resp, "num_tokens"):
-            return resp.num_tokens
-        else:
-            psrl_logger.warning(f"[LMCache] Unexpected response type from Worker: {type(resp).__name__}")
-            return 0
-
-    def _get_or_create_zmq_socket(self, rank: int):
+    async def _utility(self, method: str, *args) -> object:
         """
-        Get or lazily create the async ZMQ REQ socket for a given local rank.
+        Call a `psrl_*` method on the vLLM `EngineCore` via `call_utility_async`.
+
+        GPU block-pool operations must run in the EngineCore process, next to
+        `block_pool`, so they are dispatched there rather than to a worker.
+        This is safe for TP>1 because the state is never copied across
+        process boundaries.
 
         Args:
-            rank (int): Local rank whose LMCacheWorker REP socket to connect to.
+            method (str): The `RolloutScheduler` method name to call on EngineCore.
+            *args: Positional arguments forwarded to the method.
 
         Returns:
-            zmq.asyncio.Socket: Connected ZMQ REQ socket for `rank`.
+            object: The return value of the called method.
         """
-        socket = self._direct_zmq_sockets.get(rank)
-        if socket is None:
-            import zmq
-            import zmq.asyncio
+        return await self._inference_engine.engine_core.call_utility_async(method, *args)
 
-            assert 0 <= rank < len(self._worker_zmq_urls), (
-                f"[LMCache] rank {rank} out of range for {len(self._worker_zmq_urls)} worker zmq urls."
-            )
-            worker_zmq_url = self._worker_zmq_urls[rank]
-            if self._direct_zmq_context is None:
-                self._direct_zmq_context = zmq.asyncio.Context()
-            socket = self._direct_zmq_context.socket(zmq.REQ)
-            socket.connect(f"tcp://{worker_zmq_url}")
-            # Set send/recv timeout to avoid hanging indefinitely.
-            socket.setsockopt(zmq.SNDTIMEO, 10000)  # 10s
-            socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30s
-            self._direct_zmq_sockets[rank] = socket
-            psrl_logger.info(f"[LMCache] Direct ZMQ socket connected to {worker_zmq_url} (rank {rank}).")
-        return socket
+    # --- Backend pin internals ---
 
-    def _reset_zmq_socket(self, rank: int) -> None:
+    def _l1_pin_body(self, tokens: list[int]) -> dict:
         """
-        Close and discard one rank's direct ZMQ socket so the next call rebuilds it.
-
-        Called after a send/recv failure on the REQ socket. A REQ socket that
-        raised mid send→recv is stuck in a bad EFSM state and cannot be reused.
-        dropping it here lets `_get_or_create_zmq_socket` reconnect cleanly.
-
-        Caller must hold that rank's `_direct_zmq_locks[rank]`.
+        Build the L1 pin/unpin body for one token sequence.
 
         Args:
-            rank (int): Local rank whose socket to reset.
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            dict: Request body for `POST`/`DELETE /cache/l1/pins`.
         """
-        socket = self._direct_zmq_sockets.pop(rank, None)
-        if socket is not None:
-            try:
-                socket.close(linger=0)
-            except Exception:
-                pass
-            psrl_logger.warning(
-                f"[LMCache] Direct ZMQ socket for rank {rank} reset after transfer "
-                "failure. It will reconnect on the next transfer."
+        assert self.model_name, (
+            "LMCache model_name is unset. Call set_parallel_geometry() before backend pin operations."
+        )
+        request_configs = (
+            {"lmcache.tag.model_version": str(self.current_version)} if self.config.multi_version_kv else None
+        )
+        return {
+            "model_name": self.model_name,
+            "world_size": self.kv_world_size,
+            "token_ids": tokens,
+            "cache_salt": "",
+            "request_configs": request_configs,
+        }
+
+    async def _pin_backend(self, tokens: list[int]) -> bool:
+        """
+        Pin the trajectory's cached chunks in the MP server's L1.
+
+        Chunks that are not resident are reported by the server as missing and
+        are not treated as an error, so a pinned prefix shorter than `tokens`
+        behaves the same as before. Only a pin that retained at least one chunk
+        is remembered, so a later pin can retry chunks that were not stored yet.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            bool: True if the request succeeded.
+        """
+        key = tuple(tokens)
+        if key in self._pinned_backend:
+            # Repeated pins must not increment the server's pin count.
+            return True
+
+        if not self.config.enable:
+            return True
+
+        body = self._l1_pin_body(tokens)
+        result = await self._request("POST", "/cache/l1/pins", body)
+        pinned = int(result.get("pinned", 0))
+        if pinned > 0:
+            self._pinned_backend[key] = body
+        elif int(result.get("missing", 0)) > 0:
+            psrl_logger.debug(
+                f"[LMCache] Backend pin found no resident chunks for {len(tokens)} tokens. "
+                "the prefix may not have been stored yet."
             )
+        return True
 
-    def _reset_all_zmq_sockets(self) -> None:
+    async def _unpin_backend(self, tokens: list[int]) -> bool:
         """
-        Close and discard all per-rank direct ZMQ sockets.
+        Release the trajectory's L1 pins on the MP server.
 
-        Called from `set_peer_registry` so sockets reconnect with the new worker
-        URLs on next use.
+        Unpinning reuses the body recorded at pin time so the release happens
+        under the same identity tags even if the model version advanced.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            bool: True if the request succeeded.
         """
-        for rank in list(self._direct_zmq_sockets.keys()):
-            socket = self._direct_zmq_sockets.pop(rank, None)
-            if socket is not None:
-                try:
-                    socket.close(linger=0)
-                except Exception:
-                    pass
+        body = self._pinned_backend.pop(tuple(tokens), None)
+        if body is None:
+            psrl_logger.debug("[LMCache] Backend unpin skipped: sequence was not pinned.")
+            return True
+        await self._request("DELETE", "/cache/l1/pins", body)
+        return True
 
     # --- GPU pin budget internals ---
 

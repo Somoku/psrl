@@ -3,81 +3,104 @@
 # Whether to enable LMCache KV offloading in vLLM.
 enable: False
 
-# Backend for offloaded KV: "cpu", "disk", or "remote" (TODO: remote).
-backend: cpu
+# --- L1 cache ---
 
-# Total GiB across all TP ranks. vLLM converts it to a per-rank budget.
-# Do not set `LMCACHE_MAX_LOCAL_CPU_SIZE`, which would apply the total to every rank.
+# L1 capacity in GiB for one node's MP server.
 offload_size_gb: 100.0
 
 # Token chunk size for hash-based KV indexing (must divide the block size).
 chunk_size: 256
 
-# Full LMCache YAML config path. When set, it overrides all individual fields.
-config_file: null
+# Chunk-key hash algorithm: "blake3" or "sha256".
+hash_algorithm: blake3
+
+# L1 allocation alignment in bytes. Raise it to 65536 when P2P is enabled so
+# RDMA reads stay efficient.
+l1_align_bytes: 4096
+
+# L1 eviction policy: "LRU", "IsolatedLRU", or "noop".
+eviction_policy: LRU
+
+# --- L2 (optional extra tiers) ---
+
+# L2 adapters as JSON objects, e.g. [{type: fs, path: /mnt/kv}].
+l2_adapters: []
+
+# L2 store and prefetch policies (LMCache adapter registry names).
+l2_store_policy: default
+l2_prefetch_policy: default
+
+# --- Runtime endpoints (allocated by the server actor at launch) ---
+
+# Host the MP server binds for its worker message queue.
+server_host: 127.0.0.1
+
+# ZMQ message-queue port. Zero allocates one at launch.
+server_port: 0
+
+# Management HTTP port. Zero allocates one at launch.
+http_port: 0
+
+# --- P2P transfer ---
+
+# Enable peer-to-peer KV sharing between instances.
+enable_p2p: False
+
+# Node IP advertised for the RDMA transfer channel (set at launch).
+p2p_advertise_host: ""
+
+# Transfer-channel port. Zero allocates one at launch.
+p2p_transfer_port: 0
+
+# Transfer engine: "nixl" (default) or "mooncake_te".
+p2p_transfer_engine: nixl
+
+# Peer lookup and load timeouts in seconds.
+p2p_lookup_timeout_s: 30.0
+p2p_load_timeout_s: 30.0
+
+# --- Coordinator ---
+
+# Host where the shared MP coordinator runs. Defaults to the PS manager node.
+coordinator_host: ${psrl.ps_manager_ip}
+
+# Coordinator HTTP port.
+coordinator_port: 9300
+
+# Coordinator startup timeout in seconds for contended manager nodes.
+coordinator_health_timeout_s: 3000
+
+# Report cache events to the coordinator. Required for fleet-level views and
+# for the LMCache-tier KV event stream consumed by routing.
+coordinator_event_reporting: False
+
+# ZMQ PUB port for the LMCache-tier KV event stream. Zero allocates at launch.
+event_publish_port: 0
+
+# --- Connector ---
+
+# Timeout in seconds for MP message-queue requests.
+mq_timeout_s: 300
+
+# Interval in seconds between connector heartbeats to the MP server.
+heartbeat_interval_s: 10
+
+# Submit the LMCache lookup as soon as a request is scheduled.
+eager_prefetch: False
+
+# --- Cache behaviour ---
 
 # Whether to clear stale KV cache after model weight pull from PS.
 clear_on_weight_update: False
 
-# Whether to enable multi-version KV cache.
+# Whether to tag KV entries with the model version. Required when P2P is
+# enabled because the P2P tier cannot be cleared during weight sync.
 multi_version_kv: True
 
-# --- CPU backend ---
+# Publish KV cache events so routing can score the off-GPU cache tier.
+enable_kv_events: False
 
-# GiB of CPU memory to keep free and never use for KV offloading.
-reserve_local_cpu_size: 0.0
+# --- GPU pin budget ---
 
-# --- Disk backend ---
-
-# Filesystem path for disk-backed KV storage (required when backend=disk).
-disk_path: null
-
-# Max disk usage in GiB when using the disk backend.
-max_disk_size_gb: 1000.0
-
-# --- Remote backend (TODO) ---
-
-# Remote LMCache server URL (e.g., "redis://host:6379").
-remote_url: null
-
-# --- Cache behaviour ---
-
-# Also cache KV from decode steps (increases memory, helps multi-turn reuse).
-save_decode_cache: True
-
-# NOTE(lhy): The `save_unfull_chunk` option is buggy and must remain disabled.
-save_unfull_chunk: False
-
-# Eviction policy: "LRU" (default) or "FIFO".
-cache_policy: LRU
-
-# NOTE(lhy): Async cache loading is buggy and must remain disabled.
-enable_async_loading: False
-
-# P2P is required by routing_strategy.kv_transfer.enable and requires `clear_on_weight_update=False`.
-# Keep `multi_version_kv=True` because version tags prevent stale hits while P2PBackend cannot clear during weight sync.
-enable_p2p: False
-
-# `nixl` selects shared memory, IPC, or RDMA.
-# Use `tcp` when NIXL or UCX is unavailable.
-p2p_transfer_channel: nixl
-
-# Base HTTP port. `RolloutCoordinator` selects an available port from this value.
-controller_base_port: 9000
-
-# Health timeout includes slow imports and cluster CPU or filesystem contention.
-controller_health_timeout_s: 3000
-
-# Host where the LMCache Controller runs. Defaults to psrl.ps_manager_ip.
-# Both PSRL (HTTP) and LMCache workers (ZMQ) connect to this host.
-controller_host: ${psrl.ps_manager_ip}
-
-# ZMQ PULL port for LMCache worker registration and heartbeats.
-controller_pull_port: 8300
-
-# ZMQ REPLY port for controller instructions to LMCache workers.
-controller_reply_port: 8400
-
-# Maximum pinned GPU KV blocks. Zero disables the limit.
-# The oldest pinned trajectory is released first.
+# Max pinned GPU KV blocks, oldest released first. Zero disables the limit.
 gpu_pin_block_budget: 0

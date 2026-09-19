@@ -123,7 +123,6 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.loss_agg_mode=token-mean \
     train_actor_rollout_ref.actor.megatron.param_offload=False \
-    train_actor_rollout_ref.actor.megatron.grad_offload=True \
     train_actor_rollout_ref.actor.megatron.optimizer_offload=True \
     train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP} \
     train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${TRAIN_PP} \

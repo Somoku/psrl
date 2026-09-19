@@ -15,7 +15,7 @@ from verl.utils.megatron_utils import get_model
 from verl.utils.torch_dtypes import PrecisionType
 
 # Import verl utilities
-from verl.workers.megatron_workers import set_random_seed
+from verl.workers.engine.megatron.utils import set_random_seed
 
 QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE", "/tmp") + "/models/Qwen2.5-0.5B-Instruct"
 

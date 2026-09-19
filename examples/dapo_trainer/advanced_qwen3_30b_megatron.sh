@@ -180,7 +180,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     train_actor_rollout_ref.actor.megatron.param_offload=False \
     train_actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
-    train_actor_rollout_ref.actor.megatron.grad_offload=${offload} \
     train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP} \
     train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${TRAIN_PP} \
     train_actor_rollout_ref.actor.megatron.context_parallel_size=${TRAIN_CP} \

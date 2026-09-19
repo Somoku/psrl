@@ -97,7 +97,6 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     train_actor_rollout_ref.actor.megatron.param_offload=False \
-    train_actor_rollout_ref.actor.megatron.grad_offload=True \
     train_actor_rollout_ref.actor.megatron.optimizer_offload=True \
     train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=$tensor_model_parallel_size \
     train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=$pipeline_model_parallel_size \

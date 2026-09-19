@@ -153,7 +153,7 @@ gateway and TITO design.
 
 ## 8. veRL patch inventory
 
-The patch filename must match the exact installed veRL commit. `bf48903d.patch` changes:
+The patch filename must match the exact installed veRL commit. `3efe38c7.patch` changes:
 
 | Patched area | PSRL requirement |
 | --- | --- |
@@ -161,7 +161,7 @@ The patch filename must match the exact installed veRL commit. `bf48903d.patch` 
 | `single_controller/ray/base.py` | Fractional GPU resources per placement-group bundle |
 | `trainer/config/data/legacy_data.yaml`, `engine/*.yaml`, `model/hf_model.yaml` | No implicit shuffle, shared-memory model loading, `load_weight`, and per-rank checkpoint switches |
 | `trainer/ppo/core_algos.py`, `workers/config/actor.py`, `workers/utils/losses.py` | `session-mean-token-mean` loss, its metric aggregation, and length-corruption diagnostics |
-| `trainer/ppo/metric_utils.py` | Max-length metadata, per-source reward metrics, MoE load-balance metrics, and non-numeric validation metadata |
+| `trainer/ppo/metric_utils.py` | Metadata-driven max prompt/response lengths, per-source `original_reward_score` metrics, and skipping non-numeric validation variables |
 | `trainer/ppo/padding_utils.py` | Unique numeric padding ids, `parent_id`, per-response fields shrunk by length rather than by name, and route-safe padding |
 | `trainer/ppo/rollout_corr_helper.py` | Drop zero-response rows from sequence importance-sampling metrics |
 | `utils/dataset/rl_dataset.py` | Multi-dataset identity, reward-model dictionaries, and over-sampling |

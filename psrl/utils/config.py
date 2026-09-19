@@ -1,4 +1,4 @@
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from verl.utils.config import omega_conf_to_dataclass
 
 from psrl.trainer.ppo.batch_schedule import (
@@ -118,17 +118,18 @@ def validate_config(
         use_critic (bool): is critic needed
     """
 
-    # Router replay is configured on the actor but needs the rollout side to capture routing.
-    actor_router_replay = config.train_actor_rollout_ref.actor.router_replay.mode
+    # Router replay lives on the training engine config, which Hydra mounts under a strategy-specific
+    # key. Only the Megatron and VeOmni engine templates expose it, so a missing key means disabled.
+    actor_config = config.train_actor_rollout_ref.actor
+    engine_mount = "megatron" if actor_config.strategy == "megatron" else "fsdp_config"
+    actor_router_replay = OmegaConf.select(actor_config, f"{engine_mount}.router_replay.mode", default="disabled")
     rollout_routing_replay = config.gen_actor_rollout_ref.rollout.enable_rollout_routing_replay
     if actor_router_replay == "R3" and not rollout_routing_replay:
         raise ValueError(
             "Router replay mode R3 requires gen_actor_rollout_ref.rollout.enable_rollout_routing_replay=True."
         )
     if rollout_routing_replay and actor_router_replay != "R3":
-        raise ValueError(
-            "Rollout routing replay is only valid with train_actor_rollout_ref.actor.router_replay.mode='R3'."
-        )
+        raise ValueError("Rollout routing replay is only valid with the actor engine's router_replay.mode='R3'.")
 
     train_n_gpus = config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
     if not config.train_actor_rollout_ref.actor.use_dynamic_bsz:

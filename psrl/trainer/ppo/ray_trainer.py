@@ -2682,23 +2682,34 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
-        # AGENT(VERL): PSRL use `actor_wg` while VERL use `actor_rollout_wg`.
-        if do_profile:
-            self.actor_wg.start_profile(role="e2e", profile_step=self.global_steps)
-            if self.use_reference_policy:
-                self.ref_policy_wg.start_profile(profile_step=self.global_steps)
-            if self.use_critic:
-                self.critic_wg.start_profile(profile_step=self.global_steps)
+        # AGENT(VERL): PSRL trains through `actor_wg`, and the rollout engines are profiled separately.
+        if not do_profile:
+            return
+        # The reference and critic groups can alias `actor_wg`, and every start/stop round-trips to
+        # all ranks, so drive each distinct group once and only profile the training window.
+        self.actor_wg.start_profile(role="train", profile_step=self.global_steps)
+        seen = {id(self.actor_wg)}
+        if self.use_reference_policy and id(self.ref_policy_wg) not in seen:
+            seen.add(id(self.ref_policy_wg))
+            self.ref_policy_wg.start_profile(profile_step=self.global_steps)
+        if self.use_critic and id(self.critic_wg) not in seen:
+            seen.add(id(self.critic_wg))
+            self.critic_wg.start_profile(profile_step=self.global_steps)
 
-    def _stop_profiling(self, do_profile: bool) -> None:
+    def _stop_profiling(self, do_profile: bool, run_command: bool = False) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
+        # `run_command` is True only on the last profiled step, so the finish command fires once.
         # AGENT(VERL): PSRL use `actor_wg` while VERL use `actor_rollout_wg`.
-        if do_profile:
-            self.actor_wg.stop_profile()
-            if self.use_reference_policy:
-                self.ref_policy_wg.stop_profile()
-            if self.use_critic:
-                self.critic_wg.stop_profile()
+        if not do_profile:
+            return
+        self.actor_wg.stop_profile(run_command=run_command)
+        seen = {id(self.actor_wg)}
+        if self.use_reference_policy and id(self.ref_policy_wg) not in seen:
+            seen.add(id(self.ref_policy_wg))
+            self.ref_policy_wg.stop_profile(run_command=run_command)
+        if self.use_critic and id(self.critic_wg) not in seen:
+            seen.add(id(self.critic_wg))
+            self.critic_wg.stop_profile(run_command=run_command)
 
     def _get_required_batch_multiple(self, dp_size: int) -> int:
         """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
@@ -3452,10 +3463,17 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     if self.config.global_profiler.steps is not None
                     else False
                 )
+                # The finish command (for example a trace upload of the whole save_path) must fire
+                # once, on the last profiled step, rather than once per profiled step.
+                profiled_steps = self.config.global_profiler.steps
+                run_finish_command = bool(
+                    curr_step_profile and profiled_steps and (self.global_steps == max(profiled_steps) or is_last_step)
+                )
                 self._stop_profiling(
                     curr_step_profile and not next_step_profile
                     if self.config.global_profiler.profile_continuous_steps
-                    else curr_step_profile
+                    else curr_step_profile,
+                    run_command=run_finish_command,
                 )
                 prev_step_profile = curr_step_profile
                 curr_step_profile = next_step_profile

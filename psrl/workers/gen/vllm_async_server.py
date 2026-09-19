@@ -762,17 +762,29 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
 
-    async def abort_all_requests(self, reset_prefix_cache: bool = False) -> dict[str, Any]:
+    async def abort_all_requests(
+        self, reset_prefix_cache: bool = False, reject_request: bool = False
+    ) -> dict[str, Any]:
         """
         Abort all ongoing requests asynchronously.
 
         This method is used to abort all requests, typically during shutdown or
         when a global interruption is needed.
 
+        Args:
+            reset_prefix_cache: Clear the KV cache after aborting.
+            reject_request: Fail requests that arrive behind the parked gate instead of letting them
+                wait for a resume. The SMG servicer owns admission, so this wakes the parked gate in
+                its failing state and the gateway reroutes those requests. A later
+                `resume_after_sync` clears the flag.
+
         Returns:
             The number of requests that were aborted.
         """
         # AGENT(VERL): the implementation is different from verl, skip when bump dependency.
+
+        if reject_request:
+            self.grpc_servicer.fail_generation_admission()
 
         request_states_snapshot = list(self.engine.output_processor.request_states.items())
         request_ids = [req_id for req_id, _ in request_states_snapshot]

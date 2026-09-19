@@ -184,3 +184,38 @@ def test_policy_from_str_cache_aware_v1():
 
     assert policy_from_str("cache_aware_v1") == PolicyType.CacheAwareV1
     assert policy_from_str("cache_aware") == PolicyType.CacheAware
+
+
+def _make_lmcache_config(**lmcache_overrides):
+    from types import SimpleNamespace
+
+    lmcache = {
+        "enable": True,
+        "coordinator_host": "10.0.0.2",
+        "coordinator_port": 9300,
+        "coordinator_event_reporting": True,
+        **lmcache_overrides,
+    }
+    return SimpleNamespace(psrl=SimpleNamespace(lmcache=SimpleNamespace(**lmcache)))
+
+
+@pytest.mark.unit
+def test_lmcache_coordinator_addr_derived_when_events_enabled():
+    from psrl.workers.gen.smg_adapter import _lmcache_coordinator_addr
+
+    assert _lmcache_coordinator_addr(_make_lmcache_config()) == "http://10.0.0.2:9300"
+
+
+@pytest.mark.unit
+def test_lmcache_coordinator_addr_empty_when_events_disabled():
+    from psrl.workers.gen.smg_adapter import _lmcache_coordinator_addr
+
+    assert _lmcache_coordinator_addr(_make_lmcache_config(enable=False)) == ""
+    assert _lmcache_coordinator_addr(_make_lmcache_config(coordinator_event_reporting=False)) == ""
+
+
+@pytest.mark.unit
+def test_lmcache_coordinator_addr_empty_without_host():
+    from psrl.workers.gen.smg_adapter import _lmcache_coordinator_addr
+
+    assert _lmcache_coordinator_addr(_make_lmcache_config(coordinator_host="")) == ""

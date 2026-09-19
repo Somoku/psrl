@@ -68,6 +68,19 @@ def _resolve_custom_chat_template(config: Any) -> str | None:
     return target
 
 
+def _lmcache_coordinator_addr(config: Any) -> str:
+    """Base URL of the LMCache coordinator, or empty when off-GPU events are off."""
+    if not cfg_get(config, "psrl.lmcache.enable", False):
+        return ""
+    if not cfg_get(config, "psrl.lmcache.coordinator_event_reporting", False):
+        return ""
+    host = str(cfg_get(config, "psrl.lmcache.coordinator_host", ""))
+    if not host:
+        return ""
+    port = int(cfg_get(config, "psrl.lmcache.coordinator_port", 9300))
+    return f"http://{host}:{port}"
+
+
 def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr: str):
     from smg.launch_router import RouterArgs
 
@@ -154,6 +167,7 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         psrl_kv_transfer_enable=kv_transfer_enable,
         psrl_kv_transfer_mode=kv_transfer_mode,
         psrl_kv_transfer_timeout_ms=kv_transfer_timeout_ms,
+        psrl_lmcache_coordinator_addr=_lmcache_coordinator_addr(config),
         enable_tito=bool(cfg_get(config, "psrl.rollout_gateway.enable_tito", True)),
         tito_debug=bool(cfg_get(config, "psrl.rollout_gateway.tito_debug", False)),
         tito_gc_threshold=cfg_get(config, "psrl.rollout_gateway.tito_gc_threshold", None),

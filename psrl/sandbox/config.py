@@ -13,7 +13,7 @@ from psrl.sandbox.manager import SandboxManager
 class SandboxManagerConfig:
     """Worker-local sandbox backend registry."""
 
-    default_backend: str
+    default_backend: str = "docker"
     backends: dict[str, Any] = field(default_factory=dict)
     capacity: SandboxCapacityConfig = field(default_factory=SandboxCapacityConfig)
 

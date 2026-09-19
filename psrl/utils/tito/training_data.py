@@ -87,6 +87,11 @@ def build_training_data(
 
     Returns:
         Dict with keys: prompt_ids, response_ids, response_mask, logprobs, num_turns.
+
+    Raises:
+        ValueError: If a turn contributed tokens to ``accumulated_token_ids`` but its
+            record carries no ``output_logprobs``, or if the fields appended per turn
+            drift apart. Both indicate a gateway/TITO contract violation.
     """
     if not records:
         return {

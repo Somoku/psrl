@@ -23,6 +23,9 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 class RolloutScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Request IDs preempted while the waiting queue exceeded the threshold,
+        # drained per `make_stats` snapshot and forwarded to the gateway.
+        self.preemption_req_ids: list[str] = []
         # The server supplies prefill logging settings through scheduler attributes.
         sc = self.scheduler_config
         self._pcomp_enable: bool = bool(getattr(sc, "psrl_prefill_composition_enable", False))
@@ -217,7 +220,9 @@ class RolloutScheduler(AsyncScheduler):
                 pinned += 1
         if blocks_to_touch:
             # NOTE(claude): Standard models pass one sequence because they have one KV-cache group.
-            block_pool.touch((blocks_to_touch,))
+            # `touch` takes a flat sequence of blocks (vLLM >= 0.29), not a
+            # sequence-of-groups.
+            block_pool.touch(blocks_to_touch)
             for block in blocks_to_touch:
                 assert block.ref_cnt > 0, (
                     f"Invalid block reference count after touch: block_id={block.block_id}, ref_cnt={block.ref_cnt}."
@@ -284,8 +289,8 @@ class RolloutScheduler(AsyncScheduler):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
-        # Notify external gateway if threshold is configured and waiting queue
-        # is already congested. Local requeuing would only worsen the load.
-        threshold = self.scheduler_config.preemption_notification_threshold
+        # Notify the gateway when the waiting queue is already congested. The
+        # threshold is a dynamic SchedulerConfig attribute, hence the getattr.
+        threshold = getattr(self.scheduler_config, "preemption_notification_threshold", None)
         if self.log_stats and threshold is not None and len(self.waiting) > threshold:
             self.preemption_req_ids.append(request.request_id)

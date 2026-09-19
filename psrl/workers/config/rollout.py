@@ -112,6 +112,10 @@ class RolloutConfig(_VeRLRolloutConfig):
 
     enable_weights_cpu_backup: bool = False
 
+    # Release idle NCCL communicator memory while sleeping (ncclCommSuspend /
+    # ncclCommResume). Requires NCCL >= 2.29.7. Otherwise it is a no-op.
+    enable_nccl_comm_suspend: bool = False
+
     multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
 
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)

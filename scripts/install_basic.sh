@@ -100,7 +100,7 @@ python -c "from smg.router import Router; print('  ✓ smg.router binding instal
 echo "7. Install vllm and verl"
 if [ -z "$VLLM_PATH" ]; then
     pushd $THIRD_PARTY_PATH
-    git clone -b releases/v0.22.0 https://github.com/vllm-project/vllm.git
+    git clone -b releases/v0.29.0 https://github.com/vllm-project/vllm.git
     VLLM_PATH=$THIRD_PARTY_PATH/vllm
     popd
 fi

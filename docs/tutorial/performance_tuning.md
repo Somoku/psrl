@@ -403,3 +403,29 @@ memory overhead.
 {doc}`../design/resource_elasticity` for the full TMS lifecycle, and the TMS section
 of {doc}`configuration` for every individual switch.
 ```
+
+## Sleep-mode NCCL release
+
+**Config**: `rollout.enable_nccl_comm_suspend`
+
+While an engine sleeps, each PyNccl communicator keeps its dynamic GPU buffers
+resident even though no collective is running. Setting
+`rollout.enable_nccl_comm_suspend=True` releases those buffers with
+`ncclCommSuspend` and restores them on wake. Topology and connection state are
+preserved, so no re-initialization or bootstrap rendezvous is needed.
+
+This requires NCCL 2.29.7 or newer, which provides `ncclCommSuspend` /
+`ncclCommResume`. The symbols come from the NCCL that torch loads; on an older
+NCCL the option is a validated no-op, so enabling it is safe but has no effect.
+
+## Model runner selection
+
+PSRL supports both of vLLM's model runners on vLLM 0.29: the v2 runner (vLLM's
+default on CUDA) and v1. Leave the choice to vLLM — do not set
+`VLLM_USE_V2_MODEL_RUNNER` via `engine_kwargs`. That variable short-circuits
+vLLM's own feature check, so setting it to `1` would force v2 onto a
+configuration that needs v1, and setting it to `0` would pin v1 even where v2 is
+supported. When a configuration enables a feature v2 does not implement yet,
+vLLM logs a warning and falls back to v1 on its own; PSRL's patches cover both
+paths.
+

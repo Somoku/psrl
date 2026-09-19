@@ -106,7 +106,7 @@ python -m pip install -e .
   Apex, and common Python dependencies.
 - SMG, including the release Rust gateway, Python
   binding, gRPC protocol/client package, PSRL state protocol, and gRPC servicer.
-- vLLM `releases/v0.22.0` and the PSRL vLLM patches.
+- vLLM `releases/v0.29.0` and the PSRL vLLM patches.
 - A pinned veRL checkout and the PSRL veRL patches. The pinned veRL requirements install `TransferQueue==0.1.7` during the core installation. `SimpleStorage` is the default TransferQueue backend.
 - `torch_memory_saver`.
 

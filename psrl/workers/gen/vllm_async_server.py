@@ -356,6 +356,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "max_num_batched_tokens": self.config.max_num_batched_tokens,
             "enable_prefix_caching": self.config.enable_prefix_caching,
             "enable_sleep_mode": self.config.enable_sleep_mode,
+            "enable_nccl_comm_suspend": self.config.enable_nccl_comm_suspend,
             "logprobs_mode": self.config.logprobs_mode,
             "enforce_eager": self.config.enforce_eager,
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
@@ -517,6 +518,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         vllm_config.scheduler_config.psrl_logging_path = str(self.psrl_config.logging_path)
         vllm_config.scheduler_config.psrl_replica_idx = self.get_replica_idx()
 
+        # Select the TMS sleep backend when the torch_memory_saver patches are
+        # active. ModelConfig reaches the workers, so setting it here is enough.
+        if os.environ.get("PSRL_VLLM_PATCHES", "").strip().startswith("TMS"):
+            vllm_config.model_config.sleep_mode_backend = "tms"
+            psrl_logger.info("Using vLLM sleep-mode backend: tms")
+
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}
         if "enable_log_requests" in fn_args:
@@ -524,14 +531,18 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
-        # AGENT(VERL): apply stat logger patch for PSRL
-        # NOTE(linsh): enable custom stat collection for PSRL
+        # vLLM dispatches stat-logger factories per engine. Returning the same
+        # shared instance for every index preserves the single-collector model.
         self.preemption_queue: asyncio.Queue = asyncio.Queue(maxsize=0)
         self.psrl_preemption_logger = PreemptionStatLogger(
             vllm_config,
             engine_index=0,
             preemption_queue=self.preemption_queue,
         )
+
+        def preemption_logger_factory(vllm_config, engine_index=0):
+            return self.psrl_preemption_logger
+
         if not self.config.disable_log_stats and self.psrl_config.status_collection.enable:
             self.stat_collector = DPLBStatCollector(
                 vllm_config,
@@ -545,9 +556,13 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             self.stat_collector.init_output_queue(self.status_queue)
             for data_parallel_rank in range(self.config.data_parallel_size):
                 self.stat_collector.record_model_version_update(0, data_parallel_rank)
-            kwargs["stat_loggers"] = [self.stat_collector, self.psrl_preemption_logger]
+
+            def dplb_stat_logger_factory(vllm_config, engine_index=0):
+                return self.stat_collector
+
+            kwargs["stat_loggers"] = [dplb_stat_logger_factory, preemption_logger_factory]
         else:
-            kwargs["stat_loggers"] = [self.psrl_preemption_logger]
+            kwargs["stat_loggers"] = [preemption_logger_factory]
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
@@ -724,10 +739,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             aggressive_empty_cache(force_sync=True)
 
     async def wake_up(self):
-        wake_up_tags = ["weights", "kv_cache"]
-        if self.psrl_config.tms.enable_cuda_graph:
-            wake_up_tags.append("graph")
-        await self.engine.wake_up(tags=wake_up_tags)
+        # The TMS backend resumes its "graph" region implicitly, so "graph" is
+        # not requested here. Executor.wake_up rejects tags it did not record.
+        await self.engine.wake_up(tags=["weights", "kv_cache"])
 
     async def clear_kv_cache(self):
         await self.engine.reset_prefix_cache(reset_connector=True)
@@ -824,7 +838,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         return self.gen_interface.rollout_replica_idx
 
     def get_instance_num(self) -> int:
-        return self.engine.engine_core.num_engines
+        # Number of EngineCore instances (data-parallel replicas) this server
+        # manages. `engine_ranks_managed` is vLLM's own MPClient attribute.
+        return len(self.engine.engine_core.engine_ranks_managed)
 
     def get_active_task_num(self, data_parallel_rank: int) -> int:
         return self.active_task_num.get(data_parallel_rank, 0)

@@ -22,6 +22,6 @@ repos:
     hooks:
       - id: prose-style
         name: audit prose style
-        entry: python scripts/audit_prose_style.py
+        entry: python3 scripts/audit_prose_style.py
         language: system
         files: ^(?:(?:psrl|tests|unit_tests|examples|scripts|hydra_plugins|\.github)/.*\.(?:py|sh|ya?ml|jinja2?|toml)|setup\.py|pyproject\.toml|\.pre-commit-config\.yaml)$

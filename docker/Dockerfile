@@ -23,7 +23,7 @@ ARG INSTALL_FLASH_ATTN_3=1
 # be revalidated whenever one of these defaults changes.
 ARG UCX_REF=v1.20.0
 ARG NIXL_REF=v1.2.0
-ARG VLLM_REF=v0.22.0
+ARG VLLM_REF=v0.29.0
 ARG VERL_REF=e5ca4acb
 ARG TRANSFER_QUEUE_REF=434f8c476b4be24bc087e6e95070e64efcc739f9
 ARG LMCACHE_REF=v0.4.6
@@ -286,8 +286,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         "from importlib.metadata import version; import nixl; version('nixl-cu13'); \
         nixl.nixl_agent('psrl-build-check')"
 
-# vLLM is installed from a patched editable checkout so PSRL can access the
-# patched scheduler, gRPC, memory-suspension, and weight-layout behavior.
+# vLLM is installed from a patched editable checkout. The source patch is kept
+# deliberately narrow: it adds the PSRL scheduler-stats fields and backports
+# upstream sleep-mode NCCL communicator release. All other PSRL behavior lives in
+# the vllm_patches plugin rather than in the vLLM source tree.
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/vllm-project/vllm.git ${PSRL_THIRD_PARTY}/vllm && \
     git -C ${PSRL_THIRD_PARTY}/vllm checkout ${VLLM_REF} && \

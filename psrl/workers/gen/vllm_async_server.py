@@ -201,10 +201,14 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # One MP server per node owns all local KV ranks, so its identity is
         # node-scoped when a replica spans nodes and replica-scoped otherwise.
-        lmcache_instance_id = f"psrl_instance_{self.get_replica_idx()}"
+        replica_id = f"psrl_instance_{self.get_replica_idx()}"
+        lmcache_instance_id = replica_id
         if self.nnodes > 1:
-            lmcache_instance_id = f"{lmcache_instance_id}_n{self.node_rank}"
+            lmcache_instance_id = f"{replica_id}_n{self.node_rank}"
         lmcache_raw["lmcache_instance_id"] = lmcache_instance_id
+        # Registered with the coordinator so a transfer can reach every node of
+        # this replica from either its replica id or a single node id.
+        lmcache_raw["replica_id"] = replica_id
 
         if lmcache_raw.get("enable_p2p", False):
             lmcache_raw.setdefault(
@@ -231,26 +235,34 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         )
 
         lmcache_cfg = LMCacheConfig(**lmcache_raw)
+        if lmcache_cfg.n_servers > 1:
+            # The connector numbers ranks in node-contiguous blocks, one block
+            # per configured server, and vLLM rejects that alongside DP.
+            assert self.config.data_parallel_size == 1, (
+                f"lmcache.mp_server_urls splits the replica across {lmcache_cfg.n_servers} servers, which "
+                f"LMCacheMPConnector does not support with data_parallel_size="
+                f"{self.config.data_parallel_size}. Leave it empty or disable data parallelism."
+            )
+            assert lmcache_cfg.n_servers == max(1, self.nnodes), (
+                f"lmcache.mp_server_urls lists {lmcache_cfg.n_servers} servers but this replica spans "
+                f"{self.nnodes} node(s). List every node's server, ordered by node rank."
+            )
         kv_cache_manager = KVCacheManager(lmcache_cfg)
         if lmcache_cfg.enable:
-            # KV is shared across TP and PP ranks in a replica, and each MP
-            # server holds one node's share of it.
-            kv_world_size = max(
-                1,
-                (self.config.tensor_model_parallel_size * self.config.pipeline_model_parallel_size)
-                // max(1, self.nnodes),
-            )
-            kv_cache_manager.set_parallel_geometry(self.model_config.path, kv_world_size)
+            # Per-rank keys follow the connector's own geometry, which is
+            # resolved from the engine config once the engine exists.
             await self._start_lmcache_mp_runtime(lmcache_cfg, kv_cache_manager)
         return kv_cache_manager
 
-    def _verify_lmcache_geometry(self, vllm_config) -> None:
+    def _set_lmcache_geometry(self, vllm_config) -> None:
         """
-        Warn when the configured KV world size disagrees with the engine's.
+        Derive the KV rank fan-out from the engine config.
 
-        A mismatch does not corrupt cache state, but it makes backend pins and
-        cross-instance transfer silently address the wrong keys. This runs only
-        on the master node, where the engine config is available.
+        The connector computes its fan-out from this same helper, so taking the
+        value from the engine is what keeps backend pins and cross-instance
+        transfer addressing the keys that were actually stored. Duplicating the
+        formula instead silently mis-addresses multi-node replicas and MLA
+        models, which replicate KV across TP ranks.
 
         Args:
             vllm_config: The vLLM config created for this server.
@@ -261,16 +273,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             build_parallel_strategy_from_vllm_config,
         )
 
-        strategy = build_parallel_strategy_from_vllm_config(vllm_config, max(1, self.nnodes))
-        expected = strategy.kv_world_size
-        actual = self.kv_cache_manager.kv_world_size
-        if expected != actual:
-            psrl_logger.warning(
-                f"[LMCache] KV world size mismatch: configured {actual}, engine reports "
-                f"{expected}. Backend pin and transfer will not find keys until the "
-                "configured geometry matches the connector (for example MLA models "
-                "replicate KV across TP ranks)."
-            )
+        n_servers = max(1, self.kv_cache_manager.config.n_servers)
+        strategy = build_parallel_strategy_from_vllm_config(vllm_config, n_servers)
+        self.kv_cache_manager.set_parallel_geometry(self.model_config.path, strategy.kv_world_size)
 
     async def _start_lmcache_mp_runtime(self, lmcache_cfg: LMCacheConfig, kv_cache_manager: KVCacheManager) -> None:
         """
@@ -571,7 +576,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
-        self._verify_lmcache_geometry(vllm_config)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
         # AGENT(VERL): wire preemption_notification_threshold into vLLM for the PSRL gateway loopback.
         vllm_config.scheduler_config.preemption_notification_threshold = (
@@ -632,6 +636,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             kwargs["stat_loggers"] = [preemption_logger_factory]
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
+
+        # Every node addresses the keys its own workers stored, so the geometry
+        # is resolved here rather than only on the node that serves HTTP.
+        self._set_lmcache_geometry(vllm_config)
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
@@ -811,7 +819,17 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         await self.engine.wake_up(tags=["weights", "kv_cache"])
 
     async def clear_kv_cache(self):
-        await self.engine.reset_prefix_cache(reset_connector=True)
+        # vLLM refuses to reset the prefix cache while any block is referenced,
+        # so drop PSRL's own pins or old-weight KV stays reachable.
+        if self.kv_cache_manager is not None and self.kv_cache_manager.enabled:
+            await self.kv_cache_manager.unpin_all_gpu()
+        reset = await self.engine.reset_prefix_cache(reset_connector=True)
+        if reset is False:
+            psrl_logger.error(
+                "[LMCache] vLLM refused to reset the prefix cache after a weight update, so KV "
+                "produced by the previous weights may still be served. Some blocks are still "
+                "referenced by a live request."
+            )
         await self.engine.reset_mm_cache()
         await self.engine.reset_encoder_cache()
 

@@ -806,6 +806,26 @@ multi-turn workloads. LMCache runs as one multiprocess server per node, and
 : L1 eviction policy, `LRU`, `IsolatedLRU`, or `noop`.
   **Default:** `LRU`
 
+`lmcache.l1_use_lazy`
+: Grow the L1 allocation on demand instead of committing all of
+  `offload_size_gb` up front. Turn it off only when the node is expected to fill
+  the whole cap, since the allocation is then committed at startup.
+  **Default:** `True`
+
+`lmcache.l1_init_size_gb`
+: GiB committed at startup when lazy allocation is on. Must not exceed
+  `offload_size_gb`.
+  **Default:** `20`
+
+`lmcache.mp_server_urls`
+: Every MP server backing one replica, ordered by node rank, as `host:port`
+  strings. Empty makes the replica a single-server deployment, which is correct
+  for `rollout_nnodes_per_instance: 1` and also works across nodes, at the cost
+  of each node fetching the other nodes' ranks over P2P when a prefix is warmed.
+  Setting it splits the replica's KV across its nodes, and requires
+  node-contiguous ranks and `data_parallel_size == 1`.
+  **Default:** `[]`
+
 `lmcache.l2_adapters`
 : Extra L2 tiers for the MP server, as JSON objects such as
   `{type: fs, path: /mnt/kv}`. On top of these, P2P peers act as read-only L2.

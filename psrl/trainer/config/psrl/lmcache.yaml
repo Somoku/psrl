@@ -21,6 +21,12 @@ l1_align_bytes: 4096
 # L1 eviction policy: "LRU", "IsolatedLRU", or "noop".
 eviction_policy: LRU
 
+# Grow the L1 allocation on demand instead of committing all of the cap up front.
+l1_use_lazy: True
+
+# L1 GiB committed at startup when lazy allocation is on.
+l1_init_size_gb: 20
+
 # --- L2 (optional extra tiers) ---
 
 # L2 adapters as JSON objects, e.g. [{type: fs, path: /mnt/kv}].
@@ -74,13 +80,14 @@ coordinator_health_timeout_s: 3000
 # for the LMCache-tier KV event stream consumed by routing.
 coordinator_event_reporting: False
 
-# ZMQ PUB port for the LMCache-tier KV event stream. Zero allocates at launch.
-event_publish_port: 0
-
 # --- Connector ---
 
 # Timeout in seconds for MP message-queue requests.
 mq_timeout_s: 300
+
+# Every MP server backing one replica, ordered by node rank, as "host:port".
+# Empty keeps the replica a single-server deployment for kv_rank purposes.
+mp_server_urls: []
 
 # Interval in seconds between connector heartbeats to the MP server.
 heartbeat_interval_s: 10

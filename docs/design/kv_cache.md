@@ -121,6 +121,10 @@ The factor of four covers key plus value in fp16. For a 7B model with 32 layers,
 4096 hidden dim, 64 concurrent sequences at 4k average length, this is about
 64 GB of L1.
 
+The cap is not committed up front. L1 grows lazily from `l1_init_size_gb` as it
+fills, so a generous `offload_size_gb` costs nothing until the cache is actually
+used. Set `l1_use_lazy: false` only to pre-commit the whole cap.
+
 ## Cross-instance transfer
 
 Config: `psrl.lmcache.enable_p2p`
@@ -150,13 +154,20 @@ sequenceDiagram
     Src-->>RC: transfer result
 ```
 
-- The destination must acquire **every** chunk. A partial result returns a
-  failure so the destination re-prefills the remainder.
+- The destination must acquire **every** chunk on **every node**. A partial
+  result returns a failure so the destination re-prefills the remainder.
 - `copy: false` deletes the prefix at the source after the destination confirms.
   That delete is best effort and non-atomic, and it is refused while the source
   prefix is pinned.
 - Instances discover each other through the shared MP coordinator. No
   instance-to-instance configuration is required.
+
+A replica can span nodes, and each node's MP server holds that node's share of
+the KV. Every server registers its `replica_id` with the coordinator, so naming
+either a replica or one of its nodes resolves to the same node set: the transfer
+warms all of them, and `copy: false` deletes from all of them. `enable_p2p`
+therefore works unchanged for a multi-node replica, whether or not
+`mp_server_urls` splits its ranks across nodes.
 
 ### Routing modes
 
@@ -185,6 +196,11 @@ score is built from the cache events an MP server publishes. Enabling it implies
 registered with the coordinator, so routers discover it from the instance
 registry instead of being configured per instance.
 
+The stream is advisory and lossy by design: a consumer that falls behind drops
+batches instead of stalling the server's observability thread. `GET
+/cache/events/stats` reports `dropped_total` alongside the subscriber count, so a
+stalled consumer is visible instead of silently under-scoring the tier.
+
 ## Gotchas
 
 - **L1 is shared by every local KV rank.** `offload_size_gb` is one server's
@@ -199,3 +215,17 @@ registry instead of being configured per instance.
   version cannot be read back and must be invalidated.
 - **`clear_on_weight_update` also drops pins.** A forced clear discards client
   pins, so re-pin after a weight sync if routing depends on them.
+- **GPU and backend pins are not the same mechanism.** A GPU pin holds a prefix
+  cache block open by raising its reference count, so vLLM refuses to reset the
+  prefix cache while any pin is live. PSRL releases its own pins before a weight
+  update and reports it if the reset still fails.
+- **GPU pinning follows every KV cache group.** A hybrid model caches a
+  different prefix per group, so the pin is limited to the prefix that all groups
+  can serve, which is the prefix a later request can actually reuse.
+- **A pin can arrive before its store lands.** The LMCache store path is
+  asynchronous, so a backend pin is retried a bounded number of times and a
+  prefix that never becomes resident is reported as a failure rather than
+  ignored.
+- **Hybrid KV cache management is left to vLLM.** The MP connector declares
+  support, so PSRL no longer forces it off. Models that require it, such as
+  hybrid SSM models, now start as vLLM intends.

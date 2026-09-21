@@ -30,8 +30,26 @@ class TestLMCacheConfig:
         assert transfer["kv_connector_module_path"] == MP_CONNECTOR_MODULE
         assert transfer["kv_role"] == "kv_both"
         assert transfer["kv_connector_extra_config"]["lmcache.mp.port"] == 5555
-        # HMA is disabled for this connector version.
-        assert kwargs["disable_hybrid_kv_cache_manager"] is True
+
+    def test_engine_kwargs_leave_hma_to_vllm(self):
+        """LMCacheMPConnector declares SupportsHMA, so it must not be forced off."""
+        kwargs = LMCacheConfig(enable=True, server_port=5555).to_engine_kwargs()
+        assert "disable_hybrid_kv_cache_manager" not in kwargs
+
+    def test_engine_kwargs_single_server_by_default(self):
+        config = LMCacheConfig(enable=True, server_port=5555)
+        assert config.n_servers == 1
+        assert "lmcache.mp.server_urls" not in config.to_connector_extra_config()
+
+    def test_engine_kwargs_advertise_multiple_servers(self):
+        urls = ["tcp://10.0.0.1:5555", "tcp://10.0.0.2:5555"]
+        config = LMCacheConfig(enable=True, server_port=5555, mp_server_urls=urls)
+        assert config.n_servers == 2
+        assert config.to_connector_extra_config()["lmcache.mp.server_urls"] == ",".join(urls)
+
+    def test_engine_kwargs_reject_blank_server_url(self):
+        with pytest.raises(AssertionError):
+            LMCacheConfig(enable=True, server_port=5555, mp_server_urls=[""]).to_engine_kwargs()
 
     def test_engine_kwargs_omit_offloading_backend(self):
         """Capacity is owned by the MP server, not passed through vLLM."""
@@ -98,6 +116,54 @@ class TestLMCacheConfig:
     def test_server_argv_instance_id(self):
         argv = self._runtime_config(lmcache_instance_id="psrl_instance_3").to_server_argv()
         assert argv[argv.index("--instance-id") + 1] == "psrl_instance_3"
+
+    def test_server_argv_l1_lazy_defaults(self):
+        argv = self._runtime_config().to_server_argv()
+        assert argv[argv.index("--l1-init-size-gb") + 1] == "20"
+        assert "--l1-use-lazy" in argv
+        assert "--no-l1-use-lazy" not in argv
+
+    def test_server_argv_can_disable_l1_lazy(self):
+        argv = self._runtime_config(l1_use_lazy=False).to_server_argv()
+        assert "--no-l1-use-lazy" in argv
+        assert "--l1-use-lazy" not in argv
+
+    def test_server_argv_rejects_init_size_above_capacity(self):
+        with pytest.raises(AssertionError):
+            self._runtime_config(l1_init_size_gb=64, offload_size_gb=20.0).to_server_argv()
+
+    def test_server_argv_rejects_zero_init_size(self):
+        with pytest.raises(AssertionError):
+            self._runtime_config(l1_init_size_gb=0).to_server_argv()
+
+    def test_shipped_yaml_matches_the_config_dataclass(self):
+        """The server actor splats the yaml, so a stale key would raise TypeError."""
+        import dataclasses
+        from pathlib import Path
+
+        known = {f.name for f in dataclasses.fields(LMCacheConfig)}
+        yaml_path = Path(__file__).resolve().parents[2] / "psrl/trainer/config/psrl/lmcache.yaml"
+        named = {
+            line.split(":", 1)[0].strip()
+            for line in yaml_path.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#") and ":" in line
+        }
+        assert named <= known, f"lmcache.yaml names unknown fields: {sorted(named - known)}"
+
+    def test_coordinator_metadata_carries_replica(self):
+        config = self._runtime_config(
+            coordinator_host="10.0.0.2",
+            replica_id="psrl_instance_3",
+            lmcache_instance_id="psrl_instance_3_n1",
+        )
+        argv = config.to_server_argv()
+        metadata = json.loads(argv[argv.index("--coordinator-metadata") + 1])
+        assert metadata["replica_id"] == "psrl_instance_3"
+        assert metadata["node_instance_id"] == "psrl_instance_3_n1"
+
+    def test_coordinator_metadata_skipped_without_coordinator(self):
+        argv = self._runtime_config(replica_id="psrl_instance_3").to_server_argv()
+        assert "--coordinator-metadata" not in argv
 
     # --- management HTTP host resolution ---
 
@@ -213,3 +279,130 @@ class TestKVCacheManager:
         manager.set_peer_registry({"psrl_instance_1": ["http://10.0.0.1:8080"]})
         manager.set_peer_registry({"psrl_instance_2": ["http://10.0.0.2:8080"]})
         assert set(manager.peer_registry) == {"psrl_instance_1", "psrl_instance_2"}
+
+    # --- multi-node replica handling ---
+
+    def _multi_node_manager(self) -> KVCacheManager:
+        """A manager whose replica spans two nodes, as the registry would build it."""
+        manager = KVCacheManager(LMCacheConfig(enable=True, enable_p2p=True, coordinator_host="10.0.0.254"))
+        manager.set_parallel_geometry("org/model", 8)
+        manager.peer_registry = {
+            "psrl_instance_0_n0": ["http://10.0.0.1:9001"],
+            "psrl_instance_0_n1": ["http://10.0.0.2:9001"],
+        }
+        manager.replica_registry = {"psrl_instance_0": ["http://10.0.0.1:9001", "http://10.0.0.2:9001"]}
+        manager.replica_nodes = {"psrl_instance_0": ["psrl_instance_0_n0", "psrl_instance_0_n1"]}
+        manager._replica_of_node = {
+            "psrl_instance_0_n0": "psrl_instance_0",
+            "psrl_instance_0_n1": "psrl_instance_0",
+        }
+        # Treat the registry as freshly refreshed so no coordinator call is made.
+        manager._peer_registry_refreshed_at = float("inf")
+        return manager
+
+    def test_node_id_resolves_to_its_whole_replica(self):
+        manager = self._multi_node_manager()
+        assert manager._node_urls("psrl_instance_0") == manager.replica_registry["psrl_instance_0"]
+        # Each node holds part of the KV, so a transfer has to reach all of them.
+        assert manager._node_urls("psrl_instance_0_n1") == manager.replica_registry["psrl_instance_0"]
+        assert manager._node_ids("psrl_instance_0_n0") == manager.replica_nodes["psrl_instance_0"]
+        assert manager._node_ids("unknown") == ["unknown"]
+
+    def test_transfer_reaches_every_node_of_the_replica(self):
+        import asyncio
+
+        manager = self._multi_node_manager()
+        submitted, deleted = [], []
+
+        async def fake_request(method, url, payload=None):
+            if "/cache/prefetches" in url and method == "POST":
+                host = url.split("//")[1].split(":")[0]
+                submitted.append(host)
+                return {"request_id": f"r-{host}", "chunks": 4}
+            if "/cache/prefetches/" in url:
+                return {"status": "completed", "found_keys": 4}
+            if url.endswith("/cache/delete"):
+                deleted.append(payload["instance_id"])
+                return {"skipped": 0}
+            raise AssertionError(url)
+
+        manager._request_url = fake_request
+        transferred = asyncio.run(
+            manager.transfer_direct(
+                [1, 2, 3],
+                ("psrl_instance_0", "LocalCPUBackend"),
+                ("psrl_instance_0", "LocalCPUBackend"),
+                copy=False,
+            )
+        )
+        assert transferred is True
+        assert sorted(submitted) == ["10.0.0.1", "10.0.0.2"]
+        assert sorted(deleted) == ["psrl_instance_0_n0", "psrl_instance_0_n1"]
+
+    def test_transfer_fails_when_one_node_stays_incomplete(self):
+        import asyncio
+
+        manager = self._multi_node_manager()
+
+        async def fake_request(method, url, payload=None):
+            if "/cache/prefetches" in url and method == "POST":
+                host = url.split("//")[1].split(":")[0]
+                return {"request_id": f"r-{host}", "chunks": 4}
+            if "/cache/prefetches/" in url:
+                host = url.split("//")[1].split(":")[0]
+                return {"status": "completed", "found_keys": 4 if host == "10.0.0.1" else 1}
+            raise AssertionError(url)
+
+        manager._request_url = fake_request
+        assert (
+            asyncio.run(manager.transfer_direct([1, 2, 3], ("psrl_instance_0", ""), ("psrl_instance_0", ""))) is False
+        )
+        assert "incomplete prefix" in manager._last_transfer_error
+
+    # --- store to pin race ---
+
+    def test_backend_pin_retries_a_store_in_flight(self):
+        import asyncio
+
+        manager = KVCacheManager(LMCacheConfig(enable=True))
+        manager.set_parallel_geometry("org/model", 1)
+        responses = [
+            {"chunks": 4, "pinned": 0, "missing": 4},
+            {"chunks": 4, "pinned": 4, "missing": 0},
+        ]
+        calls = []
+
+        async def fake_request(method, path, payload=None):
+            calls.append(path)
+            return responses.pop(0)
+
+        manager._request = fake_request
+        assert asyncio.run(manager._pin_backend([1, 2, 3])) is True
+        assert len(calls) == 2
+        assert (1, 2, 3) in manager._pinned_backend
+
+    def test_backend_pin_reports_a_prefix_that_never_lands(self):
+        import asyncio
+
+        manager = KVCacheManager(LMCacheConfig(enable=True))
+        manager.set_parallel_geometry("org/model", 1)
+
+        async def fake_request(method, path, payload=None):
+            return {"chunks": 4, "pinned": 0, "missing": 4}
+
+        manager._request = fake_request
+        assert asyncio.run(manager._pin_backend([1, 2, 3])) is False
+        # Nothing was pinned, so nothing may be recorded for a later unpin.
+        assert (1, 2, 3) not in manager._pinned_backend
+
+    def test_backend_pin_of_a_sub_chunk_sequence_is_not_a_failure(self):
+        import asyncio
+
+        manager = KVCacheManager(LMCacheConfig(enable=True))
+        manager.set_parallel_geometry("org/model", 1)
+
+        async def fake_request(method, path, payload=None):
+            return {"chunks": 0, "pinned": 0, "missing": 0, "status": "noop"}
+
+        manager._request = fake_request
+        assert asyncio.run(manager._pin_backend([1, 2, 3])) is True

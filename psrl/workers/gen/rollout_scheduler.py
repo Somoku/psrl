@@ -4,7 +4,7 @@ import time
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
-from vllm.v1.core.kv_cache_utils import hash_block_tokens, init_none_hash, make_block_hash_with_group_id
+from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock, hash_block_tokens, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
@@ -158,39 +158,54 @@ class RolloutScheduler(AsyncScheduler):
         hash_algo = self.vllm_config.cache_config.prefix_caching_hash_algo
         return get_hash_fn_by_name(hash_algo)
 
-    def _psrl_iter_gpu_prefix_blocks(self, tokens: list[int]):
+    def _psrl_gpu_prefix_blocks(self, tokens: list[int]) -> list[KVCacheBlock]:
         """
-        Yield GPU `KVCacheBlock` objects forming the longest contiguous cached prefix.
+        Return the GPU blocks currently caching `tokens`' reusable prefix.
 
-        Walks the prefix-hash chain on `block_pool.cached_block_hash_to_block`,
-        stopping at the first miss.
+        The token chain is hashed once at the pool's hash granularity, then
+        resolved by the KV cache coordinator, which applies each cache group's
+        own block size and attention window and reconciles them to the prefix
+        every group can serve. Pinning that reconciled prefix is what lets a
+        later request reuse it, and it is what keeps the routine correct for
+        hybrid models whose cache groups disagree, for example a sliding-window
+        group that only retains a tail.
 
         Args:
             tokens (list[int]): Full token sequence.
 
-        Yields:
-            KVCacheBlock: Blocks in prefix order.
+        Returns:
+            list[KVCacheBlock]: Real blocks caching the prefix, in prefix order,
+            excluding null placeholders and duplicates.
         """
         block_pool = self.kv_cache_manager.block_pool
-        block_size = block_pool.hash_block_size
+        hash_block_size = block_pool.hash_block_size
         hash_fn = self._psrl_get_caching_hash_fn()
         # `NONE_HASH` must be initialized before calling `hash_block_tokens`.
         init_none_hash(hash_fn)
 
+        block_hashes: list[BlockHash] = []
         prev_hash = None
-        num_full_blocks = len(tokens) // block_size
-        for block_idx in range(num_full_blocks):
-            start = block_idx * block_size
-            end = start + block_size
-            chunk = tokens[start:end]
-            block_hash = hash_block_tokens(hash_fn, prev_hash, chunk, None)
-            prev_hash = block_hash
-            # `kv_cache_group_id=0` for standard (non-MLA) models.
-            key = make_block_hash_with_group_id(block_hash, 0)
-            block = block_pool.cached_block_hash_to_block.get_one_block(key)
-            if block is None:
-                return  # prefix break
-            yield block
+        num_hashed = len(tokens) - len(tokens) % hash_block_size
+        for start in range(0, num_hashed, hash_block_size):
+            prev_hash = hash_block_tokens(hash_fn, prev_hash, tokens[start : start + hash_block_size], None)
+            block_hashes.append(prev_hash)
+        if not block_hashes:
+            return []
+
+        # The last token is never reusable from cache, which is how vLLM sizes a
+        # new request's maximum hit.
+        hit_blocks, _, _ = self.kv_cache_manager.coordinator.find_longest_cache_hit(
+            block_hashes, max(0, len(tokens) - 1)
+        )
+        blocks: list[KVCacheBlock] = []
+        seen: set[int] = set()
+        for group_blocks in hit_blocks:
+            for block in group_blocks:
+                if block.is_null or block.block_id in seen:
+                    continue
+                seen.add(block.block_id)
+                blocks.append(block)
+        return blocks
 
     def psrl_pin_gpu(self, tokens: list[int]) -> int:
         """
@@ -213,15 +228,13 @@ class RolloutScheduler(AsyncScheduler):
         block_pool = self.kv_cache_manager.block_pool
         pinned = 0
         blocks_to_touch = []
-        for block in self._psrl_iter_gpu_prefix_blocks(tokens):
+        for block in self._psrl_gpu_prefix_blocks(tokens):
             if block.ref_cnt == 0 and block.block_id not in self._psrl_pinned_block_ids:
                 blocks_to_touch.append(block)
                 self._psrl_pinned_block_ids.add(block.block_id)
                 pinned += 1
         if blocks_to_touch:
-            # NOTE(claude): Standard models pass one sequence because they have one KV-cache group.
-            # `touch` takes a flat sequence of blocks (vLLM >= 0.29), not a
-            # sequence-of-groups.
+            # `touch` takes one flat sequence of blocks across every cache group.
             block_pool.touch(blocks_to_touch)
             for block in blocks_to_touch:
                 assert block.ref_cnt > 0, (
@@ -236,6 +249,8 @@ class RolloutScheduler(AsyncScheduler):
 
         Only decrements `ref_cnt` for blocks that PSRL itself pinned (tracked in
         `_psrl_pinned_block_ids`), preventing interference with active requests.
+        Blocks are addressed by id rather than by hash so a pin is still
+        released after the hash map entry is gone.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
@@ -248,18 +263,44 @@ class RolloutScheduler(AsyncScheduler):
             self._psrl_pinned_block_ids: set[int] = set()
 
         block_pool = self.kv_cache_manager.block_pool
+        owned = {block.block_id for block in self._psrl_gpu_prefix_blocks(tokens)}
         freed = 0
-        for block in self._psrl_iter_gpu_prefix_blocks(tokens):
-            if block.block_id in self._psrl_pinned_block_ids:
-                assert block.ref_cnt > 0, (
-                    f"Invalid block reference count before free_blocks: block_id={block.block_id}, "
-                    f"ref_cnt={block.ref_cnt}. "
-                    "Cannot unpin a block with ref_cnt <= 0."
-                )
-                block_pool.free_blocks([block])
-                self._psrl_pinned_block_ids.discard(block.block_id)
-                freed += 1
+        for block_id in sorted(owned & self._psrl_pinned_block_ids):
+            block = block_pool.blocks[block_id]
+            assert block.ref_cnt > 0, (
+                f"Invalid block reference count before free_blocks: block_id={block_id}, "
+                f"ref_cnt={block.ref_cnt}. Cannot unpin a block with ref_cnt <= 0."
+            )
+            block_pool.free_blocks([block])
+            self._psrl_pinned_block_ids.discard(block_id)
+            freed += 1
         psrl_logger.debug(f"[LMCache] Scheduler GPU unpin: blocks={freed}, token_count={len(tokens)}.")
+        return freed
+
+    def psrl_unpin_all_gpu(self) -> int:
+        """
+        Unpin every GPU block PSRL pinned.
+
+        vLLM refuses to reset the prefix cache while any block is referenced, so
+        a weight update releases PSRL's pins before clearing the cache. Freeing
+        by id also covers blocks whose hash map entry was already dropped.
+
+        Returns:
+            int: Number of blocks unpinned.
+        """
+        if not hasattr(self, "_psrl_pinned_block_ids"):
+            return 0
+        block_pool = self.kv_cache_manager.block_pool
+        freed = 0
+        for block_id in sorted(self._psrl_pinned_block_ids):
+            block = block_pool.blocks[block_id]
+            if block.ref_cnt <= 0:
+                # Already released, for example by a reset that cleared refs.
+                continue
+            block_pool.free_blocks([block])
+            freed += 1
+        self._psrl_pinned_block_ids.clear()
+        psrl_logger.debug(f"[LMCache] Scheduler GPU unpin-all: blocks={freed}.")
         return freed
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:

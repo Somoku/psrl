@@ -20,6 +20,10 @@ _PEER_REGISTRY_TTL_S = 5.0
 _PREFETCH_POLL_INTERVAL_S = 0.2
 _PREFETCH_TIMEOUT_S = 60.0
 
+# L1 pin attempts, separated so a store still in flight can land first.
+_PIN_ATTEMPTS = 3
+_PIN_RETRY_DELAY_S = 0.2
+
 # Legacy in-process backend label SMG sends. MP transfer is tier-agnostic.
 _LEGACY_BACKEND = "LocalCPUBackend"
 
@@ -59,9 +63,18 @@ class KVCacheManager:
         self._runtime: LMCacheMPRuntime | None = None
         self._http: aiohttp.ClientSession | None = None
 
-        # Maps a peer instance_id to its MP HTTP base URL. The list shape
+        # Maps a peer node instance_id to its MP HTTP base URL. The list shape
         # matches the peer-registry contract SMG already expects.
         self.peer_registry: dict[str, list[str]] = {}
+        # Maps a replica_id to every node URL in that replica, ordered by node
+        # rank. A replica can span nodes, so a transfer must reach all of them.
+        self.replica_registry: dict[str, list[str]] = {}
+        # Maps a replica_id to its node instance ids, for calls that address a
+        # node by name rather than by URL.
+        self.replica_nodes: dict[str, list[str]] = {}
+        # Maps a node instance_id to the replica that owns it, so a caller that
+        # names either one resolves to the same node set.
+        self._replica_of_node: dict[str, str] = {}
         self._peer_registry_refreshed_at: float = 0.0
 
         # Last transfer failure reason, surfaced by the SMG servicer.
@@ -305,6 +318,10 @@ class KVCacheManager:
         """
         Refresh instance endpoints from the coordinator's instance registry.
 
+        Builds both the per-node map and the per-replica grouping that a
+        multi-node transfer needs, since one replica can own several MP
+        servers.
+
         Args:
             max_age_s (float): Reuse the cached registry when it was refreshed
                 more recently than this many seconds.
@@ -322,16 +339,78 @@ class KVCacheManager:
 
         instances = resp.get("instances", []) if isinstance(resp, dict) else resp
         refreshed: dict[str, list[str]] = {}
-        for instance in instances or []:
+        replica_members: dict[str, list[tuple[str, str]]] = {}
+        replica_of_node: dict[str, str] = {}
+        for instance in sorted(instances or [], key=lambda item: str(item.get("instance_id", ""))):
             instance_id = instance.get("instance_id")
             ip = instance.get("ip")
             http_port = instance.get("http_port")
-            if instance_id and ip and http_port:
-                refreshed[instance_id] = [f"http://{ip}:{http_port}"]
+            if not (instance_id and ip and http_port):
+                continue
+            url = f"http://{ip}:{http_port}"
+            refreshed[instance_id] = [url]
+            metadata = instance.get("metadata") or {}
+            replica_id = metadata.get("replica_id")
+            if replica_id:
+                replica_members.setdefault(replica_id, []).append((instance_id, url))
+                replica_of_node[instance_id] = replica_id
+
         if refreshed:
             self.peer_registry.update(refreshed)
+        self.replica_registry = {
+            replica_id: [url for _, url in members] for replica_id, members in replica_members.items()
+        }
+        self.replica_nodes = {
+            replica_id: [node_id for node_id, _ in members] for replica_id, members in replica_members.items()
+        }
+        self._replica_of_node = replica_of_node
         self._peer_registry_refreshed_at = now
-        psrl_logger.debug(f"[LMCache] Peer registry refreshed: {len(refreshed)} instances registered.")
+        psrl_logger.debug(
+            f"[LMCache] Peer registry refreshed: {len(refreshed)} instances, "
+            f"{len(self.replica_registry)} replicas registered."
+        )
+
+    def _node_urls(self, instance_id: str) -> list[str]:
+        """
+        Resolve an instance name to the MP servers a transfer must reach.
+
+        Accepts either a replica id or a node instance id. A replica resolves to
+        every node in it, because a request is served by all of a replica's
+        nodes and each node's server holds that node's share of the KV.
+
+        Args:
+            instance_id (str): Replica id or node instance id.
+
+        Returns:
+            list[str]: Node MP base URLs, empty when the name is unknown.
+        """
+        if instance_id in self.replica_registry:
+            return list(self.replica_registry[instance_id])
+        replica_id = self._replica_of_node.get(instance_id)
+        if replica_id is not None:
+            return list(self.replica_registry.get(replica_id, []))
+        # Unregistered peer, for example when the registry was seeded directly.
+        return list(self.peer_registry.get(instance_id, []))
+
+    def _node_ids(self, instance_id: str) -> list[str]:
+        """
+        Resolve an instance name to the node instance ids it covers.
+
+        Mirrors `_node_urls` for coordinator calls, which address a node by its
+        registered instance id rather than by URL.
+
+        Args:
+            instance_id (str): Replica id or node instance id.
+
+        Returns:
+            list[str]: Node instance ids.
+        """
+        if instance_id in self.replica_nodes:
+            return list(self.replica_nodes[instance_id])
+        replica_id = self._replica_of_node.get(instance_id)
+        if replica_id is not None:
+            return list(self.replica_nodes.get(replica_id, []))
+        return [instance_id]
 
     # --- Cache operations ---
 
@@ -410,14 +489,19 @@ class KVCacheManager:
         """
         Transfer a cached prefix to another rollout instance.
 
-        MP transfer is a pull: this method asks the destination's MP server to
-        warm its own L1 from whichever peer holds the prefix. The source is
-        therefore never targeted, and a partial result leaves the destination to
-        re-prefill the remainder.
+        MP transfer is a pull: this method asks each destination node's MP
+        server to warm its own L1 from whichever peer holds the prefix. The
+        source is therefore never targeted, and a partial result leaves the
+        destination to re-prefill the remainder.
+
+        A replica can span nodes, and each node's server holds that node's
+        share of the KV, so every node of the destination is asked and all of
+        them must report a complete prefix.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
-            src (tuple[str, str]): Source `(lmcache_instance_id, backend)`.
+            src (tuple[str, str]): Source `(lmcache_instance_id, backend)`. The
+                id may name a replica or a single node.
             dst (tuple[str, str]): Destination `(lmcache_instance_id, backend)`.
             copy (bool): If False, best-effort delete the prefix from the source
                 once the destination confirms it. The delete is refused while
@@ -426,7 +510,7 @@ class KVCacheManager:
                 the destination. -1 means version-agnostic (no tag).
 
         Returns:
-            bool: True if the destination acquired the whole prefix.
+            bool: True if every destination node acquired the whole prefix.
         """
         self._last_transfer_error = ""
         if not self.config.enable_p2p:
@@ -438,8 +522,8 @@ class KVCacheManager:
 
         dst_instance_id = dst[0]
         await self.refresh_peer_registry()
-        dst_urls = self.peer_registry.get(dst_instance_id)
-        if not dst_urls or not dst_urls[0]:
+        dst_urls = self._node_urls(dst_instance_id)
+        if not dst_urls:
             self._last_transfer_error = f"no MP endpoint known for destination {dst_instance_id!r}"
             psrl_logger.warning(f"[LMCache] {self._last_transfer_error}. The destination will re-prefill.")
             return False
@@ -459,33 +543,68 @@ class KVCacheManager:
                 {"lmcache.tag.model_version": str(dst_model_version)} if dst_model_version >= 0 else None
             ),
         }
-        dst_base = dst_urls[0]
 
-        try:
-            submitted = await self._request_url("POST", f"{dst_base}/cache/prefetches", body)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            self._last_transfer_error = f"destination prefetch submit failed: {e}"
+        submissions = await asyncio.gather(*(self._submit_prefetch(url, body) for url in dst_urls))
+        failed = [error for _, _, error in submissions if error]
+        if failed:
+            self._last_transfer_error = (
+                f"destination prefetch submit failed on {len(failed)}/{len(dst_urls)} nodes ({failed[0]})"
+            )
             psrl_logger.warning(f"[LMCache] {self._last_transfer_error}. The destination will re-prefill.")
             return False
 
-        chunks = int(submitted.get("chunks", 0))
-        request_id = submitted.get("request_id")
-        if not request_id or chunks == 0:
-            self._last_transfer_error = "token sequence is shorter than one chunk"
+        total_chunks = sum(chunks for _, chunks, _ in submissions)
+        if total_chunks == 0:
+            self._last_transfer_error = "no destination node had a full chunk to transfer"
+            psrl_logger.info(f"[LMCache] {self._last_transfer_error}.")
             return False
 
-        found = await self._await_prefetch(str(dst_base), str(request_id))
-        if found < chunks:
+        waits = [
+            (url, chunks, self._await_prefetch(url, request_id))
+            for url, (request_id, chunks, _) in zip(dst_urls, submissions)
+            if request_id is not None
+        ]
+        polled = await asyncio.gather(*(wait for _, _, wait in waits)) if waits else []
+        incomplete = [(url, found, chunks) for (url, chunks, _), found in zip(waits, polled) if found < chunks]
+        if incomplete:
+            url, found, chunks = incomplete[0]
             self._last_transfer_error = (
-                f"destination acquired {found}/{chunks} chunks. It will re-prefill the remainder"
+                f"destination acquired an incomplete prefix on {len(incomplete)}/{len(dst_urls)} "
+                f"nodes (worst {found}/{chunks} chunks at {url}). "
+                "It will re-prefill the remainder"
             )
             psrl_logger.info(f"[LMCache] {self._last_transfer_error}")
             return False
 
         if not copy:
             await self._delete_at_source(src[0], body)
-        psrl_logger.debug(f"[LMCache] Transferred {chunks} chunks to {dst_instance_id!r} (copy={copy}).")
+        psrl_logger.debug(
+            f"[LMCache] Transferred {total_chunks} chunks across {len(dst_urls)} node(s) "
+            f"to {dst_instance_id!r} (copy={copy})."
+        )
         return True
+
+    async def _submit_prefetch(self, base_url: str, body: dict) -> tuple[str | None, int, str]:
+        """
+        Ask one destination node to warm its L1 from a peer.
+
+        Args:
+            base_url (str): Destination node MP base URL.
+            body (dict): Prefetch body describing the prefix and its identity.
+
+        Returns:
+            tuple[str | None, int, str]: Prefetch request id, chunk count, and
+            an error string, empty when the submission succeeded.
+        """
+        try:
+            submitted = await self._request_url("POST", f"{base_url}/cache/prefetches", body)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            return None, 0, f"{base_url}: {e}"
+        request_id = submitted.get("request_id")
+        chunks = int(submitted.get("chunks", 0))
+        if chunks and not request_id:
+            return None, 0, f"{base_url}: server accepted no work ({submitted!r})"
+        return (str(request_id) if request_id else None), chunks, ""
 
     async def _await_prefetch(self, dst_base: str, request_id: str) -> int:
         """
@@ -524,36 +643,39 @@ class KVCacheManager:
         Best-effort delete of a transferred prefix from the source instance.
 
         The coordinator resolves the token sequence and forwards the delete to
-        the named instance. Pinned or locked keys are refused by the node, so a
-        source that is still pinned keeps its copy.
+        each named node, since a replica's KV is spread across its nodes.
+        Pinned or locked keys are refused by the node, so a source that is still
+        pinned keeps its copy.
 
         Args:
-            src_instance_id (str): Instance to delete from.
+            src_instance_id (str): Replica id or node instance id to delete from.
             body (dict): Prefetch body whose identity fields are reused.
         """
         if not src_instance_id or not self.config.coordinator_host:
             return
-        request = {
-            "instance_id": src_instance_id,
-            "model_name": body["model_name"],
-            "world_size": body["world_size"],
-            "token_ids": body["token_ids"],
-            "cache_salt": body["cache_salt"],
-            "request_configs": body["request_configs"],
-            "tier": "l1",
-            # Pins are an explicit client contract, so do not bypass them.
-            "force": False,
-        }
-        try:
-            result = await self._request_url("POST", f"{self.coordinator_url}/cache/delete", request)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            psrl_logger.warning(f"[LMCache] Source delete after transfer failed (best effort, non-atomic): {e}")
-            return
-        skipped = int(result.get("skipped", 0))
-        if skipped:
-            psrl_logger.info(
-                f"[LMCache] Source delete skipped {skipped} keys (locked or pinned). The source keeps its copy."
-            )
+        for node_id in self._node_ids(src_instance_id):
+            request = {
+                "instance_id": node_id,
+                "model_name": body["model_name"],
+                "world_size": body["world_size"],
+                "token_ids": body["token_ids"],
+                "cache_salt": body["cache_salt"],
+                "request_configs": body["request_configs"],
+                "tier": "l1",
+                # Pins are an explicit client contract, so do not bypass them.
+                "force": False,
+            }
+            try:
+                result = await self._request_url("POST", f"{self.coordinator_url}/cache/delete", request)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                psrl_logger.warning(f"[LMCache] Source delete on {node_id!r} failed (best effort): {e}")
+                continue
+            skipped = int(result.get("skipped", 0))
+            if skipped:
+                psrl_logger.info(
+                    f"[LMCache] Source delete on {node_id!r} skipped {skipped} keys "
+                    "(locked or pinned). The source keeps its copy."
+                )
 
     # --- Private helpers ---
 
@@ -610,16 +732,18 @@ class KVCacheManager:
         """
         Pin the trajectory's cached chunks in the MP server's L1.
 
-        Chunks that are not resident are reported by the server as missing and
-        are not treated as an error, so a pinned prefix shorter than `tokens`
-        behaves the same as before. Only a pin that retained at least one chunk
-        is remembered, so a later pin can retry chunks that were not stored yet.
+        The store path is asynchronous, so a pin issued right after a request
+        can observe a prefix that is not resident yet. The call is retried a
+        bounded number of times, and a prefix that never becomes resident is
+        reported as a failure rather than ignored, because a caller that
+        believes a prefix is pinned may hand its trajectory to another replica.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
 
         Returns:
-            bool: True if the request succeeded.
+            bool: True when the pin retained at least one chunk, or when the
+            sequence holds no complete chunk to pin.
         """
         key = tuple(tokens)
         if key in self._pinned_backend:
@@ -630,16 +754,30 @@ class KVCacheManager:
             return True
 
         body = self._l1_pin_body(tokens)
-        result = await self._request("POST", "/cache/l1/pins", body)
-        pinned = int(result.get("pinned", 0))
+        pinned = missing = chunks = 0
+        for attempt in range(_PIN_ATTEMPTS):
+            result = await self._request("POST", "/cache/l1/pins", body)
+            pinned = int(result.get("pinned", 0))
+            missing = int(result.get("missing", 0))
+            chunks = int(result.get("chunks", 0))
+            if pinned > 0 or missing == 0:
+                break
+            if attempt + 1 < _PIN_ATTEMPTS:
+                await asyncio.sleep(_PIN_RETRY_DELAY_S)
+
         if pinned > 0:
             self._pinned_backend[key] = body
-        elif int(result.get("missing", 0)) > 0:
-            psrl_logger.debug(
-                f"[LMCache] Backend pin found no resident chunks for {len(tokens)} tokens. "
-                "the prefix may not have been stored yet."
-            )
-        return True
+            return True
+        if chunks == 0:
+            # Shorter than one chunk, so there is nothing to pin.
+            return True
+
+        psrl_logger.warning(
+            f"[LMCache] Backend pin retained no chunk for {len(tokens)} tokens "
+            f"({missing} keys still not resident after {_PIN_ATTEMPTS} attempts). "
+            "The prefix was likely never stored as a complete chunk."
+        )
+        return False
 
     async def _unpin_backend(self, tokens: list[int]) -> bool:
         """
@@ -730,3 +868,22 @@ class KVCacheManager:
         self._gpu_pinned_order = deque(t for t in self._gpu_pinned_order if t != tokens)
         psrl_logger.debug(f"[LMCache] GPU unpin: {freed} blocks freed, total={self._pinned_gpu_blocks}.")
         return True
+
+    async def unpin_all_gpu(self) -> int:
+        """
+        Release every GPU block PSRL pinned.
+
+        vLLM refuses to reset the prefix cache while any block is still
+        referenced, so a weight update has to drop PSRL's own pins first or the
+        cache keeps serving KV produced by the previous weights.
+
+        Returns:
+            int: Number of blocks unpinned.
+        """
+        if self._inference_engine is None:
+            return 0
+        freed: int = await self._utility("psrl_unpin_all_gpu")
+        self._gpu_pinned_order.clear()
+        self._pinned_gpu_blocks = 0
+        psrl_logger.debug(f"[LMCache] Released every GPU pin: {freed} blocks freed.")
+        return freed

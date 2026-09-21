@@ -690,7 +690,7 @@ index 1bd26022..1f4544e1 100644
          self, keys: list[ObjectKey]
      ) -> tuple[list[ObjectKey], list[MemoryObj]]:
 diff --git a/lmcache/v1/mp_coordinator/cache_events.py b/lmcache/v1/mp_coordinator/cache_events.py
-index 409b887b..bb7a824f 100644
+index 409b887b..12abd34b 100644
 --- a/lmcache/v1/mp_coordinator/cache_events.py
 +++ b/lmcache/v1/mp_coordinator/cache_events.py
 @@ -15,6 +15,8 @@ emission thread or task. See
@@ -702,7 +702,7 @@ index 409b887b..bb7a824f 100644
  import time
  
  # Third Party
-@@ -120,6 +122,122 @@ class HttpCacheEventSink(CacheEventSink):
+@@ -120,6 +122,172 @@ class HttpCacheEventSink(CacheEventSink):
          self._client.close()
  
  
@@ -715,14 +715,23 @@ index 409b887b..bb7a824f 100644
 +    the drain thread. Losing batches on a slow consumer is acceptable because a
 +    router treats this stream as advisory cache state.
 +
++    Drops are counted rather than only logged, so an operator can distinguish a
++    consumer that is briefly behind from one that is stalled and permanently
++    under-scoring the off-GPU tier. The count is cumulative for the process
++    lifetime, so it survives subscriber churn.
++
 +    Args:
 +        maxsize: Per-subscriber queue capacity.
++        drop_log_interval_s: Minimum seconds between overflow warnings.
 +    """
 +
-+    def __init__(self, maxsize: int = 1024) -> None:
++    def __init__(self, maxsize: int = 1024, drop_log_interval_s: float = 30.0) -> None:
 +        self._lock = threading.Lock()
 +        self._subscribers: set[queue.Queue] = set()
++        self._dropped_total = 0
 +        self._maxsize = maxsize
++        self._drop_log_interval_s = drop_log_interval_s
++        self._last_drop_log_time = 0.0
 +
 +    def subscribe(self) -> "queue.Queue[bytes]":
 +        """Register a subscriber.
@@ -753,13 +762,54 @@ index 409b887b..bb7a824f 100644
 +        """
 +        with self._lock:
 +            subscribers = list(self._subscribers)
++        dropped = 0
 +        for subscriber in subscribers:
 +            try:
 +                subscriber.put_nowait(payload)
 +            except queue.Full:
-+                logger.warning(
-+                    "Dropping a cache-event payload for a slow stream subscriber"
-+                )
++                dropped += 1
++        if dropped:
++            with self._lock:
++                self._dropped_total += dropped
++            self._log_drop(dropped)
++
++    def _log_drop(self, dropped: int) -> None:
++        """Warn about overflow at most once per ``drop_log_interval_s``.
++
++        Args:
++            dropped: Subscribers that overflowed on this payload.
++        """
++        now = time.monotonic()
++        if now - self._last_drop_log_time < self._drop_log_interval_s:
++            return
++        self._last_drop_log_time = now
++        logger.warning(
++            "Dropped a cache-event payload for %d slow stream subscriber(s); "
++            "dropped_total=%d. A router following this stream will under-score "
++            "the off-GPU tier until the next store or delete event arrives.",
++            dropped,
++            self.dropped_total,
++        )
++
++    @property
++    def dropped_total(self) -> int:
++        """Batches dropped across all subscribers since the stream started."""
++        with self._lock:
++            return self._dropped_total
++
++    def stats(self) -> dict[str, int]:
++        """Return stream health for operators and consumers.
++
++        Returns:
++            dict[str, int]: Subscriber count, per-subscriber capacity, and the
++            cumulative dropped-batch count.
++        """
++        with self._lock:
++            return {
++                "subscribers": len(self._subscribers),
++                "capacity": self._maxsize,
++                "dropped_total": self._dropped_total,
++            }
 +
 +
 +class StreamCacheEventSink(CacheEventSink):
@@ -1480,10 +1530,10 @@ index 25c95271..14e2fa95 100644
  
 diff --git a/lmcache/v1/multiprocess/http_apis/events_api.py b/lmcache/v1/multiprocess/http_apis/events_api.py
 new file mode 100644
-index 00000000..7eee4030
+index 00000000..e50198eb
 --- /dev/null
 +++ b/lmcache/v1/multiprocess/http_apis/events_api.py
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,82 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Cache-event streaming endpoint on the MP server.
 +
@@ -1545,6 +1595,27 @@ index 00000000..7eee4030
 +            stream.unsubscribe(subscriber)
 +
 +    return StreamingResponse(event_source(), media_type="application/x-ndjson")
++
++
++@router.get("/cache/events/stats")
++async def cache_event_stream_stats(request: Request) -> dict:
++    """Report cache-event stream health.
++
++    The stream drops batches for a slow consumer instead of stalling the
++    observability drain thread, so a non-zero ``dropped_total`` means a
++    consumer fell behind and its view of the off-GPU tier is incomplete.
++
++    Responses:
++        200: Subscriber count, per-subscriber capacity, and dropped total.
++        503: The stream is not enabled on this server.
++    """
++    stream = getattr(request.app.state, "event_stream", None)
++    if stream is None:
++        raise HTTPException(
++            status_code=503,
++            detail="cache event stream is not enabled on this server",
++        )
++    return stream.stats()
 diff --git a/lmcache/v1/multiprocess/http_apis/schemas.py b/lmcache/v1/multiprocess/http_apis/schemas.py
 index 4595884c..9b8a228d 100644
 --- a/lmcache/v1/multiprocess/http_apis/schemas.py

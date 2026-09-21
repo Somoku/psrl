@@ -54,6 +54,14 @@ class LMCacheConfig:
     # L1 eviction policy: "LRU", "IsolatedLRU", or "noop".
     eviction_policy: str = "LRU"
 
+    # Grow the L1 allocation on demand instead of committing all of
+    # `offload_size_gb` up front.
+    l1_use_lazy: bool = True
+
+    # L1 bytes committed at startup when `l1_use_lazy` is set. The server grows
+    # the allocation from here up to `offload_size_gb` as it fills.
+    l1_init_size_gb: int = 20
+
     # --- L2 (optional local/remote tiers) ---
 
     # L2 adapters as JSON-serializable dicts, one per adapter.
@@ -85,6 +93,10 @@ class LMCacheConfig:
     # Instance identifier registered with the coordinator and advertised to
     # SMG. Set by the server actor before the MP server starts.
     lmcache_instance_id: str = ""
+
+    # Replica this server belongs to. Registered as coordinator metadata so a
+    # caller that names a replica can reach every one of its nodes.
+    replica_id: str = ""
 
     # --- P2P transfer ---
 
@@ -124,6 +136,10 @@ class LMCacheConfig:
     # Timeout in seconds for MP message-queue requests.
     mq_timeout_s: int = 300
 
+    # Every MP server backing one replica, ordered by node rank, as `host:port`
+    # strings. Empty keeps the replica a single-server deployment for kv_rank.
+    mp_server_urls: list = field(default_factory=list)
+
     # Interval in seconds between connector heartbeats to the MP server.
     heartbeat_interval_s: int = 10
 
@@ -150,6 +166,21 @@ class LMCacheConfig:
     # --- Derived configuration ---
 
     @property
+    def n_servers(self) -> int:
+        """
+        Number of MP servers the connector sees backing this replica.
+
+        Must match what `LMCacheMPConnector` resolves, because it divides the
+        replica's KV into that many rank shards and encodes the count into
+        every cache key.
+
+        Returns:
+            int: Count of configured server URLs, or 1 for the single-server
+            deployment that `server_host` and `server_port` describe.
+        """
+        return len(self.mp_server_urls) or 1
+
+    @property
     def resolved_http_host(self) -> str:
         """Host the management HTTP server binds to."""
         return self.http_host or self.server_host
@@ -169,6 +200,26 @@ class LMCacheConfig:
         """Endpoint consumers subscribe to for the LMCache-tier event stream."""
         return f"{self.http_base_url}/cache/events/stream"
 
+    def coordinator_metadata(self) -> dict[str, str]:
+        """
+        Build the free-form metadata this server registers with the coordinator.
+
+        Consumers read it back from `GET /instances`, so it is how a peer or a
+        router discovers which replica a server belongs to and where its event
+        stream lives.
+
+        Returns:
+            dict[str, str]: Registration metadata, possibly empty.
+        """
+        metadata: dict[str, str] = {}
+        if self.replica_id:
+            metadata["replica_id"] = self.replica_id
+        if self.replica_id and self.lmcache_instance_id:
+            metadata["node_instance_id"] = self.lmcache_instance_id
+        if self.coordinator_event_reporting and self.enable_kv_events:
+            metadata["event_stream_url"] = self.event_stream_url
+        return metadata
+
     def to_connector_extra_config(self) -> dict:
         """
         Build the vLLM connector extra config for the MP client.
@@ -177,13 +228,18 @@ class LMCacheConfig:
             dict: Keys consumed by `LMCacheMPConnector` via
                 `kv_transfer_config.kv_connector_extra_config`.
         """
-        return {
+        extra = {
             "lmcache.mp.host": self.server_host,
             "lmcache.mp.port": self.server_port,
             "lmcache.mp.mq_timeout": self.mq_timeout_s,
             "lmcache.mp.heartbeat_interval": self.heartbeat_interval_s,
             "lmcache.mp.eager_prefetch": self.eager_prefetch,
         }
+        if self.mp_server_urls:
+            # The connector prefers `server_urls` over `host`/`port`, and
+            # derives `n_servers` from its length.
+            extra["lmcache.mp.server_urls"] = ",".join(self.mp_server_urls)
+        return extra
 
     def to_engine_kwargs(self) -> dict:
         """
@@ -198,6 +254,7 @@ class LMCacheConfig:
         assert self.server_port > 0, (
             "LMCache MP server port is unset. Allocate runtime ports before building engine kwargs."
         )
+        assert all(self.mp_server_urls), f"mp_server_urls must not contain empty entries, got {self.mp_server_urls!r}."
 
         return {
             "kv_transfer_config": {
@@ -206,8 +263,6 @@ class LMCacheConfig:
                 "kv_role": "kv_both",
                 "kv_connector_extra_config": self.to_connector_extra_config(),
             },
-            # LMCacheMPConnector does not implement HMA in this version.
-            "disable_hybrid_kv_cache_manager": True,
         }
 
     def to_server_argv(self) -> list[str]:
@@ -227,6 +282,10 @@ class LMCacheConfig:
         )
         assert self.l1_align_bytes >= MIN_L1_ALIGN_BYTES, (
             f"l1_align_bytes must be at least {MIN_L1_ALIGN_BYTES}, got {self.l1_align_bytes}."
+        )
+        assert self.l1_init_size_gb >= 1, f"l1_init_size_gb must be at least 1, got {self.l1_init_size_gb}."
+        assert self.l1_init_size_gb <= self.offload_size_gb, (
+            f"l1_init_size_gb ({self.l1_init_size_gb}) must not exceed offload_size_gb ({self.offload_size_gb})."
         )
         if self.enable_p2p:
             assert self.p2p_transfer_engine in SUPPORTED_TRANSFER_ENGINES, (
@@ -259,6 +318,9 @@ class LMCacheConfig:
             str(self.l1_align_bytes),
             "--eviction-policy",
             self.eviction_policy,
+            "--l1-init-size-gb",
+            str(self.l1_init_size_gb),
+            "--l1-use-lazy" if self.l1_use_lazy else "--no-l1-use-lazy",
         ]
 
         if self.lmcache_instance_id:
@@ -297,11 +359,13 @@ class LMCacheConfig:
         if self.coordinator_event_reporting:
             argv += ["--coordinator-event-reporting"]
             if self.enable_kv_events:
-                argv += [
-                    "--coordinator-event-stream-enable",
-                    "--coordinator-metadata",
-                    _to_json({"event_stream_url": self.event_stream_url}),
-                ]
+                argv += ["--coordinator-event-stream-enable"]
+
+        # Registration metadata tells peers and routers which replica this
+        # server belongs to and where its event stream lives.
+        metadata = self.coordinator_metadata() if self.coordinator_host else {}
+        if metadata:
+            argv += ["--coordinator-metadata", _to_json(metadata)]
 
         return argv
 

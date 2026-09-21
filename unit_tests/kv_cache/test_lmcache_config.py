@@ -9,6 +9,20 @@ from psrl.utils.kv_cache.config import (
 from psrl.utils.kv_cache.manager import KVCacheManager
 
 
+def _runtime_config(**overrides) -> LMCacheConfig:
+    """Build a config whose runtime endpoints are already allocated."""
+    base = dict(
+        enable=True,
+        server_host="127.0.0.1",
+        server_port=5555,
+        http_port=8080,
+        offload_size_gb=20.0,
+        chunk_size=128,
+    )
+    base.update(overrides)
+    return LMCacheConfig(**base)
+
+
 class TestLMCacheConfig:
     def test_disabled_by_default(self):
         config = LMCacheConfig()
@@ -60,20 +74,8 @@ class TestLMCacheConfig:
 
     # --- to_server_argv ---
 
-    def _runtime_config(self, **overrides) -> LMCacheConfig:
-        base = dict(
-            enable=True,
-            server_host="127.0.0.1",
-            server_port=5555,
-            http_port=8080,
-            offload_size_gb=20.0,
-            chunk_size=128,
-        )
-        base.update(overrides)
-        return LMCacheConfig(**base)
-
     def test_server_argv_core_flags(self):
-        argv = self._runtime_config().to_server_argv()
+        argv = _runtime_config().to_server_argv()
         assert argv[argv.index("--l1-size-gb") + 1] == "20.0"
         assert argv[argv.index("--port") + 1] == "5555"
         assert argv[argv.index("--http-port") + 1] == "8080"
@@ -84,12 +86,12 @@ class TestLMCacheConfig:
             LMCacheConfig(enable=True, http_port=8080).to_server_argv()
 
     def test_server_argv_omits_p2p_when_disabled(self):
-        argv = self._runtime_config().to_server_argv()
+        argv = _runtime_config().to_server_argv()
         assert "--p2p-advertise-url" not in argv
         assert "--coordinator-url" not in argv
 
     def test_server_argv_p2p_flags(self):
-        argv = self._runtime_config(
+        argv = _runtime_config(
             enable_p2p=True,
             p2p_advertise_host="10.0.0.1",
             p2p_transfer_port=18200,
@@ -101,11 +103,11 @@ class TestLMCacheConfig:
         assert argv[argv.index("--coordinator-url") + 1] == "http://10.0.0.2:9300"
 
     def test_server_argv_event_reporting_flag(self):
-        argv = self._runtime_config(coordinator_event_reporting=True).to_server_argv()
+        argv = _runtime_config(coordinator_event_reporting=True).to_server_argv()
         assert "--coordinator-event-reporting" in argv
 
     def test_server_argv_l2_adapters(self):
-        argv = self._runtime_config(
+        argv = _runtime_config(
             l2_adapters=[{"type": "fs", "path": "/mnt/kv"}],
             l2_store_policy="default",
             l2_prefetch_policy="retain",
@@ -114,27 +116,27 @@ class TestLMCacheConfig:
         assert argv[argv.index("--l2-prefetch-policy") + 1] == "retain"
 
     def test_server_argv_instance_id(self):
-        argv = self._runtime_config(lmcache_instance_id="psrl_instance_3").to_server_argv()
+        argv = _runtime_config(lmcache_instance_id="psrl_instance_3").to_server_argv()
         assert argv[argv.index("--instance-id") + 1] == "psrl_instance_3"
 
     def test_server_argv_l1_lazy_defaults(self):
-        argv = self._runtime_config().to_server_argv()
+        argv = _runtime_config().to_server_argv()
         assert argv[argv.index("--l1-init-size-gb") + 1] == "20"
         assert "--l1-use-lazy" in argv
         assert "--no-l1-use-lazy" not in argv
 
     def test_server_argv_can_disable_l1_lazy(self):
-        argv = self._runtime_config(l1_use_lazy=False).to_server_argv()
+        argv = _runtime_config(l1_use_lazy=False).to_server_argv()
         assert "--no-l1-use-lazy" in argv
         assert "--l1-use-lazy" not in argv
 
     def test_server_argv_rejects_init_size_above_capacity(self):
         with pytest.raises(AssertionError):
-            self._runtime_config(l1_init_size_gb=64, offload_size_gb=20.0).to_server_argv()
+            _runtime_config(l1_init_size_gb=64, offload_size_gb=20.0).to_server_argv()
 
     def test_server_argv_rejects_zero_init_size(self):
         with pytest.raises(AssertionError):
-            self._runtime_config(l1_init_size_gb=0).to_server_argv()
+            _runtime_config(l1_init_size_gb=0).to_server_argv()
 
     def test_shipped_yaml_matches_the_config_dataclass(self):
         """The server actor splats the yaml, so a stale key would raise TypeError."""
@@ -151,7 +153,7 @@ class TestLMCacheConfig:
         assert named <= known, f"lmcache.yaml names unknown fields: {sorted(named - known)}"
 
     def test_coordinator_metadata_carries_replica(self):
-        config = self._runtime_config(
+        config = _runtime_config(
             coordinator_host="10.0.0.2",
             replica_id="psrl_instance_3",
             lmcache_instance_id="psrl_instance_3_n1",
@@ -162,19 +164,19 @@ class TestLMCacheConfig:
         assert metadata["node_instance_id"] == "psrl_instance_3_n1"
 
     def test_coordinator_metadata_skipped_without_coordinator(self):
-        argv = self._runtime_config(replica_id="psrl_instance_3").to_server_argv()
+        argv = _runtime_config(replica_id="psrl_instance_3").to_server_argv()
         assert "--coordinator-metadata" not in argv
 
     # --- management HTTP host resolution ---
 
     def test_http_host_defaults_to_server_host(self):
-        config = self._runtime_config()
+        config = _runtime_config()
         assert config.resolved_http_host == "127.0.0.1"
         assert config.resolved_http_advertise_host == "127.0.0.1"
         assert config.http_base_url == "http://127.0.0.1:8080"
 
     def test_http_host_advertised_for_cross_instance_calls(self):
-        config = self._runtime_config(http_host="0.0.0.0", http_advertise_host="10.0.0.1")
+        config = _runtime_config(http_host="0.0.0.0", http_advertise_host="10.0.0.1")
         argv = config.to_server_argv()
         assert argv[argv.index("--http-host") + 1] == "0.0.0.0"
         assert config.http_base_url == "http://10.0.0.1:8080"
@@ -223,38 +225,86 @@ class TestKVCacheManager:
 
             asyncio.run(manager.pin([1, 2, 3], ["gpu"]))
 
-    def test_backend_pin_requires_geometry(self):
+    def test_backend_target_is_ignored_on_pin(self, monkeypatch):
+        """L1 retention moved to pin groups, so the retired target is a no-op."""
+        import asyncio
+
         manager = KVCacheManager(LMCacheConfig(enable=True))
+        manager.attach_engine(object())
+        calls = []
+
+        async def fake_utility(method, *args):
+            calls.append(method)
+            return 2
+
+        monkeypatch.setattr(manager, "_utility", fake_utility)
+        assert asyncio.run(manager.pin([1, 2, 3], ["gpu", "backend"])) is True
+        assert calls == ["psrl_pin_gpu"]
+        # A backend-only request does no work rather than failing the caller.
+        assert asyncio.run(manager.pin([1, 2, 3], ["backend"])) is True
+        assert calls == ["psrl_pin_gpu"]
+
+    def test_backend_target_is_ignored_on_unpin(self, monkeypatch):
+        import asyncio
+
+        manager = KVCacheManager(LMCacheConfig(enable=True))
+        manager.attach_engine(object())
+        calls = []
+
+        async def fake_utility(method, *args):
+            calls.append(method)
+            return 1
+
+        monkeypatch.setattr(manager, "_utility", fake_utility)
+        assert asyncio.run(manager.unpin([1, 2, 3], ["gpu", "backend"])) is True
+        assert calls == ["psrl_unpin_gpu"]
+
+    def test_invalid_pin_target_is_rejected(self):
+        import asyncio
+
+        manager = KVCacheManager(LMCacheConfig(enable=True))
+        manager.attach_engine(object())
         with pytest.raises(AssertionError):
-            manager._l1_pin_body([1, 2, 3])
+            asyncio.run(manager.pin([1, 2, 3], ["disk"]))
 
-    def test_backend_pin_body_carries_version_tag(self):
-        manager = KVCacheManager(LMCacheConfig(enable=True, multi_version_kv=True))
-        manager.set_parallel_geometry("org/model", 4)
-        manager.set_current_version(7)
-        body = manager._l1_pin_body([1, 2, 3])
-        assert body["model_name"] == "org/model"
-        assert body["world_size"] == 4
-        assert body["request_configs"] == {"lmcache.tag.model_version": "7"}
+    def test_pin_group_admin_is_disabled_without_lmcache(self):
+        import asyncio
 
-    def test_backend_pin_body_untagged_when_multi_version_off(self):
-        manager = KVCacheManager(LMCacheConfig(enable=True, multi_version_kv=False))
-        manager.set_parallel_geometry("org/model", 1)
-        assert manager._l1_pin_body([1])["request_configs"] is None
+        manager = KVCacheManager(LMCacheConfig(enable=False))
+        assert asyncio.run(manager.release_pin_groups()) == {}
+        assert asyncio.run(manager.pin_group_stats()) == {}
+
+    def test_pin_group_admin_targets_the_management_api(self):
+        import asyncio
+
+        manager = KVCacheManager(LMCacheConfig(enable=True))
+        seen = []
+
+        async def fake_request(method, path, payload=None):
+            seen.append((method, path))
+            return {"released": 2} if method == "DELETE" else {"policy": "all"}
+
+        manager._request = fake_request
+        assert asyncio.run(manager.release_pin_groups()) == {"released": 2}
+        assert asyncio.run(manager.pin_group_stats()) == {"policy": "all"}
+        assert seen == [
+            ("DELETE", "/cache/l1/pins/groups"),
+            ("GET", "/cache/l1/pins/stats"),
+        ]
 
     def test_event_stream_url_is_served_from_the_management_port(self):
-        config = self._runtime_config(http_host="0.0.0.0", http_advertise_host="10.0.0.1")
+        config = _runtime_config(http_host="0.0.0.0", http_advertise_host="10.0.0.1")
         assert config.event_stream_url == "http://10.0.0.1:8080/cache/events/stream"
 
     def test_event_stream_flags(self):
-        argv = self._runtime_config(coordinator_event_reporting=True, enable_kv_events=True).to_server_argv()
+        argv = _runtime_config(coordinator_event_reporting=True, enable_kv_events=True).to_server_argv()
         assert "--coordinator-event-reporting" in argv
         assert "--coordinator-event-stream-enable" in argv
         metadata = json.loads(argv[argv.index("--coordinator-metadata") + 1])
         assert metadata["event_stream_url"].endswith("/cache/events/stream")
 
     def test_event_stream_disabled_without_kv_events(self):
-        argv = self._runtime_config(coordinator_event_reporting=True).to_server_argv()
+        argv = _runtime_config(coordinator_event_reporting=True).to_server_argv()
         assert "--coordinator-event-reporting" in argv
         assert "--coordinator-event-stream-enable" not in argv
 
@@ -361,48 +411,29 @@ class TestKVCacheManager:
 
     # --- store to pin race ---
 
-    def test_backend_pin_retries_a_store_in_flight(self):
-        import asyncio
+    # --- pin policy configuration ---
 
-        manager = KVCacheManager(LMCacheConfig(enable=True))
-        manager.set_parallel_geometry("org/model", 1)
-        responses = [
-            {"chunks": 4, "pinned": 0, "missing": 4},
-            {"chunks": 4, "pinned": 4, "missing": 0},
-        ]
-        calls = []
+    def test_pin_policy_defaults_to_off(self):
+        argv = _runtime_config().to_server_argv()
+        assert argv[argv.index("--l1-pin-policy") + 1] == "off"
+        assert argv[argv.index("--l1-pin-budget-ratio") + 1] == "0.25"
+        assert argv[argv.index("--l1-pin-ttl-seconds") + 1] == "600.0"
 
-        async def fake_request(method, path, payload=None):
-            calls.append(path)
-            return responses.pop(0)
+    def test_pin_policy_is_forwarded(self):
+        argv = _runtime_config(pin_policy="all", pin_budget_ratio=0.5, pin_ttl_seconds=60.0).to_server_argv()
+        assert argv[argv.index("--l1-pin-policy") + 1] == "all"
+        assert argv[argv.index("--l1-pin-budget-ratio") + 1] == "0.5"
+        assert argv[argv.index("--l1-pin-ttl-seconds") + 1] == "60.0"
 
-        manager._request = fake_request
-        assert asyncio.run(manager._pin_backend([1, 2, 3])) is True
-        assert len(calls) == 2
-        assert (1, 2, 3) in manager._pinned_backend
+    def test_pin_policy_rejects_noop_eviction(self):
+        """Pinned objects cannot be reclaimed without eviction."""
+        with pytest.raises(AssertionError):
+            _runtime_config(pin_policy="all", eviction_policy="noop").to_server_argv()
 
-    def test_backend_pin_reports_a_prefix_that_never_lands(self):
-        import asyncio
-
-        manager = KVCacheManager(LMCacheConfig(enable=True))
-        manager.set_parallel_geometry("org/model", 1)
-
-        async def fake_request(method, path, payload=None):
-            return {"chunks": 4, "pinned": 0, "missing": 4}
-
-        manager._request = fake_request
-        assert asyncio.run(manager._pin_backend([1, 2, 3])) is False
-        # Nothing was pinned, so nothing may be recorded for a later unpin.
-        assert (1, 2, 3) not in manager._pinned_backend
-
-    def test_backend_pin_of_a_sub_chunk_sequence_is_not_a_failure(self):
-        import asyncio
-
-        manager = KVCacheManager(LMCacheConfig(enable=True))
-        manager.set_parallel_geometry("org/model", 1)
-
-        async def fake_request(method, path, payload=None):
-            return {"chunks": 0, "pinned": 0, "missing": 0, "status": "noop"}
-
-        manager._request = fake_request
-        assert asyncio.run(manager._pin_backend([1, 2, 3])) is True
+    def test_pin_policy_validates_its_own_values(self):
+        with pytest.raises(AssertionError):
+            _runtime_config(pin_policy="sometimes").to_server_argv()
+        with pytest.raises(AssertionError):
+            _runtime_config(pin_budget_ratio=1.5).to_server_argv()
+        with pytest.raises(AssertionError):
+            _runtime_config(pin_ttl_seconds=0).to_server_argv()

@@ -1488,6 +1488,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         if self.kv_cache_manager is not None and self.kv_cache_manager.should_clear_on_weight_update:
             await self.kv_cache_manager.clear()
             psrl_logger.debug("Cleared LMCache backend after model weight update.")
+        if self.kv_cache_manager is not None and self.kv_cache_manager.enabled:
+            # Older-version pins are unreachable now, so they only hold budget.
+            await self.kv_cache_manager.release_pin_groups()
 
     async def nixl_pull_model(self) -> None:
         assert self.gen_interface.ps_manager_handle is not None, "nixl_pull_model requires a PS manager handle"

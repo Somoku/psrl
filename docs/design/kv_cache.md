@@ -180,7 +180,7 @@ decides how.
 |-----------------|----------|----------|
 | `async` | Start transfer, begin generation immediately | Latency sensitive, short prefixes |
 | `sync` | Wait for the transfer, then begin generation | Long prefixes where re-prefill is expensive |
-| `pin_sync` | Pin source KV, transfer, then unpin | Maximum reliability, highest overhead |
+| `pin_sync` | Deprecated alias for `sync` | Existing configurations only |
 
 P2P transfer uses the NIXL transport, so `psrl.ps_mode` must be `nixl_cpu` or
 `nixl_gpu` when `enable_p2p` is on.
@@ -201,6 +201,42 @@ batches instead of stalling the server's observability thread. `GET
 /cache/events/stats` reports `dropped_total` alongside the subscriber count, so a
 stalled consumer is visible instead of silently under-scoring the tier.
 
+## Prefix pinning
+
+Config: `psrl.lmcache.pin_policy`
+
+A multi-turn trajectory's prefix has to survive the idle gap between two turns.
+LRU cannot promise that: its horizon is how much unrelated traffic arrives, not
+when the prefix comes back, and a burst of generation during a tool call is
+exactly when a warm prefix is swept. Pinning replaces that unpredictable horizon
+with the reuse interval itself.
+
+A pin group is named `<model version>:<tail chunk hash>`, where the tail is the
+last complete chunk of the request's token sequence. Identity comes from the
+prefix, so no caller has to name its own trajectory, which the engine never
+receives in auto trajectory mode. Two consequences follow:
+
+- A longer prefix supersedes its own ancestor, because the previous turn's tail
+  is now an interior chunk of the current prefix. The next turn therefore
+  releases the previous group without either side tracking a group id, and the
+  shared chunks stay pinned by the new group.
+- Trajectories that share a system prompt but diverge have different tails, so
+  they hold separate groups and share the common chunks through reference
+  counts.
+
+Three policies: `off`, `all`, and `tagged` (only requests carrying an
+`lmcache.pin_group` request config). `off` is the default because pinning moves
+capacity out of the general cache, so it is only a win when a prefix is being
+evicted before its next turn. `all` is the production setting, chosen by
+measuring turn-two hit rate and re-prefill volume.
+
+The group table is bounded by design rather than by hope: an idle TTL releases
+groups a client never released, a byte budget releases the least recently pinned
+groups first, and a prefix larger than the whole budget stays unpinned instead
+of overshooting the ceiling. Because every node's server derives the same group
+from the same request, the mechanism is replica-wide without any cross-node
+coordination.
+
 ## Gotchas
 
 - **L1 is shared by every local KV rank.** `offload_size_gb` is one server's
@@ -215,17 +251,27 @@ stalled consumer is visible instead of silently under-scoring the tier.
   version cannot be read back and must be invalidated.
 - **`clear_on_weight_update` also drops pins.** A forced clear discards client
   pins, so re-pin after a weight sync if routing depends on them.
-- **GPU and backend pins are not the same mechanism.** A GPU pin holds a prefix
-  cache block open by raising its reference count, so vLLM refuses to reset the
-  prefix cache while any pin is live. PSRL releases its own pins before a weight
-  update and reports it if the reset still fails.
+- **GPU and L1 pins are different mechanisms.** A GPU pin holds a prefix cache
+  block open by raising its reference count, so vLLM refuses to reset the prefix
+  cache while any pin is live. PSRL releases its own pins before a weight update
+  and reports it if the reset still fails. L1 retention runs through pin groups
+  instead, which the request path drives.
 - **GPU pinning follows every KV cache group.** A hybrid model caches a
   different prefix per group, so the pin is limited to the prefix that all groups
   can serve, which is the prefix a later request can actually reuse.
-- **A pin can arrive before its store lands.** The LMCache store path is
-  asynchronous, so a backend pin is retried a bounded number of times and a
-  prefix that never becomes resident is reported as a failure rather than
-  ignored.
+- **L1 pins are applied where the store commits.** The store path pins the
+  prefix in the same stream step that makes it visible, and the prefetch path
+  pins what a transfer warms, so a prefix is never evictable in between. A pin
+  no longer needs a retry loop against an in-flight store.
+- **The pin budget is a hard ceiling.** A prefix larger than the whole budget
+  stays unpinned and falls back to LRU. That is deliberate: overshooting would
+  let one long prefix starve L1, and the warning names the bytes needed.
+- **Pinning is off unless asked for.** It moves capacity out of the general
+  cache, so it is only a win when prefixes are actually evicted before their
+  next turn. Measure before enabling `pin_policy: all`.
+- **`pin_sync` is retired.** A transfer's source prefix is protected by the read
+  lock LMCache takes while resolving the objects, so the surrounding pin added
+  nothing while costing two RPCs per transfer. `pin_sync` now behaves as `sync`.
 - **Hybrid KV cache management is left to vLLM.** The MP connector declares
   support, so PSRL no longer forces it off. Models that require it, such as
   hybrid SSM models, now start as vLLM intends.

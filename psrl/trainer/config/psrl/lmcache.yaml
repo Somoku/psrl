@@ -27,6 +27,16 @@ l1_use_lazy: True
 # L1 GiB committed at startup when lazy allocation is on.
 l1_init_size_gb: 20
 
+# Which prefixes to hold resident across turns: "off", "all", or "tagged".
+# Pinning trades cache capacity for hit rate, so measure before enabling it.
+pin_policy: off
+
+# Fraction of L1 the pin groups may hold.
+pin_budget_ratio: 0.25
+
+# Idle seconds after which a pin group is released.
+pin_ttl_seconds: 600.0
+
 # --- L2 (optional extra tiers) ---
 
 # L2 adapters as JSON objects, e.g. [{type: fs, path: /mnt/kv}].

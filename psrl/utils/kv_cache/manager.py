@@ -20,9 +20,36 @@ _PEER_REGISTRY_TTL_S = 5.0
 _PREFETCH_POLL_INTERVAL_S = 0.2
 _PREFETCH_TIMEOUT_S = 60.0
 
-# L1 pin attempts, separated so a store still in flight can land first.
-_PIN_ATTEMPTS = 3
-_PIN_RETRY_DELAY_S = 0.2
+# Warn once per process when a caller still asks for a backend pin.
+_BACKEND_TARGET_WARNED = False
+
+
+def _check_pin_targets(targets: list[str], action: str) -> None:
+    """
+    Validate pin targets, warning once when a retired target is requested.
+
+    Callers on the wire still send `"backend"`, because LMCache's L1 retention
+    used to be a token-addressed call. It is now driven by prefix-derived pin
+    groups on the request path, so the target is accepted and ignored rather
+    than rejected, which would make every such caller start failing.
+
+    Args:
+        targets (list[str]): Targets the caller asked for.
+        action (str): Operation name, for the message.
+    """
+    assert all(t in ("gpu", "backend") for t in targets), (
+        f"Invalid {action} targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
+    )
+    global _BACKEND_TARGET_WARNED
+    if "backend" in targets and not _BACKEND_TARGET_WARNED:
+        _BACKEND_TARGET_WARNED = True
+        psrl_logger.warning(
+            "[LMCache] Ignoring the 'backend' %s target: L1 retention runs through "
+            "prefix pin groups on the request path, not a token-addressed call. "
+            "This message is logged once per process.",
+            action,
+        )
+
 
 # Legacy in-process backend label SMG sends. MP transfer is tier-agnostic.
 _LEGACY_BACKEND = "LocalCPUBackend"
@@ -54,10 +81,6 @@ class KVCacheManager:
         # to the same per-rank keys the connector stored them under.
         self.model_name: str = ""
         self.kv_world_size: int = 1
-
-        # Token sequences pinned on the MP server, keyed by token tuple. The
-        # stored body lets unpin reuse the same identity tags the pin used.
-        self._pinned_backend: dict[tuple[int, ...], dict] = {}
 
         self._inference_engine = None
         self._runtime: LMCacheMPRuntime | None = None
@@ -428,55 +451,50 @@ class KVCacheManager:
 
     async def pin(self, tokens: list[int], targets: list[str]) -> bool:
         """
-        Pin the cached prefix of a trajectory to prevent LRU eviction.
+        Pin a trajectory's cached prefix to prevent eviction.
 
-        Supported targets: `"gpu"` (vLLM block pool) and `"backend"` (LMCache).
-        GPU pinning is subject to `gpu_pin_block_budget`. If the budget is
-        exceeded, the oldest-pinned entry is unpinned first (PSRL-side LRU).
+        Only the GPU prefix cache is pinned from here. LMCache's L1 retention is
+        driven by prefix-derived pin groups on the request path, which cover
+        every node of a replica without a per-node call, so a token-addressed
+        backend pin would only duplicate that at the cost of shipping the whole
+        sequence. GPU block pinning is subject to `gpu_pin_block_budget`. If the
+        budget is exceeded, the oldest-pinned entry is unpinned first.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
-            targets (list[str]): Subset of `["gpu", "backend"]`.
+            targets (list[str]): Subset of `["gpu"]`. `"backend"` is accepted for
+                wire compatibility and ignored.
 
         Returns:
-            bool: True if all requested pin operations succeeded.
+            bool: True if the GPU pin succeeded.
         """
         self._assert_engine()
         assert tokens, "tokens must be a non-empty list."
         assert targets, "targets must be a non-empty list."
-        assert all(t in ("gpu", "backend") for t in targets), (
-            f"Invalid pin targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
-        )
-        ok = True
-        if "gpu" in targets:
-            ok = ok and await self._pin_gpu(tokens)
-        if "backend" in targets:
-            ok = ok and await self._pin_backend(tokens)
-        return ok
+        _check_pin_targets(targets, "pin")
+        if "gpu" not in targets:
+            return True
+        return await self._pin_gpu(tokens)
 
     async def unpin(self, tokens: list[int], targets: list[str]) -> bool:
         """
-        Unpin the cached prefix of a trajectory, allowing LRU eviction.
+        Unpin a trajectory's cached prefix, allowing LRU eviction.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
-            targets (list[str]): Subset of `["gpu", "backend"]`.
+            targets (list[str]): Subset of `["gpu"]`. `"backend"` is accepted for
+                wire compatibility and ignored.
 
         Returns:
-            bool: True if all unpin operations completed without error.
+            bool: True if the GPU unpin completed.
         """
         self._assert_engine()
         assert tokens, "tokens must be a non-empty list."
         assert targets, "targets must be a non-empty list."
-        assert all(t in ("gpu", "backend") for t in targets), (
-            f"Invalid unpin targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
-        )
-        ok = True
-        if "gpu" in targets:
-            ok = ok and await self._unpin_gpu(tokens)
-        if "backend" in targets:
-            ok = ok and await self._unpin_backend(tokens)
-        return ok
+        _check_pin_targets(targets, "unpin")
+        if "gpu" not in targets:
+            return True
+        return await self._unpin_gpu(tokens)
 
     async def transfer_direct(
         self,
@@ -702,102 +720,36 @@ class KVCacheManager:
         """
         return await self._inference_engine.engine_core.call_utility_async(method, *args)
 
-    # --- Backend pin internals ---
+    # --- L1 pin group administration ---
 
-    def _l1_pin_body(self, tokens: list[int]) -> dict:
+    async def release_pin_groups(self) -> dict:
         """
-        Build the L1 pin/unpin body for one token sequence.
+        Release every L1 pin group on this node's MP server.
 
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
+        Called after a weight pull. Objects pinned under an older model version
+        are already unreachable, because the version tag takes part in cache
+        identity, so holding them only spends the pin budget.
 
         Returns:
-            dict: Request body for `POST`/`DELETE /cache/l1/pins`.
+            dict: `{"released": <count>}`, empty when LMCache is disabled.
         """
-        assert self.model_name, (
-            "LMCache model_name is unset. Call set_parallel_geometry() before backend pin operations."
-        )
-        request_configs = (
-            {"lmcache.tag.model_version": str(self.current_version)} if self.config.multi_version_kv else None
-        )
-        return {
-            "model_name": self.model_name,
-            "world_size": self.kv_world_size,
-            "token_ids": tokens,
-            "cache_salt": "",
-            "request_configs": request_configs,
-        }
-
-    async def _pin_backend(self, tokens: list[int]) -> bool:
-        """
-        Pin the trajectory's cached chunks in the MP server's L1.
-
-        The store path is asynchronous, so a pin issued right after a request
-        can observe a prefix that is not resident yet. The call is retried a
-        bounded number of times, and a prefix that never becomes resident is
-        reported as a failure rather than ignored, because a caller that
-        believes a prefix is pinned may hand its trajectory to another replica.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-
-        Returns:
-            bool: True when the pin retained at least one chunk, or when the
-            sequence holds no complete chunk to pin.
-        """
-        key = tuple(tokens)
-        if key in self._pinned_backend:
-            # Repeated pins must not increment the server's pin count.
-            return True
-
         if not self.config.enable:
-            return True
+            return {}
+        result = await self._request("DELETE", "/cache/l1/pins/groups")
+        psrl_logger.info(f"[LMCache] Released {result.get('released', 0)} pin group(s) after a weight pull.")
+        return result
 
-        body = self._l1_pin_body(tokens)
-        pinned = missing = chunks = 0
-        for attempt in range(_PIN_ATTEMPTS):
-            result = await self._request("POST", "/cache/l1/pins", body)
-            pinned = int(result.get("pinned", 0))
-            missing = int(result.get("missing", 0))
-            chunks = int(result.get("chunks", 0))
-            if pinned > 0 or missing == 0:
-                break
-            if attempt + 1 < _PIN_ATTEMPTS:
-                await asyncio.sleep(_PIN_RETRY_DELAY_S)
-
-        if pinned > 0:
-            self._pinned_backend[key] = body
-            return True
-        if chunks == 0:
-            # Shorter than one chunk, so there is nothing to pin.
-            return True
-
-        psrl_logger.warning(
-            f"[LMCache] Backend pin retained no chunk for {len(tokens)} tokens "
-            f"({missing} keys still not resident after {_PIN_ATTEMPTS} attempts). "
-            "The prefix was likely never stored as a complete chunk."
-        )
-        return False
-
-    async def _unpin_backend(self, tokens: list[int]) -> bool:
+    async def pin_group_stats(self) -> dict:
         """
-        Release the trajectory's L1 pins on the MP server.
-
-        Unpinning reuses the body recorded at pin time so the release happens
-        under the same identity tags even if the model version advanced.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
+        Report this node's L1 pin groups.
 
         Returns:
-            bool: True if the request succeeded.
+            dict: Policy, live groups, held bytes and keys, and cumulative
+            counters. Empty when LMCache is disabled.
         """
-        body = self._pinned_backend.pop(tuple(tokens), None)
-        if body is None:
-            psrl_logger.debug("[LMCache] Backend unpin skipped: sequence was not pinned.")
-            return True
-        await self._request("DELETE", "/cache/l1/pins", body)
-        return True
+        if not self.config.enable:
+            return {}
+        return await self._request("GET", "/cache/l1/pins/stats")
 
     # --- GPU pin budget internals ---
 

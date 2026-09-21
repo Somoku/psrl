@@ -15,6 +15,9 @@ SUPPORTED_TRANSFER_ENGINES = ("nixl", "mooncake_te")
 # L1 eviction policies the MP server accepts.
 SUPPORTED_EVICTION_POLICIES = ("LRU", "IsolatedLRU", "noop")
 
+# Prefix-retention policies the MP server accepts.
+SUPPORTED_PIN_POLICIES = ("off", "all", "tagged")
+
 # Alignment the MP server accepts. RDMA reads want a larger power of two.
 MIN_L1_ALIGN_BYTES = 4096
 RECOMMENDED_P2P_ALIGN_BYTES = 65536
@@ -61,6 +64,17 @@ class LMCacheConfig:
     # L1 bytes committed at startup when `l1_use_lazy` is set. The server grows
     # the allocation from here up to `offload_size_gb` as it fills.
     l1_init_size_gb: int = 20
+
+    # --- L1 pin groups (prefix retention across turns) ---
+    # Which prefixes to pin: "off", "all", or "tagged".
+    pin_policy: str = "off"
+
+    # Fraction of L1 the pin groups may hold. Pinned objects cannot be evicted,
+    # so this bounds what pinning may take from ordinary caching.
+    pin_budget_ratio: float = 0.25
+
+    # Idle seconds after which a pin group is released.
+    pin_ttl_seconds: float = 600.0
 
     # --- L2 (optional local/remote tiers) ---
 
@@ -287,6 +301,20 @@ class LMCacheConfig:
         assert self.l1_init_size_gb <= self.offload_size_gb, (
             f"l1_init_size_gb ({self.l1_init_size_gb}) must not exceed offload_size_gb ({self.offload_size_gb})."
         )
+        assert self.pin_policy in SUPPORTED_PIN_POLICIES, (
+            f"pin_policy must be one of {SUPPORTED_PIN_POLICIES}, got {self.pin_policy!r}."
+        )
+        assert 0.0 <= self.pin_budget_ratio <= 1.0, (
+            f"pin_budget_ratio must be within [0.0, 1.0], got {self.pin_budget_ratio}."
+        )
+        assert self.pin_ttl_seconds > 0, f"pin_ttl_seconds must be > 0, got {self.pin_ttl_seconds}."
+        if self.pin_policy != "off":
+            # Pinned objects cannot be reclaimed without eviction, so the pair
+            # would let the first prefix that fills L1 wedge every later store.
+            assert self.eviction_policy != "noop", (
+                f"pin_policy={self.pin_policy!r} needs an eviction policy that can "
+                "reclaim pinned objects, but eviction_policy is 'noop'."
+            )
         if self.enable_p2p:
             assert self.p2p_transfer_engine in SUPPORTED_TRANSFER_ENGINES, (
                 f"p2p_transfer_engine must be one of {SUPPORTED_TRANSFER_ENGINES}, got {self.p2p_transfer_engine!r}."
@@ -321,6 +349,12 @@ class LMCacheConfig:
             "--l1-init-size-gb",
             str(self.l1_init_size_gb),
             "--l1-use-lazy" if self.l1_use_lazy else "--no-l1-use-lazy",
+            "--l1-pin-policy",
+            self.pin_policy,
+            "--l1-pin-budget-ratio",
+            str(self.pin_budget_ratio),
+            "--l1-pin-ttl-seconds",
+            str(self.pin_ttl_seconds),
         ]
 
         if self.lmcache_instance_id:

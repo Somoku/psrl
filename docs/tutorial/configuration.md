@@ -498,8 +498,8 @@ Controls how generation requests are dispatched across rollout instances.
   | Sub-field | Description |
   |---|---|
   | `enable` | Master switch. **Default:** `False` |
-  | `transfer_mode` | `async` (fire-and-forget), `sync` (await, no pin), `pin_sync` (pin→await→unpin). **Default:** `async` |
-  | `transfer_timeout_ms` | Timeout for `sync`/`pin_sync` modes before falling back to re-prefill. **Default:** `5000` |
+  | `transfer_mode` | `async` (fire-and-forget) or `sync` (await the transfer). `pin_sync` is a deprecated alias for `sync`. **Default:** `async` |
+  | `transfer_timeout_ms` | Timeout for `sync` before falling back to re-prefill. **Default:** `5000` |
   | `stats_log_interval_s` | Interval (s) between periodic KV-transfer stats log lines on each source instance. `0` suppresses stats even when transfer is enabled. **Default:** `30` |
 
 `rollout_coordination.routing_strategy.cost_model_path`
@@ -817,6 +817,26 @@ multi-turn workloads. LMCache runs as one multiprocess server per node, and
   `offload_size_gb`.
   **Default:** `20`
 
+`lmcache.pin_policy`
+: Which prefixes to hold resident across turns. `off` disables pinning, `all`
+  pins every stored prefix, and `tagged` pins only requests carrying an
+  `lmcache.pin_group` request config. A pin group survives the idle gap between
+  two turns, which LRU cannot guarantee, but pinned bytes cannot be evicted, so
+  enabling it trades cache capacity for hit rate. Measure turn-two hit rate and
+  re-prefill volume before choosing `all`.
+  **Default:** `off`
+
+`lmcache.pin_budget_ratio`
+: Fraction of `offload_size_gb` that pin groups may hold. The least recently
+  pinned groups are released when it is exceeded, and a prefix larger than the
+  whole budget stays unpinned rather than overshooting it.
+  **Default:** `0.25`
+
+`lmcache.pin_ttl_seconds`
+: Idle seconds after which a pin group is released. Pins carry no TTL of their
+  own, so this is the safety net for a client that never releases.
+  **Default:** `600.0`
+
 `lmcache.mp_server_urls`
 : Every MP server backing one replica, ordered by node rank, as `host:port`
   strings. Empty makes the replica a single-server deployment, which is correct
@@ -890,9 +910,9 @@ multi-turn workloads. LMCache runs as one multiprocess server per node, and
   **Default:** `300`
 
 `lmcache.gpu_pin_block_budget`
-: Max number of GPU KV blocks PSRL may hold pinned simultaneously, used by
-  `routing_strategy.kv_transfer.transfer_mode == "pin_sync"`. When exceeded, the
-  oldest-pinned trajectory is unpinned (PSRL-side LRU). `0` means no limit.
+: Max number of GPU KV blocks PSRL may hold pinned simultaneously, as asked for
+  by an explicit `PinKv` target of `gpu`. When exceeded, the oldest-pinned
+  trajectory is unpinned (PSRL-side LRU). `0` means no limit.
   **Default:** `0`
 
 ```{seealso}

@@ -1,5 +1,57 @@
+diff --git a/docs/source/mp/configuration.rst b/docs/source/mp/configuration.rst
+index dfc98fe8..51187fa8 100644
+--- a/docs/source/mp/configuration.rst
++++ b/docs/source/mp/configuration.rst
+@@ -471,6 +471,47 @@ Source: ``lmcache/v1/distributed/config.py``
+      - ``0.2``
+      - Fraction of allocated memory to evict when triggered (0.0--1.0).
+ 
++Prefix Pinning
++--------------
++
++Source: ``lmcache/v1/multiprocess/config.py``, ``lmcache/v1/distributed/config.py``
++
++A pin group holds one conversation prefix resident so it survives the idle gap
++between two turns. LRU cannot do that on its own: its horizon is how much
++unrelated traffic arrives, not when the prefix is reused. Groups are named
++``<model version>:<tail chunk hash>`` and derived from the request, so no client
++has to identify its own trajectory. A longer prefix supersedes its own ancestor,
++so the next turn releases the previous group with no extra call.
++
++.. list-table::
++   :header-rows: 1
++   :widths: 30 15 55
++
++   * - Argument
++     - Default
++     - Description
++   * - ``--l1-pin-policy``
++     - ``off``
++     - Which prefixes to pin. ``off`` disables pinning. ``all`` pins every
++       stored prefix. ``tagged`` pins only requests carrying an
++       ``lmcache.pin_group`` request config. Pinning trades cache capacity for
++       hit rate, so ``all`` is worth enabling only when a prefix is measured to
++       be evicted before its next turn.
++   * - ``--l1-pin-budget-ratio``
++     - ``0.25``
++     - Fraction of ``--l1-size-gb`` that pin groups may hold. Pinned objects
++       cannot be evicted, so this is what keeps pinning from starving ordinary
++       caching. When the budget is exceeded the least recently pinned groups
++       are released, and a single prefix larger than the whole budget stays
++       unpinned rather than overshooting the ceiling.
++   * - ``--l1-pin-ttl-seconds``
++     - ``600.0``
++     - Idle seconds after which a group is released. This is the safety net for
++       a client that never releases, since pins carry no TTL of their own.
++
++``--l1-pin-policy`` must be ``off`` when ``--eviction-policy noop`` is set,
++because pinned objects cannot be reclaimed without eviction.
++
+ L2 Policies
+ -----------
+ 
 diff --git a/lmcache/v1/distributed/api.py b/lmcache/v1/distributed/api.py
-index ab8876cc..a641db3e 100644
+index ab8876cc..ba67d964 100644
 --- a/lmcache/v1/distributed/api.py
 +++ b/lmcache/v1/distributed/api.py
 @@ -7,7 +7,7 @@ Could be implemented by native code in the future
@@ -150,7 +202,23 @@ index ab8876cc..a641db3e 100644
          )
  
  
-@@ -508,9 +605,13 @@ def ipc_key_to_object_keys(
+@@ -440,6 +537,15 @@ class PrefetchRequestSpec:
+     policy: TrimPolicy = TrimPolicy.PREFIX
+     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
+     mode: PrefetchMode = PrefetchMode.LOOKUP
++    pin_group: str = ""
++    """Pin group to hold the loaded keys under, empty when the caller does not
++    want them retained past the idle TTL. Only the pinned copy survives
++    eviction, so a transfer that should outlive its turn sets this."""
++    pin_version: str = ""
++    """Model version the loaded objects belong to, used to fence older groups."""
++    pin_tail: bytes = b""
++    """Chunk hash of the prefix's last complete chunk, which names the group and
++    identifies the groups this load supersedes."""
+ 
+     def __post_init__(self) -> None:
+         if self.num_kv_readers < 1:
+@@ -508,9 +614,13 @@ def ipc_key_to_object_keys(
      duplicating the source of truth would risk silent isolation bugs
      where a caller passes ``ipc_key`` but forgets the salt.
  
@@ -165,7 +233,7 @@ index ab8876cc..a641db3e 100644
          chunk_hashes: List of chunk hash bytes, one per chunk.
          object_group_ids: Object group ids to produce keys for.
  
-@@ -519,6 +620,7 @@ def ipc_key_to_object_keys(
+@@ -519,6 +629,7 @@ def ipc_key_to_object_keys(
          for ``object_group_ids[i]``.
      """
      cache_salt = ipc_key.cache_salt
@@ -173,7 +241,7 @@ index ab8876cc..a641db3e 100644
  
      # The (chunk_hash, kv_rank) expansion is independent of the object group,
      # so compute it once and reuse it for every group.
-@@ -553,6 +655,7 @@ def ipc_key_to_object_keys(
+@@ -553,6 +664,7 @@ def ipc_key_to_object_keys(
                  kv_rank=kv_rank,
                  object_group_id=object_group_id,
                  cache_salt=cache_salt,
@@ -181,8 +249,131 @@ index ab8876cc..a641db3e 100644
              )
              for chunk_hash in chunk_hashes
              for kv_rank in kv_ranks
+diff --git a/lmcache/v1/distributed/config.py b/lmcache/v1/distributed/config.py
+index a5899b04..a5d29e3d 100644
+--- a/lmcache/v1/distributed/config.py
++++ b/lmcache/v1/distributed/config.py
+@@ -284,6 +284,32 @@ class EvictionConfig:
+     """ Seconds between L1 memory usage log lines when extra logging is enabled. """
+ 
+ 
++@dataclass
++class PinConfig:
++    """Configuration for prefix-derived L1 pin groups.
++
++    A pin group holds a conversation prefix resident so it survives the gap
++    between two turns. The budget is the ceiling that keeps pinning from
++    starving ordinary caching, so it is the part of this config that protects
++    throughput rather than hit rate.
++    """
++
++    policy: Literal["off", "all", "tagged"] = field(default="off")
++    """ Which prefixes to pin: none, every stored prefix, or only requests that
++    carry an explicit ``lmcache.pin_group`` tag. """
++
++    budget_ratio: float = field(default=0.25)
++    """ Fraction of L1 that pin groups may hold, used to derive the byte
++    budget from the configured L1 size. """
++
++    ttl_seconds: float = field(default=600.0)
++    """ Idle seconds after which a pin group is released. """
++
++    budget_bytes: int = field(default=0)
++    """ Absolute ceiling on pinned bytes. Derived from ``budget_ratio`` and the
++    L1 size when the config is built from the command line. """
++
++
+ @dataclass
+ class StorageManagerConfig:
+     """
+@@ -296,6 +322,9 @@ class StorageManagerConfig:
+     eviction_config: EvictionConfig
+     """ The configuration for eviction policies. """
+ 
++    pin_config: PinConfig = field(default_factory=PinConfig)
++    """ The configuration for prefix-derived L1 pin groups. """
++
+     l2_adapter_config: L2AdaptersConfig = field(
+         default_factory=lambda: L2AdaptersConfig([])
+     )
+@@ -359,6 +388,25 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
+     ):
+         raise ValueError("gds-l1-path cannot be used with l1-devdax-path")
+ 
++    pin_config = config.pin_config
++    if pin_config.policy != "off" and config.eviction_config.eviction_policy == "noop":
++        # Pins exclude objects from eviction. With eviction disabled, pinned
++        # bytes are never reclaimed, so the first prefix that fills L1 wedges
++        # every later store.
++        raise ValueError(
++            "l1-pin-policy must be 'off' when eviction-policy is 'noop': "
++            "pinned objects cannot be reclaimed without eviction."
++        )
++    if not 0.0 <= pin_config.budget_ratio <= 1.0:
++        raise ValueError(
++            f"l1-pin-budget-ratio must be within [0.0, 1.0], "
++            f"got {pin_config.budget_ratio}"
++        )
++    if pin_config.ttl_seconds <= 0:
++        raise ValueError(
++            f"l1-pin-ttl-seconds must be > 0, got {pin_config.ttl_seconds}"
++        )
++
+     memory_config = config.l1_manager_config.memory_config
+     if not (memory_config.devdax_path and memory_config.devdax_size_in_bytes):
+         return
+@@ -524,6 +572,29 @@ def add_storage_manager_args(
+         "'IsolatedLRU' maintains one LRU list per cache_salt and requires "
+         "quotas keyed by cache_salt to be configured via the HTTP API.",
+     )
++    eviction_group.add_argument(
++        "--l1-pin-policy",
++        type=str,
++        choices=["off", "all", "tagged"],
++        default="off",
++        help="Which prefixes to hold resident as pin groups. 'all' pins every "
++        "stored prefix, 'tagged' pins only requests carrying an "
++        "'lmcache.pin_group' request config, 'off' disables pinning.",
++    )
++    eviction_group.add_argument(
++        "--l1-pin-budget-ratio",
++        type=float,
++        default=0.25,
++        help="Fraction of L1 that pin groups may hold (0.0 to 1.0). Pins "
++        "exclude objects from eviction, so this bounds how much of L1 the "
++        "groups may take from ordinary caching.",
++    )
++    eviction_group.add_argument(
++        "--l1-pin-ttl-seconds",
++        type=float,
++        default=600.0,
++        help="Idle seconds after which a pin group is released (must be > 0).",
++    )
+     eviction_group.add_argument(
+         "--eviction-trigger-watermark",
+         type=float,
+@@ -668,9 +739,19 @@ def parse_args_to_config(
+ 
+     l2_adapter_config = parse_args_to_l2_adapters_config(args)
+ 
++    pin_config = PinConfig(
++        policy=args.l1_pin_policy,
++        budget_ratio=args.l1_pin_budget_ratio,
++        ttl_seconds=args.l1_pin_ttl_seconds,
++        # The budget is a fraction of the L1 cap, not of current usage, so it
++        # does not drift as the lazy allocation grows.
++        budget_bytes=int(args.l1_size_gb * (1 << 30) * args.l1_pin_budget_ratio),
++    )
++
+     config = StorageManagerConfig(
+         l1_manager_config=l1_manager_config,
+         eviction_config=eviction_config,
++        pin_config=pin_config,
+         l2_adapter_config=l2_adapter_config,
+         store_policy=args.l2_store_policy,
+         prefetch_policy=args.l2_prefetch_policy,
 diff --git a/lmcache/v1/distributed/l1_manager.py b/lmcache/v1/distributed/l1_manager.py
-index 4c9db61a..9238b2f5 100644
+index 4c9db61a..29311bf3 100644
 --- a/lmcache/v1/distributed/l1_manager.py
 +++ b/lmcache/v1/distributed/l1_manager.py
 @@ -50,6 +50,23 @@ class L1ObjectState:
@@ -209,7 +400,7 @@ index 4c9db61a..9238b2f5 100644
      def available_for_read(self) -> bool:
          """Check if the object is available for read.
  
-@@ -676,6 +693,62 @@ class L1Manager:
+@@ -676,6 +693,88 @@ class L1Manager:
          )
          return ret
  
@@ -242,6 +433,32 @@ index 4c9db61a..9238b2f5 100644
 +        return ret
 +
 +    @l1_mgr_synchronized
++    def pin_with_sizes(self, keys: list[ObjectKey]) -> tuple[list[ObjectKey], int]:
++        """Pin the given keys and report how many bytes they hold.
++
++        The size is returned by the same call that takes the pin, so a caller
++        accounting pinned bytes cannot observe a partially applied pin. A key
++        that is not resident is skipped rather than refused, because a caller
++        may pin a prefix whose later chunks were never stored.
++
++        Args:
++            keys: The object keys to pin.
++
++        Returns:
++            A tuple of the keys that were pinned and their total size in bytes.
++        """
++        pinned: list[ObjectKey] = []
++        total_bytes = 0
++        for key in keys:
++            entry = self._objects.get(key, None)
++            if entry is None:
++                continue
++            entry.pin_count += 1
++            pinned.append(key)
++            total_bytes += entry.memory_obj.get_size()
++        return pinned, total_bytes
++
++    @l1_mgr_synchronized
 +    def unpin(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
 +        """Release one pin per key, allowing eviction once the count hits 0.
 +
@@ -272,7 +489,7 @@ index 4c9db61a..9238b2f5 100644
      @l1_mgr_synchronized
      def delete(
          self, keys: list[ObjectKey], force: bool = False
-@@ -693,8 +766,8 @@ class L1Manager:
+@@ -693,8 +792,8 @@ class L1Manager:
  
          Errors:
              KEY_NOT_EXIST: The key does not exist.
@@ -283,7 +500,7 @@ index 4c9db61a..9238b2f5 100644
          """
          need_to_free: list[MemoryObj] = []
          ret: dict[ObjectKey, L1Error] = {}
-@@ -706,7 +779,11 @@ class L1Manager:
+@@ -706,7 +805,11 @@ class L1Manager:
                  ret[key] = L1Error.KEY_NOT_EXIST
                  continue
  
@@ -296,7 +513,7 @@ index 4c9db61a..9238b2f5 100644
              if locked and not force:
                  ret[key] = L1Error.KEY_IS_LOCKED
                  continue
-@@ -752,10 +829,11 @@ class L1Manager:
+@@ -752,10 +855,11 @@ class L1Manager:
          """Clear objects from L1 cache.
  
          Args:
@@ -312,7 +529,7 @@ index 4c9db61a..9238b2f5 100644
          """
          if force:
              logger.warning(
-@@ -786,11 +864,15 @@ class L1Manager:
+@@ -786,11 +890,15 @@ class L1Manager:
          keys_to_clear: list[ObjectKey] = []
          objs_to_free: list[MemoryObj] = []
          locked_count = 0
@@ -328,7 +545,7 @@ index 4c9db61a..9238b2f5 100644
              keys_to_clear.append(key)
              objs_to_free.append(entry.memory_obj)
  
-@@ -811,28 +893,33 @@ class L1Manager:
+@@ -811,28 +919,33 @@ class L1Manager:
              )
  
          logger.info(
@@ -367,7 +584,7 @@ index 4c9db61a..9238b2f5 100644
          return not entry.read_lock.is_locked() and not entry.write_lock.is_locked()
  
      def get_memory_usage(self) -> tuple[int, int]:
-@@ -867,6 +954,7 @@ class L1Manager:
+@@ -867,6 +980,7 @@ class L1Manager:
          write_locked = 0
          read_locked = 0
          temporary = 0
@@ -375,7 +592,7 @@ index 4c9db61a..9238b2f5 100644
          for entry in self._objects.values():
              if entry.write_lock.is_locked():
                  write_locked += 1
-@@ -874,6 +962,8 @@ class L1Manager:
+@@ -874,6 +988,8 @@ class L1Manager:
                  read_locked += 1
              if entry.is_temporary:
                  temporary += 1
@@ -384,7 +601,7 @@ index 4c9db61a..9238b2f5 100644
          used, total = self._memory_manager.get_memory_usage()
          # ``memory_total_bytes`` is what the allocator currently backs (the
          # grown heap on the lazy tier); this is the declared size. Summed to
-@@ -884,6 +974,7 @@ class L1Manager:
+@@ -884,6 +1000,7 @@ class L1Manager:
              "write_locked_count": write_locked,
              "read_locked_count": read_locked,
              "temporary_count": temporary,
@@ -638,11 +855,571 @@ index 5fb347f4..85aaa057 100644
  
  
  class SageMakerHyperPodL2AdapterConfig(L2AdapterConfigBase):
+diff --git a/lmcache/v1/distributed/pin_groups.py b/lmcache/v1/distributed/pin_groups.py
+new file mode 100644
+index 00000000..d84f2812
+--- /dev/null
++++ b/lmcache/v1/distributed/pin_groups.py
+@@ -0,0 +1,444 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Prefix-derived pin groups for L1 objects.
++
++A pin group keeps one conversation prefix resident so it survives the idle gap
++between two turns. Group identity comes from the prefix itself rather than from
++the client: the id is ``<model_version>:<tail chunk hash>``, where the tail is
++the last complete chunk of the request's token sequence. Two properties follow.
++No caller has to supply a trajectory id, which the engine never receives in
++auto trajectory mode. And because a prefix only grows across turns, the previous
++turn's group is released by matching its tail against the current prefix's
++chunk hashes.
++
++Pins themselves are reference counted and never expire, so this registry adds
++the lifecycle that makes them safe to leave running unattended: an idle TTL, a
++byte budget that releases the oldest groups first, and release when a newer
++model version appears.
++
++Identity invariant: a pin group must never take part in cache identity. Callers
++name the tag ``lmcache.pin_group``, deliberately outside the ``lmcache.tag.``
++prefix that :meth:`IPCCacheServerKey.derive_tags` reads.
++"""
++
++# Standard
++from dataclasses import dataclass, field
++import threading
++import time
++from typing import TYPE_CHECKING, Iterable, Sequence
++
++# First Party
++from lmcache.logging import init_logger
++from lmcache.v1.distributed.api import ObjectKey
++
++if TYPE_CHECKING:
++    from lmcache.v1.distributed.l1_manager import L1Manager
++
++logger = init_logger(__name__)
++
++# Policies accepted by ``--l1-pin-policy``.
++PIN_POLICIES = ("off", "all", "tagged")
++
++# Request-config key carrying an explicit pin group. It must stay outside the
++# ``lmcache.tag.`` namespace, which participates in cache identity.
++PIN_GROUP_CONFIG_KEY = "lmcache.pin_group"
++
++# Request-config key carrying the model version, which does participate in
++# cache identity. Read here only to name the group and to fence older versions.
++MODEL_VERSION_CONFIG_KEY = "lmcache.tag.model_version"
++
++
++@dataclass(frozen=True)
++class PinTarget:
++    """One prefix to hold resident, already resolved to object keys.
++
++    Attributes:
++        group: Group id, ``<version>:<tail hex>``.
++        version: Model version the objects were stored under, empty when the
++            deployment does not tag versions.
++        tail: Chunk hash of the prefix's last complete chunk.
++        keys: Every object key of the prefix, resident or just written.
++        prefix_hashes: Chunk hashes of the whole prefix, used to recognise the
++            groups this one supersedes.
++    """
++
++    group: str
++    version: str
++    tail: bytes
++    keys: tuple[ObjectKey, ...]
++    prefix_hashes: frozenset[bytes]
++
++
++@dataclass
++class PinGroup:
++    """Bookkeeping for one live pin group."""
++
++    group: str
++    version: str
++    tail: bytes
++    keys: set[ObjectKey] = field(default_factory=set)
++    bytes: int = 0
++    created_at: float = 0.0
++    last_touch: float = 0.0
++
++
++@dataclass(frozen=True)
++class PinResult:
++    """Outcome of one pin or release.
++
++    Attributes:
++        group: Group the call addressed.
++        pinned: Keys this call pinned. For a release, keys it unpinned.
++        already: Keys the group already held, so no pin was taken again.
++        missing: Keys that were not resident and therefore not pinned.
++        bytes: Bytes the group holds after the call.
++        released_groups: Groups dropped while servicing the call, because they
++            were superseded, expired, or released to stay inside the budget.
++        rejected: Why the pin was refused, empty when it was accepted.
++    """
++
++    group: str
++    pinned: int = 0
++    already: int = 0
++    missing: int = 0
++    bytes: int = 0
++    released_groups: tuple[str, ...] = ()
++    rejected: str = ""
++
++
++class PinGroupRegistry:
++    """Hold L1 prefixes resident under a bounded budget.
++
++    The registry owns the group table and never touches cache identity, so a
++    group is invisible to lookups. It is thread safe: the store path pins from
++    the device host-function callback thread while HTTP handlers release.
++
++    Args:
++        l1_manager: The node's L1 manager, used to pin and unpin objects.
++        policy: ``off``, ``all``, or ``tagged``.
++        budget_bytes: Hard ceiling on pinned bytes. Zero disables the ceiling.
++        ttl_seconds: Idle time after which a group is released.
++        clock: Monotonic clock, injectable for tests.
++    """
++
++    def __init__(
++        self,
++        l1_manager: "L1Manager",
++        policy: str = "off",
++        budget_bytes: int = 0,
++        ttl_seconds: float = 600.0,
++        clock=None,
++    ) -> None:
++        if policy not in PIN_POLICIES:
++            raise ValueError(
++                f"unknown pin policy {policy!r}; expected one of {PIN_POLICIES}"
++            )
++        if budget_bytes < 0:
++            raise ValueError(f"budget_bytes must be >= 0, got {budget_bytes}")
++        if ttl_seconds <= 0:
++            raise ValueError(f"ttl_seconds must be > 0, got {ttl_seconds}")
++        self._l1_manager = l1_manager
++        self._policy = policy
++        self._budget_bytes = budget_bytes
++        self._ttl_seconds = ttl_seconds
++        self._clock = clock if clock is not None else time.monotonic
++        self._lock = threading.Lock()
++        self._groups: dict[str, PinGroup] = {}
++        self._pinned_total = 0
++        self._released_total = 0
++        self._rejected_total = 0
++
++    @property
++    def policy(self) -> str:
++        """The configured pin policy."""
++        return self._policy
++
++    @property
++    def enabled(self) -> bool:
++        """Whether the policy can pin anything at all."""
++        return self._policy != "off"
++
++    @property
++    def budget_bytes(self) -> int:
++        """The configured ceiling on pinned bytes, zero when unbounded."""
++        return self._budget_bytes
++
++    @property
++    def pinned_bytes(self) -> int:
++        """Bytes currently held resident by pin groups."""
++        with self._lock:
++            return sum(rec.bytes for rec in self._groups.values())
++
++    def pin(self, target: PinTarget, now: float | None = None) -> PinResult:
++        """Hold ``target``'s prefix resident, releasing what it supersedes.
++
++        Releases, in order: groups idle past the TTL, groups from an older
++        model version, groups this prefix supersedes, and finally groups
++        evicted to stay inside the byte budget. The last of those is the only
++        ordering that can refuse the call: when the new group alone would
++        exceed the budget it is released again and ``rejected`` is set, because
++        a ceiling that silently overshoots would let one long prefix starve L1.
++
++        Args:
++            target: The prefix to pin, already resolved to object keys.
++            now: Clock override for tests.
++
++        Returns:
++            PinResult: What was pinned, and what was released to do it.
++        """
++        timestamp = self._clock() if now is None else now
++        released: list[str] = []
++
++        with self._lock:
++            released.extend(self._sweep_locked(timestamp))
++            released.extend(self._release_older_versions_locked(target.version))
++            released.extend(self._release_superseded_locked(target))
++
++            rec = self._groups.get(target.group)
++            is_new = rec is None
++            if is_new:
++                rec = PinGroup(
++                    group=target.group,
++                    version=target.version,
++                    tail=target.tail,
++                    created_at=timestamp,
++                )
++
++            fresh = [key for key in target.keys if key not in rec.keys]
++            pinned_keys, pinned_bytes = self._l1_manager.pin_with_sizes(fresh)
++            rec.keys.update(pinned_keys)
++            rec.bytes += pinned_bytes
++            rec.last_touch = timestamp
++            self._groups[target.group] = rec
++            self._pinned_total += len(pinned_keys)
++
++            if self._budget_bytes and self._total_bytes_locked() > self._budget_bytes:
++                released.extend(self._enforce_budget_locked(exclude=target.group))
++                if (
++                    self._total_bytes_locked() > self._budget_bytes
++                    and is_new
++                    and rec.keys
++                ):
++                    # Only the new group can be responsible at this point.
++                    self._release_group_locked(rec)
++                    self._rejected_total += 1
++                    logger.warning(
++                        "Pin group %s needs %d bytes but the budget is %d; the "
++                        "prefix stays unpinned and falls back to LRU. Raise "
++                        "--l1-pin-budget-ratio until it covers one prefix.",
++                        target.group,
++                        rec.bytes,
++                        self._budget_bytes,
++                    )
++                    return PinResult(
++                        group=target.group,
++                        missing=len(fresh) - len(pinned_keys),
++                        released_groups=tuple(released),
++                        rejected="budget",
++                    )
++
++            return PinResult(
++                group=target.group,
++                pinned=len(pinned_keys),
++                already=len(target.keys) - len(fresh),
++                missing=len(fresh) - len(pinned_keys),
++                bytes=rec.bytes,
++                released_groups=tuple(released),
++            )
++
++    def release(self, group: str) -> PinResult:
++        """Release one group, releasing its keys exactly once.
++
++        Missing groups are not an error, because a restarted server and an
++        expired TTL both leave the caller holding an id the node no longer
++        knows. That idempotence is what lets a client release unconditionally.
++
++        Args:
++            group: Group id to release.
++
++        Returns:
++            PinResult: Keys unpinned, and the bytes the group held.
++        """
++        with self._lock:
++            rec = self._groups.get(group)
++            if rec is None:
++                return PinResult(group=group, released_groups=(group,))
++            unpinned = len(rec.keys)
++            held = rec.bytes
++            self._release_group_locked(rec)
++            return PinResult(
++                group=group,
++                pinned=unpinned,
++                bytes=held,
++                released_groups=(group,),
++            )
++
++    def release_all(self) -> int:
++        """Release every group, for example after a weight update.
++
++        Returns:
++            int: Number of groups released.
++        """
++        with self._lock:
++            groups = list(self._groups.values())
++            for rec in groups:
++                self._release_group_locked(rec)
++            return len(groups)
++
++    def sweep(self, now: float | None = None) -> int:
++        """Release groups that have been idle past the TTL.
++
++        Args:
++            now: Clock override for tests.
++
++        Returns:
++            int: Number of groups released.
++        """
++        timestamp = self._clock() if now is None else now
++        with self._lock:
++            return len(self._sweep_locked(timestamp))
++
++    def stats(self) -> dict[str, object]:
++        """Report the registry's state for operators.
++
++        Returns:
++            dict[str, object]: Policy, live groups, held bytes and keys, the
++            budget, and cumulative pin/release/reject counters.
++        """
++        with self._lock:
++            return {
++                "policy": self._policy,
++                "groups": len(self._groups),
++                "keys": sum(len(rec.keys) for rec in self._groups.values()),
++                "bytes": self._total_bytes_locked(),
++                "budget_bytes": self._budget_bytes,
++                "pinned_total": self._pinned_total,
++                "released_total": self._released_total,
++                "rejected_total": self._rejected_total,
++                "groups_detail": [
++                    {
++                        "group": rec.group,
++                        "version": rec.version,
++                        "keys": len(rec.keys),
++                        "bytes": rec.bytes,
++                    }
++                    for rec in sorted(self._groups.values(), key=lambda r: r.last_touch)
++                ],
++            }
++
++    def live_groups(self) -> list[str]:
++        """Return the ids of every live group, oldest first."""
++        with self._lock:
++            return [
++                rec.group
++                for rec in sorted(self._groups.values(), key=lambda r: r.last_touch)
++            ]
++
++    # --- internals, all called with ``self._lock`` held ---
++
++    def _total_bytes_locked(self) -> int:
++        return sum(rec.bytes for rec in self._groups.values())
++
++    def _release_group_locked(self, rec: PinGroup) -> None:
++        keys = list(rec.keys)
++        self._groups.pop(rec.group, None)
++        if keys:
++            self._l1_manager.unpin(keys)
++        self._released_total += 1
++
++    def _sweep_locked(self, now: float) -> list[str]:
++        expired = [
++            rec
++            for rec in self._groups.values()
++            if now - rec.last_touch > self._ttl_seconds
++        ]
++        for rec in expired:
++            self._release_group_locked(rec)
++            logger.debug(
++                "Pin group %s expired after %.0fs idle", rec.group, now - rec.last_touch
++            )
++        return [rec.group for rec in expired]
++
++    def _release_older_versions_locked(self, version: str) -> list[str]:
++        """Drop groups stored under an older model version.
++
++        Their objects are already unreachable, because the version tag takes
++        part in cache identity, so holding them only spends budget.
++        """
++        if not version.isdigit():
++            return []
++        newest = int(version)
++        stale = [
++            rec
++            for rec in self._groups.values()
++            if rec.version.isdigit() and int(rec.version) < newest
++        ]
++        for rec in stale:
++            self._release_group_locked(rec)
++        return [rec.group for rec in stale]
++
++    def _release_superseded_locked(self, target: PinTarget) -> list[str]:
++        """Drop the groups this prefix already covers.
++
++        A group is superseded when its tail chunk is itself a chunk of the new
++        prefix, which can only happen for an earlier turn of the same
++        conversation: chunk hashes chain over the whole prefix, so a matching
++        tail means a matching prefix.
++        """
++        superseded = [
++            rec
++            for rec in self._groups.values()
++            if rec.group != target.group and rec.tail in target.prefix_hashes
++        ]
++        for rec in superseded:
++            self._release_group_locked(rec)
++        return [rec.group for rec in superseded]
++
++    def _enforce_budget_locked(self, exclude: str) -> list[str]:
++        """Release the least recently pinned groups until the budget holds."""
++        released: list[str] = []
++        victims: Sequence[PinGroup] = sorted(
++            (rec for rec in self._groups.values() if rec.group != exclude),
++            key=lambda rec: rec.last_touch,
++        )
++        for rec in victims:
++            if self._total_bytes_locked() <= self._budget_bytes:
++                break
++            self._release_group_locked(rec)
++            released.append(rec.group)
++        return released
++
++
++def is_pin_group_requested(policy: str, request_configs: dict | None) -> bool:
++    """Decide whether this request's prefix should be pinned.
++
++    Args:
++        policy: ``off``, ``all``, or ``tagged``.
++        request_configs: The request's LMCache request configs.
++
++    Returns:
++        bool: True when the policy wants this request pinned.
++    """
++    if policy == "off":
++        return False
++    if policy == "all":
++        return True
++    configs = request_configs or {}
++    return bool(configs.get(PIN_GROUP_CONFIG_KEY))
++
++
++def iter_group_leaves(
++    object_keys: Iterable[ObjectKey],
++) -> tuple[bytes | None, frozenset[bytes]]:
++    """Return a chunk list's tail hash and its whole hash set.
++
++    Args:
++        object_keys: Object keys of one object group, in prefix order.
++
++    Returns:
++        tuple[bytes | None, frozenset[bytes]]: The last chunk's hash, and every
++        chunk hash present. The tail is ``None`` for an empty input.
++    """
++    hashes = [key.chunk_hash for key in object_keys]
++    if not hashes:
++        return None, frozenset()
++    return hashes[-1], frozenset(hashes)
+diff --git a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+index ef78cee0..4b4e1ff1 100644
+--- a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
++++ b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+@@ -71,6 +71,7 @@ from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_ranked
+ from lmcache.v1.distributed.error import L1Error
+ from lmcache.v1.distributed.l1_manager import L1Manager
+ from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
++from lmcache.v1.distributed.pin_groups import PinGroupRegistry, PinTarget
+ from lmcache.v1.distributed.storage_controller import StorageControllerInterface
+ from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
+     AddAdapterOp,
+@@ -266,6 +267,8 @@ class PrefetchController(StorageControllerInterface):
+         adapter_descriptors: Descriptors for each L2 adapter (same order).
+         policy: The prefetch policy for load plan decisions.
+         max_in_flight: Maximum number of concurrent prefetch requests.
++        pin_groups: Pin groups to hold a loaded prefix resident when the
++            request asks for it. ``None`` disables pinning on this path.
+     """
+ 
+     # Singleton dispatch for the in-flight load gauges: tests may construct
+@@ -282,8 +285,10 @@ class PrefetchController(StorageControllerInterface):
+         adapter_descriptors: list[AdapterDescriptor],
+         policy: PrefetchPolicy,
+         max_in_flight: int = 8,
++        pin_groups: "PinGroupRegistry | None" = None,
+     ) -> None:
+         self._l1_manager = l1_manager
++        self._pin_groups = pin_groups
+         self._l2_adapters: dict[int, L2AdapterInterface] = {
+             desc.index: adapter
+             for desc, adapter in zip(adapter_descriptors, l2_adapters, strict=True)
+@@ -392,6 +397,37 @@ class PrefetchController(StorageControllerInterface):
+     # External API (thread-safe)
+     # =========================================================================
+ 
++    def _pin_loaded(
++        self, request: PrefetchRequestSpec, loaded_keys: list[ObjectKey]
++    ) -> None:
++        """Hold a warmed prefix resident when the request asked for it.
++
++        A transfer writes a peer's prefix straight into L1 without a store, so
++        this is the only place a migrated prefix can be pinned. Without it a
++        trajectory that just moved would lose its cache to the next eviction,
++        which is exactly when its next turn needs it.
++
++        Args:
++            request: The finished prefetch request.
++            loaded_keys: The keys the load actually committed.
++        """
++        if self._pin_groups is None or not request.pin_group or not loaded_keys:
++            return
++        target = PinTarget(
++            group=request.pin_group,
++            version=request.pin_version,
++            tail=request.pin_tail,
++            keys=tuple(loaded_keys),
++            prefix_hashes=frozenset(key.chunk_hash for key in loaded_keys),
++        )
++        result = self._pin_groups.pin(target)
++        logger.debug(
++            "Pinned %d warmed keys under group %s (released %d groups)",
++            result.pinned,
++            result.group,
++            len(result.released_groups),
++        )
++
+     def submit_prefetch_request(
+         self,
+         spec: PrefetchRequestSpec,
+@@ -1343,6 +1379,7 @@ class PrefetchController(StorageControllerInterface):
+             if request.mode is PrefetchMode.WARM:
+                 # Warm: make ready, lock nothing.
+                 l1_mgr.finish_write(loaded_keys)
++                self._pin_loaded(request, loaded_keys)
+             else:
+                 # write-locked -> read-locked; num_kv_readers so each TP
+                 # worker gets its own read lock.
 diff --git a/lmcache/v1/distributed/storage_manager.py b/lmcache/v1/distributed/storage_manager.py
-index 1bd26022..1f4544e1 100644
+index 1bd26022..022be4d5 100644
 --- a/lmcache/v1/distributed/storage_manager.py
 +++ b/lmcache/v1/distributed/storage_manager.py
-@@ -767,6 +767,46 @@ class StorageManager:
+@@ -41,6 +41,7 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
+     L2ReconfigureError,
+ )
+ from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
++from lmcache.v1.distributed.pin_groups import PinGroupRegistry
+ from lmcache.v1.distributed.quota_manager import QuotaManager
+ from lmcache.v1.distributed.serde import create_serde_processor
+ from lmcache.v1.distributed.storage_controllers import (
+@@ -87,6 +88,15 @@ class StorageManager:
+         )
+         self._eviction_controller.start()
+ 
++        # Prefix-derived pin groups. Owned here so the store path, the prefetch
++        # controller, and the HTTP handlers all reach the same table.
++        self._pin_groups = PinGroupRegistry(
++            self._l1_manager,
++            policy=config.pin_config.policy,
++            budget_bytes=config.pin_config.budget_bytes,
++            ttl_seconds=config.pin_config.ttl_seconds,
++        )
++
+         # L2 adapters and store controller. When an adapter config carries
+         # a ``serde_config``, the adapter is wrapped with
+         # ``SerdeL2AdapterWrapper`` so controllers see a plain L2 adapter
+@@ -162,6 +172,7 @@ class StorageManager:
+             adapter_descriptors=list(self._adapter_descriptors.values()),
+             policy=create_prefetch_policy(config.prefetch_policy),
+             max_in_flight=config.prefetch_max_in_flight,
++            pin_groups=self._pin_groups,
+         )
+         self._prefetch_controller.start()
+ 
+@@ -767,6 +778,46 @@ class StorageManager:
          skipped = sum(1 for err in results.values() if err == L1Error.KEY_IS_LOCKED)
          return deleted, skipped
  
@@ -689,6 +1466,22 @@ index 1bd26022..1f4544e1 100644
      def unsafe_read(
          self, keys: list[ObjectKey]
      ) -> tuple[list[ObjectKey], list[MemoryObj]]:
+@@ -797,6 +848,15 @@ class StorageManager:
+         """Descriptor of the L1 memory buffer backing this storage manager."""
+         return self._l1_memory_desc
+ 
++    @property
++    def pin_groups(self) -> PinGroupRegistry:
++        """Prefix-derived pin groups holding L1 prefixes resident.
++
++        Exposed so the store path, the prefetch controller, and the HTTP
++        handlers all reach the same table.
++        """
++        return self._pin_groups
++
+     def get_l2_usages(
+         self,
+     ) -> list[tuple[int | float, dict[str, object]]]:
 diff --git a/lmcache/v1/mp_coordinator/cache_events.py b/lmcache/v1/mp_coordinator/cache_events.py
 index 409b887b..12abd34b 100644
 --- a/lmcache/v1/mp_coordinator/cache_events.py
@@ -1241,10 +2034,22 @@ index 00000000..50d9eb4a
 +        except ValueError as exc:
 +            raise InvalidRequest(str(exc)) from None
 diff --git a/lmcache/v1/multiprocess/cache_control/prefetch_service.py b/lmcache/v1/multiprocess/cache_control/prefetch_service.py
-index 692922da..c7b23786 100644
+index 692922da..5ffd9b77 100644
 --- a/lmcache/v1/multiprocess/cache_control/prefetch_service.py
 +++ b/lmcache/v1/multiprocess/cache_control/prefetch_service.py
-@@ -49,9 +49,15 @@ class PrefetchService:
+@@ -13,6 +13,11 @@ from typing import Any
+ 
+ # First Party
+ from lmcache.v1.distributed.api import Tier
++from lmcache.v1.distributed.pin_groups import (
++    MODEL_VERSION_CONFIG_KEY,
++    PIN_GROUP_CONFIG_KEY,
++    is_pin_group_requested,
++)
+ from lmcache.v1.multiprocess.cache_control.errors import (
+     InvalidRequest,
+     NotFound,
+@@ -49,9 +54,15 @@ class PrefetchService:
          cache_salt: str,
          source_tier: Tier,
          target_tier: Tier,
@@ -1260,7 +2065,7 @@ index 692922da..c7b23786 100644
          Returns:
              ``{"request_id", "chunks", "status": "submitted"}``, or
              ``{"chunks": 0, "status": "noop"}`` for a sub-chunk sequence.
-@@ -77,7 +83,12 @@ class PrefetchService:
+@@ -77,17 +88,62 @@ class PrefetchService:
              )
          try:
              obj_keys, chunks = resolve_object_keys(
@@ -1274,6 +2079,57 @@ index 692922da..c7b23786 100644
              )
          except ValueError as exc:
              raise InvalidRequest(str(exc)) from None
+         if not chunks:
+             return {"chunks": 0, "status": "noop"}
++        pin_group, pin_version, pin_tail = self._pin_decision(
++            ctx, obj_keys, request_configs
++        )
+         request_id = self._jobs.submit(
+-            self._engine.storage_manager, obj_keys, layout_desc
++            self._engine.storage_manager,
++            obj_keys,
++            layout_desc,
++            pin_group=pin_group,
++            pin_version=pin_version,
++            pin_tail=pin_tail,
+         )
+         return {"request_id": request_id, "chunks": chunks, "status": "submitted"}
+ 
++    @staticmethod
++    def _pin_decision(
++        ctx: Any,
++        obj_keys: list[Any],
++        request_configs: dict[str, Any] | None,
++    ) -> tuple[str, str, bytes]:
++        """Name the pin group for a warm prefetch, or leave it empty.
++
++        A transfer writes a peer's prefix into L1 without a store, so this is
++        the only place a migrated prefix can be pinned. The group is named the
++        same way the store path names one, so a migrated prefix and a
++        locally-stored one of the same conversation share a group.
++
++        Args:
++            ctx: The MP server context.
++            obj_keys: The keys the prefetch will load, in prefix order.
++            request_configs: The request's LMCache request configs.
++
++        Returns:
++            tuple[str, str, bytes]: Group id, model version, and tail chunk
++            hash. All empty when the prefix should not be retained.
++        """
++        configs = request_configs or {}
++        policy = ctx.storage_manager.pin_groups.policy
++        if not obj_keys or not is_pin_group_requested(policy, configs):
++            return "", "", b""
++        tail = obj_keys[-1].chunk_hash
++        version = str(configs.get(MODEL_VERSION_CONFIG_KEY, ""))
++        explicit = configs.get(PIN_GROUP_CONFIG_KEY)
++        group = str(explicit) if explicit else f"{version}:{tail.hex()}"
++        return group, version, tail
++
+     def status(self, request_id: str) -> dict[str, object]:
+         """Report a job's status, finalizing it on the first completed poll.
+ 
 diff --git a/lmcache/v1/multiprocess/config.py b/lmcache/v1/multiprocess/config.py
 index 396f24d9..6d604b25 100644
 --- a/lmcache/v1/multiprocess/config.py
@@ -1414,19 +2270,22 @@ index b8ecdb8d..55ca3b80 100644
          """Declared reader count; rejects keys from pre-field clients.
  
 diff --git a/lmcache/v1/multiprocess/http_apis/cache_api.py b/lmcache/v1/multiprocess/http_apis/cache_api.py
-index 22459c43..b5790cad 100644
+index 22459c43..9976c7bf 100644
 --- a/lmcache/v1/multiprocess/http_apis/cache_api.py
 +++ b/lmcache/v1/multiprocess/http_apis/cache_api.py
-@@ -10,6 +10,8 @@ A single ``/cache/*`` surface, thin over the typed services in
+@@ -10,6 +10,11 @@ A single ``/cache/*`` surface, thin over the typed services in
    (``GET /config/adapters``).
  - Prefetch  -- ``POST /cache/prefetches``, ``GET /cache/prefetches/{id}``
    (:class:`PrefetchService`).
 +- L1 pins   -- ``POST`` / ``DELETE /cache/l1/pins`` (:class:`PinService`);
 +  token-addressed, reference-counted L1 retention with no TTL.
++- Pin groups -- ``GET /cache/l1/pins/stats`` and ``DELETE`` on
++  ``/cache/l1/pins/groups[/{group}]``; prefix-derived groups with an idle TTL
++  and a byte budget, which is the retention path clients normally use.
  - Diagnostics -- ``POST /cache/clear``, ``POST /cache/checksums`` (engine-local).
  
  The object / prefetch routes are pass-throughs: the services validate and raise
-@@ -37,6 +39,7 @@ from lmcache.v1.multiprocess.http_apis.schemas import (
+@@ -37,6 +42,7 @@ from lmcache.v1.multiprocess.http_apis.schemas import (
      ChecksumRequest,
      ClearRequest,
      DeleteObjectsRequest,
@@ -1434,7 +2293,7 @@ index 22459c43..b5790cad 100644
      PrefetchRequest,
  )
  import lmcache.lmcache_native as lmcache_native
-@@ -122,6 +125,7 @@ async def submit_prefetch(body: PrefetchRequest, request: Request) -> dict[str,
+@@ -122,6 +128,7 @@ async def submit_prefetch(body: PrefetchRequest, request: Request) -> dict[str,
          body.cache_salt,
          body.source_tier,
          body.target_tier,
@@ -1442,7 +2301,7 @@ index 22459c43..b5790cad 100644
      )
  
  
-@@ -137,6 +141,51 @@ async def get_prefetch(request_id: str, request: Request) -> dict[str, object]:
+@@ -137,6 +144,104 @@ async def get_prefetch(request_id: str, request: Request) -> dict[str, object]:
      return get_context(request).prefetch_service.status(request_id)
  
  
@@ -1489,6 +2348,59 @@ index 22459c43..b5790cad 100644
 +        body.cache_salt,
 +        body.request_configs,
 +    )
++
++
++def _pin_groups(request: Request):
++    """Return this node's pin group registry."""
++    return get_context(request).engine.context.storage_manager.pin_groups
++
++
++@router.get("/cache/l1/pins/stats", response_model=None)
++async def pin_group_stats(request: Request) -> dict[str, object]:
++    """Report the prefix-derived pin groups holding L1 resident on this node.
++
++    Pin groups are what keeps a conversation prefix alive across the gap
++    between two turns. A non-zero ``rejected_total`` means a prefix was larger
++    than the whole budget and stayed unpinned, so it fell back to plain LRU.
++
++    Responses:
++        200: Policy, live groups, held bytes and keys, and cumulative counters.
++    """
++    return _pin_groups(request).stats()
++
++
++@router.delete("/cache/l1/pins/groups", response_model=None)
++async def release_all_pin_groups(request: Request) -> dict[str, object]:
++    """Release every pin group on this node.
++
++    Used after a weight update: objects pinned under an older model version
++    are already unreachable, because the version tag takes part in cache
++    identity, so holding them only spends budget.
++
++    Responses:
++        200: ``{"released", "status"}``.
++    """
++    released = _pin_groups(request).release_all()
++    return {"released": released, "status": "released"}
++
++
++@router.delete("/cache/l1/pins/groups/{group}", response_model=None)
++async def release_pin_group(group: str, request: Request) -> dict[str, object]:
++    """Release one pin group by id.
++
++    Idempotent: an unknown group succeeds, because a restarted server and an
++    expired TTL both leave a caller holding an id this node no longer knows.
++
++    Responses:
++        200: ``{"group", "unpinned", "bytes", "status"}``.
++    """
++    result = _pin_groups(request).release(group)
++    return {
++        "group": result.group,
++        "unpinned": result.pinned,
++        "bytes": result.bytes,
++        "status": "released",
++    }
 +
 +
  # ---------------------------------------------------------------------------
@@ -1712,3 +2624,614 @@ index ed6f9b84..7fc46a52 100644
                  instance_id=mp_config.instance_id,
                  # Server start time: fences out placements this instance
                  # reported before a restart (its pools restarted empty).
+diff --git a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+index 90688f19..15485246 100644
+--- a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -22,6 +22,7 @@ from lmcache.v1.distributed.api import (
+     MemoryLayoutDesc,
+     ObjectKey,
+ )
++from lmcache.v1.distributed.pin_groups import PinTarget
+ from lmcache.v1.gpu_connector.gpu_ops import (
+     build_staging_copies,
+     lmcache_memcpy_async_d2h,
+@@ -44,6 +45,7 @@ from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
+ from lmcache.v1.multiprocess.engine_module import InstanceLivenessTarget
+ from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+ from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
++from lmcache.v1.multiprocess.pin_policy import resolve_pin_target
+ from lmcache.v1.multiprocess.native_completion import (
+     DeviceHostFuncDispatcher,
+     submit_callback_to_stream,
+@@ -708,6 +710,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+             self._ctx.storage_manager.finish_read_prefetched,
+             payload_type=list[ObjectKey],
+         )
++        # Pins the stored prefix once the write is visible. The group has to be
++        # carried here rather than looked up later, because the callback runs
++        # after store() has returned.
++        self._device_host_func_dispatcher.register(
++            "finish_write_and_pin",
++            self._finish_write_and_pin,
++            payload_type=tuple[list[ObjectKey], list[ObjectKey], str, str, bytes],
++        )
+         self._device_host_func_dispatcher.start()
+ 
+     def register_host_func(self, kind: str, handler: Any, payload_type: Any) -> None:
+@@ -922,6 +932,38 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+             self._cache_contexts.clear()
+         self._release_entries(entries)
+ 
++    def _validate_chunk_size(
++        self, instance_id: int, engine_group_infos: list[EngineGroupInfo]
++    ) -> None:
++        """Fail registration when a rank's block geometry cannot form a chunk.
++
++        A chunk is an exact number of engine blocks on every rank, so a chunk
++        size that is not a multiple of a group's tokens-per-block would make
++        this server hash a different chunking than the workers store under.
++        That mismatch is silent and total, because caches and pins both stop
++        finding keys, so it is rejected here rather than at first use.
++
++        Args:
++            instance_id: The registering GPU instance, for the message.
++            engine_group_infos: The rank's per-engine-group block geometry.
++
++        Raises:
++            ValueError: If the chunk size is not a multiple of a group's tokens
++                per block.
++        """
++        chunk_size = self._ctx.chunk_size
++        for info in engine_group_infos:
++            tokens_per_block = info.tokens_per_block
++            if tokens_per_block <= 0:
++                continue
++            if chunk_size % tokens_per_block != 0:
++                raise ValueError(
++                    f"LMCache chunk size {chunk_size} must be a multiple of "
++                    f"engine group {info.engine_group_id}'s {tokens_per_block} "
++                    f"tokens per block (instance {instance_id}). Align the "
++                    "chunk size with the serving engine's block geometry."
++                )
++
+     def register_kv_cache(
+         self,
+         instance_id: int,
+@@ -948,6 +990,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 (already msgspec-decoded by the message queue).
+         """
+         now = time.monotonic()
++        self._validate_chunk_size(instance_id, engine_group_infos)
+         # NOOP-register: an already-registered instance (e.g. a recovering
+         # worker re-registering on its first ping) refreshes its last-seen
+         # time so a stale entry is not reaped right after recovery. REGISTER
+@@ -1035,6 +1078,79 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+         self._release_entries(popped)
+         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
+ 
++    def _finish_write_and_pin(
++        self,
++        finish_keys: list[ObjectKey],
++        pin_keys: list[ObjectKey],
++        group: str,
++        version: str,
++        tail: bytes,
++    ) -> None:
++        """Commit a store and hold its prefix resident in one stream step.
++
++        Runs on the device host-function dispatcher once the copy has landed,
++        which is the only moment the objects are both visible and still
++        associated with the group that named them. Doing both here is what
++        removes the window a control-plane pin would otherwise race.
++
++        Args:
++            finish_keys: Keys whose write lock to release.
++            pin_keys: Every object key of the stored prefix.
++            group: Pin group id.
++            version: Model version the objects were stored under.
++            tail: Chunk hash of the prefix's last complete chunk.
++        """
++        # Unlock first: a write-locked object is not yet readable by others.
++        self._ctx.storage_manager.finish_write(finish_keys)
++        if not pin_keys:
++            return
++        target = PinTarget(
++            group=group,
++            version=version,
++            tail=tail,
++            keys=tuple(pin_keys),
++            prefix_hashes=frozenset(pin_key.chunk_hash for pin_key in pin_keys),
++        )
++        result = self._ctx.storage_manager.pin_groups.pin(target)
++        if result.pinned:
++            logger.debug(
++                "Pinned %d keys under group %s (released %d groups)",
++                result.pinned,
++                result.group,
++                len(result.released_groups),
++            )
++
++    def _resolve_pin_target(
++        self, key: IPCCacheServerKey, obj_keys_per_obj_group: list[list[ObjectKey]]
++    ) -> PinTarget | None:
++        """Resolve the pin target for a store, or ``None`` to skip pinning.
++
++        Pinning is an optimisation, so failing to resolve it must never fail
++        the store that would have carried it.
++
++        Args:
++            key: The store's IPC key.
++            obj_keys_per_obj_group: The keys the store resolved, one list per
++                object group.
++
++        Returns:
++            PinTarget | None: The prefix to pin.
++        """
++        try:
++            return resolve_pin_target(
++                self._ctx.storage_manager.pin_groups.policy,
++                key.request_configs,
++                key,
++                list(range(len(obj_keys_per_obj_group))),
++                self._ctx.resolve_obj_keys,
++            )
++        except Exception:  # noqa: BLE001 - never fail a store over a pin
++            logger.exception(
++                "Cannot resolve a pin group for request %s; storing without pinning",
++                key.request_id,
++            )
++            return None
++
+     @_lmcache_nvtx_annotate
+     def store(
+         self,
+@@ -1246,11 +1362,27 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 # copied successfully; otherwise the whole store is skipped.
+                 stored_count = len(all_dict) if store_succeeded else 0
+                 if stored_count:
+-                    submit_callback_to_stream(
+-                        cache_context.cupy_stream,
+-                        "finish_write",
+-                        list(all_dict.keys()),
+-                    )
++                    pin_target = self._resolve_pin_target(key, obj_keys_per_obj_group)
++                    if pin_target is None:
++                        submit_callback_to_stream(
++                            cache_context.cupy_stream,
++                            "finish_write",
++                            list(all_dict.keys()),
++                        )
++                    else:
++                        # Commit and pin in one stream step, so the prefix is
++                        # never visible to eviction before it is pinned.
++                        submit_callback_to_stream(
++                            cache_context.cupy_stream,
++                            "finish_write_and_pin",
++                            (
++                                list(all_dict.keys()),
++                                list(pin_target.keys),
++                                pin_target.group,
++                                pin_target.version,
++                                pin_target.tail,
++                            ),
++                        )
+                 else:
+                     total_bytes = 0
+                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
+diff --git a/lmcache/v1/multiprocess/pin_policy.py b/lmcache/v1/multiprocess/pin_policy.py
+new file mode 100644
+index 00000000..f7b8eb0e
+--- /dev/null
++++ b/lmcache/v1/multiprocess/pin_policy.py
+@@ -0,0 +1,89 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Decide whether a request's prefix should be pinned, and name the group.
++
++The policy lives here rather than in the L1 layer because it needs the request
++key and the token hasher, which only the multiprocess server has. The
++bookkeeping it feeds lives in
++:class:`lmcache.v1.distributed.pin_groups.PinGroupRegistry`.
++"""
++
++# Standard
++from dataclasses import replace
++from typing import Any, Callable
++
++# First Party
++from lmcache.logging import init_logger
++from lmcache.v1.distributed.api import ObjectKey
++from lmcache.v1.distributed.pin_groups import (
++    MODEL_VERSION_CONFIG_KEY,
++    PIN_GROUP_CONFIG_KEY,
++    PinTarget,
++    is_pin_group_requested,
++    iter_group_leaves,
++)
++from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
++
++logger = init_logger(__name__)
++
++# Resolves a key's token range into per-object-group object keys.
++ResolveKeys = Callable[[IPCCacheServerKey, list[int]], list[list[ObjectKey]]]
++
++
++def resolve_pin_target(
++    policy: str,
++    request_configs: dict[str, Any] | None,
++    key: IPCCacheServerKey,
++    object_group_ids: list[int],
++    resolve_keys: ResolveKeys,
++) -> PinTarget | None:
++    """Resolve the prefix to pin, or ``None`` when the policy does not apply.
++
++    The group is named ``<model_version>:<tail chunk hash>`` unless the request
++    carries an explicit ``lmcache.pin_group``, which overrides it. The hash
++    suffix is what lets a later turn recognise this group as its own ancestor
++    without either side knowing a trajectory id.
++
++    The whole prefix is resolved, not just the chunks this call wrote, because
++    a group must cover the full prefix it claims: the next turn releases this
++    group, and anything it left uncovered would become evictable.
++
++    Args:
++        policy: ``off``, ``all``, or ``tagged``.
++        request_configs: The request's LMCache request configs.
++        key: The IPC key of the store or prefetch being pinned.
++        object_group_ids: Object groups to resolve keys for.
++        resolve_keys: Resolver for a key's token range.
++
++    Returns:
++        PinTarget | None: The prefix to pin, or ``None`` if it is not wanted or
++        the sequence holds no complete chunk.
++
++    Raises:
++        ValueError: Propagated from the resolver for an invalid key.
++    """
++    if not is_pin_group_requested(policy, request_configs):
++        return None
++
++    # The prefix always starts at token zero: a group covers a conversation's
++    # whole cached prefix, not the range one operation happened to touch.
++    prefix_key = replace(key, start=0, end=len(key.token_ids))
++    resolved = resolve_keys(prefix_key, object_group_ids)
++    if not resolved or not resolved[0]:
++        return None
++
++    tail, prefix_hashes = iter_group_leaves(resolved[0])
++    if tail is None:
++        return None
++
++    configs = request_configs or {}
++    version = str(configs.get(MODEL_VERSION_CONFIG_KEY, ""))
++    explicit = configs.get(PIN_GROUP_CONFIG_KEY)
++    group = str(explicit) if explicit else f"{version}:{tail.hex()}"
++
++    return PinTarget(
++        group=group,
++        version=version,
++        tail=tail,
++        keys=tuple(obj_key for group_keys in resolved for obj_key in group_keys),
++        prefix_hashes=prefix_hashes,
++    )
+diff --git a/lmcache/v1/multiprocess/warm_prefetch.py b/lmcache/v1/multiprocess/warm_prefetch.py
+index 13558231..1b66cba9 100644
+--- a/lmcache/v1/multiprocess/warm_prefetch.py
++++ b/lmcache/v1/multiprocess/warm_prefetch.py
+@@ -78,6 +78,9 @@ class WarmPrefetchJobs:
+         storage_manager: StorageManager,
+         keys: list[ObjectKey],
+         layout_desc: MemoryLayoutDesc,
++        pin_group: str = "",
++        pin_version: str = "",
++        pin_tail: bytes = b"",
+     ) -> str:
+         """Start a no-lock retain prefetch and register its handle.
+ 
+@@ -85,6 +88,10 @@ class WarmPrefetchJobs:
+             storage_manager: The MP server's storage manager.
+             keys: Object keys to load from L2 into L1.
+             layout_desc: Memory layout for the L1 write buffers.
++            pin_group: Pin group to hold the loaded prefix under, empty when the
++                caller does not want it retained past the idle TTL.
++            pin_version: Model version the loaded objects belong to.
++            pin_tail: Chunk hash of the prefix's last complete chunk.
+ 
+         Returns:
+             An opaque request id to pass to :meth:`poll`.
+@@ -95,6 +102,9 @@ class WarmPrefetchJobs:
+                 group_layout_descs={0: layout_desc},
+                 mode=PrefetchMode.WARM,
+                 policy=TrimPolicy.SPARSE,
++                pin_group=pin_group,
++                pin_version=pin_version,
++                pin_tail=pin_tail,
+             )
+         )
+         request_id = uuid.uuid4().hex
+diff --git a/tests/v1/distributed/test_pin_groups.py b/tests/v1/distributed/test_pin_groups.py
+new file mode 100644
+index 00000000..98df2e76
+--- /dev/null
++++ b/tests/v1/distributed/test_pin_groups.py
+@@ -0,0 +1,280 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Tests for prefix-derived pin groups.
++
++The registry is exercised against a fake L1 manager rather than a real slab, so
++the assertions can be about reference-count balance, which is the property that
++decides whether pinning leaks or wedges L1. The fake fails loudly on an
++unbalanced release instead of silently dropping the count to zero.
++"""
++
++# Standard
++import pytest
++
++# First Party
++from lmcache.v1.distributed.api import ObjectKey
++from lmcache.v1.distributed.pin_groups import (
++    PIN_GROUP_CONFIG_KEY,
++    PinGroupRegistry,
++    PinTarget,
++    is_pin_group_requested,
++    iter_group_leaves,
++)
++
++CHUNK = 8 * 1024
++
++
++def hashes(count: int) -> list[bytes]:
++    return [bytes([index + 1]) * 4 for index in range(count)]
++
++
++class FakeL1Manager:
++    """Minimal L1 manager whose reference counts must balance exactly."""
++
++    def __init__(self) -> None:
++        self.resident: set[ObjectKey] = set()
++        self.pins: dict[ObjectKey, int] = {}
++
++    def pin_with_sizes(self, keys: list[ObjectKey]) -> tuple[list[ObjectKey], int]:
++        pinned: list[ObjectKey] = []
++        total = 0
++        for key in keys:
++            if key not in self.resident:
++                continue
++            self.pins[key] = self.pins.get(key, 0) + 1
++            pinned.append(key)
++            total += CHUNK
++        return pinned, total
++
++    def unpin(self, keys: list[ObjectKey]) -> dict[ObjectKey, object]:
++        for key in keys:
++            if key not in self.pins:
++                # Mirrors L1Manager, which reports KEY_NOT_EXIST for a key that
++                # is already gone rather than failing the release.
++                continue
++            remaining = self.pins[key] - 1
++            assert remaining >= 0, f"unbalanced unpin for {key}"
++            self.pins[key] = remaining
++        return {}
++
++
++def key_for(chunk_hash: bytes, kv_rank: int = 0) -> ObjectKey:
++    return ObjectKey(chunk_hash=chunk_hash, model_name="model", kv_rank=kv_rank)
++
++
++def target(
++    group: str, chunk_hashes: list[bytes], ranks: int = 1, version: str = "1"
++) -> PinTarget:
++    return PinTarget(
++        group=group,
++        version=version,
++        tail=chunk_hashes[-1],
++        keys=tuple(
++            key_for(chunk_hash, rank)
++            for chunk_hash in chunk_hashes
++            for rank in range(ranks)
++        ),
++        prefix_hashes=frozenset(chunk_hashes),
++    )
++
++
++@pytest.fixture
++def l1() -> FakeL1Manager:
++    manager = FakeL1Manager()
++    all_hashes = hashes(8)
++    manager.resident = {key_for(chunk_hash) for chunk_hash in all_hashes}
++    return manager
++
++
++@pytest.fixture
++def registry(l1: FakeL1Manager) -> PinGroupRegistry:
++    return PinGroupRegistry(l1, policy="all", ttl_seconds=600.0)
++
++
++class TestPinGroupRegistry:
++    def test_pin_holds_every_resident_chunk(self, l1, registry):
++        chunk_hashes = hashes(3)
++        result = registry.pin(target("1:aa", chunk_hashes))
++        assert result.pinned == 3
++        assert result.bytes == 3 * CHUNK
++        assert registry.pinned_bytes == 3 * CHUNK
++        assert all(l1.pins[key_for(h)] == 1 for h in chunk_hashes)
++
++    def test_repinning_a_group_does_not_double_pin(self, l1, registry):
++        chunk_hashes = hashes(3)
++        registry.pin(target("1:aa", chunk_hashes))
++        result = registry.pin(target("1:aa", chunk_hashes))
++        assert result.pinned == 0
++        assert result.already == 3
++        assert all(l1.pins[key_for(h)] == 1 for h in chunk_hashes)
++
++    def test_missing_chunks_are_counted_not_pinned(self, l1, registry):
++        chunk_hashes = hashes(3)
++        l1.resident.discard(key_for(chunk_hashes[2]))
++        result = registry.pin(target("1:aa", chunk_hashes))
++        assert result.pinned == 2
++        assert result.missing == 1
++        assert key_for(chunk_hashes[2]) not in l1.pins
++
++    def test_a_longer_prefix_supersedes_its_ancestor(self, l1, registry):
++        """The next turn replaces the previous group without unpinning shared chunks."""
++        first = hashes(3)
++        registry.pin(target("1:aa", first))
++        longer = hashes(5)
++        result = registry.pin(target("1:bb", longer))
++
++        assert result.released_groups == ("1:aa",)
++        assert registry.live_groups() == ["1:bb"]
++        # Every chunk of the longer prefix is held exactly once: the ancestor's
++        # pin was released while the new group took its own.
++        assert all(l1.pins[key_for(h)] == 1 for h in longer)
++
++    def test_superseded_group_is_released_after_chunks_leave_l1(self, l1, registry):
++        """A chunk that is gone cannot be unpinned, and must not break the ledger."""
++        first = hashes(3)
++        registry.pin(target("1:aa", first))
++        l1.resident.discard(key_for(first[0]))
++        # Keep the pin map consistent with L1 losing the object outright.
++        l1.pins.pop(key_for(first[0]), None)
++
++        result = registry.pin(target("1:bb", hashes(5)))
++        assert "1:aa" in result.released_groups
++        assert registry.live_groups() == ["1:bb"]
++
++    def test_a_newer_version_releases_the_previous_one(self, l1, registry):
++        registry.pin(target("1:aa", hashes(3), version="1"))
++        result = registry.pin(target("2:bb", hashes(5), version="2"))
++        assert result.released_groups == ("1:aa",)
++        assert registry.live_groups() == ["2:bb"]
++
++    def test_release_is_idempotent(self, l1, registry):
++        chunk_hashes = hashes(3)
++        registry.pin(target("1:aa", chunk_hashes))
++        assert registry.release("1:aa").pinned == 3
++        assert all(l1.pins[key_for(h)] == 0 for h in chunk_hashes)
++        # Releasing again, or releasing something never seen, succeeds.
++        assert registry.release("1:aa").pinned == 0
++        assert registry.release("never-existed").released_groups == ("never-existed",)
++
++    def test_release_all_clears_every_group(self, l1, registry):
++        registry.pin(target("1:aa", hashes(2)))
++        registry.pin(target("1:bb", hashes(3)))
++        assert registry.release_all() == 2
++        assert registry.stats()["groups"] == 0
++        assert all(count == 0 for count in l1.pins.values())
++
++    def test_idle_groups_expire(self, l1):
++        now = {"value": 1000.0}
++        registry = PinGroupRegistry(
++            l1, policy="all", ttl_seconds=10.0, clock=lambda: now["value"]
++        )
++        registry.pin(target("1:aa", hashes(3)))
++        now["value"] += 5
++        assert registry.sweep() == 0
++        now["value"] += 11
++        assert registry.sweep() == 1
++        assert registry.live_groups() == []
++
++    def test_budget_releases_the_oldest_group_first(self, l1):
++        now = {"value": 1000.0}
++        registry = PinGroupRegistry(
++            l1, policy="all", budget_bytes=3 * CHUNK, clock=lambda: now["value"]
++        )
++        registry.pin(target("1:aa", hashes(2)))
++        now["value"] += 1
++        result = registry.pin(target("1:bb", hashes(3)))
++
++        assert result.released_groups == ("1:aa",)
++        assert registry.pinned_bytes <= 3 * CHUNK
++        assert registry.live_groups() == ["1:bb"]
++
++    def test_a_prefix_larger_than_the_budget_is_refused(self, l1):
++        """The cap is hard: one oversized prefix falls back to LRU, unpinned."""
++        registry = PinGroupRegistry(l1, policy="all", budget_bytes=2 * CHUNK)
++        result = registry.pin(target("1:aa", hashes(4)))
++
++        assert result.rejected == "budget"
++        assert result.pinned == 0
++        assert registry.pinned_bytes == 0
++        assert registry.live_groups() == []
++        assert registry.stats()["rejected_total"] == 1
++
++    def test_stats_report_the_live_set(self, l1, registry):
++        registry.pin(target("1:aa", hashes(3), ranks=2))
++        stats = registry.stats()
++        assert stats["policy"] == "all"
++        assert stats["groups"] == 1
++        assert stats["keys"] == 6
++        assert stats["bytes"] == 6 * CHUNK
++        assert stats["budget_bytes"] == 0
++        assert stats["groups_detail"][0]["group"] == "1:aa"
++
++    def test_ranks_are_pinned_independently(self, l1):
++        registry = PinGroupRegistry(l1, policy="all")
++        l1.resident = {key_for(hashes(2)[0], rank) for rank in range(2)}
++        result = registry.pin(target("1:aa", hashes(2)[:1], ranks=2))
++        assert result.pinned == 2
++        assert l1.pins[key_for(hashes(2)[0], 0)] == 1
++        assert l1.pins[key_for(hashes(2)[0], 1)] == 1
++
++    def test_config_rejects_unknown_policy_and_values(self, l1):
++        with pytest.raises(ValueError):
++            PinGroupRegistry(l1, policy="sometimes")
++        with pytest.raises(ValueError):
++            PinGroupRegistry(l1, policy="all", budget_bytes=-1)
++        with pytest.raises(ValueError):
++            PinGroupRegistry(l1, policy="all", ttl_seconds=0)
++
++
++class TestPinPolicyHelpers:
++    def test_policy_off_never_pins(self):
++        assert is_pin_group_requested("off", None) is False
++        assert is_pin_group_requested("off", {PIN_GROUP_CONFIG_KEY: "g"}) is False
++
++    def test_policy_all_pins_every_request(self):
++        assert is_pin_group_requested("all", None) is True
++
++    def test_policy_tagged_requires_the_tag(self):
++        assert is_pin_group_requested("tagged", None) is False
++        assert is_pin_group_requested("tagged", {}) is False
++        assert is_pin_group_requested("tagged", {PIN_GROUP_CONFIG_KEY: "g"}) is True
++
++    def test_iter_group_leaves_reports_tail_and_set(self):
++        chunk_hashes = hashes(3)
++        tail, present = iter_group_leaves([key_for(h) for h in chunk_hashes])
++        assert tail == chunk_hashes[-1]
++        assert present == frozenset(chunk_hashes)
++        assert iter_group_leaves([]) == (None, frozenset())
++
++
++class TestPinGroupIsNotCacheIdentity:
++    def test_derive_tags_ignores_the_pin_group(self):
++        """A pin group must never change which objects a lookup addresses."""
++        # First Party
++        from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
++
++        tagged = IPCCacheServerKey(
++            model_name="model",
++            world_size=1,
++            worker_id=0,
++            token_ids=(1, 2, 3),
++            start=0,
++            end=3,
++            request_id="r1",
++            request_configs={
++                PIN_GROUP_CONFIG_KEY: "trajectory-a",
++                "lmcache.tag.model_version": "7",
++            },
++        )
++        assert tagged.derive_tags() == (("model_version", "7"),)
++
++        untagged = IPCCacheServerKey(
++            model_name="model",
++            world_size=1,
++            worker_id=0,
++            token_ids=(1, 2, 3),
++            start=0,
++            end=3,
++            request_id="r2",
++            request_configs={PIN_GROUP_CONFIG_KEY: "trajectory-b"},
++        )
++        assert untagged.derive_tags() == ()

@@ -13,7 +13,7 @@ from verl.utils.tokenizer.chat_template import apply_chat_template, initialize_s
 
 from psrl.environments.base import ConversationType, Environment
 from psrl.workers.agent_loop.agent_data.base import AgentData, SessionData, Trajectory
-from psrl.workers.gen.utils import TokenOutput
+from psrl.workers.gen.utils import TokenOutput, rollout_token_budget
 
 
 def normalize_openai_messages(openai_messages: list[dict]) -> ConversationType:
@@ -281,7 +281,7 @@ class ConversationAgentData(AgentData[ConversationType, object]):
             bool: True if `len(prompt_ids) + len(response_ids) >= max_model_len`.
         """
         rollout = self.config.gen_actor_rollout_ref.rollout
-        max_model_len = rollout.prompt_length + rollout.response_length
+        max_model_len = rollout_token_budget(rollout)
         context_len = len(trajectory.prompt_ids) + len(trajectory.response_ids)
         return context_len >= max_model_len
 

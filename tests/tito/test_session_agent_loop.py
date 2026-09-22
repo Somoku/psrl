@@ -292,3 +292,58 @@ async def test_normalize_messages_rejects_ambiguous_fallback_count():
 
     with pytest.raises(ValueError, match="Cannot align image placeholders"):
         await normalize_messages(messages, mm_data={"images": ["only-one"]})
+
+
+_BUDGET = 65536
+
+
+def _loop_with_budget(rollout_budget: int) -> SessionAgentLoop:
+    loop = _bare_loop()
+    loop.rollout_budget = rollout_budget
+    return loop
+
+
+def _training_data(prompt_tokens: int, response_tokens: int, routed_experts_rows: int = 0) -> dict:
+    return {
+        "trajectory_id": 3,
+        "prompt_ids": list(range(prompt_tokens)),
+        "response_ids": list(range(response_tokens)),
+        "response_mask": [1] * response_tokens,
+        "logprobs": [-0.5] * response_tokens,
+        "routed_experts": None if routed_experts_rows == 0 else [[0]] * routed_experts_rows,
+        "num_turns": 7,
+        "finish_reason": "stop",
+    }
+
+
+def test_build_token_output_keeps_a_response_longer_than_response_length() -> None:
+    # A multi-turn trajectory is one sample whose limit is the total context, so a
+    # 40k response must survive while prompt+response fits the trainable budget.
+    loop = _loop_with_budget(_BUDGET)
+    training_data = _training_data(prompt_tokens=1000, response_tokens=40000)
+
+    output = loop.build_token_output(training_data)
+
+    assert len(output.response_ids) == 40000
+    assert len(output.response_mask) == 40000
+    assert len(output.response_log_probs) == 40000
+
+
+def test_build_token_output_clamps_only_at_the_shared_budget() -> None:
+    loop = _loop_with_budget(_BUDGET)
+    training_data = _training_data(prompt_tokens=30000, response_tokens=40000)
+
+    output = loop.build_token_output(training_data)
+
+    assert len(output.response_ids) == _BUDGET - 30000
+    assert len(output.response_mask) == len(output.response_ids)
+    assert len(output.response_log_probs) == len(output.response_ids)
+
+
+def test_build_token_output_trims_routed_experts_to_the_kept_tokens() -> None:
+    loop = _loop_with_budget(_BUDGET)
+    training_data = _training_data(prompt_tokens=30000, response_tokens=40000, routed_experts_rows=200000)
+
+    output = loop.build_token_output(training_data)
+
+    assert len(output.routed_experts) == 30000 + (_BUDGET - 30000)

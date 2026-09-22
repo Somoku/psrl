@@ -72,6 +72,8 @@ def get_logs_eval(
     # the surrounding sentinels captured between them.
     if not status_map and markers:
         status_map = parser(log_text, test_spec)
+    # Upstream reports `ok=True` for an empty map, and under `fail_only` an empty
+    # map marks every expected test as success. An unreadable log must not score.
     return status_map, bool(status_map)
 
 
@@ -88,6 +90,9 @@ def get_eval_tests_report(
         if test_passed(test_case, eval_status_map):
             success.append(test_case)
         else:
+            # NOTE(claude): Upstream drops a SKIPPED expected test from both lists,
+            # which empties the fail-to-pass denominator and resolves the task.
+            # An expected test that did not pass must count as a failure.
             failed.append(test_case)
 
     def check_fail_only(test_case: str, success: list[str], failed: list[str]) -> None:

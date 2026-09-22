@@ -138,6 +138,10 @@ class DockerLifecycle:
             self._stop_event.set()
             heartbeat_thread = self._heartbeat_thread
             self._heartbeat_thread = None
+        # Join the writer before removing the lease, or a heartbeat already in flight
+        # recreates the file and leaves a live-looking lease for a dead owner.
+        if heartbeat_thread is not None and heartbeat_thread is not threading.current_thread():
+            heartbeat_thread.join(timeout=1.0)
         force_remove_containers_by_label(
             "psrl.actor_id",
             self.owner_id,
@@ -147,8 +151,6 @@ class DockerLifecycle:
             remove_owner_heartbeat(self.config.heartbeat_dir, self.owner_id)
         except OSError as exc:
             psrl_logger.warning(f"Could not remove Docker owner lease {self.owner_id!r}: {exc}.")
-        if heartbeat_thread is not None and heartbeat_thread is not threading.current_thread():
-            heartbeat_thread.join(timeout=1.0)
         if self._atexit_registered:
             atexit.unregister(self.close)
             self._atexit_registered = False

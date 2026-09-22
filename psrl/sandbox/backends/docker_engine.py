@@ -21,19 +21,6 @@ class DockerEngineError(RuntimeError):
         self.message = message
 
 
-class DockerExecOutputLimitError(RuntimeError):
-    """A Docker exec stream exceeded the configured output budget.
-
-    This is a transport guard rather than an Engine API failure: the response
-    is HTTP 200, but the client stopped reading it. It is deliberately not a
-    `DockerEngineError`, which carries an HTTP status that callers branch on.
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__(f"Docker command output limit exceeded: {message}.")
-        self.message = message
-
-
 class DockerEngine(Protocol):
     """Operations consumed by `DockerBackend`."""
 
@@ -67,7 +54,7 @@ class DockerEngine(Protocol):
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
         timeout_s: float | None = None,
-    ) -> tuple[int, bytes, bytes]: ...
+    ) -> tuple[int, bytes, bytes, bool]: ...
 
     async def read_file(self, container_id: str, path: str) -> bytes: ...
 
@@ -127,19 +114,38 @@ class DockerEngineClient:
         timeout_s: float | None = None,
         max_response_bytes: int | None = None,
         **kwargs: Any,
-    ) -> tuple[aiohttp.typedefs.LooseHeaders, bytes, int]:
+    ) -> tuple[aiohttp.typedefs.LooseHeaders, bytes, int, bool]:
+        """Send one Engine request, optionally bounding the retained response body.
+
+        A bounded read keeps draining the response after the budget is spent instead of
+        abandoning it. Abandoning the stream would leave the command running inside the
+        container with nobody reading it, which is why the old behaviour had to destroy
+        the sandbox to stay safe. Draining costs bandwidth and keeps memory bounded, so
+        the caller gets a truncated answer from a healthy container.
+
+        Returns:
+            The response headers, the retained body, the status, and whether the body
+            was truncated.
+        """
         session = await self._get_session()
         if timeout_s is not None:
             kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout_s)
         async with session.request(method, f"{self._base_url}{path}", **kwargs) as response:
             if max_response_bytes is None:
                 body = await response.read()
+                truncated = False
             else:
                 buffer = bytearray()
+                truncated = False
                 async for chunk in response.content.iter_chunked(64 * 1024):
-                    if len(buffer) + len(chunk) > max_response_bytes:
-                        raise DockerExecOutputLimitError(f"{max_response_bytes} bytes")
-                    buffer.extend(chunk)
+                    if truncated:
+                        continue
+                    room = max_response_bytes - len(buffer)
+                    if len(chunk) > room:
+                        buffer.extend(chunk[:room])
+                        truncated = True
+                    else:
+                        buffer.extend(chunk)
                 body = bytes(buffer)
             if response.status not in expected:
                 message = body.decode(errors="replace")
@@ -148,10 +154,10 @@ class DockerEngineClient:
                 except (json.JSONDecodeError, AttributeError):
                     pass
                 raise DockerEngineError(response.status, message.strip())
-            return response.headers, body, response.status
+            return response.headers, body, response.status, truncated
 
     async def info(self) -> Mapping[str, Any]:
-        _, body, _ = await self._request("GET", "/info", expected=(200,))
+        _, body, _, _ = await self._request("GET", "/info", expected=(200,))
         return json.loads(body)
 
     async def pull_image(self, reference: str, auth: Mapping[str, str] | None = None) -> None:
@@ -179,12 +185,12 @@ class DockerEngineClient:
         """
         Check the daemon cache without downloading or refreshing a mutable tag.
         """
-        _, _, status = await self._request("GET", f"/images/{quote(reference, safe='')}/json", expected=(200, 404))
+        _, _, status, _ = await self._request("GET", f"/images/{quote(reference, safe='')}/json", expected=(200, 404))
         return status == 200
 
     async def create_container(self, name: str, config: Mapping[str, Any]) -> str:
         path = f"/containers/create?name={quote(name, safe='')}"
-        _, body, _ = await self._request("POST", path, expected=(201,), json=dict(config))
+        _, body, _, _ = await self._request("POST", path, expected=(201,), json=dict(config))
         return str(json.loads(body)["Id"])
 
     async def start_container(self, container_id: str) -> None:
@@ -202,12 +208,12 @@ class DockerEngineClient:
             f"&repo={quote(repository, safe='')}&tag={quote(tag, safe='')}"
         )
         # The Engine API rejects /commit unless Content-Type is application/json.
-        _, body, _ = await self._request("POST", path, expected=(201,), json={})
+        _, body, _, _ = await self._request("POST", path, expected=(201,), json={})
         return str(json.loads(body)["Id"])
 
     async def inspect_container(self, container_id: str) -> Mapping[str, Any] | None:
         try:
-            _, body, _ = await self._request("GET", f"/containers/{container_id}/json", expected=(200,))
+            _, body, _, _ = await self._request("GET", f"/containers/{container_id}/json", expected=(200,))
         except DockerEngineError as exc:
             if exc.status == 404:
                 return None
@@ -236,7 +242,16 @@ class DockerEngineClient:
         await self._request("POST", f"/containers/{container_id}/unpause", expected=(204,))
 
     @staticmethod
-    def _demultiplex_exec(body: bytes) -> tuple[bytes, bytes]:
+    def _demultiplex_exec(body: bytes) -> tuple[bytes, bytes, bool]:
+        """Split a framed exec stream into (stdout, stderr, truncated).
+
+        The Docker stream protocol frames stdout and stderr as
+        ``[stream][3 pad][big-endian size][payload]``. A body that ends mid-frame is
+        reported as truncated and the partial frame is dropped: returning the frame
+        header and its payload as if they were output would put binary framing into a
+        command's result. A body that is not framed at all is passed through unchanged,
+        which keeps clients of providers that return raw output working.
+        """
         stdout = bytearray()
         stderr = bytearray()
         offset = 0
@@ -245,13 +260,15 @@ class DockerEngineClient:
             frame_size = int.from_bytes(body[offset + 4 : offset + 8], "big")
             frame_end = offset + 8 + frame_size
             if stream not in (1, 2) or frame_end > len(body):
-                return body, b""
+                if offset == 0:
+                    return body, b"", False
+                return bytes(stdout), bytes(stderr), True
             target = stdout if stream == 1 else stderr
             target.extend(body[offset + 8 : frame_end])
             offset = frame_end
         if offset != len(body):
-            return body, b""
-        return bytes(stdout), bytes(stderr)
+            return bytes(stdout), bytes(stderr), True
+        return bytes(stdout), bytes(stderr), False
 
     async def exec(
         self,
@@ -261,7 +278,7 @@ class DockerEngineClient:
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
         timeout_s: float | None = None,
-    ) -> tuple[int, bytes, bytes]:
+    ) -> tuple[int, bytes, bytes, bool]:
         payload: dict[str, Any] = {
             "AttachStdout": True,
             "AttachStderr": True,
@@ -272,14 +289,14 @@ class DockerEngineClient:
             payload["WorkingDir"] = cwd
         if env:
             payload["Env"] = [f"{key}={value}" for key, value in env.items()]
-        _, body, _ = await self._request(
+        _, body, _, _ = await self._request(
             "POST",
             f"/containers/{container_id}/exec",
             expected=(201,),
             json=payload,
         )
         exec_id = str(json.loads(body)["Id"])
-        _, output, _ = await self._request(
+        _, output, _, output_truncated = await self._request(
             "POST",
             f"/exec/{exec_id}/start",
             expected=(200,),
@@ -287,17 +304,17 @@ class DockerEngineClient:
             max_response_bytes=self.max_exec_output_bytes,
             json={"Detach": False, "Tty": False},
         )
-        _, inspect_body, _ = await self._request("GET", f"/exec/{exec_id}/json", expected=(200,))
+        _, inspect_body, _, _ = await self._request("GET", f"/exec/{exec_id}/json", expected=(200,))
         inspection = json.loads(inspect_body)
         if inspection.get("Running") or inspection.get("ExitCode") is None:
             raise DockerEngineError(200, "Docker exec stream ended before a final exit status was available")
         exit_code = int(inspection["ExitCode"])
-        stdout, stderr = self._demultiplex_exec(output)
-        return exit_code, stdout, stderr
+        stdout, stderr, framing_truncated = self._demultiplex_exec(output)
+        return exit_code, stdout, stderr, output_truncated or framing_truncated
 
     async def read_file(self, container_id: str, path: str) -> bytes:
         archive_path = quote(path, safe="")
-        _, body, _ = await self._request(
+        _, body, _, _ = await self._request(
             "GET",
             f"/containers/{container_id}/archive?path={archive_path}",
             expected=(200,),
@@ -332,7 +349,7 @@ class DockerEngineClient:
         )
 
     async def stats(self, container_id: str) -> Mapping[str, Any]:
-        _, body, _ = await self._request(
+        _, body, _, _ = await self._request(
             "GET",
             f"/containers/{container_id}/stats?stream=false&one-shot=true",
             expected=(200,),

@@ -15,6 +15,7 @@ from psrl.environments.tool_env import ToolAction
 from psrl.tools.tool_parser.base import ToolParser
 from psrl.workers.agent_loop.agent_data.base import AgentData
 from psrl.workers.agent_loop.agent_data.conversation_agent_data import ConversationAgentData
+from psrl.workers.gen.utils import rollout_token_budget
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -236,9 +237,6 @@ class ToolAgentData(ConversationAgentData):
         # Check length limit
         usage = output.get("usage", {})
         total_tokens = usage.get("total_tokens", 0)
-        overlong = total_tokens > (
-            self.config.gen_actor_rollout_ref.rollout.prompt_length
-            + self.config.gen_actor_rollout_ref.rollout.response_length
-        )
+        overlong = total_tokens > rollout_token_budget(self.config.gen_actor_rollout_ref.rollout)
 
         return tool_calls_dict, overlong

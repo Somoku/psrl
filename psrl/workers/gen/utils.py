@@ -14,6 +14,24 @@ DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_CONNECTIONS = 2000
 
 
+def rollout_token_budget(rollout_config: Any) -> int:
+    """
+    Return the trainable context budget shared by prompt and response tokens.
+
+    A multi-turn trajectory is one sample whose real limit is the total context,
+    so prompt and response share one budget. Capping the response at
+    `rollout.response_length` alone would drop the final turns of a long episode.
+
+    Args:
+        rollout_config (Any): A rollout config exposing `prompt_length` and
+            `response_length`, either a structured config or an OmegaConf node.
+
+    Returns:
+        int: The prompt plus response token budget.
+    """
+    return int(rollout_config.prompt_length) + int(rollout_config.response_length)
+
+
 @dataclass
 class TokenInput:
     input_ids: list[int]

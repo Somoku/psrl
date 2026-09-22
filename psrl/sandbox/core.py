@@ -9,6 +9,25 @@ from enum import Enum
 from typing import Any
 
 
+class SandboxOomError(RuntimeError):
+    """Raised when a sandbox's container was OOM-killed mid-command.
+
+    The kernel kills the whole container, so the episode loses its sandbox and any
+    partial work in it. Reported as its own type because it is a resource fault, not
+    a model or task failure, and it must not be confused with a slow or hung episode.
+    """
+
+
+class SandboxCapacityTimeout(RuntimeError):
+    """Raised when node capacity admission never granted a sandbox in time.
+
+    The sandbox was never created, so no episode ever ran: this is a capacity
+    planning fault rather than a task, model, or harness failure. It is reported
+    as its own type so callers can classify it apart from a cancelled or failed
+    episode, and so the wait is visible instead of surfacing as a bare
+    cancellation."""
+
+
 class SandboxFeature(str, Enum):
     """Optional semantic features exposed by a sandbox backend."""
 
@@ -148,7 +167,20 @@ class MountSpec:
 
 @dataclass(frozen=True)
 class SandboxSpec:
-    """Portable sandbox creation request."""
+    """Portable sandbox creation request.
+
+    ``resource_class`` names the role this sandbox plays in a workflow, such as
+    ``rollout`` or ``grader``. Node capacity admission grants each class a
+    guaranteed share of the envelope, so the name must be declared by the
+    caller that knows the role and never inferred from the requested size.
+    Inferring it from size is what let a large grader class starve behind a
+    steady stream of smaller rollout requests.
+
+    ``workflow_id`` groups the leases that belong to one multi-phase job, such as
+    a rollout sandbox followed by a grader sandbox. It lets the manager detect a
+    job that holds one sandbox while asking for another, which is the shape that
+    deadlocks a shared envelope.
+    """
 
     source: SandboxSource
     resources: ResourceSpec = field(default_factory=ResourceSpec)
@@ -161,12 +193,18 @@ class SandboxSpec:
     idempotency_key: str | None = None
     state_policy: SandboxStatePolicy = field(default_factory=SandboxStatePolicy)
     required_features: frozenset[SandboxFeature] = frozenset()
+    resource_class: str = "default"
+    workflow_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.idle_timeout_s is not None and self.idle_timeout_s <= 0:
             raise ValueError("Sandbox timeout must be greater than zero.")
         if self.idempotency_key is not None and not self.idempotency_key.strip():
             raise ValueError("Sandbox idempotency_key cannot be empty.")
+        if not self.resource_class.strip():
+            raise ValueError("Sandbox resource_class cannot be empty.")
+        if self.workflow_id is not None and not self.workflow_id.strip():
+            raise ValueError("Sandbox workflow_id cannot be empty when set.")
 
 
 @dataclass(frozen=True)
@@ -176,6 +214,9 @@ class ExecResult:
     exit_code: int
     stdout: str
     stderr: str
+    # Set when the backend stopped retaining output at its diagnostic budget. The command
+    # itself ran to completion, so this reports a bounded answer rather than a failure.
+    truncated: bool = False
 
 
 @dataclass(frozen=True)

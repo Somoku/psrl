@@ -16,6 +16,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
 from verl.utils.tokenizer.chat_template import apply_chat_template, initialize_system_prompt
 
+from psrl.sandbox import SandboxCapacityTimeout
 from psrl.utils.common.http_io_thread import get_http_io_thread
 from psrl.utils.common.http_utils import (
     RequestAbortedByGatewayError,
@@ -31,8 +32,14 @@ from psrl.utils.rollout.vision_utils import (
     resolve_message_image_refs,
 )
 from psrl.workers.agent_loop.context import AgentLoopContext
+from psrl.workers.agent_loop.loops.budget import (
+    EpisodeBudget,
+    EpisodeBudgetExpired,
+    RolloutDeadlineExceeded,
+)
 from psrl.workers.agent_loop.loops.utils import TerminateReason
-from psrl.workers.gen.utils import TokenInput, TokenOutput
+from psrl.workers.agent_loop.timeouts import resolve_from_config
+from psrl.workers.gen.utils import TokenInput, TokenOutput, rollout_token_budget
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__name__)
@@ -40,6 +47,17 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 class AgentLoopBase(ABC):
+    """Base class for one rollout episode.
+
+    A loop that provisions a sandbox before doing episode work sets
+    `episode_starts_after_provisioning` and calls `arm_episode_budget` once the
+    sandbox and environment are ready. That keeps node capacity admission, which is
+    scheduling latency, out of the episode budget; the admission deadline bounds it
+    instead. Loops that do no provisioning keep the default and are timed from the call.
+    """
+
+    episode_starts_after_provisioning = False
+
     def __init__(
         self,
         context: AgentLoopContext,
@@ -53,6 +71,10 @@ class AgentLoopBase(ABC):
         self.model_config = self.config.gen_actor_rollout_ref.model
         self.rollout_config = self.config.gen_actor_rollout_ref.rollout
         self.rollout_gateway_url = context.rollout_gateway_url.rstrip("/")
+        # One ladder for every deadline this loop enforces, derived from the episode budget
+        # so the harness cap, the setup allowance, and the manager's stall threshold cannot
+        # disagree with each other.
+        self.timeouts = resolve_from_config(self.config)
 
         self.reward_manager = context.reward_manager
         self.ps_manager_handle = context.ps_manager_handle
@@ -69,7 +91,11 @@ class AgentLoopBase(ABC):
         self.loop = asyncio.get_running_loop()
         self.response_length = self.rollout_config.response_length
         self.prompt_length = self.rollout_config.prompt_length
+        self.rollout_budget = rollout_token_budget(self.rollout_config)
         self.output_in_tq = False
+        # Replaced per attempt by `run_with_termination_handling`. The placeholder is
+        # disabled so `arm_episode_budget` is safe on a loop used outside that path.
+        self.episode_budget = EpisodeBudget(None, starts_after_provisioning=self.episode_starts_after_provisioning)
         # Retry handling may convert an exception into a TerminateReason, so keep the original
         # failure for the final worker and manager diagnostics.
         self.last_error: BaseException | None = None
@@ -511,15 +537,15 @@ class AgentLoopBase(ABC):
         if has_images and self.gateway_multimodal.uses_rust_preprocessing:
             input_length = self.rollout_config.prompt_length
 
-        # When max_model_len is not configured (None), fall back to prompt_length + response_length
+        # When max_model_len is not configured (None), fall back to the shared rollout budget.
         max_model_len = self.rollout_config.max_model_len
         if max_model_len is None:
-            max_model_len = self.rollout_config.prompt_length + self.rollout_config.response_length
+            max_model_len = rollout_token_budget(self.rollout_config)
         max_possible_tokens = max_model_len - input_length
         if max_possible_tokens < 0:
             raise ValueError(f"Input length {input_length} exceeds the maximum model length {max_model_len}")
 
-        max_tokens = self.rollout_config.response_length + self.rollout_config.prompt_length - input_length
+        max_tokens = rollout_token_budget(self.rollout_config) - input_length
         max_tokens = max(0, min(max_tokens, max_possible_tokens))
         assert max_tokens <= max_possible_tokens, (
             f"max_tokens={max_tokens} exceeds available context space={max_possible_tokens}."
@@ -700,11 +726,40 @@ class AgentLoopBase(ABC):
                 else:
                     psrl_logger.exception(f"Unsupported value: type={type(v)!r}, key={k!r}.")
 
-            timeout = self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
-            output, terminate_reason = await asyncio.wait_for(
-                self.run(prompt),
-                timeout=timeout,
+            # The budget excludes sandbox admission and preparation for loops that provision
+            # a sandbox, because that time is scheduling latency rather than episode work.
+            # The setup allowance is what keeps the excluded region bounded.
+            self.episode_budget = EpisodeBudget(
+                self.timeouts.episode_timeout_s,
+                starts_after_provisioning=self.episode_starts_after_provisioning,
+                setup_limit_s=self.timeouts.setup_timeout_s,
             )
+            output, terminate_reason = None, None
+            run_task = asyncio.ensure_future(self.run(prompt))
+            try:
+                output, terminate_reason = await self.episode_budget.wait_for(run_task)
+            except RolloutDeadlineExceeded as expired:
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+                self._record_error(expired)
+                psrl_logger.error(
+                    "Rollout for request %s never started an episode within its %ss setup allowance.",
+                    request_ids,
+                    self.timeouts.setup_timeout_s,
+                )
+                return None, TerminateReason.ROLLOUT_DEADLINE_EXCEEDED
+            except EpisodeBudgetExpired as expired:
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+                self._record_error(expired)
+                psrl_logger.error(
+                    "Episode budget expired in agent_loop.run for request %s after %ss of episode time "
+                    "(%.0fs spent in admission and preparation).",
+                    request_ids,
+                    self.episode_budget.total_s,
+                    self.episode_budget.wait_s(),
+                )
+                return None, TerminateReason.TRAJECTORY_TIMEOUT
             if output is not None:
                 await self._resolve_version_for_dump(output, prompt)
                 self._attach_loop_timing(output)
@@ -743,16 +798,28 @@ class AgentLoopBase(ABC):
                 e.request_id or "N/A",
             )
             return None, TerminateReason.ABORTED
-        except asyncio.TimeoutError:
+        except SandboxCapacityTimeout as exc:
+            # The sandbox was never admitted, so no episode ran. Reported separately from a
+            # rollout error because the fix is a capacity setting, not a task or harness change.
+            self._record_error(exc)
             psrl_logger.error(
-                "Timeout in agent_loop.run for request %s (this can come from downstream calls, not only trajectory_timeout)",  # noqa: E501
+                "Sandbox capacity was never granted for request %s.\nUnderlying failure:\n%s",
                 request_ids,
-                exc_info=True,
+                self.last_error_traceback,
             )
-            return None, TerminateReason.TRAJECTORY_TIMEOUT
+            return None, TerminateReason.SANDBOX_CAPACITY_TIMEOUT
+        except asyncio.TimeoutError as exc:
+            # A call inside the episode timed out, which is an infrastructure fault
+            # rather than the configured episode budget. Record its traceback first.
+            self._record_error(exc)
+            psrl_logger.error(
+                "Downstream timeout in agent_loop.run for request %s.\nUnderlying failure:\n%s",
+                request_ids,
+                self.last_error_traceback,
+            )
+            return None, TerminateReason.DOWNSTREAM_TIMEOUT
         except Exception as exc:
-            self.last_error = exc
-            self.last_error_traceback = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            self._record_error(exc)
             if not raise_on_error:
                 psrl_logger.error(
                     "Exception in agent_loop.run for request %s.\nUnderlying failure:\n%s",
@@ -762,6 +829,20 @@ class AgentLoopBase(ABC):
                 )
                 return None, TerminateReason.ROLLOUT_ERROR
             raise
+
+    def _record_error(self, exc: BaseException) -> None:
+        """Keep the original failure for the worker and manager diagnostics."""
+        self.last_error = exc
+        self.last_error_traceback = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+    def arm_episode_budget(self) -> None:
+        """Start the episode clock now that the sandbox and environment are ready.
+
+        Called by loops that declare `episode_starts_after_provisioning`. Until this
+        runs, time spent on capacity admission and preparation is not charged to the
+        episode; the admission deadline bounds that region on its own.
+        """
+        self.episode_budget.arm()
 
     def _attach_loop_timing(self, output: "TokenOutput | list[TokenOutput]") -> None:
         """Stamp the per-trajectory wall-clock timing onto each output.

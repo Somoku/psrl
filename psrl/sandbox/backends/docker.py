@@ -21,7 +21,6 @@ from psrl.sandbox.backends.docker_engine import (
     DockerEngine,
     DockerEngineClient,
     DockerEngineError,
-    DockerExecOutputLimitError,
 )
 from psrl.sandbox.backends.docker_lifecycle import DockerLifecycle, DockerLifecycleConfig
 from psrl.sandbox.core import (
@@ -31,6 +30,7 @@ from psrl.sandbox.core import (
     SandboxBackend,
     SandboxCapabilities,
     SandboxFeature,
+    SandboxOomError,
     SandboxRef,
     SandboxSession,
     SandboxSource,
@@ -89,6 +89,12 @@ def _append_no_proxy_alias(value: str, host_alias: str) -> str:
     return ",".join(dict.fromkeys([*entries, host_alias]))
 
 
+def _describe_command(command: str, limit: int = 120) -> str:
+    """Return a one-line preview of a command for a diagnostic message."""
+    flat = " ".join(command.split())
+    return repr(flat if len(flat) <= limit else f"{flat[:limit]}...")
+
+
 @dataclass(frozen=True)
 class DockerSecurityConfig:
     """Security controls applied to every Docker sandbox."""
@@ -102,10 +108,15 @@ class DockerSecurityConfig:
     seccomp_profile: str | None = None
     user: str | None = None
     tmpfs: Mapping[str, str] = field(default_factory=dict)
+    # Protect the container's init from the kernel OOM killer, so a runaway command
+    # dies instead of the whole container. None leaves Docker's default of 0.
+    oom_score_adj: int | None = -500
 
     def __post_init__(self) -> None:
         if self.pids_limit <= 0:
             raise ValueError("Docker pids_limit must be greater than zero.")
+        if self.oom_score_adj is not None and not -1000 <= self.oom_score_adj <= 1000:
+            raise ValueError("Docker oom_score_adj must be within [-1000, 1000] or None.")
 
 
 @dataclass(frozen=True)
@@ -124,6 +135,7 @@ class DockerPolicyProfile:
     seccomp_profile: str | None = None
     user: str | None = None
     tmpfs: Mapping[str, str] = field(default_factory=dict)
+    oom_score_adj: int | None = None
 
     def __post_init__(self) -> None:
         if self.pids_limit is not None and self.pids_limit <= 0:
@@ -186,6 +198,7 @@ class DockerBackend(SandboxBackend):
         keepalive_command: Sequence[str] = ("tail", "-f", "/dev/null"),
         command_interpreter: Sequence[str] = ("bash", "-lc"),
         request_timeout_s: float = 180.0,
+        container_watch_interval_s: float = 15.0,
         connection_limit: int = 128,
         image_pull_concurrency: int = 2,
         max_exec_output_bytes: int = 16 * 1024 * 1024,
@@ -207,6 +220,12 @@ class DockerBackend(SandboxBackend):
         )
         self.keepalive_command = tuple(keepalive_command)
         self.command_interpreter = tuple(command_interpreter)
+        # Retained so a session can describe its own truncation without reaching into the
+        # engine client, which test doubles and other engines do not have to expose.
+        self.max_exec_output_bytes = max_exec_output_bytes
+        if container_watch_interval_s <= 0:
+            raise ValueError("Docker container_watch_interval_s must be greater than zero.")
+        self.container_watch_interval_s = container_watch_interval_s
         if not self.keepalive_command or not self.command_interpreter:
             raise ValueError("Docker keepalive_command and command_interpreter cannot be empty.")
         self.owner_id = os.getenv(owner_id_env, "")
@@ -403,6 +422,9 @@ class DockerBackend(SandboxBackend):
             host_config["NanoCpus"] = int(spec.resources.cpu_count * 1_000_000_000)
         if spec.resources.memory_mb is not None:
             host_config["Memory"] = spec.resources.memory_mb * 1024 * 1024
+        oom_score_adj = self.security.oom_score_adj if policy.oom_score_adj is None else policy.oom_score_adj
+        if oom_score_adj is not None:
+            host_config["OomScoreAdj"] = oom_score_adj
 
         environment = dict(spec.env)
         if policy.host_gateway_alias:
@@ -591,6 +613,7 @@ class DockerSession(SandboxSession):
         self._command_count = 0
         self._terminate_lock = asyncio.Lock()
         self._terminated = False
+        self._lost_container_reason: str | None = None
         self._timeout_task = (
             asyncio.create_task(self._terminate_at_deadline(lifetime_timeout_s))
             if lifetime_timeout_s is not None
@@ -655,39 +678,136 @@ class DockerSession(SandboxSession):
         timeout_s: float | None = None,
     ) -> ExecResult:
         self._command_count += 1
+        self._lost_container_reason = None
+        exec_task = asyncio.ensure_future(self._run_command(command, cwd=cwd, env=env, timeout_s=timeout_s))
+        # A container that dies mid-command leaves the exec stream open forever, so the
+        # command has to be aborted as soon as the container stops.
+        watcher = asyncio.ensure_future(self._watch_container(exec_task))
         try:
             with self.backend.metrics.measure("exec"):
-                exit_code, stdout, stderr = await asyncio.wait_for(
-                    self.backend.engine.exec(
-                        self.sandbox_id,
-                        [*self.backend.command_interpreter, command],
-                        cwd=cwd,
-                        env=env,
-                        timeout_s=timeout_s,
-                    ),
-                    timeout=timeout_s,
-                )
+                done, _ = await asyncio.wait({exec_task}, timeout=timeout_s)
+            if exec_task not in done:
+                exec_task.cancel()
+                await asyncio.gather(exec_task, return_exceptions=True)
+                raise TimeoutError(f"Docker command timed out (requested timeout={timeout_s!r}).")
+            exit_code, stdout, stderr, truncated = exec_task.result()
         except (
             asyncio.CancelledError,
             TimeoutError,
             asyncio.TimeoutError,
             aiohttp.ClientError,
             DockerEngineError,
-            DockerExecOutputLimitError,
         ) as exc:
-            # Losing the exec stream does not stop the process in Docker.
-            try:
-                await self.terminate()
-            except Exception:
-                psrl_logger.warning("Failed to terminate a Docker sandbox after command failure.", exc_info=True)
-            if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
-                raise TimeoutError(f"Docker command timed out (requested timeout={timeout_s!r}).") from exc
-            raise
+            replacement = await self._container_failure(exc, timeout_s=timeout_s)
+            if replacement is exc:
+                raise
+            raise replacement from exc
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+        text_stdout = stdout.decode(errors="replace")
+        text_stderr = stderr.decode(errors="replace")
+        if truncated:
+            psrl_logger.warning(
+                f"Docker sandbox {self.sandbox_id} produced more output than the "
+                f"{self.backend.max_exec_output_bytes}-byte diagnostic budget while running "
+                f"{_describe_command(command)}; the command completed and its output is truncated."
+            )
+            marker = (
+                f"\n[psrl: output truncated at {self.backend.max_exec_output_bytes} bytes; write the "
+                "result to a file and read that file when the full output matters]\n"
+            )
+            if text_stdout:
+                text_stdout += marker
+            else:
+                text_stderr += marker
         return ExecResult(
             exit_code=exit_code,
-            stdout=stdout.decode(errors="replace"),
-            stderr=stderr.decode(errors="replace"),
+            stdout=text_stdout,
+            stderr=text_stderr,
+            truncated=truncated,
         )
+
+    async def _run_command(
+        self,
+        command: str,
+        *,
+        cwd: str | None,
+        env: Mapping[str, str] | None,
+        timeout_s: float | None,
+    ) -> tuple[int, bytes, bytes, bool]:
+        """Run one command inside the container and return its raw result."""
+        return await self.backend.engine.exec(
+            self.sandbox_id,
+            [*self.backend.command_interpreter, command],
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+        )
+
+    async def _watch_container(self, exec_task: asyncio.Future) -> None:
+        """Abort a command once its container stops, and record why it stopped."""
+        while not exec_task.done():
+            await asyncio.sleep(self.backend.container_watch_interval_s)
+            reason = await self._container_stop_reason()
+            if reason is None:
+                continue
+            self._lost_container_reason = reason
+            exec_task.cancel()
+            return
+
+    async def _container_stop_reason(self) -> str | None:
+        """Return why the container is no longer running, or None while it is."""
+        try:
+            inspection = await self.backend.engine.inspect_container(self.sandbox_id)
+        except (aiohttp.ClientError, DockerEngineError):
+            return None
+        if inspection is None:
+            return "removed"
+        state = inspection.get("State") or {}
+        # Only an explicit `Running: False` proves the container stopped. An inspect
+        # payload that omits it must not turn a stream failure into a stop.
+        if state.get("Running") is not False:
+            return None
+        return "oom_killed" if state.get("OOMKilled") else "exited"
+
+    async def _container_failure(self, exc: BaseException, *, timeout_s: float | None) -> BaseException:
+        """Classify a command failure and release the sandbox it happened in.
+
+        Only failures that leave the container unusable belong here: a stopped or
+        OOM-killed container, or a lost transport. A command that merely produced more
+        output than the diagnostic budget is not one of them, because the engine drains
+        and truncates that stream rather than abandoning it, so the container is still
+        healthy and the caller gets a bounded answer instead of losing its work.
+        """
+        if self._lost_container_reason is None:
+            self._lost_container_reason = await self._container_stop_reason()
+        reason = self._lost_container_reason
+        # Losing the exec stream does not stop the process in Docker.
+        try:
+            await self.terminate()
+        except Exception:
+            psrl_logger.warning("Failed to terminate a Docker sandbox after command failure.", exc_info=True)
+        if reason == "oom_killed":
+            memory_mb = self._spec.resources.memory_mb if self._spec is not None else None
+            psrl_logger.error(
+                "Docker sandbox %s was OOM-killed during a command (memory limit %s MB).",
+                self.sandbox_id,
+                memory_mb,
+            )
+            return SandboxOomError(
+                f"Docker sandbox {self.sandbox_id} was OOM-killed during a command, "
+                f"so the episode lost its container and its work. memory_limit_mb={memory_mb}. "
+                "Raise the sandbox memory limit for this workload."
+            )
+        if reason is not None:
+            return RuntimeError(
+                f"Docker sandbox {self.sandbox_id} stopped ({reason}) while a command was running, "
+                f"so the command never completed. Underlying failure: {exc!r}."
+            )
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            return TimeoutError(f"Docker command timed out (requested timeout={timeout_s!r}).")
+        return exc
 
     async def read_bytes(self, path: str) -> bytes:
         with self.backend.metrics.measure("read_bytes"):

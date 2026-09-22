@@ -10,6 +10,21 @@ thinking_template: multi_traj
 # is refilled with a fresh prompt, and any success resets the count.
 refill_failure_threshold: 32
 
+# Consecutive groups that may be lost to node capacity admission before training aborts. Each
+# attempt already costs the full sandbox `capacity.acquire_timeout_s`, and its replacement pays it
+# again, so an exhausted node would otherwise refill forever while the buffer never fills. Set to
+# 0 to wait indefinitely.
+capacity_failure_threshold: 4
+
+# Seconds of silence after which a training entry is treated as dead and refilled. This is a
+# liveness check: children heartbeat while they work, so a slow episode keeps its entry alive
+# and is bounded by its own episode budget instead of by this number. Leave it null to derive
+# it from the heartbeat (a few missed beats); set it only to raise it.
+entry_stall_timeout_s: null
+
+# Seconds between progress lines while the driver waits for an incomplete buffer.
+buffer_wait_log_interval_s: 60
+
 # Per-trajectory text dump written by all agent loops via TrajectoryWriter.
 # Files land at <dir>/v{version}/{uid}.txt (one per rollout trajectory).
 trajectory_output:

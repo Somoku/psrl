@@ -273,25 +273,27 @@ class SessionAgentLoop(AgentLoopBase):
     def build_token_output(self, training_data: dict, *, extra_fields: dict | None = None) -> TokenOutput:
         """Convert one TITO trajectory into the canonical rollout output.
 
-        The response side is clamped to `rollout.response_length`, mirroring
-        `AgentData.finalize_output` and `GenerateAgentLoop`. Without the clamp an
-        over-long trajectory reaches the trainer intact and trips
-        `rearrange_micro_batches`' `max_token_len >= max_seq_len` assertion, which
-        surfaces as a crash rather than a truncated sample.
+        The response is clamped to the trainable context budget left after the
+        prompt, not to `rollout.response_length`. A multi-turn trajectory is one
+        sample whose real limit is the total context, so clamping at
+        `response_length` would drop the final turns of a long valid episode.
+        Without any clamp an over-long sample trips `rearrange_micro_batches`'
+        `max_token_len >= max_seq_len` assertion instead of being truncated.
         """
-        response_length = int(self.rollout_config.response_length)
-        response_ids = training_data["response_ids"][:response_length]
-        response_mask = training_data["response_mask"][:response_length]
+        prompt_ids = training_data["prompt_ids"]
+        response_budget = max(0, self.rollout_budget - len(prompt_ids))
+        response_ids = training_data["response_ids"][:response_budget]
+        response_mask = training_data["response_mask"][:response_budget]
         logprobs = training_data["logprobs"]
-        response_log_probs = logprobs[:response_length] if logprobs else None
+        response_log_probs = logprobs[:response_budget] if logprobs else None
         routed_experts = training_data["routed_experts"]
         if routed_experts is not None:
-            routed_experts = routed_experts[: len(training_data["prompt_ids"]) + response_length]
+            routed_experts = routed_experts[: len(prompt_ids) + response_budget]
 
         trajectory_fields = dict(extra_fields or {})
         trajectory_fields["trajectory_id"] = training_data["trajectory_id"]
         return TokenOutput(
-            prompt_ids=training_data["prompt_ids"],
+            prompt_ids=prompt_ids,
             response_ids=response_ids,
             response_mask=response_mask,
             response_log_probs=response_log_probs,

@@ -69,6 +69,33 @@ def test_mini_swe_runner_maps_task_data_to_portable_specs() -> None:
     assert "ROLLOUT_ONLY" not in grader.env
 
 
+def test_mini_swe_runner_declares_the_capacity_class_and_workflow() -> None:
+    """Both sandboxes of a task name their capacity class and share one workflow id.
+
+    The class keeps the larger grader from starving behind a stream of rollout
+    requests, and the shared workflow id lets the manager report a job that asks for
+    its grader before releasing its rollout sandbox.
+    """
+    payload = _payload()
+    payload["sandbox_prefix"] = "task-1"
+    payload["runtime_config"]["sandbox_config"]["rollout_environment"]["resource_class"] = "rollout"
+    payload["runtime_config"]["sandbox_config"]["grader_environment"]["resource_class"] = "grader"
+
+    rollout = build_sandbox_spec(payload)
+    grader = build_sandbox_spec(payload, grading=True)
+
+    assert rollout.resource_class == "rollout"
+    assert grader.resource_class == "grader"
+    assert rollout.workflow_id == grader.workflow_id == "task-1"
+    assert rollout.idempotency_key != grader.idempotency_key
+
+
+def test_mini_swe_runner_defaults_the_capacity_class() -> None:
+    payload = _payload()
+
+    assert build_sandbox_spec(payload).resource_class == "default"
+
+
 def test_mini_swe_runner_preserves_forward_env_and_docker_memory_units() -> None:
     payload = _payload()
     payload["runtime_config"]["sandbox_config"]["environment"].update(

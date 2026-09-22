@@ -32,14 +32,14 @@ def _write_heartbeat(heartbeat_dir: str, owner_id: str, age_s: float) -> None:
     os.utime(docker_utils.owner_heartbeat_path(heartbeat_dir, owner_id), (when, when))
 
 
-def _install_docker_list(monkeypatch, containers: list[tuple[str, str]]) -> list[list[str]]:
+def _install_docker_list(monkeypatch, containers: list[tuple[str, str, str]]) -> list[list[str]]:
     """Fake ``docker ps``/``docker rm -f`` and return the recorded argv calls."""
     calls: list[list[str]] = []
 
     def fake_run(args, **kwargs):
         calls.append(list(args))
         if args[1] == "ps":
-            stdout = "".join(f"{container_id}\t{actor_id}\n" for container_id, actor_id in containers).encode()
+            stdout = "".join(f"{cid}\t{actor}\t{state}\n" for cid, actor, state in containers).encode()
             return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
         return SimpleNamespace(returncode=0, stdout=("\n".join(args[3:]) + "\n").encode(), stderr=b"")
 
@@ -52,8 +52,8 @@ def test_sweep_reaps_only_containers_with_expired_owner_leases(monkeypatch, tmp_
     _write_heartbeat(heartbeat_dir, "stale-owner", age_s=10_000)
     _write_heartbeat(heartbeat_dir, "fresh-owner", age_s=1)
     containers = [
-        ("stale-sandbox", "stale-owner"),
-        ("fresh-sandbox", "fresh-owner"),
+        ("stale-sandbox", "stale-owner", "running"),
+        ("fresh-sandbox", "fresh-owner", "running"),
     ]
     calls = _install_docker_list(monkeypatch, containers)
 
@@ -66,7 +66,7 @@ def test_sweep_reaps_only_containers_with_expired_owner_leases(monkeypatch, tmp_
 
 def test_sweep_reaps_missing_owner_heartbeat(monkeypatch, tmp_path) -> None:
     heartbeat_dir = str(tmp_path / "hb")
-    calls = _install_docker_list(monkeypatch, [("orphan", "dead-actor")])
+    calls = _install_docker_list(monkeypatch, [("orphan", "dead-actor", "running")])
 
     reaped, _ = docker_utils.sweep_stale_sandboxes(heartbeat_dir, ttl_s=900)
 
@@ -110,3 +110,24 @@ def test_failed_docker_query_is_not_reported_as_idle(monkeypatch, tmp_path) -> N
 
     assert reaped == []
     assert remaining is None
+
+
+def test_sweep_reaps_a_stopped_sandbox_even_while_its_owner_lives(monkeypatch, tmp_path) -> None:
+    # A container that exited can never serve another command, so an OOM-killed one
+    # must not hold its name and disk until its owner happens to exit.
+    heartbeat_dir = str(tmp_path / "hb")
+    _write_heartbeat(heartbeat_dir, "live-owner", age_s=1)
+    calls = _install_docker_list(
+        monkeypatch,
+        [
+            ("oom-killed", "live-owner", "exited"),
+            ("healthy", "live-owner", "running"),
+        ],
+    )
+
+    reaped, remaining = docker_utils.sweep_stale_sandboxes(heartbeat_dir, ttl_s=900)
+
+    assert reaped == ["oom-killed"]
+    assert ["docker", "rm", "-f", "-v", "oom-killed"] in calls
+    assert remaining == 1
+    assert os.path.exists(docker_utils.owner_heartbeat_path(heartbeat_dir, "live-owner"))

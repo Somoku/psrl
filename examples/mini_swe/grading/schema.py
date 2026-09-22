@@ -144,6 +144,10 @@ class GradingPlan:
 class GradingResult:
     """
     The scorecard shared by the sandbox driver and the reward adapter.
+
+    `f2p_failed` and `p2p_failed` name the expected tests that did not pass, so a
+    consumer can tell an environment-broken test from a regression. Each list is
+    bounded by the row's own expected tests.
     """
 
     resolved: bool = False
@@ -151,6 +155,8 @@ class GradingResult:
     f2p_total: int = 0
     p2p_pass: int = 0
     p2p_total: int = 0
+    f2p_failed: tuple[str, ...] = ()
+    p2p_failed: tuple[str, ...] = ()
     parser_error: str | None = None
     failure_reason: str | None = None
     timeout: bool = False
@@ -172,11 +178,15 @@ class GradingResult:
                 raise ValueError("Scorecard errors must be strings or null.")
         if not isinstance(self.output_tail, str):
             raise ValueError("Scorecard output_tail must be a string.")
+        object.__setattr__(self, "f2p_failed", normalize_test_ids(self.f2p_failed))
+        object.__setattr__(self, "p2p_failed", normalize_test_ids(self.p2p_failed))
         if self.resolved and (
             self.timeout
             or self.failure_reason
             or self.parser_error
             or self.error
+            or self.f2p_failed
+            or self.p2p_failed
             or self.f2p_pass != self.f2p_total
             or self.p2p_pass != self.p2p_total
             or self.f2p_total + self.p2p_total == 0

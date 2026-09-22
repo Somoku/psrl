@@ -17,7 +17,9 @@ loop produced no sample).
 
 The `acc` field (0/1 float, set in `agent_data.finalize_output`) is emitted
 alongside `score` on wandb to track resolve_rate separately from the shaped
-training signal.
+training signal. `gold_ceiling` and `grading_failed` qualify it, so a low `acc`
+can be told apart from a split that cannot be solved and from a grader that
+could not read its own log.
 """
 
 import logging
@@ -278,6 +280,25 @@ def _compute_swe_reward(
     return {"score": score, "acc": 0.0}
 
 
+def _grading_diagnostics(extra_info: dict[str, Any] | None) -> dict[str, float]:
+    """
+    Return the val metrics that qualify `acc`.
+
+    `gold_ceiling` is 1.0 when the row resolves with its own gold patch, so
+    `acc` can be read against the best score the split allows. `grading_failed`
+    marks a sample the grader could not score for infrastructure reasons, which
+    keeps an unreadable log from being read as a wrong answer.
+    """
+    info = extra_info or {}
+    problem = info.get("swe_problem") or {}
+    grader_result = info.get("grader_result") or {}
+    ceiling = problem.get("gold_ceiling")
+    return {
+        "gold_ceiling": 1.0 if ceiling is None else float(ceiling),
+        "grading_failed": float(bool(grader_result.get("failure_reason"))),
+    }
+
+
 # --- PSRL reward entry point ---
 
 
@@ -309,9 +330,10 @@ def compute_score(
         float: For toy data sources (``mini_swe_agent_simple``, ``mini_swe_agent``),
             returns a plain float reward in the range [-0.1, 1.0].
         dict[str, Any]: For SWE-bench data sources (``swebench_verified``,
-            ``swe_smith_py``, ``swe_gym``), returns ``{"score": float, "acc": float}`` so that
-            `DAPORewardLoopManager` emits both the shaped training signal and the
-            0/1 resolve_rate metric to wandb separately.
+            ``swe_smith_py``, ``swe_gym``), returns ``{"score": float, "acc": float,
+            "gold_ceiling": float, "grading_failed": float}`` so that
+            `DAPORewardLoopManager` emits the shaped training signal, the 0/1
+            resolve rate, and the grading diagnostics to wandb separately.
 
             Reward values are +1.0 resolved, 0.0 aborted (0 turns or Docker failure),
             0.0 not resolved (binary_01 mode), -1.0 in all other cases (binary mode),
@@ -319,7 +341,9 @@ def compute_score(
     """
     # --- SWE-bench Verified / SWE-smith-py: test-execution reward ---
     if data_source in ("swebench_verified", "swe_smith_py", "swe_gym"):
-        return _compute_swe_reward(extra_info, reward_mode=reward_mode)
+        result = _compute_swe_reward(extra_info, reward_mode=reward_mode)
+        result.update(_grading_diagnostics(extra_info))
+        return result
 
     # --- Toy / simple-test data sources: patch-overlap shaping ---
     if data_source not in ("mini_swe_agent_simple", "mini_swe_agent"):

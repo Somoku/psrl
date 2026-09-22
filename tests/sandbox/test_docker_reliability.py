@@ -9,7 +9,7 @@ import aiohttp
 import pytest
 from psrl.sandbox import SandboxManager, SandboxSource, SandboxSpec, SnapshotKind, SnapshotRef
 from psrl.sandbox.backends.docker import DockerBackend
-from psrl.sandbox.backends.docker_engine import DockerEngineClient, DockerEngineError, DockerExecOutputLimitError
+from psrl.sandbox.backends.docker_engine import DockerEngineClient, DockerEngineError
 from psrl.sandbox.utils import docker_utils
 
 from tests.sandbox.test_docker_backend import FakeDockerEngine
@@ -57,17 +57,19 @@ async def test_pull_rejects_errors_in_successful_http_stream(monkeypatch, field)
     assert response.closed, "Failed image pulls must release the connection."
 
 
-async def test_exec_output_budget_closes_the_response(monkeypatch) -> None:
-    response = StreamResponse([b"1234", b"5678"])
+async def test_exec_output_budget_truncates_and_drains(monkeypatch) -> None:
+    """An oversized command result is bounded, not fatal, and never abandons the stream."""
+    response = StreamResponse([b"1234", b"5678", b"90"])
     engine = DockerEngineClient()
     monkeypatch.setattr(
         engine, "_get_session", AsyncMock(return_value=SimpleNamespace(request=lambda *a, **k: response))
     )
 
-    with pytest.raises(DockerExecOutputLimitError):
-        await engine._request("POST", "/exec/id/start", expected=(200,), max_response_bytes=5)
+    _, body, _, truncated = await engine._request("POST", "/exec/id/start", expected=(200,), max_response_bytes=5)
 
-    assert response.closed, "Oversized output must release the connection."
+    assert body == b"12345", "The retained prefix must respect the budget."
+    assert truncated is True
+    assert response.closed, "The rest of the stream must be drained so the command can finish."
 
 
 async def test_prepare_shares_pull_and_survives_one_cancelled_waiter(monkeypatch) -> None:
@@ -128,7 +130,10 @@ async def test_prepare_limits_distinct_image_downloads_and_drains_on_shutdown(mo
     assert engine.closed, "Shutdown must close the transport."
 
 
-@pytest.mark.parametrize("error", [aiohttp.ClientPayloadError("broken"), DockerExecOutputLimitError("large")])
+@pytest.mark.parametrize(
+    "error",
+    [aiohttp.ClientPayloadError("broken"), DockerEngineError(500, "daemon error")],
+)
 async def test_exec_stream_failure_terminates_the_container(monkeypatch, error) -> None:
     engine = FakeDockerEngine()
     backend = DockerBackend(engine=engine)
@@ -139,6 +144,19 @@ async def test_exec_stream_failure_terminates_the_container(monkeypatch, error) 
         await session.exec("background-work")
 
     assert engine.removes == 1, "Disconnected exec processes must not outlive their sandbox."
+
+
+async def test_oversized_exec_output_keeps_the_sandbox(monkeypatch) -> None:
+    """A bounded answer must not cost the episode its container or its workspace."""
+    engine = FakeDockerEngine()
+    session = await DockerBackend(engine=engine).create(SandboxSpec(SandboxSource.image("image")))
+    monkeypatch.setattr(engine, "exec", AsyncMock(return_value=(0, b"x" * 32, b"", True)))
+
+    result = await session.exec("cat large-file")
+
+    assert result.truncated is True
+    assert "output truncated" in result.stdout, "A truncated answer must say so."
+    assert engine.removes == 0, "A large command result must not terminate a healthy sandbox."
 
 
 async def test_exec_deadline_includes_engine_setup(monkeypatch) -> None:
@@ -167,7 +185,9 @@ async def test_snapshot_references_are_immutable(monkeypatch) -> None:
 
 
 def test_gc_does_not_treat_unreadable_lease_as_dead_owner(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(docker_utils, "_list_sandbox_containers", lambda command, **kwargs: [("container", "owner")])
+    monkeypatch.setattr(
+        docker_utils, "_list_sandbox_containers", lambda command, **kwargs: [("container", "owner", "running")]
+    )
 
     def unreadable(*args, **kwargs):
         raise PermissionError("unreadable lease")
@@ -184,7 +204,13 @@ async def test_exec_requires_a_final_exit_status(monkeypatch, inspection) -> Non
     monkeypatch.setattr(
         engine,
         "_request",
-        AsyncMock(side_effect=[({}, b'{"Id":"exec"}', 201), ({}, b"", 200), ({}, json.dumps(inspection), 200)]),
+        AsyncMock(
+            side_effect=[
+                ({}, b'{"Id":"exec"}', 201, False),
+                ({}, b"", 200, False),
+                ({}, json.dumps(inspection), 200, False),
+            ]
+        ),
     )
 
     with pytest.raises(DockerEngineError, match="final exit status"):

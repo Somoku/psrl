@@ -15,7 +15,7 @@ from examples.mini_swe.utils.harness_task import build_harness_prompt, collect_g
 from examples.mini_swe.utils.integrity import scan_trajectory_integrity
 
 from psrl.environments import Environment
-from psrl.sandbox import SandboxSession, SnapshotRef
+from psrl.sandbox import SandboxCapacityTimeout, SandboxSession, SnapshotRef
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.harness import HarnessResult, HarnessRuntime, HarnessTaskContext
 from psrl.workers.agent_loop.loops.harness_agent_loop import HarnessAgentLoop
@@ -208,7 +208,19 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
         if artifact.integrity.get("violated") or patch_policy.get("violated"):
             grader_result = self._integrity_failure_result(swe_problem, artifact.integrity, patch_policy)
         else:
-            grader_result = await self._grade_patch(task, artifact.patch, clean_snapshot)
+            try:
+                grader_result = await self._grade_patch(task, artifact.patch, clean_snapshot)
+            except SandboxCapacityTimeout:
+                # The grader sandbox was never admitted. The rollout itself is complete and
+                # valid, so keep it and report it as ungraded: discarding it would throw away
+                # the whole episode, and scoring it zero would train the absence of a
+                # measurement as a measured failure.
+                self.grader_unavailable = True
+                grader_result = self._grader_unavailable_result(swe_problem)
+                psrl_logger.error(
+                    "Grader sandbox was never admitted for task %r; keeping the trajectory as ungraded.",
+                    observation.get("swe_task_id", ""),
+                )
         timing["grading_s"] = time.perf_counter() - grading_started
         result = grader_result or {}
         return {
@@ -240,6 +252,28 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
             "elapsed_s": 0.0,
             "output_tail": "",
             "resolved_by": "integrity_blocked",
+        }
+
+    @staticmethod
+    def _grader_unavailable_result(swe_problem: dict) -> dict:
+        """Return a grader-shaped result for an episode the grader never saw.
+
+        Distinct from `_integrity_failure_result`: nothing was measured here, so the
+        result carries no verdict. `TerminateReason.VERIFIER_ERROR` is what tells the
+        loss to ignore it.
+        """
+        return {
+            "resolved": False,
+            "apply_ok": False,
+            "f2p_pass": 0,
+            "f2p_total": len(swe_problem.get("FAIL_TO_PASS", [])),
+            "p2p_pass": 0,
+            "p2p_total": len(swe_problem.get("PASS_TO_PASS", [])),
+            "timeout": False,
+            "error": "grader_capacity_timeout",
+            "elapsed_s": 0.0,
+            "output_tail": "",
+            "resolved_by": "grader_unavailable",
         }
 
     async def close_harness_task(self, task: HarnessTaskContext[MiniSWEHarnessTaskState]) -> None:

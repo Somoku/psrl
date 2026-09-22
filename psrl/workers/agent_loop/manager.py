@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
+import time
 from collections import Counter, OrderedDict
+from collections.abc import Iterable
 
 import ray
 import transfer_queue as tq
@@ -29,6 +31,7 @@ from psrl.utils.transferqueue_utils import (
     validate_ready_payload,
 )
 from psrl.workers.agent_loop.loops.utils import TerminateReason
+from psrl.workers.agent_loop.timeouts import resolve_from_config
 from psrl.workers.gen.utils import RolloutInstanceId
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.ps.staleness_controller import EntryInfo
@@ -215,12 +218,34 @@ class PSRL_AgentLoopManager:
 
         # Refill breaker state (train only). Groups that fail before being replaced are counted
         # consecutively and cleared by any occupied group, so sporadic failures never trip it.
+        # Only reasons that say something about the rollout itself count: a coordination fault
+        # such as an unadmitted sandbox or a teardown cancellation is tracked separately, because
+        # counting it would let the recovery path fill the streak that is meant to guard it.
         self.refill_failure_threshold = self.config.psrl.agentic_rl.get("refill_failure_threshold", 32)
+        # Groups lost to node capacity admission need their own bound. They are not evidence
+        # about the harness, but they are also not self-limiting: each costs a full acquisition
+        # deadline and is replaced, so an exhausted node refills until the run is stopped.
+        self.capacity_failure_threshold = self.config.psrl.agentic_rl.get("capacity_failure_threshold", 4)
         self._consecutive_group_failures = 0
+        self._capacity_failure_streak = 0
         self._group_failure_reasons: Counter = Counter()
+        self._coordination_failures: Counter = Counter()
+        self._shutting_down = False
         # Set once the breaker trips. `wait_for_training_batch` turns it into the
         # exception that ends the run.
         self._refill_breaker_diagnosis: str | None = None
+
+        # Train entries whose children were dispatched, keyed by parent id to
+        # `(dispatched_at, last_report_at)`, where a report is either a child's result or its
+        # liveness heartbeat. The watchdog fails an entry only when nothing reports at all,
+        # so it recovers a wedged worker without abandoning a slow but healthy episode.
+        self._inflight_train_groups: dict[int, tuple[float, float]] = {}
+        self.timeouts = resolve_from_config(self.config)
+        self.entry_stall_timeout_s = self.timeouts.entry_stall_timeout_s
+        self.entry_stall_check_interval_s = max(0.05, min(60.0, self.timeouts.heartbeat_interval_s / 2))
+        self._stall_watchdog_task: asyncio.Task | None = None
+        # The driver logs a progress line this often while a buffer is incomplete.
+        self.buffer_wait_log_interval_s = float(self.config.psrl.agentic_rl.get("buffer_wait_log_interval_s", 60))
 
         # Build logger
         self.log_prefix = "AgentLoopManager"
@@ -328,6 +353,9 @@ class PSRL_AgentLoopManager:
 
     async def stop_busy_loop(self):
         """Stop the busy loop and wait for all tasks to complete."""
+        # Every in-flight episode fails once teardown starts, so failures arriving from here
+        # on describe the shutdown rather than the rollout and must not feed the breaker.
+        self._shutting_down = True
         if (
             (not self.train_dispatch_task or self.train_dispatch_task.done())
             and (not self.val_dispatch_task or self.val_dispatch_task.done())
@@ -514,26 +542,56 @@ class PSRL_AgentLoopManager:
         return len(data)
 
     def _reset_group_failure_streak(self) -> None:
-        """Clear the refill breaker's failure streak after a group is occupied.
+        """Clear the refill breaker's failure streaks after a group is occupied.
 
         One occupied group proves the rollout pipeline can still produce trainable
         data, so the preceding failures were sporadic rather than deterministic.
         Resetting here is what keeps a long run from tripping on accumulated noise.
         """
+        self._capacity_failure_streak = 0
         if self._consecutive_group_failures:
             self._consecutive_group_failures = 0
             self._group_failure_reasons.clear()
 
     def _record_group_failure(self, terminate_reason: TerminateReason | None) -> None:
-        """Account one failed training group against the refill breaker.
+        """Account one failed training group against the run's breakers.
+
+        A failure only extends the environment-fault streak when it is evidence about the
+        rollout itself. Coordination faults are counted in their own tally, so a stalled or
+        cancelled batch cannot fill the streak that exists to detect a broken harness.
+
+        Capacity faults get their own streak rather than none at all. They are not evidence
+        about the harness, but they are not harmless either: every sandbox that cannot be
+        admitted costs a full `acquire_timeout_s` and the group is replaced, so a node that
+        has run out of admittable capacity refills forever while the buffer never fills.
+        That is a livelock with a capacity cause, and it needs to end with a capacity
+        diagnosis instead of hanging. Failures seen while the manager is shutting down are
+        recorded and dropped, because every in-flight episode fails at that point regardless
+        of its health.
 
         Args:
             terminate_reason (TerminateReason | None): Why the rollout produced no
                 data. Recorded so the breaker can name the dominant cause instead of
                 reporting a bare count.
         """
-        self._consecutive_group_failures += 1
         reason = terminate_reason.value if terminate_reason is not None else TerminateReason.UNKNOWN.value
+        if self._shutting_down:
+            psrl_logger.info(
+                "Group failure during shutdown ignored for the refill breaker: reason=%s.",
+                reason,
+            )
+            return
+        if terminate_reason is TerminateReason.SANDBOX_CAPACITY_TIMEOUT:
+            self._coordination_failures[reason] += 1
+            self._record_capacity_failure(reason)
+            return
+        counted = terminate_reason is None or terminate_reason.counts_toward_refill_breaker()
+        if not counted:
+            self._coordination_failures[reason] += 1
+            self._report_coordination_failures()
+            return
+
+        self._consecutive_group_failures += 1
         self._group_failure_reasons[reason] += 1
 
         if self._consecutive_group_failures >= self.refill_failure_threshold:
@@ -546,6 +604,52 @@ class PSRL_AgentLoopManager:
                 f"harness fault rather than a transient error. Raise "
                 f"psrl.agentic_rl.refill_failure_threshold only if these failures are genuinely sporadic."
             )
+
+    def _record_capacity_failure(self, reason: str) -> None:
+        """Account a group lost because no sandbox could be admitted, and bound the wait.
+
+        Each of these already cost a full `acquire_timeout_s`, and the replacement group
+        will pay it again. Once the threshold is reached the run cannot make progress: stop
+        with the capacity diagnosis, which says what to look at, instead of refilling for
+        hours. Set `capacity_failure_threshold` to zero to wait indefinitely.
+        """
+        if self.capacity_failure_threshold <= 0:
+            self._report_coordination_failures()
+            return
+        self._capacity_failure_streak += 1
+        if self._capacity_failure_streak < self.capacity_failure_threshold:
+            return
+        breakdown = ", ".join(f"{name}={count}" for name, count in self._coordination_failures.most_common())
+        self._trip_refill_breaker(
+            f"{self._capacity_failure_streak} consecutive rollout groups were lost because no sandbox could be "
+            f"admitted (threshold={self.capacity_failure_threshold}). Every attempt waited the full "
+            f"{self.timeouts.admission_timeout_s:.0f}s "
+            f"acquisition deadline, so no episode ever started and the buffer could never fill. Coordination "
+            f"reasons: {breakdown}. This is a capacity planning fault, not a harness fault: check that node "
+            "capacity leases are actually returned (a lease held without a sandbox keeps the node full), that "
+            "the envelope and `capacity.classes` match the workloads, and that the node has the disk and "
+            "memory those sandboxes need."
+        )
+
+    def _report_coordination_failures(self) -> None:
+        """Report scheduling and teardown failures without consuming the breaker streak.
+
+        These failures are real and do cost buffer slots, so they are counted and logged
+        at the same threshold. They are not converted into an abort, because the fix is a
+        capacity or lifecycle setting rather than a task or harness change.
+        """
+        total = sum(self._coordination_failures.values())
+        if total < self.refill_failure_threshold:
+            return
+        if total % self.refill_failure_threshold:
+            return
+        breakdown = ", ".join(f"{reason}={count}" for reason, count in self._coordination_failures.most_common())
+        psrl_logger.error(
+            f"{total} rollout groups failed for coordination reasons: {breakdown}. These are not counted "
+            "against the refill breaker because no episode ran or the run was stopping, but training cannot "
+            "make progress while they continue. Check node capacity admission: "
+            "rollout.agent.sandbox.capacity.classes, acquire_timeout_s, and the envelope size."
+        )
 
     def _trip_refill_breaker(self, diagnosis: str) -> None:
         """Latch a refill failure and fail every training waiter with it.
@@ -585,6 +689,90 @@ class PSRL_AgentLoopManager:
     def _refill_breaker_error(self) -> RuntimeError:
         """Build the exception that reports a tripped refill breaker."""
         return RuntimeError(f"Training aborted, rollout groups cannot be refilled. {self._refill_breaker_diagnosis}")
+
+    def _register_inflight_groups(self, uids: Iterable, is_validate: bool) -> None:
+        """Record newly dispatched training entries for the stall watchdog.
+
+        Validation entries are excluded: they have no replacement prompt, and their
+        recovery shrinks the evaluation set instead.
+        """
+        if is_validate or self.entry_stall_timeout_s <= 0 or self.rollout_n <= 1:
+            return
+        now = time.monotonic()
+        registered = False
+        for uid in uids:
+            parent_id = int(uid) // self.rollout_n
+            if parent_id not in self._inflight_train_groups:
+                self._inflight_train_groups[parent_id] = (now, now)
+                registered = True
+        if registered:
+            self._ensure_stall_watchdog()
+
+    def _touch_inflight_group(self, parent_id: int) -> None:
+        """Record that one child of a dispatched entry reported."""
+        entry = self._inflight_train_groups.get(parent_id)
+        if entry is not None:
+            self._inflight_train_groups[parent_id] = (entry[0], time.monotonic())
+
+    async def touch_inflight_group(self, parent_id: int) -> None:
+        """Record that a child of this entry is alive, without reporting a result.
+
+        Results alone cannot tell a slow episode from a wedged worker, because a healthy
+        episode reports only once it finishes. This is the liveness half of that pair.
+        """
+        self._touch_inflight_group(int(parent_id))
+
+    def _unregister_inflight_group(self, parent_id: int) -> None:
+        """Stop watching an entry that completed or was already recovered."""
+        self._inflight_train_groups.pop(parent_id, None)
+
+    def _ensure_stall_watchdog(self) -> None:
+        """Start the stall watchdog once there is something for it to watch."""
+        if self._stall_watchdog_task is None or self._stall_watchdog_task.done():
+            self._stall_watchdog_task = asyncio.create_task(self._stall_watchdog())
+
+    def _stalled_entries(self, now: float) -> list[tuple[int, float, float]]:
+        """Return watched entries that made no progress for the stall timeout."""
+        return [
+            (parent_id, dispatched_at, last_progress_at)
+            for parent_id, (dispatched_at, last_progress_at) in self._inflight_train_groups.items()
+            if now - last_progress_at >= self.entry_stall_timeout_s
+        ]
+
+    async def _stall_watchdog(self) -> None:
+        """Recover training entries whose children stopped reporting entirely.
+
+        The threshold is a silence check, not a deadline: children send a liveness heartbeat
+        while they work, so an episode that is merely slow keeps its entry alive and is bounded
+        by its own episode budget instead. Only a worker that has stopped saying anything at all
+        — a dead actor, a wedged event loop — reaches this threshold, which is why it is a few
+        heartbeats rather than a fraction of the episode budget. Recovery still aborts the whole
+        group, so the threshold trades a false positive's wasted group against a false negative's
+        stuck buffer.
+        """
+        while True:
+            await asyncio.sleep(self.entry_stall_check_interval_s)
+            now = time.monotonic()
+            for parent_id, dispatched_at, last_progress_at in self._stalled_entries(now):
+                if parent_id not in self._inflight_train_groups:
+                    continue
+                psrl_logger.error(
+                    "Stall watchdog: entry parent_id=%s produced no result for %.0fs "
+                    "(dispatched %.0fs ago). Aborting the group and refilling.",
+                    parent_id,
+                    now - last_progress_at,
+                    now - dispatched_at,
+                )
+                await self.notify_group_failed(
+                    parent_id,
+                    failed_uid=parent_id * self.rollout_n,
+                    is_validate=False,
+                    terminate_reason=TerminateReason.DOWNSTREAM_TIMEOUT,
+                    failure_summary=(
+                        f"Stall watchdog: no child reported for {now - last_progress_at:.0f}s, "
+                        f"so the entry cannot complete. Check the worker and sandbox for a wedged episode."
+                    ),
+                )
 
     def _raise_if_refill_breaker_tripped(self) -> None:
         """Convert a latched refill failure into an exception for the driver.
@@ -654,6 +842,7 @@ class PSRL_AgentLoopManager:
     ) -> list[EntryInfo]:
         """Drop partially accumulated tracker entries and their TQ payloads."""
         entries = self.rollout_request_tracker.pop(parent_id, [])
+        self._unregister_inflight_group(parent_id)
         if not entries:
             return []
 
@@ -827,10 +1016,12 @@ class PSRL_AgentLoopManager:
                 )
                 psrl_logger.info(
                     "notify_group_failed (train): dispatched %d fresh replacement request(s) for parent_id=%s "
-                    "(consecutive failures=%d).",
+                    "(reason=%s, consecutive failures=%d, coordination failures=%d).",
                     dispatched,
                     parent_id,
+                    terminate_reason.value if terminate_reason is not None else TerminateReason.UNKNOWN.value,
                     self._consecutive_group_failures,
+                    sum(self._coordination_failures.values()),
                 )
 
     def _get_expected_ps_version(self):
@@ -878,6 +1069,8 @@ class PSRL_AgentLoopManager:
         )
         if not update_status_success:
             return
+
+        self._register_inflight_groups(uids, is_validate)
 
         dispatch_plan = self.get_dispatch_plan(data, is_validate=is_validate)
         for worker_index, batch in dispatch_plan.items():
@@ -1001,6 +1194,7 @@ class PSRL_AgentLoopManager:
                         is_validate=is_validate,
                     )
                     self.rollout_request_tracker.setdefault(prompt_id, []).append(entry_info)
+                    self._touch_inflight_group(prompt_id)
                     psrl_logger.debug(
                         f"Stored rollout entry: prompt_id={prompt_id}, entry={entry_info!r}, "
                         f"count={len(self.rollout_request_tracker[prompt_id])}."
@@ -1013,6 +1207,7 @@ class PSRL_AgentLoopManager:
                             f"samples for prompt {prompt_id}"
                         )
                         entry_infos = self.rollout_request_tracker.pop(prompt_id)
+                        self._unregister_inflight_group(prompt_id)
                         psrl_logger.debug(
                             f"Popped entry_infos from rollout_request_tracker for prompt_id {prompt_id}, "
                             f"entry count: {len(entry_infos)}"
@@ -1799,8 +1994,48 @@ class PSRL_AgentLoopManager:
         psrl_logger.info(f"Waiting for training buffer: buffer_id={buffer_id}.")
         fut = asyncio.get_event_loop().create_future()
         self._train_buffer_waiters.setdefault(buffer_id, []).append(fut)
-        batch_meta = await fut
-        return batch_meta
+        return await self._await_buffer_future(fut, buffer_id=buffer_id, is_validate=False)
+
+    async def _await_buffer_future(self, fut: asyncio.Future, *, buffer_id: int, is_validate: bool) -> KVBatchMeta:
+        """Await a buffer future, reporting progress until it resolves.
+
+        The driver blocks here for a whole step, so an unfillable buffer has to be
+        visible in the log rather than silent. The refill breaker is rechecked on each
+        tick, because it fails waiters that registered after it tripped.
+        """
+        while True:
+            done, _ = await asyncio.wait({fut}, timeout=self.buffer_wait_log_interval_s)
+            if fut in done:
+                return fut.result()
+            self._raise_if_refill_breaker_tripped()
+            psrl_logger.warning(self._buffer_wait_progress(buffer_id, is_validate))
+
+    def _buffer_wait_progress(self, buffer_id: int, is_validate: bool) -> str:
+        """Describe why a buffer is still incomplete."""
+        if is_validate:
+            accumulated = self.val_accumulated_buffer_size.get(buffer_id)
+            expected = self.val_buffer_size
+        else:
+            accumulated = self.train_accumulated_buffer_size.get(buffer_id)
+            expected = self.ready_entries_per_buffer
+        if self._inflight_train_groups:
+            now = time.monotonic()
+            oldest = max((now - dispatched for dispatched, _ in self._inflight_train_groups.values()), default=0.0)
+            silent_for = max((now - reported for _, reported in self._inflight_train_groups.values()), default=0.0)
+            inflight = (
+                f"in_flight_entries={len(self._inflight_train_groups)} oldest_dispatch_s={oldest:.0f} "
+                f"silent_for_s={silent_for:.0f} stall_in_s={max(0.0, self.entry_stall_timeout_s - silent_for):.0f}"
+            )
+        else:
+            inflight = "in_flight_entries=0"
+        return (
+            f"Buffer wait: buffer_id={buffer_id} validate={is_validate} "
+            f"accumulated={accumulated}/{expected} "
+            f"refill_failures={sum(self._group_failure_reasons.values())} "
+            f"consecutive_group_failures={self._consecutive_group_failures} "
+            f"coordination_failures={sum(self._coordination_failures.values())} "
+            f"capacity_failures={self._capacity_failure_streak}/{self.capacity_failure_threshold} {inflight}."
+        )
 
     async def wait_for_training_chunk(self, buffer_id: int, chunk_index: int) -> tuple["KVBatchMeta", bool]:
         """
@@ -1880,7 +2115,7 @@ class PSRL_AgentLoopManager:
         psrl_logger.info(f"Waiting for validation buffer: buffer_id={buffer_id}.")
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._val_buffer_waiters.setdefault(buffer_id, []).append(fut)
-        return await fut
+        return await self._await_buffer_future(fut, buffer_id=buffer_id, is_validate=True)
 
     async def generate_validate_sequences(self) -> int:
         """Dispatch a validation batch and return its buffer ID."""

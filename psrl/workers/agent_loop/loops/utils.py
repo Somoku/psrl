@@ -46,6 +46,20 @@ class TerminateReason(Enum):
     # trajectory from the turns completed before the timeout, so this keeps its data.
     ENV_TIMEOUT = "env_timeout"
     TRAJECTORY_TIMEOUT = "trajectory_timeout"
+    # A call inside the episode timed out. Kept apart from `TRAJECTORY_TIMEOUT`, which
+    # means the configured episode budget expired, because this is an infrastructure fault.
+    DOWNSTREAM_TIMEOUT = "downstream_timeout"
+    # The episode never ran: node capacity admission never granted its sandbox within the
+    # configured deadline. Distinct from every other failure because no task code executed,
+    # so it says nothing about the model or the harness.
+    SANDBOX_CAPACITY_TIMEOUT = "sandbox_capacity_timeout"
+    # The episode was cancelled from outside, typically while the run was shutting down.
+    # Kept apart from `ROLLOUT_ERROR` so teardown cannot be mistaken for a rollout fault.
+    ROLLOUT_CANCELLED = "rollout_cancelled"
+    # The child never began its episode: admission and provisioning consumed the whole setup
+    # allowance. Distinct from `SANDBOX_CAPACITY_TIMEOUT`, which is admission alone, and from
+    # `TRAJECTORY_TIMEOUT`, which means the episode itself ran out of time.
+    ROLLOUT_DEADLINE_EXCEEDED = "rollout_deadline_exceeded"
     ABORTED = "aborted"
     UNKNOWN = "unknown"
     ROLLOUT_ERROR = "rollout_error"
@@ -112,20 +126,46 @@ class TerminateReason(Enum):
 
     @property
     def is_timeout(self) -> bool:
-        """Return whether a timeout stopped the trajectory before it produced data.
+        """Return whether the configured episode budget stopped the trajectory.
 
-        Only `TRAJECTORY_TIMEOUT` qualifies: it fires from
-        `run_with_termination_handling`, which owns no partial output. `AGENT_TIMEOUT`
-        and `ENV_TIMEOUT` are timeouts too, but their loops return a finalized
-        trajectory, and this property feeds `needs_worker_retry` -- re-running an
-        episode whose turns were already accepted would duplicate them.
+        Only `TRAJECTORY_TIMEOUT` qualifies, because it is raised by the episode-level
+        `wait_for`, which owns no partial output. `DOWNSTREAM_TIMEOUT` is an
+        infrastructure fault rather than a budget, so it reports through `is_error`.
+        `AGENT_TIMEOUT` and `ENV_TIMEOUT` return a finalized trajectory, and this
+        property feeds `needs_worker_retry`, where re-running an episode whose turns
+        were already accepted would duplicate them.
         """
         return self is TerminateReason.TRAJECTORY_TIMEOUT
 
     @property
     def is_error(self) -> bool:
         """Return whether the slot was wasted by a transient error."""
-        return self in (TerminateReason.ROLLOUT_ERROR, TerminateReason.UNKNOWN)
+        return self in (
+            TerminateReason.ROLLOUT_ERROR,
+            TerminateReason.DOWNSTREAM_TIMEOUT,
+            TerminateReason.SANDBOX_CAPACITY_TIMEOUT,
+            TerminateReason.ROLLOUT_CANCELLED,
+            TerminateReason.ROLLOUT_DEADLINE_EXCEEDED,
+            TerminateReason.UNKNOWN,
+        )
+
+    @property
+    def is_coordination_fault(self) -> bool:
+        """Return whether scheduling or teardown ended the episode, not the rollout.
+
+        `SANDBOX_CAPACITY_TIMEOUT` means the sandbox was never admitted, so no episode
+        ran at all; `ROLLOUT_CANCELLED` means something outside the episode stopped it,
+        usually shutdown. Neither is evidence about the model, the harness, or the task,
+        so neither may be retried in place nor counted as a rollout failure.
+
+        `ROLLOUT_DEADLINE_EXCEEDED` is deliberately not one of them: provisioning beyond the
+        whole setup allowance says the environment could not deliver a sandbox on time, which
+        is the same class of signal as a broken harness and belongs in the breaker's count.
+        """
+        return self in (
+            TerminateReason.SANDBOX_CAPACITY_TIMEOUT,
+            TerminateReason.ROLLOUT_CANCELLED,
+        )
 
     @property
     def is_aborted(self) -> bool:
@@ -139,9 +179,15 @@ class TerminateReason(Enum):
         output for anything this returns True for. Retrying a data-bearing reason would
         both discard the trajectory and duplicate the work.
 
+        Coordination faults and a rollout that never started are excluded: an in-place
+        retry cannot create node capacity and cannot make provisioning faster, so it would
+        only spend the retry budget and re-enter the same wait.
+
         Note this is inert at the default `rollout.agent.retry_limit=1`, which yields a
         single attempt.
         """
+        if self.is_coordination_fault or self is TerminateReason.ROLLOUT_DEADLINE_EXCEEDED:
+            return False
         return self.is_timeout or self.is_error
 
     def needs_manager_retry(self) -> bool:
@@ -156,3 +202,16 @@ class TerminateReason(Enum):
         entry, so requesting another refill would double-count the failure.
         """
         return not self.is_successful and not self.is_aborted
+
+    def counts_toward_refill_breaker(self) -> bool:
+        """Return whether this failure is evidence that the run cannot make progress.
+
+        The refill breaker exists to stop a run whose harness or environment fails
+        deterministically: it counts groups that lost their slot and asks whether any
+        group succeeded in between. Coordination faults are the one exclusion, because
+        they record a scheduling or shutdown problem rather than a failing rollout, and
+        they arrive in bursts that would otherwise fill the streak on their own. Counting
+        them turns a recoverable stall into a fatal abort, and they are reported through
+        their own counters instead.
+        """
+        return self.needs_manager_retry() and not self.is_coordination_fault

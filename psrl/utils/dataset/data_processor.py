@@ -245,7 +245,7 @@ class DataProcessor:
         if self.config.psrl.rollout_coordination.redundant_rollout.enable:
             total_batch_size = self.config.psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size
         else:
-            total_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+            total_batch_size = self.config.data.get("gen_batch_size") or self.config.data.train_batch_size
 
         batch_sizes = [int(total_batch_size * ratio) for ratio in self.train_datasets_ratios]
         batch_sizes[-1] = total_batch_size - sum(batch_sizes[:-1])

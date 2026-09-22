@@ -128,19 +128,68 @@ async def test_lease_terminates_exactly_once_and_unregisters() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_release_remains_owned_for_shutdown_retry(monkeypatch) -> None:
+async def test_failed_terminate_still_returns_capacity(monkeypatch, caplog) -> None:
+    """A container that cannot be removed must not keep its capacity lease.
+
+    Capacity has no second recovery path: the owner heartbeat keeps renewing the owning
+    worker, so a lease a failed release forgot is never reclaimed. The container is left
+    to the Docker ownership sweep, which force-removes it when the owner stops.
+    """
+    released: list[str] = []
+
+    async def release_capacity(lease_id: str) -> None:
+        released.append(lease_id)
+
     backend = FakeBackend(set())
     manager = SandboxManager({"fake": backend}, "fake")
     lease = await manager.acquire(SandboxSpec(SandboxSource.image("image")))
+    lease._capacity_lease_id = "capacity-1"
+    lease._release_capacity = release_capacity
 
     async def fail_terminate() -> None:
         raise RuntimeError("temporary cleanup failure")
 
     monkeypatch.setattr(lease.session, "terminate", fail_terminate)
-    with pytest.raises(RuntimeError, match="temporary cleanup failure"):
+    with caplog.at_level("ERROR"):
         await manager.release(lease)
 
+    assert released == ["capacity-1"]
+    assert lease.released
+    assert lease not in manager._leases
+    assert any("temporary cleanup failure" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_failed_capacity_release_remains_owned_for_shutdown_retry(monkeypatch) -> None:
+    """A failed capacity release keeps the lease owned so shutdown can retry it."""
+    attempts: list[str] = []
+
+    async def flaky_release_capacity(lease_id: str) -> None:
+        attempts.append(lease_id)
+        raise RuntimeError("capacity coordinator unreachable")
+
+    backend = FakeBackend(set())
+    manager = SandboxManager({"fake": backend}, "fake")
+    lease = await manager.acquire(SandboxSpec(SandboxSource.image("image")))
+    lease._capacity_lease_id = "capacity-2"
+    lease._release_capacity = flaky_release_capacity
+
+    with pytest.raises(RuntimeError, match="capacity coordinator unreachable"):
+        await manager.release(lease)
+
+    assert attempts == ["capacity-2"]
     assert lease in manager._leases
+    assert not lease.released
+
+    async def release_capacity(lease_id: str) -> None:
+        attempts.append(lease_id)
+
+    lease._release_capacity = release_capacity
+    await manager.release(lease)
+
+    assert attempts == ["capacity-2", "capacity-2"]
+    assert lease.released
+    assert lease not in manager._leases
 
 
 @pytest.mark.asyncio
@@ -362,7 +411,7 @@ class FakeRemoteMethod:
 
 class FakeCapacityCoordinator:
     def __init__(self) -> None:
-        self.requests: list[tuple[str, str, int, float]] = []
+        self.requests: list[tuple[str, str, int, float, str]] = []
         self.released: list[str] = []
         self.released_owners: list[str] = []
         self.acquire = FakeRemoteMethod(self._acquire)
@@ -371,8 +420,15 @@ class FakeCapacityCoordinator:
         self.renew_owner = FakeRemoteMethod(self._renew_owner)
         self.release_owner = FakeRemoteMethod(self._release_owner)
 
-    async def _acquire(self, lease_id: str, owner_id: str, memory_mb: int, cpu_count: float) -> None:
-        self.requests.append((lease_id, owner_id, memory_mb, cpu_count))
+    async def _acquire(
+        self,
+        lease_id: str,
+        owner_id: str,
+        memory_mb: int,
+        cpu_count: float,
+        resource_class: str,
+    ) -> None:
+        self.requests.append((lease_id, owner_id, memory_mb, cpu_count, resource_class))
 
     async def _release(self, lease_id: str) -> None:
         self.released.append(lease_id)
@@ -401,11 +457,13 @@ async def test_local_backend_charges_actual_spec_until_sandbox_release() -> None
     manager = _capacity_manager(backend, capacity)
     resources = ResourceSpec(cpu_count=1.5, memory_mb=4096)
 
-    lease = await manager.acquire(SandboxSpec(SandboxSource.image("image"), resources=resources))
+    lease = await manager.acquire(
+        SandboxSpec(SandboxSource.image("image"), resources=resources, resource_class="grader")
+    )
 
     assert len(capacity.requests) == 1
-    lease_id, owner_id, memory_mb, cpu_count = capacity.requests[0]
-    assert (owner_id, memory_mb, cpu_count) == ("worker-1", 4096, 1.5)
+    lease_id, owner_id, memory_mb, cpu_count, resource_class = capacity.requests[0]
+    assert (owner_id, memory_mb, cpu_count, resource_class) == ("worker-1", 4096, 1.5, "grader")
     assert capacity.released == []
     await lease.release()
     assert capacity.released == [lease_id]
@@ -443,8 +501,15 @@ async def test_shutdown_frees_capacity_before_joining_waiting_creates() -> None:
             self.available = asyncio.Event()
             super().__init__()
 
-        async def _acquire(self, lease_id: str, owner_id: str, memory_mb: int, cpu_count: float) -> None:
-            await super()._acquire(lease_id, owner_id, memory_mb, cpu_count)
+        async def _acquire(
+            self,
+            lease_id: str,
+            owner_id: str,
+            memory_mb: int,
+            cpu_count: float,
+            resource_class: str,
+        ) -> None:
+            await super()._acquire(lease_id, owner_id, memory_mb, cpu_count, resource_class)
             if self.active_lease is not None:
                 self.waiting.set()
                 await self.available.wait()
@@ -472,3 +537,193 @@ async def test_shutdown_frees_capacity_before_joining_waiting_creates() -> None:
 
     assert first.session.terminated
     assert second.session.terminated
+
+
+@pytest.mark.asyncio
+async def test_hold_and_wait_is_reported_when_a_workflow_holds_a_lease(caplog) -> None:
+    """A job that asks for a second sandbox before releasing the first is reported.
+
+    That shape deadlocks a shared envelope: the job occupies one class's capacity while
+    waiting for another class, and no admission order can fix it. The manager only warns
+    and counts, because a backend that hands back a warm sandbox may one day do it on purpose.
+    """
+    backend = FakeBackend(set())
+    manager = SandboxManager({"fake": backend}, "fake")
+    first = SandboxSpec(SandboxSource.image("image"), workflow_id="task-1")
+    second = SandboxSpec(SandboxSource.image("image"), workflow_id="task-1")
+
+    with caplog.at_level("ERROR"):
+        lease = await manager.acquire(first)
+        assert manager.hold_and_wait_observed == 0
+        await manager.acquire(second)
+
+    assert manager.hold_and_wait_observed == 1
+    assert any("Hold-and-wait observed" in record.message for record in caplog.records)
+
+    await manager.release(lease)
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_released_workflow_slot_does_not_report_hold_and_wait() -> None:
+    """The supported multi-phase order, release then acquire, is not reported."""
+    backend = FakeBackend(set())
+    manager = SandboxManager({"fake": backend}, "fake")
+
+    rollout = await manager.acquire(SandboxSpec(SandboxSource.image("image"), workflow_id="task-1"))
+    await manager.release(rollout)
+    await manager.acquire(SandboxSpec(SandboxSource.image("image"), workflow_id="task-1"))
+
+    assert manager.hold_and_wait_observed == 0
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_admission_withdraws_its_queued_request() -> None:
+    """An abandoned request must not stay queued under an owner that keeps renewing it.
+
+    A queued request occupies a place in its class queue and counts as that class waiting,
+    which also blocks every other class from borrowing the elastic pool. If the withdrawal
+    were skippable, one cancelled rollout could hold capacity the node had already promised
+    to a sandbox that will never be created.
+    """
+
+    class BlockingAdmissionCoordinator(FakeCapacityCoordinator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.admission_started = asyncio.Event()
+
+        async def _acquire(
+            self,
+            lease_id: str,
+            owner_id: str,
+            memory_mb: int,
+            cpu_count: float,
+            resource_class: str,
+        ) -> None:
+            await super()._acquire(lease_id, owner_id, memory_mb, cpu_count, resource_class)
+            self.admission_started.set()
+            await asyncio.Event().wait()
+
+    backend = FakeBackend(set(), uses_node_capacity=True)
+    capacity = BlockingAdmissionCoordinator()
+    manager = _capacity_manager(backend, capacity)
+    spec = SandboxSpec(
+        SandboxSource.image("image"),
+        resources=ResourceSpec(cpu_count=1, memory_mb=1024),
+    )
+
+    create_task = asyncio.create_task(manager._acquire_new(spec, backend))
+    await capacity.admission_started.wait()
+
+    create_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await create_task
+
+    assert capacity.released == [capacity.requests[0][0]], (
+        "A cancelled admission left its request queued, so the node stays reserved for a "
+        "sandbox that will never exist."
+    )
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_capacity_release_completes_even_when_the_caller_is_cancelled() -> None:
+    """Returning capacity must not be interruptible.
+
+    A cancellation that lands inside the release skips it, and a lease whose worker is
+    still alive has no other recovery path: the owner keeps renewing it, so the coordinator
+    holds the node charged and every later sandbox waits out the full admission deadline.
+    That window is what the failed end-to-end run fell into, so the release is now awaited
+    to completion before the cancellation is re-raised.
+    """
+
+    class SlowReleaseCoordinator(FakeCapacityCoordinator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_started = asyncio.Event()
+            self.release_may_finish = asyncio.Event()
+
+        async def _release(self, lease_id: str) -> None:
+            self.release_started.set()
+            await self.release_may_finish.wait()
+            await super()._release(lease_id)
+
+    backend = FakeBackend(set(), uses_node_capacity=True)
+    capacity = SlowReleaseCoordinator()
+    manager = _capacity_manager(backend, capacity)
+    lease = await manager.acquire(
+        SandboxSpec(SandboxSource.image("image"), resources=ResourceSpec(cpu_count=1, memory_mb=1024))
+    )
+    lease_id = capacity.requests[0][0]
+
+    release_task = asyncio.create_task(lease.release())
+    await capacity.release_started.wait()
+
+    release_task.cancel()
+    await asyncio.sleep(0)
+    assert not release_task.done(), "The release finished before the cancellation was delivered."
+    assert capacity.released == []
+
+    capacity.release_may_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await release_task
+
+    assert capacity.released == [lease_id], (
+        "A cancelled teardown skipped its capacity release, so the node stays charged for a "
+        "sandbox that no longer exists."
+    )
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_teardown_leaves_the_lease_owned_so_shutdown_retries_it() -> None:
+    """Cancellation must not be able to leave a lease half-disposed.
+
+    The capacity is returned by the time the cancellation surfaces, but the disposition is
+    not marked complete, so the lease stays owned and `shutdown` retries it. That retry has
+    to be clean, because the release is what a worker's teardown runs after a cancellation.
+    """
+
+    class SlowReleaseCoordinator(FakeCapacityCoordinator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_started = asyncio.Event()
+            self.release_may_finish = asyncio.Event()
+            self.attempts = 0
+
+        async def _release(self, lease_id: str) -> None:
+            self.attempts += 1
+            self.release_started.set()
+            await self.release_may_finish.wait()
+            await super()._release(lease_id)
+
+    backend = FakeBackend(set(), uses_node_capacity=True)
+    capacity = SlowReleaseCoordinator()
+    manager = _capacity_manager(backend, capacity)
+    lease = await manager.acquire(
+        SandboxSpec(SandboxSource.image("image"), resources=ResourceSpec(cpu_count=1, memory_mb=1024))
+    )
+    lease_id = capacity.requests[0][0]
+
+    release_task = asyncio.create_task(manager.release(lease))
+    await capacity.release_started.wait()
+
+    release_task.cancel()
+    capacity.release_may_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await release_task
+
+    assert capacity.released == [lease_id]
+    assert lease in manager._leases, (
+        "A cancelled teardown claimed the disposition was complete, so no retry can happen."
+    )
+    assert not lease.released
+
+    await manager.shutdown()
+
+    assert lease.released
+    assert not manager._leases
+    assert set(capacity.released) == {lease_id}, (
+        "The shutdown retry charged or released a different lease."
+    )

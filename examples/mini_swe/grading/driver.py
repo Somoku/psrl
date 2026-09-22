@@ -61,6 +61,8 @@ def grade_log(payload: dict, log_text: str) -> GradingResult:
         resolved=resolved,
         f2p_pass=len(report["FAIL_TO_PASS"]["success"]),
         p2p_pass=len(report["PASS_TO_PASS"]["success"]),
+        f2p_failed=tuple(report["FAIL_TO_PASS"]["failure"]),
+        p2p_failed=tuple(report["PASS_TO_PASS"]["failure"]),
         output_tail="" if resolved else log_text[-_TAIL_CHARS:],
     )
 

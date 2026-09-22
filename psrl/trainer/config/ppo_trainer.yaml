@@ -243,6 +243,21 @@ global_profiler:
   # Path to save profiling contents
   save_path: "outputs/profile"
 
+  # Move backend artifacts written to a framework-fixed location into save_path when profiling
+  # finishes. Inherited by every role's profiler.
+  relocate_results: False
+
+  # Shell command executed on the selected ranks once, after the last profiled step. Inherited by
+  # every role's profiler. null disables it.
+  finish_hook_cmd: null
+
+  # Run finish_hook_cmd on all ranks. Inherited by every role's profiler.
+  finish_hook_all_ranks: False
+
+  # Ranks that run finish_hook_cmd, e.g. [] or [0,1,...]. Falls back to the profiled ranks when
+  # unset. Inherited by every role's profiler.
+  finish_hook_ranks: []
+
   # Specific tool configs, can use +profiler.tool_config.[tool].xxx to config
   global_tool_config:
 
@@ -305,6 +320,9 @@ global_profiler:
 
       # devices, record_context etc.
       kw_args: {}
+
+      # Number of profiled RL steps to retain before dumping a memory snapshot.
+      memory_snapshot_num_steps: 1
 
     # msprobe precision debugger
     precision_debugger:

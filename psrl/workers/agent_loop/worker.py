@@ -23,6 +23,7 @@ from verl.utils.tokenizer import (
 )
 from verl.workers.config.model import HFModelConfig
 
+from psrl.sandbox import SandboxCapacityTimeout
 from psrl.sandbox.config import build_sandbox_manager
 from psrl.utils.common.chat_template import resolve_chat_template_value
 from psrl.utils.common.http_io_thread import init_http_io_thread
@@ -31,11 +32,52 @@ from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
+from psrl.workers.agent_loop.timeouts import resolve_from_config
 from psrl.workers.gen.utils import TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+_CANCELLATION_ERROR_NAMES = frozenset({"CancelledError", "TaskCancelledError"})
+
+
+def _exception_chain(exc: BaseException):
+    """Yield `exc` and every wrapped exception it links to, at most once each.
+
+    Ray re-raises an actor-side failure as a `RayTaskError` whose only link to the
+    original exception is its `cause` attribute, and it leaves `__cause__` and
+    `__context__` unset, so both have to be walked to classify a failure by its root.
+    """
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.extend(
+            link
+            for link in (current.__cause__, current.__context__, getattr(current, "cause", None))
+            if isinstance(link, BaseException)
+        )
+
+
+def _classify_rollout_failure(exc: BaseException) -> TerminateReason:
+    """Map an episode exception onto the reason the manager and metrics should see.
+
+    A blanket `ROLLOUT_ERROR` mislabels the cases that matter most for scheduling: Ray
+    reports a cancelled actor call as a `TaskCancelledError` inside a `RayTaskError`,
+    which is an ordinary `Exception`, so every teardown cancellation looked like a
+    failing harness and filled the refill breaker during cleanup.
+    """
+    for current in _exception_chain(exc):
+        if isinstance(current, SandboxCapacityTimeout):
+            return TerminateReason.SANDBOX_CAPACITY_TIMEOUT
+        if type(current).__name__ in _CANCELLATION_ERROR_NAMES:
+            return TerminateReason.ROLLOUT_CANCELLED
+    return TerminateReason.ROLLOUT_ERROR
 
 
 @ray.remote
@@ -99,6 +141,10 @@ class PSRL_AgentLoopWorker:
             capacity_coordinator=capacity_coordinator,
             owner_id=self._actor_id,
         )
+        # Resolved once per worker from the same ladder the loops and the manager use, so the
+        # liveness heartbeat and the stall threshold can never be derived from different
+        # numbers.
+        self.timeouts = resolve_from_config(config)
 
         n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
         n_validate_instances = (
@@ -229,7 +275,11 @@ class PSRL_AgentLoopWorker:
         if self.agent_programs:
             await asyncio.gather(*self.agent_programs, return_exceptions=True)
         metrics = {name: snapshot.as_dict() for name, snapshot in self.sandbox_manager.metrics_snapshot().items()}
-        psrl_logger.info("Final sandbox lifecycle metrics: %s.", metrics)
+        psrl_logger.info(
+            "Final sandbox lifecycle metrics: %s. hold_and_wait_observed=%d.",
+            metrics,
+            self.sandbox_manager.hold_and_wait_observed,
+        )
         await self.sandbox_manager.shutdown()
 
     async def _launch_agent_loop(self):
@@ -329,7 +379,7 @@ class PSRL_AgentLoopWorker:
             request_index = tu.get(batch, "uid")[0]
 
         try:
-            await self._run_agent_loop_inner(agent_name, batch, prompt_index, request_index)
+            await self._run_child_with_liveness(agent_name, batch, prompt_index, request_index)
         except Exception as e:
             tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             psrl_logger.error(
@@ -338,6 +388,46 @@ class PSRL_AgentLoopWorker:
                 f"Full traceback:\n{tb_str}"
             )
             raise
+
+    async def _run_child_with_liveness(
+        self,
+        agent_name: str,
+        batch: TensorDict,
+        prompt_index,
+        request_index,
+    ) -> None:
+        """Run one child while reporting liveness to the manager.
+
+        A healthy episode reports only when it finishes, so an entry whose children are all
+        still working is indistinguishable from a wedged one by results alone. The heartbeat
+        is what separates the two, and it is why the manager's stall threshold can be a
+        silence check instead of a guess about how long a rollout should take.
+        """
+        heartbeat = asyncio.ensure_future(self._report_liveness(prompt_index))
+        try:
+            await self._run_agent_loop_inner(agent_name, batch, prompt_index, request_index)
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _report_liveness(self, prompt_index) -> None:
+        """Touch the manager's in-flight record until the child reports for real."""
+        while True:
+            await asyncio.sleep(self.timeouts.heartbeat_interval_s)
+            if self.agent_loop_manager is None:
+                continue
+            try:
+                await self.agent_loop_manager.touch_inflight_group.remote(int(prompt_index))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A missed heartbeat is not a rollout failure: the manager's own threshold
+                # decides when silence means the entry is gone.
+                psrl_logger.debug(
+                    "Sandbox liveness heartbeat failed for prompt_id=%s.",
+                    prompt_index,
+                    exc_info=True,
+                )
 
     async def _run_agent_loop_inner(
         self,
@@ -380,6 +470,16 @@ class PSRL_AgentLoopWorker:
                         output, terminate_reason = await agent_loop.run_with_termination_handling(
                             batch, raise_on_error=raise_on_error
                         )
+                    except asyncio.CancelledError:
+                        # Teardown or caller cancellation. Log the label and let it propagate
+                        # unchanged: awaiting the manager here would delay shutdown, and asking
+                        # for a refill while the run is ending is wasted work.
+                        psrl_logger.warning(
+                            "Agent loop cancelled: request_ids=%s, validate=%s.",
+                            request_ids,
+                            validate,
+                        )
+                        raise
                     except Exception as e:
                         # Log the traceback before cleanup and propagation.
                         tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
@@ -387,7 +487,7 @@ class PSRL_AgentLoopWorker:
                             f"Agent loop failed before cleanup: request_ids={request_ids!r}.\nTraceback:\n{tb_str}"
                         )
                         raised_error = e
-                        terminate_reason = TerminateReason.ROLLOUT_ERROR
+                        terminate_reason = _classify_rollout_failure(e)
                         output = None
 
                     if not terminate_reason.needs_worker_retry():
@@ -482,6 +582,18 @@ class PSRL_AgentLoopWorker:
                         event_type=EventType.OTHER,
                     ):
                         await self.postprocess_output(output, batch, terminate_reason)
+                else:
+                    # PSManager refuses the update when it already aborted this request, which
+                    # happens once a sibling failed and the entry was cleared. The trajectory is
+                    # real but cannot be committed, and dropping it silently once cost a full
+                    # buffer's worth of completed episodes with no trace in the metrics.
+                    psrl_logger.warning(
+                        "Discarding completed trajectory: request_ids=%s, reason=%s, prompt_index=%s. "
+                        "PSManager already aborted this request, so its data cannot be committed.",
+                        request_ids,
+                        terminate_reason.value,
+                        prompt_index,
+                    )
             elif terminate_reason != TerminateReason.ABORTED:
                 # Abort the reserved inventory entry after an unreported generation
                 # failure so the buffer can progress.

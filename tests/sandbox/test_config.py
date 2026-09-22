@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from omegaconf import OmegaConf
 from psrl.sandbox.backends import DockerBackend
@@ -77,3 +79,52 @@ def test_capacity_defaults_are_single_envelope_knobs() -> None:
         lease_ttl_s=180,
         heartbeat_interval_s=30,
     )
+    # An admission deadline and a recovery cap are on by default: without them an exhausted
+    # or leaking node makes the trainer wait forever instead of reporting a capacity fault.
+    assert SandboxCapacityConfig().acquire_timeout_s is not None
+    assert SandboxCapacityConfig().lease_max_age_s is not None
+
+
+def test_shipped_rollout_yaml_declares_the_capacity_classes() -> None:
+    """Guard the hand-forked rollout config against drifting from the schema.
+
+    A class name or deadline that the yaml spells differently would only surface at
+    runtime, where it reads as an undeclared class or a stalled entry.
+    """
+    import yaml
+
+    cfg = yaml.safe_load(Path("psrl/trainer/config/rollout/psrl_rollout.yaml").read_text())
+    capacity = SandboxCapacityConfig(**cfg["agent"]["sandbox"]["capacity"])
+
+    assert set(capacity.classes) == {"rollout", "grader"}
+    assert capacity.classes["rollout"].guaranteed_share == 0.6
+    assert capacity.classes["grader"].guaranteed_share == 0.25
+    assert sum(share.guaranteed_share for share in capacity.classes.values()) < 1
+    assert capacity.acquire_timeout_s is not None
+    assert capacity.lease_max_age_s is not None
+
+
+def test_capacity_classes_and_deadline_reach_the_manager_config() -> None:
+    config = OmegaConf.create(
+        {
+            "default_backend": "docker",
+            "capacity": {
+                "memory_mb": 64000,
+                "cpu_cores": 32,
+                "classes": {"rollout": {"guaranteed_share": 0.6}},
+                "acquire_timeout_s": 900,
+            },
+            "backends": {
+                "docker": {
+                    "_target_": "psrl.sandbox.backends.DockerBackend",
+                    "lifecycle": {"gc_enabled": False},
+                }
+            },
+        }
+    )
+
+    manager = build_sandbox_manager(config, capacity_coordinator=object(), owner_id="worker-1")
+
+    assert manager._capacity_coordinator is not None
+    assert config.capacity.classes.rollout.guaranteed_share == 0.6
+    assert config.capacity.acquire_timeout_s == 900

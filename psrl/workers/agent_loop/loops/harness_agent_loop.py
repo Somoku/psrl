@@ -26,7 +26,7 @@ from psrl.workers.agent_loop.harness import (
 )
 from psrl.workers.agent_loop.loops.session_agent_loop import SessionAgentLoop
 from psrl.workers.agent_loop.loops.utils import TerminateReason
-from psrl.workers.gen.utils import TokenOutput
+from psrl.workers.gen.utils import TokenOutput, rollout_token_budget
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -41,16 +41,32 @@ class HarnessAgentLoop(SessionAgentLoop):
     owner of the TITO session, sandbox lease, harness process, and snapshot.
     """
 
+    # Admission and environment preparation are scheduling latency rather than episode
+    # work, so the episode budget starts only once the harness is about to run.
+    episode_starts_after_provisioning = True
+
+    @staticmethod
+    def apply_timeout_ladder(harness_config: HarnessConfig, timeouts) -> HarnessConfig:
+        """Return the harness config with its exec budget taken from the shared ladder.
+
+        The episode budget is what stops the harness and reports why, so the harness's own
+        exec timeout only has to outlive it. Deriving it here means a harness can no longer
+        enforce a different episode length than the framework believes it set.
+        """
+        return replace(harness_config, time_budget_s=timeouts.harness_exec_timeout_s)
+
     def __init__(
         self,
         context: AgentLoopContext,
         harness: HarnessConfig | DictConfig | Mapping[str, Any],
     ) -> None:
         super().__init__(context=context)
-        self.harness_config = HarnessConfig.from_value(harness)
-        self.rollout_budget = int(self.rollout_config.prompt_length) + int(self.rollout_config.response_length)
+        self.harness_config = self.apply_timeout_ladder(HarnessConfig.from_value(harness), self.timeouts)
         self.compaction_budget: tuple[int, int] | None = None
         self.prompt_too_long_limit: int | None = None
+        # Set by a task hook when grading never ran, so the completed trajectory is kept
+        # and reported as ungraded instead of being discarded or scored as a measured zero.
+        self.grader_unavailable = False
         multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
         if not getattr(multi_turn, "enable", False):
             raise ValueError("Harness training requires rollout.multi_turn.enable=True.")
@@ -159,9 +175,7 @@ class HarnessAgentLoop(SessionAgentLoop):
         )
 
         self.max_turns = rollout_config.multi_turn.max_turns
-        context_window = rollout_config.max_model_len or (
-            rollout_config.prompt_length + rollout_config.response_length
-        )
+        context_window = rollout_config.max_model_len or rollout_token_budget(rollout_config)
         if context_window > self.rollout_budget:
             psrl_logger.warning(
                 f"Harness context window ({context_window}) exceeds the trainable budget "
@@ -246,12 +260,41 @@ class HarnessAgentLoop(SessionAgentLoop):
             timing["harness_prepare_s"] = time.perf_counter() - prepare_started
             timing["prep_s"] = time.perf_counter() - run_start
 
+            # Provisioning is complete: the sandbox lease is held, the environment is
+            # prepared, and the harness is ready. Only from here on is the wall clock spent
+            # on episode work, so this is where the episode budget starts.
+            self.arm_episode_budget()
             harness_started = time.perf_counter()
             try:
                 harness_result = await harness.run(task.prompt, harness_runtime)
-            except TimeoutError:
+            except TimeoutError as expired:
+                # The harness exec backstop fired, which means the episode budget did not.
+                # Record the cause: without it the manager can only report that some
+                # exception happened, with no exception to show.
+                self._record_error(expired)
+                psrl_logger.error(
+                    "Harness %s exceeded its %.0fs exec budget for session %s. The exec budget is a "
+                    "backstop for the %.0fs episode budget, so report this: the episode budget should "
+                    "have stopped it first.",
+                    self.harness_config.kind,
+                    self.harness_config.time_budget_s,
+                    session_id,
+                    self.timeouts.episode_timeout_s,
+                )
                 return None, TerminateReason.TRAJECTORY_TIMEOUT
             timing["assistant_s"] = time.perf_counter() - harness_started
+            if harness_result.exit_code != 0:
+                # The CLI can die without stopping the container, for example when the kernel
+                # OOM-kills it inside the sandbox. The episode continues and is trained, so say
+                # so loudly instead of recording the code as a silent data field.
+                psrl_logger.warning(
+                    "Harness %s exited with code %s for session %s, so the episode ended early. "
+                    "stderr tail: %s",
+                    self.harness_config.kind,
+                    harness_result.exit_code,
+                    session_id,
+                    (harness_result.stderr_tail or "").strip()[-500:] or "<empty>",
+                )
 
             artifact = await self.collect_harness_artifact(
                 task,
@@ -518,8 +561,20 @@ class HarnessAgentLoop(SessionAgentLoop):
     def get_harness_terminate_reason(self, training_data: list[dict]) -> TerminateReason:
         """
         Map captured TITO data to the framework's successful stop reasons.
+
+        A trajectory is response-length limited only when it no longer fits the
+        trainable context budget, which is exactly when `_build_capped_output`
+        had to cut its tail. Comparing the response alone against
+        `rollout.response_length` mislabels every finished episode that produced
+        more than the nominal response length while still fitting the budget.
+
+        An ungraded trajectory reports `VERIFIER_ERROR` even when it finished early,
+        because that flag is what stops a reward nobody measured from being trained as
+        a measured zero.
         """
-        if any(len(item["response_ids"]) >= int(self.rollout_config.response_length) for item in training_data):
+        if self.grader_unavailable:
+            return TerminateReason.VERIFIER_ERROR
+        if any(len(item["prompt_ids"]) + len(item["response_ids"]) > self.rollout_budget for item in training_data):
             return TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
         if max(item["num_turns"] for item in training_data) >= self.max_turns:
             return TerminateReason.MAX_TURNS_EXCEEDED

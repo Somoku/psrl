@@ -611,6 +611,20 @@ Env overrides: `SWE_GYM_293_TRAIN` / `SWE_GYM_293_VAL` (defaults under
 `data/swe_gym_293/`), `SWE_GYM_293_IMAGE_DIR` (shared tar cache) and
 `SWE_PREFETCH_WORKERS` (skopeo parallelism, default 64).
 
+#### Gating the split and repairing images
+
+A prefetched split is not yet proven gradeable: some problem images cannot import
+their own repository, so no patch can resolve them. Grade every row with its gold
+patch and bake the missing dependencies before training:
+
+```bash
+python -m examples.mini_swe.prepare.gold_gate \
+    --parquet examples/mini_swe/data/swe_gym_293/val.parquet --prune-p2p
+```
+
+See [GRADER_IMAGES.md](GRADER_IMAGES.md) for the gate flags, the image repair
+recipes, and the minimal rebuild commands.
+
 ### Step 3: Harness runtime trees + git-purged derivatives (harness mode only)
 
 This step applies to **any** data path (A/B/C), not just SWE-Gym — skip it unless

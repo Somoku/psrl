@@ -19,6 +19,8 @@ async def test_session_agent_loop_owns_external_agent_lifecycle():
     loop = ExampleSessionAgentLoop.__new__(ExampleSessionAgentLoop)
     loop.session_router_url = "http://session-router"
     loop.trajectory_id_strategy = "manual"
+    loop.rollout_budget = 65536
+    loop.session_snapshot = None
 
     @asynccontextmanager
     async def session_scope(request):
@@ -67,6 +69,8 @@ async def test_auto_session_agent_loop_returns_all_resolved_trajectories():
     loop = ExampleSessionAgentLoop.__new__(ExampleSessionAgentLoop)
     loop.session_router_url = "http://session-router"
     loop.trajectory_id_strategy = "auto"
+    loop.rollout_budget = 65536
+    loop.session_snapshot = None
 
     @asynccontextmanager
     async def session_scope(request):

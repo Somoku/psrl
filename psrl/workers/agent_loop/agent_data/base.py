@@ -13,7 +13,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.ray_utils import get_event_loop
 
 from psrl.environments.base import ConversationType, Environment
-from psrl.workers.gen.utils import RolloutInstanceId, TokenOutput
+from psrl.workers.gen.utils import RolloutInstanceId, TokenOutput, rollout_token_budget
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -595,21 +595,25 @@ class AgentData(ABC, Generic[ObsType, ActType]):
 
     async def finalize_output(self) -> TokenOutput | list[TokenOutput] | None:
         """Finalize the trajectory and prepare output for reward computation."""
-        response_length = self.config.gen_actor_rollout_ref.rollout.response_length
+        rollout_config = self.config.gen_actor_rollout_ref.rollout
+        rollout_budget = rollout_token_budget(rollout_config)
 
         outputs = []
         for trajectory in self.session_data.trajectories:
-            trajectory.response_ids = trajectory.response_ids[:response_length]
-            trajectory.response_mask = trajectory.response_mask[:response_length]
-            trajectory.response_logprobs = trajectory.response_logprobs[:response_length]
+            # Clamp on the shared trainable budget, not on `response_length`, because
+            # a multi-turn trajectory's real limit is the total context.
+            response_budget = max(0, rollout_budget - len(trajectory.prompt_ids))
+            trajectory.response_ids = trajectory.response_ids[:response_budget]
+            trajectory.response_mask = trajectory.response_mask[:response_budget]
+            trajectory.response_logprobs = trajectory.response_logprobs[:response_budget]
             if not trajectory.response_ids:
                 psrl_logger.error(
                     "finalize_output: empty response_ids for uid=%s, "
-                    "prompt_ids_len=%d, response_length_cfg=%d, "
+                    "prompt_ids_len=%d, response_budget=%d, "
                     "num_trajectories=%d, assistant_turns=%d, user_turns=%d",
                     self.session_data.request_id,
                     len(trajectory.prompt_ids),
-                    response_length,
+                    response_budget,
                     len(self.session_data.trajectories),
                     self.session_data.assistant_turns,
                     self.session_data.user_turns,

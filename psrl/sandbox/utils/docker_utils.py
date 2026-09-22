@@ -260,12 +260,16 @@ def owner_heartbeat_age_s(heartbeat_dir: str, owner_id: str, *, now: float | Non
     return max(0.0, current_time - modified_at)
 
 
+# Docker container states that can never serve another command.
+_STOPPED_CONTAINER_STATES = frozenset({"exited", "dead"})
+
+
 def _list_sandbox_containers(
     docker_command: Sequence[str],
     *,
     lease_store: str,
-) -> list[tuple[str, str]] | None:
-    """Return `(container_id, owner_id)` for every owned PSRL sandbox."""
+) -> list[tuple[str, str, str]] | None:
+    """Return `(container_id, owner_id, state)` for every owned PSRL sandbox."""
     try:
         result = subprocess.run(
             _command(
@@ -277,7 +281,7 @@ def _list_sandbox_containers(
                 "--filter",
                 f"label=psrl.lease_store={lease_store}",
                 "--format",
-                '{{.ID}}\t{{.Label "psrl.actor_id"}}',
+                '{{.ID}}\t{{.Label "psrl.actor_id"}}\t{{.State}}',
             ),
             capture_output=True,
             timeout=60,
@@ -291,9 +295,10 @@ def _list_sandbox_containers(
         return None
     containers = []
     for line in result.stdout.decode(errors="replace").splitlines():
-        container_id, _, owner_id = line.partition("\t")
+        container_id, _, remainder = line.partition("\t")
+        owner_id, _, state = remainder.partition("\t")
         if container_id.strip() and owner_id.strip():
-            containers.append((container_id.strip(), owner_id.strip()))
+            containers.append((container_id.strip(), owner_id.strip(), state.strip().lower()))
     return containers
 
 
@@ -335,7 +340,7 @@ def sweep_stale_sandboxes(
         return [], None
     # Read each lease once. A filesystem error is not evidence of owner death.
     stale_owners = set()
-    for owner_id in {owner_id for _, owner_id in containers}:
+    for owner_id in {owner_id for _, owner_id, _ in containers}:
         try:
             age = owner_heartbeat_age_s(heartbeat_dir, owner_id, now=current_time)
         except OSError as exc:
@@ -343,7 +348,13 @@ def sweep_stale_sandboxes(
             continue
         if age is None or age > ttl_s:
             stale_owners.add(owner_id)
-    stale = [container_id for container_id, owner_id in containers if owner_id in stale_owners]
+    # A stopped sandbox can never serve another command, so its owner's liveness must
+    # not keep it: an OOM-killed container would otherwise hold its name and disk.
+    stale = [
+        container_id
+        for container_id, owner_id, state in containers
+        if owner_id in stale_owners or state in _STOPPED_CONTAINER_STATES
+    ]
     removed: list[str] = []
     if stale:
         try:
@@ -361,7 +372,7 @@ def sweep_stale_sandboxes(
                 refreshed = _list_sandbox_containers(docker_command, lease_store=store_id)
                 if refreshed is None:
                     return [], None
-                remaining_ids = {container_id for container_id, _ in refreshed}
+                remaining_ids = {container_id for container_id, _, _ in refreshed}
                 removed = [container_id for container_id in stale if container_id not in remaining_ids]
                 containers = refreshed
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -369,7 +380,7 @@ def sweep_stale_sandboxes(
 
     removed_ids = set(removed)
     remaining_containers = [item for item in containers if item[0] not in removed_ids]
-    live_owners = {owner_id for _, owner_id in remaining_containers}
+    live_owners = {owner_id for _, owner_id, _ in remaining_containers}
     _prune_owner_heartbeats(heartbeat_dir, live_owners, ttl_s, current_time)
     return removed, len(remaining_containers)
 

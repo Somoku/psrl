@@ -182,6 +182,12 @@ def build_sandbox_spec(
         idle_timeout_s=parse_duration_seconds(container_config.get("container_timeout")),
         idempotency_key=f"{sandbox_prefix}:{'grader' if grading else 'rollout'}",
         state_policy=SandboxStatePolicy(enabled=bool(sandbox_config.get("snapshot_verifier", True))),
+        # Declared per role, never inferred from the requested size: node admission gives
+        # each class its own guaranteed slice so the larger grader cannot starve.
+        resource_class=str(container_config.get("resource_class") or "default"),
+        # Both sandboxes of one task belong to the same job, which lets the manager detect a
+        # job that asks for its grader before releasing its rollout sandbox.
+        workflow_id=sandbox_prefix,
     )
 
 

@@ -9,10 +9,17 @@
       cwd: "/testbed"
       container_timeout: "2h"
     rollout_environment:
-      memory: "8g"
+      # Must cover whatever the agent runs inside the sandbox (pytest, type checkers). An
+      # undersized limit gets the whole container OOM-killed and the episode loses its work.
+      memory: "16g"
+      # Node capacity class. Each class holds a guaranteed slice of the node envelope, so the
+      # rollout and grader sandboxes below cannot starve each other. Both names must be
+      # declared under rollout.agent.sandbox.capacity.classes.
+      resource_class: rollout
     grader_environment:
       memory: "30g"
       timeout: 900
+      resource_class: grader
   harness:
     kind: claude_code
     executable: claude

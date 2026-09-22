@@ -94,6 +94,33 @@ def test_driver_grades_raw_log_without_markers(tmp_path: Path) -> None:
     assert (scorecard["p2p_pass"], scorecard["p2p_total"]) == (1, 1)
 
 
+def test_driver_names_the_failed_expected_tests(tmp_path: Path) -> None:
+    # The gold gate prunes P2P entries the image cannot run, so the scorecard has
+    # to name which expected test failed, not just how many.
+    scorecard = _run_driver(
+        tmp_path,
+        "PASSED tests/a.py::test_a\nFAILED tests/c.py::test_c\n",
+        markers=False,
+        f2p=["tests/a.py::test_a"],
+        p2p=["tests/c.py::test_c"],
+    )
+
+    assert scorecard["resolved"] is False
+    assert scorecard["f2p_failed"] == []
+    assert scorecard["p2p_failed"] == ["tests/c.py::test_c"]
+
+
+def test_scorecard_rejects_malformed_failed_tests() -> None:
+    from examples.mini_swe.grading.schema import GradingResult
+
+    valid = {"resolved": False, "f2p_pass": 0, "f2p_total": 1, "p2p_pass": 0, "p2p_total": 0}
+    assert GradingResult.from_dict(valid).p2p_failed == ()
+    with pytest.raises(ValueError):
+        GradingResult.from_dict({**valid, "p2p_failed": [1]})
+    with pytest.raises(ValueError):
+        GradingResult.from_dict({**valid, "p2p_failed": ""})
+
+
 def test_driver_reports_partial_and_unparseable(tmp_path: Path) -> None:
     partial = _run_driver(
         tmp_path / "partial",
@@ -309,6 +336,17 @@ def test_expected_nonpassing_test_never_disappears(status: str) -> None:
 
     report = get_eval_tests_report({"test": status}, {"FAIL_TO_PASS": ["test"]}, eval_type="pass_and_fail")
     assert report["FAIL_TO_PASS"] == {"success": [], "failure": ["test"]}, "Expected test must remain failed."
+
+
+@pytest.mark.parametrize("status", ["SKIPPED", "UNKNOWN"])
+def test_expected_nonpassing_test_cannot_resolve_the_task(status: str) -> None:
+    # Upstream would drop this test from the denominator and resolve the task,
+    # which lets a patch pass by making its expected tests skip.
+    from examples.mini_swe.grading.scoring import RESOLVED_FULL, get_eval_tests_report, get_resolution_status
+
+    report = get_eval_tests_report({"test": status}, {"FAIL_TO_PASS": ["test"]}, eval_type="pass_and_fail")
+
+    assert get_resolution_status(report) != RESOLVED_FULL, "A non-passing expected test must not resolve."
 
 
 def test_missing_expected_test_fails_after_json_roundtrip(tmp_path: Path) -> None:

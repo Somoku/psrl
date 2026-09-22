@@ -49,7 +49,7 @@ sandbox:
     docker:
       _target_: psrl.sandbox.backends.DockerBackend
       image_pull_concurrency: 2  # per backend instance, not per node
-      max_exec_output_bytes: 16777216  # stdout/stderr frames combined
+      max_exec_output_bytes: 16777216  # truncated with a marker, never fatal
       lifecycle:
         # Must be shared by all workers that use the same Docker daemon.
         heartbeat_dir: /tmp/psrl-sandbox-heartbeats
@@ -131,10 +131,15 @@ Explicit filesystem snapshots remain supported and have unique tags. Full-state
 snapshots on capable microVM backends retain their existing workflow.
 
 Exec output is bounded by `max_exec_output_bytes`, including Docker frame
-headers. Exceeding the limit raises an error and destroys the disposable
-container, as do command timeout, cancellation, and transport failure. The
-command deadline includes exec creation, stream attachment, and exit-status
-inspection. The underlying per-request transport timeout still applies.
+headers. A command that exceeds it is drained and its output is truncated with a
+marker, so the command finishes, the container stays healthy, and the caller gets a
+bounded answer instead of losing its work. That budget is a diagnostic guard, not a
+limit on results: data that must survive intact is written to a file and read back
+with `read_bytes`, which has no such budget. Command timeout, cancellation, and
+transport failure still destroy the disposable container, because the container can
+no longer be trusted to have finished the command. The command deadline includes exec
+creation, stream attachment, and exit-status inspection. The underlying per-request
+transport timeout still applies.
 
 `cgroup_parent`, when configured on `DockerBackend`, is passed through as an
 opaque Docker setting so both cgroupfs paths and systemd slice names work. PSRL
@@ -151,12 +156,47 @@ container request, waits until both dimensions fit, and returns capacity only
 after the sandbox is terminated. Rollouts and graders therefore share spare
 capacity naturally; there are no fixed pools or per-worker estimates.
 
+Every request names the resource class of the sandbox it will create, such as
+`rollout` or `grader`. Each class owns a FIFO queue and a guaranteed share of the
+envelope, so the order classes arrive in cannot starve one of them: a request
+inside its own guarantee is admitted as soon as the envelope has room, whatever
+the other classes are doing. Guarantees are floors rather than partitions, and
+they are meant to sum to less than one:
+
+- the remainder is one elastic pool, borrowed by a class only while no other
+  class has a request waiting;
+- summing to less than one is what keeps every guarantee satisfiable at the same
+  time without preempting a running sandbox.
+
+Size the shares from measurement. A class needs enough of the envelope to cover
+its phase's footprint times the fraction of an episode spent in that phase, both
+of which are recorded in `reward_info.timing` and, with
+`sandbox_config.collect_resource_metrics`, in `sandbox_peak_memory_mib`. A class
+that is never declared has no guarantee and can only use the elastic pool, which
+the coordinator warns about once.
+
+A request that stays queued for `acquire_timeout_s` fails with a capacity fault
+instead of waiting forever, because a sandbox that was never admitted says
+nothing about the model or the harness and must not be reported as one. It must
+leave room for the episode inside the rollout's derived child deadline, which the
+agent loop validates at startup. Admission reports per-class guarantees, usage,
+queue depth, and wait time in `snapshot()`, which the trainer logs once per node at
+startup.
+
+A multi-phase job must hold one sandbox at a time: release the rollout sandbox
+before requesting the grader. Holding one while waiting for another cannot be
+fixed by any admission order, because each phase occupies capacity the other
+needs. `SandboxManager` reports and counts such a job when the specs share a
+`workflow_id`, so the supported ordering is a checked contract rather than a
+convention.
+
 The coordinator actor's Ray `max_concurrency` is derived from the workers
 assigned to that node and their real agent-loop concurrency. It is an internal
 scheduler bound, not a resource-budget knob and therefore is not user
-configurable. This leaves the user-facing envelope at three values: optional
-CPU, optional memory, and one utilization margin. Lease TTL and heartbeat
-interval retain typed defaults and are advanced failure-recovery settings.
+configurable. The user-facing envelope is therefore optional CPU, optional
+memory, one utilization margin, the `classes` guarantees, and the
+`acquire_timeout_s` deadline. Lease TTL and heartbeat interval retain typed
+defaults and are advanced failure-recovery settings.
 
 The defaults reclaim orphan Docker containers after 120 seconds with a
 30-second sweep interval, before the capacity owner can expire after 180
@@ -167,11 +207,8 @@ than the Docker lease TTL plus one GC interval.
 cgroup/node. `utilization` is the single safety margin for co-located services.
 Requests larger than the envelope fail immediately. Worker heartbeats renew all
 of their allocations, while lease expiry recovers capacity after a killed Ray
-actor. The queue weights requests by their dominant normalized CPU/memory share,
-admits smaller requests while they fit, and bounds bypasses of the oldest
-request. After that bound, it briefly reserves released capacity for the oldest
-request instead of allowing indefinite starvation. Remote/provider-managed
-backends do not consume this node envelope.
+actor, and reports the wait as a capacity fault rather than as a cancellation.
+Remote/provider-managed backends do not consume this node envelope.
 
 A Docker exec timeout destroys that disposable session. Once an Engine exec
 start request times out, this client cannot safely kill only that exec process;

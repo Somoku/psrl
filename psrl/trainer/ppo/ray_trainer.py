@@ -100,6 +100,7 @@ from psrl.utils.server.command import Command, CommandType
 from psrl.utils.transferqueue_utils import PayloadState, clear_payload
 from psrl.workers.agent_loop.manager import PSRL_AgentLoopManager
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
+from psrl.workers.agent_loop.timeouts import resolve_from_config, validate_lease_max_age_s
 from psrl.workers.agent_loop.worker import PSRL_AgentLoopWorker
 from psrl.workers.config.reward_model import resolve_active_managers
 from psrl.workers.gen.rollout_coordination import RolloutCoordinator
@@ -124,6 +125,24 @@ from psrl.workers.train import TrainInterface
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+def _log_agent_loop_timeouts(config) -> None:
+    """Resolve and report the rollout deadline ladder, refusing a contradictory one.
+
+    Every internal deadline derives from the episode budget, so resolving the ladder here is
+    both the validation and the place a reader can see what the run will actually enforce.
+
+    The capacity lease age cap is checked against the same ladder, because it is the
+    last-resort recovery for a lease whose release was missed and therefore has to outlive
+    the longest sandbox a healthy run can hold.
+    """
+    ladder = resolve_from_config(config)
+    psrl_logger.info("Rollout deadlines: %s.", ladder.describe())
+    validate_lease_max_age_s(
+        config.gen_actor_rollout_ref.rollout.agent.sandbox.capacity.get("lease_max_age_s"),
+        ladder,
+    )
 
 
 class ReplayBuffer:
@@ -452,8 +471,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Data queue is the communication handle between the data processor and the rollout server.
         # The size of the queue is determined by the batch size and the rollout n.
         self.data_queue_size = (
-            self.config.data.get("gen_batch_size", self.config.data.train_batch_size) * self.rollout_n
-        )
+            self.config.data.get("gen_batch_size") or self.config.data.train_batch_size
+        ) * self.rollout_n
 
         psrl_logger.debug(
             "Initialized data_queue with sizes: %d.",
@@ -1187,6 +1206,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 acc = extra_info.get("acc", 0.0)
                 reward_extra_infos_dict["reward_extra_info"].append(extra_info)
                 reward_extra_infos_dict["acc"].append(acc)
+                # Grading diagnostics need their own vars, because the trainer only
+                # publishes the names listed here. Defaults keep every list aligned.
+                reward_extra_infos_dict["gold_ceiling"].append(float(extra_info.get("gold_ceiling", 1.0)))
+                reward_extra_infos_dict["grading_failed"].append(float(extra_info.get("grading_failed", 0.0)))
 
             # Store generated outputs
             sample_outputs.extend(all_outputs[i] for i in final_indices)
@@ -1859,6 +1882,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         capacity_config = (
             OmegaConf.to_container(sandbox_config.get("capacity", {}), resolve=True) if use_node_capacity else None
         )
+        _log_agent_loop_timeouts(self.config)
         # Node-local capacity coordinators must share a node with their workers, and a soft
         # placement could fall back to an excluded node, so both need hard affinity.
         hard_affinity = bool(allowed_ips) or use_node_capacity

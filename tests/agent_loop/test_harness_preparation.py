@@ -11,6 +11,8 @@ import pytest
 from psrl.sandbox import SandboxManager, SandboxSource, SandboxSpec
 from psrl.sandbox.backends.docker import DockerBackend
 from psrl.workers.agent_loop.harness import HarnessTaskContext
+from psrl.workers.agent_loop.loops.budget import EpisodeBudget
+from psrl.workers.agent_loop.timeouts import resolve_agent_loop_timeouts
 from tests.sandbox.test_docker_backend import FakeDockerEngine
 
 pytestmark = pytest.mark.cpu_test
@@ -59,11 +61,16 @@ async def test_grader_preparation_overlaps_rollout_without_allocating_a_grader(h
         assert len(manager._leases) == 1, "Speculative preparation must not reserve grader capacity."
         assert engine.config["Image"] == "rollout", "Only the rollout container should exist."
         finish.set()
-        return SimpleNamespace()
+        return SimpleNamespace(exit_code=0, stderr_tail="")
 
     harness = SimpleNamespace(prepare=AsyncMock(), run=run_harness, abort=AsyncMock())
     monkeypatch.setattr(harness_module, "create_harness", lambda *args: harness)
     loop = harness_module.HarnessAgentLoop.__new__(harness_module.HarnessAgentLoop)
+    # Mirrors `AgentLoopBase.__init__`, which `__new__` skipped.
+    loop.episode_budget = EpisodeBudget(None, starts_after_provisioning=True)
+    loop.timeouts = resolve_agent_loop_timeouts(None, None)
+    # The base class is stubbed out for this module, so borrow the real arming hook.
+    loop.arm_episode_budget = loop.episode_budget.arm
     output = SimpleNamespace()
     loop.sandbox_manager = manager
     loop.resolve_request_settings = lambda request: None
@@ -108,6 +115,11 @@ async def test_cancelled_session_setup_cancels_preparation_and_cleans_task(harne
             cancelled.set()
 
     loop = harness_module.HarnessAgentLoop.__new__(harness_module.HarnessAgentLoop)
+    # Mirrors `AgentLoopBase.__init__`, which `__new__` skipped.
+    loop.episode_budget = EpisodeBudget(None, starts_after_provisioning=True)
+    loop.timeouts = resolve_agent_loop_timeouts(None, None)
+    # The base class is stubbed out for this module, so borrow the real arming hook.
+    loop.arm_episode_budget = loop.episode_budget.arm
     task = HarnessTaskContext(state=None, prompt="fix", sandbox_spec=SandboxSpec(SandboxSource.image("rollout")))
     loop.sandbox_manager = SimpleNamespace(prepare=prepare)
     loop.resolve_request_settings = lambda request: None

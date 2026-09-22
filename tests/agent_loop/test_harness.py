@@ -10,7 +10,11 @@ from pathlib import Path
 
 import pytest
 from examples.mini_swe.config import build_runtime_config
-from examples.mini_swe.utils.harness_task import build_harness_prompt, collect_git_patch
+from examples.mini_swe.utils.harness_task import (
+    _HARNESS_PATCH_PATH,
+    build_harness_prompt,
+    collect_git_patch,
+)
 from omegaconf import OmegaConf
 from psrl.sandbox import (
     ExecResult,
@@ -253,10 +257,17 @@ async def test_failed_trajectory_can_collect_output_after_successful_cli_exit() 
 
 
 @pytest.mark.asyncio
-async def test_patch_collection_includes_staged_and_untracked_changes() -> None:
-    sandbox = FakeSandbox()
+async def test_patch_collection_reads_the_patch_file_in_full() -> None:
+    """The patch is fetched as a file, so no command-output budget can cut it short.
 
-    await collect_git_patch(sandbox, "/testbed")
+    Reading it back as command output capped the patch at the diagnostic budget, and a
+    patch cut short would be graded as if it were the agent's whole solution.
+    """
+    sandbox = FakeSandbox()
+    collected = b"diff --git a/x b/x\n+line\n" * 100_000
+    sandbox.writes[_HARNESS_PATCH_PATH] = collected
+
+    patch = await collect_git_patch(sandbox, "/testbed")
 
     script, cwd, _ = sandbox.commands[-1]
     assert cwd == "/testbed"
@@ -268,6 +279,10 @@ async def test_patch_collection_includes_staged_and_untracked_changes() -> None:
     assert '[ -e "$d/.git" ]' in script
     # The collector never stages, so a nested repo without a commit cannot break it.
     assert "git add" not in script
+    # The patch leaves the sandbox as a file rather than as command output.
+    assert f"out={_HARNESS_PATCH_PATH}" in script
+    assert "cat " not in script
+    assert patch == collected.decode()
 
 
 @pytest.mark.asyncio

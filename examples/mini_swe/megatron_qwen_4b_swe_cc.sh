@@ -27,13 +27,11 @@ ray status 2>/dev/null | head -5 || echo "WARNING: ray status failed"
 echo "=== Pre-flight done ==="
 
 # --- Model ---
-# NOTE(lhy): Modify max_position_embeddings in config.json to 32768 after downloading.
+# Qwen3.5-4B has max_position_embeddings=262144, so do not patch config.json.
 HF_MODEL_PATH=/apdcephfs_zwfy_303760348/share_303760348/ls/models/Qwen3.5-4B
 
 # --- Data ---
-# Train: SWE-smith-py 1 000-problem repo-balanced subset.
-#
-# Validation: SWE-bench Verified 80-problem repo-balanced subset.
+# Both splits are SkyRL-v0-293: 293 train and 23 validation SWE-bench Verified rows.
 TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_gym_293/train.parquet
 TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_gym_293/val.parquet
 
@@ -102,14 +100,8 @@ clip_ratio_high=0.28
 
 # --- Sequence lengths ---
 #
-# The harness protocol prompt (Claude Code system prompt + tool catalog + task)
-# is ~3.2k tokens, so the prompt budget must exceed 2048.
-#
-# TITO compaction branches carry the whole pre-compaction context as their
-# prompt (up to ~30k). With packing_length=32000 (<= the 32768-token model
-#
-# window) those branches still fit, because the response is capped to
-# budget minus prompt.
+# One multi-turn trajectory shares a 65536-token budget between prompt and response,
+# and max_model_len matches it so the CLI compaction trigger stays trainable.
 max_turns=80
 val_max_turns=160
 max_prompt_length=32768
@@ -123,7 +115,7 @@ actor_lr=1e-6
 enable_overlong_buffer=False
 overlong_buffer_len=$((1024 * 30))
 overlong_penalty_factor=1.0
-loss_agg_mode="session-mean-token-mean"
+loss_agg_mode="token-mean"
 train_prompt_bsz=8
 n_resp_per_prompt=16
 n_resp_per_prompt_val=1

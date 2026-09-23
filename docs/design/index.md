@@ -70,6 +70,14 @@ TMS-backed worker lifecycle and elastic inference resources, with current coloca
 constraints documented explicitly.
 :::
 
+:::{grid-item-card} {octicon}`container;1.5em` Sandbox Lifecycle
+:link: sandbox_lifecycle
+:link-type: doc
+
+Sandbox ownership, node capacity admission, and Docker failure semantics, with the
+invariants that keep resource accounting aligned with running containers.
+:::
+
 ::::
 
 ---
@@ -86,4 +94,5 @@ flexible_rollout
 staleness_control
 kv_cache
 resource_elasticity
+sandbox_lifecycle
 ```

@@ -1,360 +1,225 @@
-# PSRL sandbox abstraction
+# PSRL sandboxes
 
-`SandboxManager` is worker-scoped and `SandboxLease` is trajectory-scoped.
-Agent loops and environments treat the runtime as a black box: they build a
-`SandboxSpec`, then use `exec`, binary file I/O, status, resource stats and
-lifecycle methods without importing Docker, E2B, AgentEnv or CubeSandbox code.
+`SandboxManager` owns execution environments for one worker. Build a
+`SandboxSpec`, acquire a lease, and use its session for commands, binary file
+I/O, resource statistics, and capability-gated state operations. Release the
+lease when the trajectory or grading phase ends.
 
-The required data plane is deliberately small. State operations are optional
-semantic capabilities; a filesystem snapshot is never treated as a full-state
-snapshot. Docker supports filesystem snapshot/restore through image commits but
-does not advertise process-memory snapshots or native fork.
-
-## Runtime boundary
-
-- `SandboxManager`: backend registry, idempotent create, lease ownership,
-  capability/state-policy checks, node-capacity RPC and shutdown.
-- `SandboxCapacityCoordinator`: one Ray actor per Docker node; owns only the
-  shared CPU/memory envelope and weighted admission queue.
-- `SyncSandboxManager`: thread-safe synchronous facade over the worker event
-  loop; it does not create a second backend client or event loop.
-- `DockerBackend`: persistent asynchronous Docker Engine API pool. The Docker
-  CLI remains only in the crash-recovery path, which must survive interpreter
-  failure.
-- `DockerLifecycle`: one worker ownership lease and graceful cleanup. A single
-  detached collector per lease directory reclaims containers after the owner
-  lease expires.
-- `E2BBackend`: E2B SDK data plane and generic E2B native state driver.
-- `AgentEnvBackend` / `CubeSandboxBackend`: provider-specific control-plane
-  factories and state drivers with an E2B-compatible command/file data plane.
-
-MiniSWE keeps two separate adapters. `MiniSWEEnvironment` only translates
-dataset rows to observations. `MiniSWEAgentAdapter` implements the synchronous
-third-party harness protocol and delegates all runtime work to
-`SyncSandboxSession`.
+Each trajectory gets a fresh writable filesystem. Cached image layers are
+shared, but mutable containers are never pooled between unrelated trajectories.
+For lifecycle invariants and implementation boundaries, see
+[Sandbox lifecycle](../../docs/design/sandbox_lifecycle.md).
 
 ## Configuration
 
-Backends are Hydra targets under
-`gen_actor_rollout_ref.rollout.agent.sandbox.backends`:
+Configure Hydra targets under
+`gen_actor_rollout_ref.rollout.agent.sandbox.backends`. For example:
 
 ```yaml
 sandbox:
   default_backend: docker
   capacity:
-    memory_mb: null    # detect the node/cgroup limit
-    cpu_cores: null    # detect the node/cgroup limit
-    utilization: 0.5   # the only node-envelope safety margin
+    memory_mb: null
+    cpu_cores: null
+    utilization: 0.5
+    classes:
+      rollout:
+        guaranteed_share: 0.60
+      grader:
+        guaranteed_share: 0.25
+    acquire_timeout_s: 1800
   backends:
     docker:
       _target_: psrl.sandbox.backends.DockerBackend
-      image_pull_concurrency: 2  # per backend instance, not per node
-      max_exec_output_bytes: 16777216  # truncated with a marker, never fatal
-      lifecycle:
-        # Must be shared by all workers that use the same Docker daemon.
-        heartbeat_dir: /tmp/psrl-sandbox-heartbeats
-      disk_admission:
-        # Optional and disabled by default. The path must be the daemon data
-        # filesystem as mounted on the worker host.
-        path: /dockerdata
-        min_free_mb: 51200
-        wait_timeout_s: 300
+      image_pull_concurrency: 2
+      connection_limit: 128
+      max_exec_output_bytes: 16777216
       security:
-        require_rootless: false  # turn on after every node uses rootless dockerd
+        require_rootless: false
         pids_limit: 4096
         cap_drop: [ALL]
-        cap_add: []
         no_new_privileges: true
-        read_only_rootfs: false
-      policy_profiles:
-        # Docker's bridge network remains isolated from host loopback services.
-        mini_swe: {}
-    agentenv:
-      _target_: psrl.sandbox.backends.AgentEnvBackend
-      api_url: ${oc.env:AGENTENV_E2B_API_URL}
-      api_key: ${oc.env:AGENTENV_API_KEY,null}
-    cubesandbox:
-      _target_: psrl.sandbox.backends.CubeSandboxBackend
-      api_url: ${oc.env:CUBE_E2B_API_URL}
-      api_key: ${oc.env:CUBE_API_KEY,null}
 ```
 
-Docker uses the daemon's default seccomp profile unless `seccomp_profile` is
-set. `seccomp=unconfined` is rejected. Read-only rootfs and rootless mode are
-opt-in because they require compatible images/daemons; capability drop,
-no-new-privileges, PID limiting and init/reaping are enabled by default.
-MiniSWE uses Docker's bridge network. Its default policy maps
-`host.docker.internal` to the daemon host and rewrites loopback HTTP(S)/ALL
-proxy URLs to that alias, so node-local proxies remain reachable without host
-networking. Remote proxy URLs are unchanged.
+Declare a sandbox's `resource_class` at the workload call site. The node
+coordinator admits its complete CPU and memory request atomically. Unset node
+limits use cgroup or machine detection, with `utilization` applied to both.
+Provider-managed microVMs do not consume the worker node's Docker envelope.
 
-Crash recovery uses one heartbeat thread per worker rather than one asyncio
-task per container, so long-running commands and a busy event loop do not make
-healthy leases appear stale. The heartbeat directory is the coordination
-boundary: workers connected to one daemon must see the same directory. In a
-containerized deployment, mount it from the daemon host. The collector uses an
-advisory file lock, which the kernel releases automatically if the collector
-dies; a backend restarts a collector that previously exited after an idle
-period.
+Class guarantees set admission priority, and optional `max_share` sets a hard
+ceiling. A request inside its class guarantee is admitted as soon as the envelope
+has room, whatever the other classes are waiting for. When a guaranteed request
+does not fit, the remaining slack is held for it instead of being lent out. Other
+requests borrow the slack in arrival order, and an older borrower that does not
+fit does not block a younger one that does. A request larger than its class
+ceiling or the node envelope fails immediately. Watch
+`max_borrow_bypasses`: a borrower that keeps being skipped means the class shares
+no longer match the workload, and `acquire_timeout_s` will report it as a
+capacity fault rather than hanging.
 
-Collectors filter containers by `psrl.lease_store`, derived from the absolute
-heartbeat directory. Use the same absolute mount path and lease policy for all
-workers in one namespace, and a separate directory for each Docker endpoint.
-Deploy this change with old collectors stopped: older collectors do not honor
-the namespace label. Containers created before this label was added need their
-original owner cleanup or an explicit administrative cleanup. Unreadable lease
-files are treated as an infrastructure error, not proof that their owners died.
+Use the same `workflow_id` for sequential rollout and grading phases. Release
+one phase before acquiring the next. The manager rejects a second reservation
+while the workflow still owns a sandbox or has provisioning in progress.
+`acquire_timeout_s` bounds admission independently of the episode's work budget.
 
-Docker image preparation is asynchronous and does not reserve container CPU or
-memory. `await manager.prepare(spec, backend=...)` checks the daemon image cache
-and, when `auto_pull` is enabled, pulls missing images. Concurrent requests for
-one image share a download; distinct downloads are bounded by
-`image_pull_concurrency`. Cancellation of one waiter does not cancel another
-task's shared download. Backend shutdown cancels and joins remaining downloads.
-Completed requests are not cached in Python, so external image deletion is
-observed by the next preparation request. Use immutable image digests when
-reproducibility matters; preparation does not refresh an already cached tag.
+Docker enforces CPU and memory limits and disables swap when memory is limited.
+It uses an init process, drops capabilities, and retains the daemon's seccomp
+profile. Rootless mode and a read-only root filesystem require compatible
+images and are opt-in. Kernel OOM priorities are left alone, because a negative
+`OomScoreAdj` is inherited by the whole container and only shifts the *host*
+ranking, which would make the kernel kill the trainer before a disposable
+sandbox. Set `security.oom_score_adj` when you want that trade.
+Image entrypoints are cleared so the configured keepalive command owns startup.
 
-The generic harness loop overlaps rollout image preparation with TITO session
-creation and grader image preparation with rollout. MiniSWE's threaded agent
-loop also starts grader image preparation before dispatching its runner.
-Container setup and harness preparation remain ordered within a trajectory:
-the first command requires a ready container. These operations can overlap
-other trajectories, but this is not a ready-container pool or a dataset-wide
-prefetch scheduler.
+Use typed `policy_profiles` for workload overrides. MiniSWE's configured bridge
+profile maps `host.docker.internal` to the Docker host and rewrites loopback
+proxy URLs to that alias. Remote proxy URLs retain their original destination.
 
-Grading always uses a separate container. Docker shares the cached immutable
-image layers while allocating a fresh writable layer; the rollout lease is
-released before the grader requests capacity. The generic loop no longer
-commits an unprepared Docker container merely to recreate the same baseline.
-Explicit filesystem snapshots remain supported and have unique tags. Full-state
-snapshots on capable microVM backends retain their existing workflow.
+## Ownership and cleanup
 
-Exec output is bounded by `max_exec_output_bytes`, including Docker frame
-headers. A command that exceeds it is drained and its output is truncated with a
-marker, so the command finishes, the container stays healthy, and the caller gets a
-bounded answer instead of losing its work. That budget is a diagnostic guard, not a
-limit on results: data that must survive intact is written to a file and read back
-with `read_bytes`, which has no such budget. Command timeout, cancellation, and
-transport failure still destroy the disposable container, because the container can
-no longer be trusted to have finished the command. The command deadline includes exec
-creation, stream attachment, and exit-status inspection. The underlying per-request
-transport timeout still applies.
+A lease is released only after confirmed sandbox destruction and capacity
+return. Repeated cancellation waits for the complete ownership transition.
+If deletion or capacity return fails, the manager retains the lease and retries
+with exponential backoff up to 30 seconds. Completed episodes can return while
+cleanup is deferred, but the reservation remains charged.
 
-`cgroup_parent`, when configured on `DockerBackend`, is passed through as an
-opaque Docker setting so both cgroupfs paths and systemd slice names work. PSRL
-does not create cgroups or write version-specific control files. Each container
-receives Docker CPU and memory limits from `ResourceSpec`; the same request is
-charged atomically against the node envelope before creation.
+A partial creation failure can carry a session in `SandboxProvisionError`.
+Backend authors must use it when a runtime object might still exist. Ordinary
+creation failures must leave no allocated runtime behind. `terminate()` must
+raise when destruction cannot be confirmed.
 
-## Node resource planning
+Identical idempotent requests share one provisioning task and lease. Cancelling
+one waiter leaves other waiters intact. When every waiter leaves, queued
+admission is withdrawn and any in-flight creation is settled and reclaimed.
+An idempotency key cannot be reused while its previous session is being reclaimed.
 
-For node-local Docker, the trainer pins one `SandboxCapacityCoordinator` to each
-node and gives every worker on that node the same actor handle. The coordinator
-owns one CPU-plus-memory envelope. `SandboxManager.acquire()` submits the actual
-container request, waits until both dimensions fit, and returns capacity only
-after the sandbox is terminated. Rollouts and graders therefore share spare
-capacity naturally; there are no fixed pools or per-worker estimates.
+Shutdown rejects new work, cancels queued admission, settles provisioning,
+reclaims leases, and closes backend transports. Unconfirmed cleanup is reported
+as a shutdown error. Allocation age alone never releases capacity.
 
-Every request names the resource class of the sandbox it will create, such as
-`rollout` or `grader`. Each class owns a FIFO queue and a guaranteed share of the
-envelope, so the order classes arrive in cannot starve one of them: a request
-inside its own guarantee is admitted as soon as the envelope has room, whatever
-the other classes are doing. Guarantees are floors rather than partitions, and
-they are meant to sum to less than one:
+## Docker execution
 
-- the remainder is one elastic pool, borrowed by a class only while no other
-  class has a request waiting;
-- summing to less than one is what keeps every guarantee satisfiable at the same
-  time without preempting a running sandbox.
+Command streams and lifecycle operations use separate persistent HTTP connection
+pools, each bounded by `connection_limit`. A full set of long-running commands
+therefore cannot consume the connections required for inspection and deletion.
+Commands in one session are serialized. The command deadline covers waiting for
+that session, exec creation, streaming, and final exit-status inspection.
 
-Size the shares from measurement. A class needs enough of the envelope to cover
-its phase's footprint times the fraction of an episode spent in that phase, both
-of which are recorded in `reward_info.timing` and, with
-`sandbox_config.collect_resource_metrics`, in `sandbox_peak_memory_mib`. A class
-that is never declared has no guarantee and can only use the elastic pool, which
-the coordinator warns about once.
+`max_exec_output_bytes` bounds the combined stdout and stderr payload. Docker
+frame headers do not consume this budget. Excess output is drained and reported
+with `ExecResult.truncated` plus a text marker. Incomplete or malformed framing
+is a transport failure. Store complete results in files and read them with
+`read_bytes` when truncation would lose task data.
 
-A request that stays queued for `acquire_timeout_s` fails with a capacity fault
-instead of waiting forever, because a sandbox that was never admitted says
-nothing about the model or the harness and must not be reported as one. It must
-leave room for the episode inside the rollout's derived child deadline, which the
-agent loop validates at startup. Admission reports per-class guarantees, usage,
-queue depth, and wait time in `snapshot()`, which the trainer logs once per node at
-startup.
+Timeout, cancellation, and transport failure destroy the disposable session:
+closing an exec connection does not establish that its process stopped.
+Container stops come from one shared Docker event stream, so an OOM kill
+interrupts its hung command within a beat instead of at the next poll. A daemon
+that will not serve `/events` falls back to inspect polling on
+`container_watch_interval_s`. Explicitly retained exit state distinguishes proven
+OOM failures through `SandboxOomError`. The container is removed after
+diagnostics. Exit code 137 alone is not proof of a container OOM.
 
-A multi-phase job must hold one sandbox at a time: release the rollout sandbox
-before requesting the grader. Holding one while waiting for another cannot be
-fixed by any admission order, because each phase occupies capacity the other
-needs. `SandboxManager` reports and counts such a job when the specs share a
-`workflow_id`, so the supported ordering is a checked contract rather than a
-convention.
+`idle_timeout_s` is an absolute Docker lifetime limit, not an inactivity timer.
+`request_timeout_s` bounds control-plane requests. Long command streams use the
+command deadline, so silent commands do not inherit a shorter HTTP total timeout.
+Binary file reads stream the archive through a spooled temporary file, so peak
+memory is one copy of the file rather than three.
 
-The coordinator actor's Ray `max_concurrency` is derived from the workers
-assigned to that node and their real agent-loop concurrency. It is an internal
-scheduler bound, not a resource-budget knob and therefore is not user
-configurable. The user-facing envelope is therefore optional CPU, optional
-memory, one utilization margin, the `classes` guarantees, and the
-`acquire_timeout_s` deadline. Lease TTL and heartbeat interval retain typed
-defaults and are advanced failure-recovery settings.
+## Image preparation and locality
 
-The defaults reclaim orphan Docker containers after 120 seconds with a
-30-second sweep interval, before the capacity owner can expire after 180
-seconds. If these advanced values are overridden, keep the capacity TTL larger
-than the Docker lease TTL plus one GC interval.
+`await manager.prepare(spec)` checks the daemon cache and pulls missing images
+when `auto_pull` is enabled. Acquisition also prepares the image before reserving
+CPU or memory. Concurrent requests share each image download, and
+`image_pull_concurrency` bounds distinct downloads per backend instance.
+Cancelling one waiter does not cancel a shared pull. Shutdown joins remaining
+preparation tasks.
 
-`memory_mb` and `cpu_cores` may be explicit or detected from the coordinator's
-cgroup/node. `utilization` is the single safety margin for co-located services.
-Requests larger than the envelope fail immediately. Worker heartbeats renew all
-of their allocations, while lease expiry recovers capacity after a killed Ray
-actor, and reports the wait as a capacity fault rather than as a cancellation.
-Remote/provider-managed backends do not consume this node envelope.
+Use immutable image digests for reproducibility. Preparation does not refresh an
+already cached mutable tag. Private registries use the backend's `registry_auth`
+mapping with secret-backed Hydra interpolation.
 
-A Docker exec timeout destroys that disposable session. Once an Engine exec
-start request times out, this client cannot safely kill only that exec process;
-retaining the container could leave a runaway process racing later commands.
+Configure `disk_admission.path` to the daemon's data filesystem as visible to the
+worker, together with `min_free_mb` and `wait_timeout_s`, to reject creation when
+space remains low. This is a host headroom check, not a container disk quota.
+Portable `ResourceSpec.disk_mb` is unsupported by Docker.
 
-When MiniSWE selects a microVM backend, set its Docker-only policy to null and
-provide a template (Cube) or template/image (AgentEnv):
+Keep a local Docker daemon on each Ray worker node. A remote daemon's resources
+are not represented by the worker's node-capacity accounting. Prefetch the exact
+image subset for a run and place trajectories on nodes with warm images when
+image loading dominates setup time.
 
-```yaml
-sandbox_config:
-  backend: cubesandbox
-  policy_profile: null
-  snapshot_verifier: true
-  environment:
-    template: my-swe-template
-```
+## Crash recovery
 
-AgentEnv/E2B templates have fixed resources, so set `memory: null` in both
-MiniSWE `rollout_environment` and `grader_environment` for template-backed
-runs. AgentEnv cold images and Cube templates accept explicit resource
-requests.
+`DockerLifecycle` maintains one heartbeat thread per worker and one detached
+collector per heartbeat directory. Workers using one daemon must share the same
+absolute directory path and policy. Use a separate directory for each daemon,
+and mount the directory from the daemon host in containerized deployments.
+The collector filters by the directory's `psrl.lease_store` namespace.
 
-## Source, resource and auth mapping
+The default Docker owner TTL is 120 seconds with a 30-second sweep interval.
+Capacity owner TTL is 180 seconds. Keep the capacity TTL above the Docker TTL
+plus a sweep interval. Unreadable heartbeat files do not prove owner death.
+A live owner's stopped container is reaped once it has stayed stopped for
+`stopped_grace_s` (300 seconds), which leaves the owning session time to read
+`OOMKilled` off it first.
 
-| Backend | Source | CPU / memory / disk | Timeout | Auth |
-|---|---|---|---|---|
-| Docker | OCI image | CPU and memory; portable disk limit rejected | local lifetime task | Docker socket permissions |
-| E2B | template | fixed by template; overrides rejected | SDK `timeout` | E2B API key |
-| AgentEnv | template or cold OCI image | cold image maps all three; template is fixed | `timeout` | `X-API-Key` plus SDK auth |
-| CubeSandbox | template/snapshot | maps `cpuCount`, `memoryMB`, `diskSizeMB` | `timeout` | `X-API-Key` plus SDK auth |
+Each worker sweeps once at startup, before it creates its first sandbox, so a
+restarted run reclaims the previous run's containers instead of being admitted
+against an envelope that does not know their memory is still spoken for.
+Reclamation is driven by heartbeat age, not by owner identity, so the new run's
+different owner id does not matter.
 
-Private Docker pulls can pass Engine `X-Registry-Auth` fields through the
-backend's `registry_auth` mapping. Prefer secret-backed Hydra environment
-interpolation and never place registry passwords directly in checked-in YAML.
+**Owner expiry assumes the node collector and daemon are healthy.** TTL ordering
+is not a physical fence during daemon failure or a prolonged cleanup backlog.
+Stop admission on an unhealthy node before resuming workloads. Shutdown errors
+and deferred-cleanup warnings must be monitored rather than treated as successful
+resource reclamation.
 
-Provider requests carry `psrl.idempotency_key` in metadata. Docker additionally
-uses a deterministic container name and a canonical spec hash, so a retry
-reuses only an exactly matching running container. Concurrent calls inside one
-worker share the same create task and lease.
+## State operations
 
-## State operations in RL
+Snapshot, restore, and branch require backend capabilities and an enabled
+`SandboxStatePolicy`. Docker snapshots include only the writable filesystem.
+They do not include process memory, bind-mounted data, or remote side effects.
+Snapshot tags are unique, and temporary branch snapshots are deleted after use.
 
-Snapshot/restore/branch require both backend capabilities and an explicitly
-enabled `SandboxStatePolicy`. PSRL takes these precautions:
+Secret-bearing environment variables and post-command capture are rejected by
+default. Restored microVMs refresh transports and mix host entropy into the guest.
+A filesystem branch reuses the source spec, with a fresh idempotency key.
+A workflow restricted to one active sandbox cannot branch while retaining its
+parent. Use separate workflow identities for intentionally concurrent branches.
 
-- secret-looking environment variables and credential-bearing proxy URLs are
-  rejected by default;
-- capturing after a user command is rejected unless the caller explicitly
-  accepts non-rollbackable external side effects;
-- the live parent reconnects after snapshot because provider command streams
-  can be invalidated;
-- restored/forked sessions use fresh client connections and mix 64 bytes of
-  host entropy into `/dev/urandom` before use;
-- temporary snapshots used to emulate branch are deleted automatically;
-- MiniSWE uses a clean verifier snapshot only when source and CPU/memory/disk
-  exactly match the grader spec, otherwise it creates a fresh verifier.
+| Backend | Source | Resource mapping | Authentication |
+|---|---|---|---|
+| Docker | OCI image | CPU and memory | Docker socket or endpoint permissions |
+| E2B | Template | Fixed by template | E2B API key |
+| AgentEnv | Template or OCI image | Cold images accept CPU, memory, disk | Provider API key |
+| CubeSandbox | Template or snapshot | CPU, memory, disk | Provider API key |
 
-Snapshotting cannot roll back remote APIs, queues, databases or already-sent
-TCP traffic. The default pre-command checkpoint rule is the enforceable safety
-boundary; `allow_external_side_effects=true` is an explicit research-mode
-escape hatch, not an exactly-once guarantee.
+For template-backed E2B or AgentEnv runs, set MiniSWE memory overrides to null.
+When selecting a microVM, set Docker-only `policy_profile` to null and provide
+the backend's template or image settings.
 
-## Metrics
+## Verification
 
-The node coordinator snapshot reports total and available CPU/memory,
-allocations, waiters, grants, releases, expirations and mean wait time. Backends
-aggregate count, failures, total/mean/max latency for create, exec,
-file I/O, stats, pause/resume, snapshot/restore/fork and terminate. They also
-track active/peak sessions and sampled current/peak memory. Metrics do constant
-work per operation and do not sample the command hot path automatically.
-
-For MiniSWE, set `sandbox_config.collect_resource_metrics=true` to add one
-cgroup stats sample per trajectory (`sandbox_memory_mib`,
-`sandbox_peak_memory_mib`, `sandbox_cpu_total_s`) and exact
-`sandbox_create_s` to trajectory timing. The worker logs final aggregate
-lifecycle metrics on shutdown.
-
-## Local and remote verification
-
-Fast checks, with no daemon/provider required:
+Run unit and contract tests without a Docker daemon:
 
 ```bash
-python -c "import psrl.sandbox; from psrl.sandbox.backends import DockerBackend, AgentEnvBackend, CubeSandboxBackend"
-ruff check .
-pytest -q tests/sandbox
+python -m pytest tests/sandbox
+ruff check psrl/sandbox tests/sandbox
+python scripts/audit_prose_style.py psrl/sandbox tests/sandbox
 git diff --check
 ```
 
-Real Docker conformance and repeatable performance samples:
+Run real Docker conformance and collect reproducible latency samples:
 
 ```bash
-PSRL_RUN_DOCKER_INTEGRATION=1 \
-PSRL_DOCKER_TEST_IMAGE=python:3.11-slim \
-pytest -q -s tests/sandbox/test_docker_live.py
-
+PSRL_RUN_DOCKER_INTEGRATION=1 PSRL_DOCKER_TEST_IMAGE=python:3.11-slim \
+  python -m pytest tests/sandbox/test_docker_live.py
 python tests/sandbox/benchmark_docker_backend.py \
-  --image python:3.11-slim --iterations 100 --concurrency 16 \
-  | tee docker-sandbox-benchmark.json
+  --image python:3.11-slim --iterations 100 --concurrency 16
 ```
 
-Set `PSRL_REQUIRE_ROOTLESS=1` in the conformance command to make rootless mode
-an assertion rather than a recommendation. Compare branches on identical idle
-nodes, with images pre-pulled, at least three runs, and report p50/p95/max create
-and exec latency plus peak container and dockerd RSS.
-
-Live microVM snapshot/restore conformance:
-
-```bash
-PSRL_LIVE_MICROVM_BACKEND=agentenv \
-PSRL_LIVE_MICROVM_API_URL=http://agentenv-api:8080 \
-PSRL_LIVE_MICROVM_API_KEY=... \
-PSRL_LIVE_MICROVM_SOURCE_KIND=image \
-PSRL_LIVE_MICROVM_SOURCE=registry/swe:tag \
-pytest -q -s tests/sandbox/test_microvm_live.py
-
-PSRL_LIVE_MICROVM_BACKEND=cubesandbox \
-PSRL_LIVE_MICROVM_API_URL=http://cube-api:8080 \
-PSRL_LIVE_MICROVM_API_KEY=... \
-PSRL_LIVE_MICROVM_SOURCE_KIND=template \
-PSRL_LIVE_MICROVM_SOURCE=my-template \
-pytest -q -s tests/sandbox/test_microvm_live.py
-```
-
-## Multi-node Docker policy
-
-Keep one node-local Docker daemon per Ray worker node. A centralized remote
-daemon adds a network hop to every exec/file operation, creates a shared failure
-and scheduling bottleneck, and loses data locality. Ray remains the distributed
-scheduler; the sandbox manager remains worker-local.
-
-For large image sets, loading every image on every node is simple but expensive.
-Prefer, in order: precompute the run's exact image subset, prefetch by digest,
-use a registry mirror/cache close to the cluster, and schedule tasks only onto
-nodes where the image is warm. A P2P image distributor or containerd lazy-pull
-snapshotter becomes worthwhile only when measured image warm-up dominates
-rollout time. Replacing Docker with Kubernetes solely for per-episode lifecycle
-is not recommended: control-plane latency and object overhead are larger than
-node-local Engine API calls.
-
-## Remaining work
-
-1. Export metrics to the repository's production metrics backend and add
-   per-node daemon RSS/disk/image-cache gauges.
-2. Add streaming file transfers and optional command-output sinks. Docker exec
-   output is bounded, but `ExecResult` still materializes the retained output.
-3. Add image-locality scheduling and digest manifests for very large SWE image
-   corpora.
-4. Evaluate warm pools only with a backend-specific, proven clean reset; never
-   lease mutable Docker state across unrelated trajectories by default.
+Compare runs on the same idle node with pre-pulled images. Report create and
+exec p50, p95, maximum latency, and peak session count. Unit tests establish
+failure semantics, not production throughput or GPU training convergence.

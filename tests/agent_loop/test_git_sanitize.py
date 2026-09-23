@@ -103,7 +103,7 @@ class _FakeExecSession:
         self._results = list(results)
         self.commands: list[str] = []
 
-    async def exec(self, command, cwd=None, env=None, timeout_s=None):  # noqa: ANN001
+    async def exec(self, command, *, cwd=None, env=None, timeout_s=None):  # noqa: ANN001
         self.commands.append(command)
         result = self._results.pop(0)
         if isinstance(result, Exception):

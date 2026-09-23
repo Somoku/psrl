@@ -10,7 +10,8 @@ from typing import Any
 
 
 class SandboxOomError(RuntimeError):
-    """Raised when a sandbox's container was OOM-killed mid-command.
+    """
+    Raised when a sandbox's container was OOM-killed mid-command.
 
     The kernel kills the whole container, so the episode loses its sandbox and any
     partial work in it. Reported as its own type because it is a resource fault, not
@@ -18,18 +19,45 @@ class SandboxOomError(RuntimeError):
     """
 
 
+class SandboxTransportError(RuntimeError):
+    """
+    Raised when a backend's control channel failed rather than the command itself.
+
+    A lost transport says nothing about the workload, so callers must not read it as a
+    task result. Backends raise their own subclass so a session can recognize a transport
+    fault without catching every `RuntimeError` its own code might raise.
+    """
+
+
 class SandboxCapacityTimeout(RuntimeError):
-    """Raised when node capacity admission never granted a sandbox in time.
+    """
+    Raised when node capacity admission never granted a sandbox in time.
 
     The sandbox was never created, so no episode ever ran: this is a capacity
     planning fault rather than a task, model, or harness failure. It is reported
     as its own type so callers can classify it apart from a cancelled or failed
     episode, and so the wait is visible instead of surfacing as a bare
-    cancellation."""
+    cancellation.
+    """
+
+
+class SandboxProvisionError(RuntimeError):
+    """
+    Transfer ownership of a partially provisioned sandbox to its caller.
+
+    The session may still consume resources and must be terminated before its
+    capacity reservation can be returned.
+    """
+
+    def __init__(self, session: SandboxSession, cause: BaseException) -> None:
+        super().__init__(f"Sandbox provisioning requires cleanup for {session.ref!r}: {cause!r}.")
+        self.session = session
 
 
 class SandboxFeature(str, Enum):
-    """Optional semantic features exposed by a sandbox backend."""
+    """
+    Optional semantic features exposed by a sandbox backend.
+    """
 
     # Suspend processes while retaining the sandbox's allocated host resources.
     FREEZE = "freeze"
@@ -48,7 +76,9 @@ class SandboxFeature(str, Enum):
 
 
 class SandboxSourceKind(str, Enum):
-    """Portable sandbox source kinds."""
+    """
+    Portable sandbox source kinds.
+    """
 
     # OCI-style image containing the sandbox filesystem and startup metadata.
     IMAGE = "image"
@@ -57,7 +87,9 @@ class SandboxSourceKind(str, Enum):
 
 
 class SnapshotKind(str, Enum):
-    """State included in a snapshot."""
+    """
+    State included in a snapshot.
+    """
 
     # Filesystem contents only. Running process and memory state are excluded.
     FILESYSTEM = "filesystem"
@@ -66,7 +98,9 @@ class SnapshotKind(str, Enum):
 
 
 class PauseMode(str, Enum):
-    """Pause semantics requested by the caller."""
+    """
+    Pause semantics requested by the caller.
+    """
 
     # Stop process scheduling but keep the sandbox resident on the current host.
     FREEZE = "freeze"
@@ -75,7 +109,9 @@ class PauseMode(str, Enum):
 
 
 class SandboxStatus(str, Enum):
-    """Backend-neutral session state."""
+    """
+    Backend-neutral session state.
+    """
 
     # The sandbox accepts commands.
     RUNNING = "running"
@@ -91,7 +127,9 @@ class SandboxStatus(str, Enum):
 
 @dataclass(frozen=True)
 class SandboxStatePolicy:
-    """Safety requirements for full-state snapshots and branches."""
+    """
+    Safety requirements for full-state snapshots and branches.
+    """
 
     enabled: bool = False
     allow_secret_capture: bool = False
@@ -101,7 +139,9 @@ class SandboxStatePolicy:
 
 @dataclass(frozen=True)
 class SandboxRef:
-    """Stable reference to a backend-owned sandbox."""
+    """
+    Stable reference to a backend-owned sandbox.
+    """
 
     backend: str
     sandbox_id: str
@@ -109,7 +149,9 @@ class SandboxRef:
 
 @dataclass(frozen=True)
 class SnapshotRef:
-    """Opaque reference to backend-owned snapshot state."""
+    """
+    Opaque reference to backend-owned snapshot state.
+    """
 
     backend: str
     snapshot_id: str
@@ -119,7 +161,9 @@ class SnapshotRef:
 
 @dataclass(frozen=True)
 class SandboxSource:
-    """Source from which a sandbox is provisioned."""
+    """
+    Source from which a sandbox is provisioned.
+    """
 
     kind: SandboxSourceKind
     reference: str
@@ -130,18 +174,24 @@ class SandboxSource:
 
     @classmethod
     def image(cls, image: str) -> SandboxSource:
-        """Create an image-backed source."""
+        """
+        Create an image-backed source.
+        """
         return cls(SandboxSourceKind.IMAGE, image)
 
     @classmethod
     def template(cls, template: str) -> SandboxSource:
-        """Create a provider-template-backed source."""
+        """
+        Create a provider-template-backed source.
+        """
         return cls(SandboxSourceKind.TEMPLATE, template)
 
 
 @dataclass(frozen=True)
 class ResourceSpec:
-    """Optional portable resource requests."""
+    """
+    Optional portable resource requests.
+    """
 
     cpu_count: float | None = None
     memory_mb: int | None = None
@@ -158,7 +208,9 @@ class ResourceSpec:
 
 @dataclass(frozen=True)
 class MountSpec:
-    """Local host bind mount requested by a sandbox workload."""
+    """
+    Local host bind mount requested by a sandbox workload.
+    """
 
     source: str
     target: str
@@ -167,19 +219,11 @@ class MountSpec:
 
 @dataclass(frozen=True)
 class SandboxSpec:
-    """Portable sandbox creation request.
+    """
+    Portable sandbox creation request.
 
-    ``resource_class`` names the role this sandbox plays in a workflow, such as
-    ``rollout`` or ``grader``. Node capacity admission grants each class a
-    guaranteed share of the envelope, so the name must be declared by the
-    caller that knows the role and never inferred from the requested size.
-    Inferring it from size is what let a large grader class starve behind a
-    steady stream of smaller rollout requests.
-
-    ``workflow_id`` groups the leases that belong to one multi-phase job, such as
-    a rollout sandbox followed by a grader sandbox. It lets the manager detect a
-    job that holds one sandbox while asking for another, which is the shape that
-    deadlocks a shared envelope.
+    `resource_class` selects admission priority. `workflow_id` reserves one
+    sandbox phase per workflow, including requests still waiting for capacity.
     """
 
     source: SandboxSource
@@ -209,7 +253,9 @@ class SandboxSpec:
 
 @dataclass(frozen=True)
 class ExecResult:
-    """Completed command result."""
+    """
+    Completed command result.
+    """
 
     exit_code: int
     stdout: str
@@ -221,7 +267,9 @@ class ExecResult:
 
 @dataclass(frozen=True)
 class ResourceUsage:
-    """Point-in-time resource usage reported by a backend."""
+    """
+    Point-in-time resource usage reported by a backend.
+    """
 
     memory_bytes: int = 0
     peak_memory_bytes: int = 0
@@ -230,23 +278,30 @@ class ResourceUsage:
 
 @dataclass(frozen=True)
 class SandboxCapabilities:
-    """Semantic capabilities implemented by one backend or session."""
+    """
+    Semantic capabilities implemented by one backend or session.
+    """
 
     features: frozenset[SandboxFeature] = frozenset()
 
     def supports(self, feature: SandboxFeature) -> bool:
-        """Return whether the feature is implemented with its declared semantics."""
+        """
+        Return whether the feature is implemented with its declared semantics.
+        """
         return feature in self.features
 
     def require(self, *features: SandboxFeature) -> None:
-        """Raise when one or more required features are unavailable."""
+        """
+        Raise when one or more required features are unavailable.
+        """
         missing = [feature.value for feature in features if feature not in self.features]
         if missing:
             raise RuntimeError(f"Sandbox does not support: {', '.join(sorted(missing))}.")
 
 
 class SandboxSession(ABC):
-    """One live execution environment.
+    """
+    One live execution environment.
 
     Command and file operations form the required data plane. State operations
     have default unsupported implementations and are enabled by capabilities,
@@ -256,103 +311,169 @@ class SandboxSession(ABC):
     @property
     @abstractmethod
     def ref(self) -> SandboxRef:
-        """Return the stable backend reference."""
+        """
+        Return the stable backend reference.
+        """
 
     @property
     @abstractmethod
     def capabilities(self) -> SandboxCapabilities:
-        """Return features implemented by this session."""
+        """
+        Return features implemented by this session.
+        """
 
     @abstractmethod
     async def exec(
         self,
         command: str,
+        *,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
         timeout_s: float | None = None,
     ) -> ExecResult:
-        """Execute a command and collect its result."""
+        """
+        Execute a command and collect its result.
+
+        Implementations may serialize commands per session, so callers must not rely on
+        running two commands in one sandbox concurrently. `timeout_s` therefore bounds the
+        whole operation including any wait for the session, not just the command itself.
+
+        Args:
+            command (str): Command line interpreted by the backend's shell.
+            cwd (str | None): Working directory, defaulting to the session's own.
+            env (Mapping[str, str] | None): Variables added for this command only.
+            timeout_s (float | None): Deadline covering the queue wait, setup, streaming,
+                and final status. None waits indefinitely.
+
+        Raises:
+            TimeoutError: When the deadline expires.
+            SandboxOomError: When the container was OOM-killed while the command ran.
+        """
 
     @abstractmethod
     async def read_bytes(self, path: str) -> bytes:
-        """Read a file without assuming text encoding."""
+        """
+        Read a file without assuming text encoding.
+        """
 
     @abstractmethod
     async def write_bytes(self, path: str, data: bytes) -> None:
-        """Write a complete file."""
+        """
+        Write a complete file.
+        """
 
     @abstractmethod
     async def status(self) -> SandboxStatus:
-        """Return the current session status."""
+        """
+        Return the current session status.
+        """
 
     @abstractmethod
     async def terminate(self) -> None:
-        """Idempotently destroy the session."""
+        """
+        Idempotently destroy the session, raising if destruction is unconfirmed.
+        """
 
     async def stats(self) -> ResourceUsage:
-        """Return resource usage when supported."""
+        """
+        Return resource usage when supported.
+        """
         return ResourceUsage()
 
     def resolve_callback_url(self, url: str) -> str:
-        """Translate a worker URL into an equivalent URL reachable from this sandbox."""
+        """
+        Translate a worker URL into an equivalent URL reachable from this sandbox.
+        """
         return url
 
     @property
     def spec(self) -> SandboxSpec | None:
-        """Return the creation spec when this process created the session."""
+        """
+        Return the creation spec when this process created the session.
+        """
         return None
 
     @property
     def command_count(self) -> int:
-        """Return the number of user commands executed by this session object."""
+        """
+        Return the number of user commands executed by this session object.
+        """
         return 0
 
     async def refresh_transport(self) -> None:
-        """Drop stale provider connections after restoring VM state."""
+        """
+        Drop stale provider connections after restoring VM state.
+        """
         return None
 
     async def pause(self, mode: PauseMode) -> None:
-        """Pause the session with explicit semantics."""
+        """
+        Pause the session with explicit semantics.
+        """
         raise NotImplementedError(f"Sandbox {self.ref} does not support {mode.value}.")
 
     async def resume(self) -> None:
-        """Resume a paused session."""
+        """
+        Resume a paused session.
+        """
         raise NotImplementedError(f"Sandbox {self.ref} does not support resume.")
 
     async def snapshot(self, kind: SnapshotKind) -> SnapshotRef:
-        """Capture session state."""
+        """
+        Capture session state.
+        """
         raise NotImplementedError(f"Sandbox {self.ref} does not support {kind.value} snapshots.")
 
     async def fork(self) -> SandboxSession:
-        """Create a backend-native branch of the session."""
+        """
+        Create a backend-native branch of the session.
+        """
         raise NotImplementedError(f"Sandbox {self.ref} does not support native fork.")
 
 
 class SandboxBackend(ABC):
-    """Provisioning and reconnection boundary for one runtime backend."""
+    """
+    Provisioning and reconnection boundary for one runtime backend.
+    """
 
     @property
     @abstractmethod
     def name(self) -> str:
-        """Return the unique manager registration name."""
+        """
+        Return the unique manager registration name.
+        """
 
     @property
     @abstractmethod
     def capabilities(self) -> SandboxCapabilities:
-        """Return capabilities available to newly created sessions."""
+        """
+        Return capabilities available to newly created sessions.
+        """
 
     @property
     def uses_node_capacity(self) -> bool:
-        """Return whether sessions consume resources on the worker's node."""
+        """
+        Return whether sessions consume resources on the worker's node.
+        """
         return False
 
     @abstractmethod
     async def create(self, spec: SandboxSpec) -> SandboxSession:
-        """Create a session from a portable specification."""
+        """
+        Create a session from a portable specification.
+
+        Raises:
+            SandboxProvisionError: When creation failed but a runtime object might still
+                exist. Carrying the session transfers cleanup to the caller, which is the
+                only way its resources can be released. Failures that allocated nothing
+                must raise their own error instead.
+        """
 
     @abstractmethod
     async def connect(self, sandbox_id: str) -> SandboxSession:
-        """Connect to and, when necessary, resume a session."""
+        """
+        Connect to and, when necessary, resume a session.
+        """
 
     async def prepare(self, spec: SandboxSpec) -> None:
         """
@@ -363,19 +484,27 @@ class SandboxBackend(ABC):
         return None
 
     async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> SandboxSession:
-        """Create a session from a snapshot when supported."""
+        """
+        Create a session from a snapshot when supported.
+        """
         raise NotImplementedError(f"Backend {self.name!r} does not support restore.")
 
     async def shutdown(self) -> None:
-        """Release backend-level resources."""
+        """
+        Release backend-level resources.
+        """
         return None
 
     async def delete_snapshot(self, snapshot: SnapshotRef) -> None:
-        """Delete a provider-owned snapshot when supported."""
+        """
+        Delete a provider-owned snapshot when supported.
+        """
         raise NotImplementedError(f"Backend {self.name!r} does not support snapshot deletion.")
 
     def metrics_snapshot(self):
-        """Return backend-local metrics without imposing an exporter."""
+        """
+        Return backend-local metrics without imposing an exporter.
+        """
         from psrl.sandbox.metrics import SandboxMetricsSnapshot
 
         return SandboxMetricsSnapshot()

@@ -7,9 +7,18 @@ from unittest.mock import AsyncMock
 
 import aiohttp
 import pytest
-from psrl.sandbox import SandboxManager, SandboxSource, SandboxSpec, SnapshotKind, SnapshotRef
+from psrl.sandbox import (
+    SandboxManager,
+    SandboxOomError,
+    SandboxSource,
+    SandboxSpec,
+    SandboxStatus,
+    SnapshotKind,
+    SnapshotRef,
+)
 from psrl.sandbox.backends.docker import DockerBackend
 from psrl.sandbox.backends.docker_engine import DockerEngineClient, DockerEngineError
+from psrl.sandbox.core import SandboxProvisionError
 from psrl.sandbox.utils import docker_utils
 
 from tests.sandbox.test_docker_backend import FakeDockerEngine
@@ -29,6 +38,7 @@ class StreamResponse:
         self.chunks = chunks
         self.content = self
         self.closed = False
+        self.chunks_read = 0
 
     async def __aenter__(self):
         return self
@@ -41,6 +51,7 @@ class StreamResponse:
 
     async def iter_chunked(self, size):
         for chunk in self.chunks:
+            self.chunks_read += 1
             yield chunk
 
 
@@ -58,18 +69,17 @@ async def test_pull_rejects_errors_in_successful_http_stream(monkeypatch, field)
 
 
 async def test_exec_output_budget_truncates_and_drains(monkeypatch) -> None:
-    """An oversized command result is bounded, not fatal, and never abandons the stream."""
-    response = StreamResponse([b"1234", b"5678", b"90"])
-    engine = DockerEngineClient()
+    from tests.sandbox.test_docker_engine import _frame
+
+    response = StreamResponse([_frame(1, b"1234"), _frame(2, b"5678"), _frame(1, b"90")])
+    engine = DockerEngineClient(max_exec_output_bytes=5)
     monkeypatch.setattr(
-        engine, "_get_session", AsyncMock(return_value=SimpleNamespace(request=lambda *a, **k: response))
+        engine, "_get_stream_session", AsyncMock(return_value=SimpleNamespace(post=lambda *a, **k: response))
     )
-
-    _, body, _, truncated = await engine._request("POST", "/exec/id/start", expected=(200,), max_response_bytes=5)
-
-    assert body == b"12345", "The retained prefix must respect the budget."
-    assert truncated is True
-    assert response.closed, "The rest of the stream must be drained so the command can finish."
+    stdout, stderr, truncated = await engine._read_exec_output("id", None)
+    assert (stdout, stderr, truncated) == (b"1234", b"5", True)
+    assert response.chunks_read == 3
+    assert response.closed
 
 
 async def test_prepare_shares_pull_and_survives_one_cancelled_waiter(monkeypatch) -> None:
@@ -206,13 +216,13 @@ async def test_exec_requires_a_final_exit_status(monkeypatch, inspection) -> Non
         "_request",
         AsyncMock(
             side_effect=[
-                ({}, b'{"Id":"exec"}', 201, False),
-                ({}, b"", 200, False),
-                ({}, json.dumps(inspection), 200, False),
+                ({}, b'{"Id":"exec"}', 201),
+                ({}, json.dumps(inspection), 200),
             ]
         ),
     )
 
+    monkeypatch.setattr(engine, "_read_exec_output", AsyncMock(return_value=(b"", b"", False)))
     with pytest.raises(DockerEngineError, match="final exit status"):
         await engine.exec("container", ["work"])
 
@@ -261,7 +271,7 @@ async def test_start_failure_is_not_replaced_by_cleanup_failure(monkeypatch) -> 
     monkeypatch.setattr(engine, "start_container", AsyncMock(side_effect=ValueError("start failed")))
     monkeypatch.setattr(engine, "remove_container", AsyncMock(side_effect=OSError("cleanup failed")))
 
-    with pytest.raises(ValueError, match="start failed"):
+    with pytest.raises(SandboxProvisionError, match="start failed"):
         await backend.create(SandboxSpec(SandboxSource.image("image")))
 
 
@@ -271,3 +281,315 @@ async def test_closed_engine_cannot_reopen_its_connection_pool() -> None:
 
     with pytest.raises(RuntimeError, match="client is closed"):
         await engine.info()
+
+
+async def test_cancelling_exec_joins_transport_task_before_return(monkeypatch):
+    engine = FakeDockerEngine()
+    backend = DockerBackend(engine=engine)
+    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+    entered, stopped = asyncio.Event(), asyncio.Event()
+
+    async def execute(*args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(engine, "exec", execute)
+    task = asyncio.create_task(session.exec("work"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stopped.is_set()
+    assert engine.removes == 1
+    await backend.shutdown()
+
+
+async def test_lost_create_response_retains_capacity_until_deletion(monkeypatch):
+    from psrl.sandbox import ResourceSpec
+
+    from tests.sandbox.test_manager import FakeCapacityCoordinator
+
+    engine = FakeDockerEngine()
+    backend = DockerBackend(engine=engine)
+    coordinator = FakeCapacityCoordinator()
+    manager = SandboxManager(
+        {"docker": backend},
+        "docker",
+        capacity_coordinator=coordinator,
+        capacity_owner_id="owner",
+        capacity_heartbeat_interval_s=30,
+    )
+    monkeypatch.setattr(engine, "create_container", AsyncMock(side_effect=aiohttp.ClientPayloadError("Lost reply.")))
+    monkeypatch.setattr(engine, "remove_container", AsyncMock(side_effect=OSError("Daemon unavailable.")))
+    with pytest.raises(SandboxProvisionError):
+        await manager.acquire(SandboxSpec(SandboxSource.image("image"), resources=ResourceSpec(1, 1)))
+    assert not coordinator.released
+    assert len(manager._pending_releases) == 1
+    remove = AsyncMock()
+    monkeypatch.setattr(engine, "remove_container", remove)
+    await asyncio.wait_for(manager._reaper_task, timeout=2)
+    assert len(coordinator.released) == 1
+    assert remove.call_args.args[0].startswith("psrl-sandbox-")
+    await manager.shutdown()
+
+
+async def test_lifecycle_pool_is_independent_of_command_stream_pool():
+    engine = DockerEngineClient(connection_limit=1)
+    control = await engine._get_session()
+    streams = await engine._get_stream_session()
+    assert control.connector is not streams.connector
+    assert streams.timeout.total is None
+    await engine.close()
+    assert control.closed and streams.closed
+
+
+async def test_failed_remove_does_not_claim_termination(monkeypatch):
+    engine = FakeDockerEngine()
+    backend = DockerBackend(engine=engine)
+    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+    remove = engine.remove_container
+    monkeypatch.setattr(engine, "remove_container", AsyncMock(side_effect=OSError("Daemon unavailable.")))
+    with pytest.raises(OSError):
+        await session.terminate()
+    assert not session._terminated
+    assert backend.metrics_snapshot().active_sessions == 1
+    monkeypatch.setattr(engine, "remove_container", remove)
+    await session.terminate()
+    assert backend.metrics_snapshot().active_sessions == 0
+    await backend.shutdown()
+
+
+async def test_cancelled_create_reclaims_container_after_daemon_reply(monkeypatch):
+    engine = FakeDockerEngine()
+    backend = DockerBackend(engine=engine)
+    entered, finish = asyncio.Event(), asyncio.Event()
+    create = engine.create_container
+
+    async def delayed_create(name, config):
+        entered.set()
+        await finish.wait()
+        return await create(name, config)
+
+    monkeypatch.setattr(engine, "create_container", delayed_create)
+    task = asyncio.create_task(backend.create(SandboxSpec(SandboxSource.image("image"))))
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert engine.removes == 1
+    assert not backend._sessions
+    await backend.shutdown()
+
+
+async def test_timeout_while_waiting_for_session_does_not_cancel_active_command(monkeypatch):
+    engine = FakeDockerEngine()
+    backend = DockerBackend(engine=engine)
+    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def execute(*args, **kwargs):
+        entered.set()
+        await finish.wait()
+        return 0, b"done", b"", False
+
+    monkeypatch.setattr(engine, "exec", execute)
+    active = asyncio.create_task(session.exec("active"))
+    await entered.wait()
+    with pytest.raises(TimeoutError):
+        await session.exec("queued", timeout_s=0.01)
+    assert engine.removes == 0
+    finish.set()
+    assert (await active).stdout == "done"
+    await backend.shutdown()
+
+
+async def test_a_removal_error_for_a_container_that_is_already_gone_is_success(monkeypatch):
+    # The API can fail after the container is gone. Retrying forever would keep a capacity
+    # reservation charged for memory nobody is using.
+    engine = FakeDockerEngine()
+    backend = DockerBackend(engine=engine)
+    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+
+    async def remove_then_report_gone(container_id):
+        engine.state = "removed"
+        raise DockerEngineError(500, "driver failed")
+
+    monkeypatch.setattr(engine, "remove_container", remove_then_report_gone)
+    cli_calls: list = []
+    monkeypatch.setattr(docker_utils, "force_remove_container_ids", lambda *a, **k: cli_calls.append(a) or [])
+
+    await session.terminate()
+
+    assert await session.status() is SandboxStatus.TERMINATED
+    assert not cli_calls, "An already-gone container must not reach the CLI."
+    assert not backend._sessions
+    await backend.shutdown()
+
+
+async def test_the_cli_is_the_last_hop_when_the_engine_api_refuses_to_delete(monkeypatch):
+    engine = FakeDockerEngine()
+    backend = DockerBackend(engine=engine)
+    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+    requested: list[list[str]] = []
+
+    async def always_fail(container_id):
+        raise DockerEngineError(500, "unlinkat: device or resource busy")
+
+    def cli_remove(ids, **kwargs):
+        requested.append(list(ids))
+        engine.state = "removed"
+        return list(ids)
+
+    monkeypatch.setattr(engine, "remove_container", always_fail)
+    monkeypatch.setattr(
+        "psrl.sandbox.backends.docker_session.force_remove_container_ids",
+        cli_remove,
+    )
+
+    await session.terminate()
+
+    assert requested == [["container-id"]]
+    assert await session.status() is SandboxStatus.TERMINATED
+    await backend.shutdown()
+
+
+async def test_a_container_neither_api_nor_cli_can_delete_keeps_its_reservation(monkeypatch):
+    engine = FakeDockerEngine()
+    backend = DockerBackend(engine=engine)
+    manager = SandboxManager({"docker": backend}, "docker")
+    lease = await manager.acquire(SandboxSpec(SandboxSource.image("image")))
+
+    async def always_fail(container_id):
+        raise DockerEngineError(500, "unlinkat: device or resource busy")
+
+    monkeypatch.setattr(engine, "remove_container", always_fail)
+    monkeypatch.setattr(
+        "psrl.sandbox.backends.docker_session.force_remove_container_ids",
+        lambda ids, **kwargs: [],
+    )
+
+    await lease.release()
+
+    assert not lease.released
+    assert lease in manager._pending_releases
+    assert manager.ownership_snapshot()["pending_releases"] == 1
+    manager._reaper_task.cancel()
+    await asyncio.gather(manager._reaper_task, return_exceptions=True)
+
+
+def _die(container_id: str, action: str = "die", nano: int = 1) -> dict:
+    return {"id": container_id, "Action": action, "timeNano": nano}
+
+
+async def test_a_stop_is_observed_from_the_event_stream_without_polling(monkeypatch):
+    engine = FakeDockerEngine()
+    engine.events_queue = asyncio.Queue()
+    backend = DockerBackend(engine=engine, container_watch_interval_s=3600)
+    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+    entered = asyncio.Event()
+
+    async def hang(*args, **kwargs):
+        entered.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(engine, "exec", hang)
+    command = asyncio.create_task(session.exec("work"))
+    await entered.wait()
+    # `oom` precedes the `die` that follows it, and outranks it.
+    await engine.events_queue.put(_die("container-id", "oom"))
+    await engine.events_queue.put(_die("container-id", "die", nano=2))
+
+    with pytest.raises(SandboxOomError):
+        await asyncio.wait_for(command, timeout=2)
+    await backend.shutdown()
+
+
+async def test_a_plain_stop_is_reported_as_an_exit_not_an_oom(monkeypatch):
+    engine = FakeDockerEngine()
+    engine.events_queue = asyncio.Queue()
+    backend = DockerBackend(engine=engine, container_watch_interval_s=3600)
+    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+    entered = asyncio.Event()
+
+    async def hang(*args, **kwargs):
+        entered.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(engine, "exec", hang)
+    command = asyncio.create_task(session.exec("work"))
+    await entered.wait()
+    await engine.events_queue.put(_die("container-id"))
+
+    with pytest.raises(RuntimeError, match="stopped"):
+        await asyncio.wait_for(command, timeout=2)
+    assert not isinstance(command.exception(), SandboxOomError)
+    await backend.shutdown()
+
+
+async def test_a_daemon_without_event_access_falls_back_to_polling(monkeypatch):
+    # FakeDockerEngine refuses events, which is how a restricted daemon behaves.
+    engine = FakeDockerEngine()
+    backend = DockerBackend(engine=engine, container_watch_interval_s=0.01)
+    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+    entered = asyncio.Event()
+
+    async def hang(*args, **kwargs):
+        entered.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(engine, "exec", hang)
+    command = asyncio.create_task(session.exec("work"))
+    await entered.wait()
+    engine.state = "exited"
+
+    with pytest.raises(RuntimeError, match="stopped"):
+        await asyncio.wait_for(command, timeout=3)
+    assert backend.container_events.supported is False
+    await backend.shutdown()
+
+
+async def test_a_stop_during_a_stream_gap_is_recovered_by_reinspection():
+    engine = FakeDockerEngine()
+    engine.events_queue = asyncio.Queue()
+    backend = DockerBackend(engine=engine, container_watch_interval_s=3600)
+    watcher = backend.container_events
+    waiting = asyncio.create_task(watcher.wait_for_stop("container-id"))
+    await asyncio.sleep(0)
+    await watcher._ready.wait()
+
+    # Drop the stream the way a daemon restart does, losing its event history.
+    async def refuse(*args, **kwargs):
+        raise DockerEngineError(500, "daemon restarting")
+        yield {}  # pragma: no cover
+
+    engine.events = refuse
+    engine.state = "exited"
+    watcher._task.cancel()
+    await asyncio.gather(watcher._task, return_exceptions=True)
+    await watcher._resync()
+
+    assert await asyncio.wait_for(waiting, timeout=1) == "exited"
+    await backend.shutdown()
+
+
+async def test_the_event_stream_replays_from_the_last_event_after_a_drop():
+    engine = FakeDockerEngine()
+    engine.events_queue = asyncio.Queue()
+    backend = DockerBackend(engine=engine, container_watch_interval_s=3600)
+    watcher = backend.container_events
+    waiting = asyncio.create_task(watcher.wait_for_stop("other"))
+    await asyncio.sleep(0)
+    await watcher._ready.wait()
+    await engine.events_queue.put(_die("unrelated", "die", nano=5_000_000_000))
+    await asyncio.sleep(0.05)
+
+    assert watcher._last_event_at == 5.0
+    waiting.cancel()
+    await asyncio.gather(waiting, return_exceptions=True)
+    await backend.shutdown()

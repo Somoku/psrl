@@ -508,7 +508,12 @@ class CubeSandboxStateDriver(ProviderStateDriver):
 
 
 class E2BBackend(SandboxBackend):
-    """Backend for E2B-compatible SDK endpoints."""
+    """Backend for E2B-compatible SDK endpoints.
+
+    TODO(claude): Raise `SandboxProvisionError` when a create can leave a provider sandbox
+    behind. Confirming which SDK failures do that needs a live endpoint, so until then a
+    lost create response leaks until the provider's own idle timeout.
+    """
 
     def __init__(
         self,

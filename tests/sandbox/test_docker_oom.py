@@ -1,8 +1,7 @@
-"""OOM detection, container release, and OOM protection for Docker sandboxes.
+"""OOM detection, container release, and OOM priority for Docker sandboxes.
 
-An 8 GiB rollout sandbox running a memory-hungry repository gets its whole container
-OOM-killed by the kernel. Before this, the exec stream stayed open, the episode hung
-until an unrelated timeout fired, and the dead container was never released.
+A container the kernel OOM-kills leaves its exec stream open forever, so the stop has to
+be detected rather than waited out, and it must be reported as a resource fault.
 """
 
 import asyncio
@@ -32,20 +31,20 @@ async def _session(engine: FakeDockerEngine, backend: DockerBackend, memory_mb: 
 
 
 class TestOomScoreAdj:
-    """The sandbox init must not be the kernel's first choice."""
+    """A sandbox must not outrank the training processes it shares a node with."""
 
-    async def test_the_default_protects_the_container_init(self):
+    async def test_the_default_leaves_host_oom_priorities_alone(self):
         engine = FakeDockerEngine()
         await _session(engine, DockerBackend(engine=engine))
 
-        assert engine.config["HostConfig"]["OomScoreAdj"] == -500
+        assert "OomScoreAdj" not in engine.config["HostConfig"]
 
-    async def test_protection_can_be_disabled(self):
+    async def test_deprioritizing_the_sandbox_is_opt_in(self):
         engine = FakeDockerEngine()
-        backend = DockerBackend(engine=engine, security=DockerSecurityConfig(oom_score_adj=None))
+        backend = DockerBackend(engine=engine, security=DockerSecurityConfig(oom_score_adj=-500))
         await _session(engine, backend)
 
-        assert "OomScoreAdj" not in engine.config["HostConfig"]
+        assert engine.config["HostConfig"]["OomScoreAdj"] == -500
 
     async def test_a_policy_override_wins(self):
         engine = FakeDockerEngine()

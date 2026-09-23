@@ -7,8 +7,9 @@ from typing import Any
 
 import pytest
 from psrl.sandbox import MountSpec, PauseMode, SandboxFeature, SandboxSource, SandboxSpec
-from psrl.sandbox.backends.docker import DockerBackend, DockerSession
+from psrl.sandbox.backends.docker import DockerBackend
 from psrl.sandbox.backends.docker_engine import DockerEngineError
+from psrl.sandbox.backends.docker_session import DockerSession
 from psrl.sandbox.utils import docker_utils
 
 
@@ -24,6 +25,9 @@ class FakeDockerEngine:
         self.closed = False
         self.pulled: list[str] = []
         self.pull_auth = None
+        self.event_since: list[float | None] = []
+        self.events_queue: asyncio.Queue | None = None
+        self.oom_killed = False
 
     async def info(self):
         return {"SecurityOptions": ["name=rootless"]}
@@ -48,7 +52,8 @@ class FakeDockerEngine:
             return None
         return {
             "Id": self.container_id,
-            "State": {"Status": self.state},
+            # `Running` is what stop detection reads, so it has to track `state`.
+            "State": {"Status": self.state, "Running": self.state == "running", "OOMKilled": self.oom_killed},
             "Config": {"Labels": (self.config or {}).get("Labels", {})},
         }
 
@@ -65,7 +70,7 @@ class FakeDockerEngine:
     async def exec(self, container_id: str, command: list[str], **kwargs):
         if self.exec_timeout:
             raise TimeoutError("timed out")
-        return 0, command[-1].encode(), b""
+        return 0, command[-1].encode(), b"", False
 
     async def read_file(self, container_id: str, path: str):
         return self.files[path]
@@ -78,6 +83,15 @@ class FakeDockerEngine:
             "memory_stats": {"usage": 1024, "max_usage": 4096},
             "cpu_stats": {"cpu_usage": {"total_usage": 123}},
         }
+
+    async def events(self, *, since: float | None = None):
+        """Replay queued events, or refuse like a daemon without event access."""
+        self.event_since.append(since)
+        if self.events_queue is None:
+            raise DockerEngineError(403, "events are not permitted")
+        yield {}
+        while True:
+            yield await self.events_queue.get()
 
     async def close(self):
         self.closed = True
@@ -113,7 +127,7 @@ async def test_docker_create_maps_spec_and_secure_defaults() -> None:
     assert engine.config["Image"] == "python:3.11"
     host_config = engine.config["HostConfig"]
     assert host_config["Init"]
-    assert host_config["AutoRemove"]
+    assert host_config["AutoRemove"] is False
     assert host_config["CapDrop"] == ["ALL"]
     assert "no-new-privileges" in host_config["SecurityOpt"]
     assert host_config["PidsLimit"] == 4096

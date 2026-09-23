@@ -28,7 +28,8 @@ from psrl.sandbox import (
     SandboxStatePolicy,
     SandboxStatus,
 )
-from psrl.sandbox.backends.docker import DockerBackend, DockerPolicyProfile, DockerSession
+from psrl.sandbox.backends.docker import DockerBackend, DockerPolicyProfile
+from psrl.sandbox.backends.docker_session import DockerSession
 from psrl.workers.agent_loop.harness import (
     HarnessCompactionConfig,
     HarnessConfig,
@@ -71,6 +72,7 @@ class FakeSandbox(SandboxSession):
     async def exec(
         self,
         command: str,
+        *,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
         timeout_s: float | None = None,

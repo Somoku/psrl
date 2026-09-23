@@ -9,11 +9,13 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
+from psrl.sandbox.async_utils import complete_cleanup
 from psrl.sandbox.capacity import ResourceQuantity
 from psrl.sandbox.core import (
     ResourceSpec,
     SandboxBackend,
     SandboxFeature,
+    SandboxProvisionError,
     SandboxRef,
     SandboxSession,
     SandboxSpec,
@@ -28,26 +30,14 @@ if TYPE_CHECKING:
 
 psrl_logger = logging.getLogger(__file__)
 
-
-async def _complete_despite_cancellation(operation: Awaitable) -> None:
-    """Await one operation to completion even when the caller is being cancelled.
-
-    Reclaiming a resource must not be interruptible. A cancellation that lands inside the
-    call would skip it, and a node capacity lease that is never returned has no recovery
-    path of its own: its owner keeps renewing the owner lease, so the coordinator cannot
-    reclaim it and the node stays full forever. This is the same protection the harness
-    cleanup applies to its own teardown, applied to the accounting that must never leak.
-    """
-    task = asyncio.ensure_future(operation)
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await task
-        raise
+# Destruction attempts before a deferred cleanup is reported as a fault rather than a retry.
+_RELEASE_ATTEMPT_ALERT = 5
 
 
 class SandboxLease:
-    """Single-owner lifecycle guard for a sandbox session."""
+    """
+    Single-owner lifecycle guard for a sandbox session.
+    """
 
     def __init__(
         self,
@@ -56,6 +46,7 @@ class SandboxLease:
         release_capacity: Callable[[str], Awaitable[None]] | None = None,
         on_released: Callable[[SandboxLease], None] | None = None,
         workflow_id: str | None = None,
+        on_cleanup_failed: Callable[[SandboxLease], None] | None = None,
     ) -> None:
         self.session = session
         self.workflow_id = workflow_id
@@ -65,47 +56,52 @@ class SandboxLease:
         self._released = False
         self._lock = asyncio.Lock()
         self._on_released = on_released
+        self._on_cleanup_failed = on_cleanup_failed
 
     @property
     def ref(self) -> SandboxRef:
-        """Return the leased sandbox reference."""
+        """
+        Return the leased sandbox reference.
+        """
         return self.session.ref
 
     @property
     def released(self) -> bool:
-        """Return whether the exit disposition has already been applied."""
+        """
+        Return whether the exit disposition has already been applied.
+        """
         return self._released
 
     async def release(self) -> None:
-        """Terminate the sandbox and return its capacity exactly once.
-
-        Termination failure is reported but not raised. A capacity lease has no second
-        recovery path, because the owning worker keeps renewing its owner lease and the
-        coordinator can therefore never reclaim capacity that a release forgot. A
-        container whose removal failed is instead left to the Docker ownership contract,
-        which force-removes every container belonging to a stopped owner. Raising here
-        would also abort a finished episode over a cleanup that cannot be fixed by its
-        caller.
-
-        A failure to return the capacity still propagates, because that is a fault the
-        caller's shutdown path must see, and it leaves the lease owned so it can be
-        retried.
         """
+        Destroy the sandbox before returning capacity, even during cancellation.
+
+        A manager may take over failed destruction for background reclamation.
+        Until destruction succeeds, both ownership and capacity remain held.
+        """
+        await complete_cleanup(self._release())
+
+    async def _release(self) -> None:
         async with self._lock:
             if self._released:
                 return
             if not self._terminated:
                 try:
                     await self.session.terminate()
-                except Exception as exc:
-                    psrl_logger.error(
-                        f"Sandbox terminate failed for {self.session.ref!r}; releasing capacity anyway. The "
-                        f"container may linger until its owner stops or the node sweep reaps it: {exc!r}."
-                    )
-                else:
-                    self._terminated = True
+                except Exception:
+                    if self._on_cleanup_failed is None:
+                        raise
+                    self._on_cleanup_failed(self)
+                    return
+                self._terminated = True
             if self._capacity_lease_id is not None and self._release_capacity is not None:
-                await self._release_capacity(self._capacity_lease_id)
+                try:
+                    await self._release_capacity(self._capacity_lease_id)
+                except Exception:
+                    if self._on_cleanup_failed is None:
+                        raise
+                    self._on_cleanup_failed(self)
+                    return
             self._released = True
             if self._on_released is not None:
                 self._on_released(self)
@@ -117,16 +113,23 @@ class SandboxLease:
         await self.release()
 
 
-@dataclass(frozen=True)
+@dataclass
 class SandboxTask:
-    """One shared create task and the spec bound to its idempotency key."""
+    """
+    One shared create task and the spec bound to its idempotency key.
+    """
 
     spec: SandboxSpec
     task: asyncio.Task[SandboxLease]
+    waiters: int = 0
+    delivered: bool = False
+    abandoned: bool = False
 
 
 class SandboxManager:
-    """Resolve backends and own active sandbox leases for one worker."""
+    """
+    Resolve backends and own active sandbox leases for one worker.
+    """
 
     def __init__(
         self,
@@ -147,38 +150,111 @@ class SandboxManager:
         self._workflow_leases: dict[str, set[SandboxLease]] = {}
         self._idempotent_leases: dict[tuple[str, str], SandboxLease] = {}
         self._create_tasks: dict[tuple[str, str], SandboxTask] = {}
-        self._anonymous_create_tasks: set[asyncio.Task[SandboxLease]] = set()
+        self._provision_tasks: set[asyncio.Task[SandboxLease]] = set()
         self._create_lock = asyncio.Lock()
         self._closed = False
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._pending_releases: set[SandboxLease] = set()
+        self._release_attempts: dict[SandboxLease, int] = {}
+        self._pending_capacity: dict[str, bool] = {}
+        self._reaper_task: asyncio.Task[None] | None = None
+        self._pending_workflows: set[str] = set()
         self._capacity_coordinator = capacity_coordinator
         self._capacity_owner_id = capacity_owner_id
         self._capacity_heartbeat_interval_s = capacity_heartbeat_interval_s
         self._capacity_heartbeat_task: asyncio.Task[None] | None = None
-        # A job that holds one sandbox while waiting for another can deadlock a shared
-        # envelope no matter how admission orders requests. Counted rather than raised
-        # because a backend that hands back a warm sandbox may one day do so on purpose.
-        self.hold_and_wait_observed = 0
         if capacity_coordinator is not None and (not capacity_owner_id or capacity_heartbeat_interval_s is None):
             raise ValueError("Sandbox capacity coordination requires an owner id and heartbeat interval.")
 
     def _register_lease(self, lease: SandboxLease) -> None:
-        """Track a lease and report a job that holds one sandbox while requesting another."""
+        """
+        Track the lease and its workflow reservation.
+        """
         self._leases.add(lease)
         workflow_id = lease.workflow_id
         if workflow_id is None:
             return
         held = self._workflow_leases.setdefault(workflow_id, set())
-        if held:
-            self.hold_and_wait_observed += 1
-            psrl_logger.error(
-                f"Hold-and-wait observed: workflow {workflow_id!r} acquired {lease.ref!r} while it still holds "
-                f"{sorted(item.ref.sandbox_id for item in held)!r}. A multi-phase job must release one sandbox "
-                "before requesting the next, or its phases will starve each other's resource class."
-            )
         held.add(lease)
 
+    def _defer_release(self, lease: SandboxLease) -> None:
+        """Take over a failed destruction without releasing its reservation.
+
+        The backend has already proven the container is neither gone nor removable, so the
+        memory it holds is real. Releasing the reservation here would over-commit the node
+        and turn one stuck container into a host OOM.
+        """
+        attempts = self._release_attempts.get(lease, 0) + 1
+        self._release_attempts[lease] = attempts
+        self._pending_releases.add(lease)
+        # The episode is over either way, so let its workflow start the next phase.
+        self._release_workflow_slot(lease)
+        if attempts == 1:
+            psrl_logger.warning(
+                f"Sandbox cleanup deferred for {lease.ref!r}. Capacity remains reserved.", exc_info=True
+            )
+        elif attempts >= _RELEASE_ATTEMPT_ALERT:
+            psrl_logger.error(
+                f"Sandbox {lease.ref!r} has resisted {attempts} destruction attempts. Its node capacity "
+                "reservation stays charged until it is removed or this worker exits. Check the Docker daemon "
+                "and the container's storage driver.",
+                exc_info=True,
+            )
+        self._ensure_reaper()
+
+    def _ensure_reaper(self) -> None:
+        if not self._closed and (self._reaper_task is None or self._reaper_task.done()):
+            self._reaper_task = asyncio.create_task(self._reap_releases())
+
+    async def _reap_releases(self) -> None:
+        delay = 1.0
+        while self._pending_releases or self._pending_capacity:
+            await asyncio.sleep(delay)
+            results = await asyncio.gather(
+                *(lease.release() for lease in list(self._pending_releases)),
+                *(self._retry_capacity(lease_id) for lease_id in list(self._pending_capacity)),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    psrl_logger.warning(f"Sandbox reclamation failed: {result!r}.")
+            delay = min(delay * 2, 30.0)
+
+    async def _reclaim_unassigned_capacity(self, lease_id: str, *, cancel: bool = False) -> None:
+        self._pending_capacity[lease_id] = cancel
+        try:
+            await self._retry_capacity(lease_id)
+        except Exception:
+            psrl_logger.warning(f"Sandbox capacity reclamation deferred for {lease_id!r}.", exc_info=True)
+        finally:
+            if lease_id in self._pending_capacity:
+                self._ensure_reaper()
+
+    async def _retry_capacity(self, lease_id: str) -> None:
+        cancel = self._pending_capacity[lease_id]
+        method = self._capacity_coordinator.cancel if cancel else self._capacity_coordinator.release
+        await complete_cleanup(method.remote(lease_id))
+        self._pending_capacity.pop(lease_id, None)
+
+    def _reserve_workflow(self, workflow_id: str | None) -> None:
+        """Hold one sandbox phase per workflow, counting requests still waiting.
+
+        Only a phase that is still running blocks the next one. Cleanup this manager has
+        taken over does not, because its reservation already protects the node.
+        """
+        if workflow_id is None:
+            return
+        if workflow_id in self._pending_workflows or self._workflow_leases.get(workflow_id):
+            raise RuntimeError(
+                f"Workflow {workflow_id!r} must release its sandbox before requesting another, or its phases "
+                "will starve each other's resource class."
+            )
+        self._pending_workflows.add(workflow_id)
+
     def backend(self, name: str | None = None) -> SandboxBackend:
-        """Resolve a configured backend by name or use the default backend."""
+        """
+        Resolve a configured backend by name or use the default backend.
+        """
         backend_name = name or self.default_backend
         return self._backends[backend_name]
 
@@ -186,7 +262,9 @@ class SandboxManager:
         self,
         backend: str | None = None,
     ) -> SyncSandboxManager:
-        """Create a facade for synchronous code running outside the current event loop."""
+        """
+        Create a facade for synchronous code running outside the current event loop.
+        """
         from psrl.sandbox.sync import SyncSandboxManager
 
         self._require_open()
@@ -226,11 +304,9 @@ class SandboxManager:
                 request.cpu_millis / 1000,
                 resource_class,
             )
-        except asyncio.CancelledError:
-            # Withdraw the queued request through the same non-interruptible path as a
-            # release, so a second cancellation cannot leave it queued under an owner that
-            # will keep renewing it.
-            await _complete_despite_cancellation(self._capacity_coordinator.cancel.remote(lease_id))
+        except BaseException:
+            # An RPC failure can race a grant, so withdraw the reservation explicitly.
+            await complete_cleanup(self._reclaim_unassigned_capacity(lease_id, cancel=True))
             raise
         return lease_id
 
@@ -241,7 +317,7 @@ class SandboxManager:
         `SandboxLease`, so no acquire failure or cancellation can leave the envelope
         charged for a sandbox that does not exist.
         """
-        await _complete_despite_cancellation(self._capacity_coordinator.release.remote(lease_id))
+        await complete_cleanup(self._capacity_coordinator.release.remote(lease_id))
 
     async def _heartbeat_capacity_owner(self) -> None:
         while True:
@@ -261,6 +337,7 @@ class SandboxManager:
             self._capacity_heartbeat_task.cancel()
             await asyncio.gather(self._capacity_heartbeat_task, return_exceptions=True)
         await self._capacity_coordinator.release_owner.remote(self._capacity_owner_id)
+        self._pending_capacity.clear()
 
     async def prepare(
         self,
@@ -281,47 +358,54 @@ class SandboxManager:
         spec: SandboxSpec,
         backend: str | None = None,
     ) -> SandboxLease:
-        """Provision a sandbox and return its explicit ownership guard."""
+        """
+        Provision one owned sandbox, sharing only identical idempotent requests.
+        """
         self._require_open()
         selected = self.backend(backend)
-        idempotency_key = spec.idempotency_key
-        if idempotency_key is None:
-            async with self._create_lock:
-                self._require_open()
-                task = asyncio.create_task(self._acquire_new(spec, selected))
-                self._anonymous_create_tasks.add(task)
-                task.add_done_callback(self._anonymous_create_tasks.discard)
-            return await asyncio.shield(task)
-
-        task_key = (selected.name, idempotency_key)
+        key = (selected.name, spec.idempotency_key) if spec.idempotency_key else None
         async with self._create_lock:
             self._require_open()
-            existing = self._idempotent_leases.get(task_key)
+            operation = self._create_tasks.get(key) if key else None
+            if operation is not None and operation.abandoned:
+                raise RuntimeError("The sandbox idempotency key is still being reclaimed.")
+            existing = self._idempotent_leases.get(key)
             if existing is not None and not existing.released:
                 if existing.session.spec != spec:
                     raise RuntimeError("A sandbox idempotency key cannot be reused with a different spec.")
+                if existing in self._pending_releases:
+                    raise RuntimeError("The sandbox idempotency key is still being reclaimed.")
                 return existing
-            create_task = self._create_tasks.get(task_key)
-            if create_task is not None and create_task.task.done():
-                self._create_tasks.pop(task_key, None)
-                create_task = None
-            if create_task is None:
-                task = asyncio.create_task(
-                    self._acquire_new(spec, selected, task_key),
-                )
-                self._create_tasks[task_key] = SandboxTask(spec, task)
-            elif create_task.spec != spec:
+            if operation is None:
+                operation = SandboxTask(spec, asyncio.create_task(self._acquire_new(spec, selected, key)))
+                if key:
+                    self._create_tasks[key] = operation
+                self._provision_tasks.add(operation.task)
+            elif operation.spec != spec:
                 raise RuntimeError("A sandbox idempotency key cannot be reused with a different spec.")
-            else:
-                task = create_task.task
+            operation.waiters += 1
         try:
-            return await asyncio.shield(task)
+            lease = await asyncio.shield(operation.task)
+            operation.delivered = True
+            return lease
         finally:
-            if task.done():
-                async with self._create_lock:
-                    create_task = self._create_tasks.get(task_key)
-                    if create_task is not None and create_task.task is task:
-                        self._create_tasks.pop(task_key, None)
+            operation.waiters -= 1
+            if operation.waiters == 0:
+                try:
+                    if not operation.delivered:
+                        operation.abandoned = True
+                        await complete_cleanup(self._abandon_create(operation.task))
+                finally:
+                    if key and self._create_tasks.get(key) is operation:
+                        self._create_tasks.pop(key)
+                    self._provision_tasks.discard(operation.task)
+
+    async def _abandon_create(self, task: asyncio.Task[SandboxLease]) -> None:
+        if not task.done():
+            task.cancel()
+        results = await asyncio.gather(task, return_exceptions=True)
+        if isinstance(results[0], SandboxLease):
+            await results[0].release()
 
     async def _acquire_new(
         self,
@@ -329,50 +413,132 @@ class SandboxManager:
         selected: SandboxBackend,
         task_key: tuple[str, str] | None = None,
     ) -> SandboxLease:
-        """Create and register one lease after admission checks."""
         required = set(spec.required_features)
         if spec.mounts:
             required.add(SandboxFeature.HOST_MOUNT)
         selected.capabilities.require(*required)
-        capacity_lease_id = await self._acquire_capacity(selected, spec.resources, spec.resource_class)
+        await selected.prepare(spec)
+        return await self._provision(
+            selected,
+            spec.resources,
+            spec.resource_class,
+            spec.workflow_id,
+            lambda: selected.create(spec),
+            task_key=task_key,
+            required=required,
+        )
+
+    async def _provision(
+        self,
+        backend: SandboxBackend,
+        resources: ResourceSpec | None,
+        resource_class: str,
+        workflow_id: str | None,
+        create: Callable[[], Awaitable[SandboxSession]],
+        *,
+        task_key: tuple[str, str] | None = None,
+        required: set[SandboxFeature] | None = None,
+        policy: SandboxStatePolicy | None = None,
+    ) -> SandboxLease:
+        """
+        Own admission, provisioning, validation, and rollback as one transaction.
+        """
+        self._reserve_workflow(workflow_id)
+        capacity_id = None
+        lease = None
         try:
-            session = await selected.create(spec)
+            capacity_id = await self._acquire_capacity(backend, resources, resource_class)
+            try:
+                creation = asyncio.ensure_future(create())
+                cancelled = False
+                try:
+                    session = await asyncio.shield(creation)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    try:
+                        await complete_cleanup(asyncio.gather(creation, return_exceptions=True))
+                    except asyncio.CancelledError:
+                        pass
+                    session = creation.result()
+            except SandboxProvisionError as exc:
+                lease = self._adopt(exc.session, capacity_id, workflow_id, task_key)
+                raise
+            lease = self._adopt(session, capacity_id, workflow_id, task_key)
+            if cancelled:
+                raise asyncio.CancelledError
+            session.capabilities.require(*(required or ()))
+            if policy is not None:
+                await self._sanitize_restored_session(session, policy)
+            return lease
         except BaseException:
-            if capacity_lease_id is not None:
-                await self._release_capacity(capacity_lease_id)
+            if lease is not None:
+                await lease.release()
+            elif capacity_id is not None:
+                await complete_cleanup(self._reclaim_unassigned_capacity(capacity_id))
             raise
-        try:
-            session.capabilities.require(*required)
-        except BaseException:
-            await session.terminate()
-            if capacity_lease_id is not None:
-                await self._release_capacity(capacity_lease_id)
-            raise
+        finally:
+            self._pending_workflows.discard(workflow_id)
+
+    def _adopt(
+        self,
+        session: SandboxSession,
+        capacity_id: str | None,
+        workflow_id: str | None,
+        task_key: tuple[str, str] | None = None,
+    ) -> SandboxLease:
         lease = SandboxLease(
             session,
-            capacity_lease_id,
+            capacity_id,
             self._release_capacity,
             on_released=lambda released: self._forget_lease(released, task_key),
-            workflow_id=spec.workflow_id,
+            workflow_id=workflow_id,
+            on_cleanup_failed=self._defer_release,
         )
         self._register_lease(lease)
         if task_key is not None:
             self._idempotent_leases[task_key] = lease
         return lease
 
+    async def _run_owned(self, operation: Awaitable[SandboxLease]) -> SandboxLease:
+        task = asyncio.create_task(operation)
+        self._provision_tasks.add(task)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await complete_cleanup(self._abandon_create(task))
+            raise
+        finally:
+            self._provision_tasks.discard(task)
+
+    def _release_workflow_slot(self, lease: SandboxLease) -> None:
+        """Free a workflow's phase slot without giving up physical ownership.
+
+        The slot exists to stop one workflow from holding the sandbox its next phase needs.
+        That is a logical constraint, and the physical resource stays protected by the
+        capacity reservation, so a cleanup this manager is still retrying must not also
+        block the next phase and fail the episode.
+        """
+        if lease.workflow_id is None:
+            return
+        held = self._workflow_leases.get(lease.workflow_id)
+        if held is None:
+            return
+        held.discard(lease)
+        if not held:
+            self._workflow_leases.pop(lease.workflow_id, None)
+
     def _forget_lease(
         self,
         lease: SandboxLease,
         task_key: tuple[str, str] | None = None,
     ) -> None:
-        """Forget a released lease, its workflow slot, and its idempotency key."""
+        """
+        Forget a released lease, its workflow slot, and its idempotency key.
+        """
         self._leases.discard(lease)
-        if lease.workflow_id is not None:
-            held = self._workflow_leases.get(lease.workflow_id)
-            if held is not None:
-                held.discard(lease)
-                if not held:
-                    self._workflow_leases.pop(lease.workflow_id, None)
+        self._pending_releases.discard(lease)
+        self._release_attempts.pop(lease, None)
+        self._release_workflow_slot(lease)
         if task_key is not None and self._idempotent_leases.get(task_key) is lease:
             self._idempotent_leases.pop(task_key, None)
 
@@ -381,19 +547,30 @@ class SandboxManager:
         ref: SandboxRef,
         resources: ResourceSpec | None = None,
     ) -> SandboxLease:
-        """Reconnect to a backend-owned sandbox and assume lifecycle ownership."""
+        """
+        Reconnect to a backend-owned sandbox and assume lifecycle ownership.
+        """
         self._require_open()
         backend = self.backend(ref.backend)
-        capacity_lease_id = await self._acquire_capacity(backend, resources)
-        try:
-            session = await backend.connect(ref.sandbox_id)
-        except BaseException:
-            if capacity_lease_id is not None:
-                await self._release_capacity(capacity_lease_id)
-            raise
-        lease = SandboxLease(session, capacity_lease_id, self._release_capacity, on_released=self._leases.discard)
-        self._register_lease(lease)
-        return lease
+        async with self._create_lock:
+            self._require_open()
+            for lease in self._leases:
+                if lease.ref == ref:
+                    if lease in self._pending_releases:
+                        raise RuntimeError("The sandbox is still being reclaimed.")
+                    if resources is not None and lease.session.spec is not None:
+                        if resources != lease.session.spec.resources:
+                            raise ValueError("Connected sandbox resources do not match the owned session.")
+                    return lease
+            return await self._run_owned(
+                self._provision(
+                    backend,
+                    resources,
+                    "default",
+                    None,
+                    lambda: backend.connect(ref.sandbox_id),
+                )
+            )
 
     async def restore(
         self,
@@ -401,7 +578,9 @@ class SandboxManager:
         spec: SandboxSpec | None = None,
         state_policy: SandboxStatePolicy | None = None,
     ) -> SandboxLease:
-        """Restore a snapshot through its owning backend."""
+        """
+        Restore a snapshot through its owning backend.
+        """
         self._require_open()
         backend = self.backend(snapshot.backend)
         backend.capabilities.require(SandboxFeature.RESTORE)
@@ -409,32 +588,16 @@ class SandboxManager:
         if not policy.enabled:
             raise RuntimeError("Sandbox restore requires an explicitly enabled SandboxStatePolicy.")
         resources = spec.resources if spec is not None else self._resources_from_snapshot(snapshot)
-        capacity_lease_id = await self._acquire_capacity(
-            backend,
-            resources,
-            spec.resource_class if spec is not None else "default",
+        return await self._run_owned(
+            self._provision(
+                backend,
+                resources,
+                spec.resource_class if spec else "default",
+                spec.workflow_id if spec else None,
+                lambda: backend.restore(snapshot, spec),
+                policy=policy,
+            )
         )
-        try:
-            session = await backend.restore(snapshot, spec)
-        except BaseException:
-            if capacity_lease_id is not None:
-                await self._release_capacity(capacity_lease_id)
-            raise
-        try:
-            await self._sanitize_restored_session(session, policy)
-        except BaseException:
-            if capacity_lease_id is not None:
-                await self._release_capacity(capacity_lease_id)
-            raise
-        lease = SandboxLease(
-            session,
-            capacity_lease_id,
-            self._release_capacity,
-            on_released=self._leases.discard,
-            workflow_id=spec.workflow_id if spec is not None else None,
-        )
-        self._register_lease(lease)
-        return lease
 
     async def branch(
         self,
@@ -442,38 +605,24 @@ class SandboxManager:
         snapshot_kind: SnapshotKind = SnapshotKind.FULL_STATE,
         state_policy: SandboxStatePolicy | None = None,
     ) -> SandboxLease:
-        """Branch state without silently weakening snapshot semantics."""
+        """
+        Branch state without silently weakening snapshot semantics.
+        """
         self._require_open()
         policy = state_policy or (session.spec.state_policy if session.spec is not None else SandboxStatePolicy())
         self._validate_state_policy(session, policy)
         if session.capabilities.supports(SandboxFeature.NATIVE_FORK):
             backend = self.backend(session.ref.backend)
-            capacity_lease_id = await self._acquire_capacity(
-                backend,
-                session.spec.resources,
-                session.spec.resource_class,
+            return await self._run_owned(
+                self._provision(
+                    backend,
+                    session.spec.resources,
+                    session.spec.resource_class,
+                    session.spec.workflow_id,
+                    session.fork,
+                    policy=policy,
+                )
             )
-            try:
-                child = await session.fork()
-            except BaseException:
-                if capacity_lease_id is not None:
-                    await self._release_capacity(capacity_lease_id)
-                raise
-            try:
-                await self._sanitize_restored_session(child, policy)
-            except BaseException:
-                if capacity_lease_id is not None:
-                    await self._release_capacity(capacity_lease_id)
-                raise
-            lease = SandboxLease(
-                child,
-                capacity_lease_id,
-                self._release_capacity,
-                on_released=self._leases.discard,
-                workflow_id=session.spec.workflow_id,
-            )
-            self._register_lease(lease)
-            return lease
 
         snapshot_feature = {
             SnapshotKind.FILESYSTEM: SandboxFeature.FILESYSTEM_SNAPSHOT,
@@ -482,7 +631,7 @@ class SandboxManager:
         session.capabilities.require(snapshot_feature, SandboxFeature.RESTORE)
         snapshot = await self.checkpoint(session, snapshot_kind, policy)
         try:
-            child = await self.restore(snapshot, state_policy=policy)
+            child = await self.restore(snapshot, spec=replace(session.spec, idempotency_key=None), state_policy=policy)
         except BaseException as restore_error:
             try:
                 await self.delete_snapshot(snapshot)
@@ -502,7 +651,9 @@ class SandboxManager:
         kind: SnapshotKind,
         state_policy: SandboxStatePolicy | None = None,
     ) -> SnapshotRef:
-        """Create a capability-gated snapshot after enforcing RL safety policy."""
+        """
+        Create a capability-gated snapshot after enforcing RL safety policy.
+        """
         policy = state_policy or (session.spec.state_policy if session.spec is not None else SandboxStatePolicy())
         self._validate_state_policy(session, policy)
         feature = {
@@ -573,33 +724,32 @@ class SandboxManager:
 
     @staticmethod
     async def _sanitize_restored_session(session: SandboxSession, policy: SandboxStatePolicy) -> None:
-        """Reset stale transports and mix host entropy into a restored microVM."""
-        try:
-            await session.refresh_transport()
-            if not policy.reseed_after_restore:
-                return
-            seed_path = f"/tmp/psrl-branch-seed-{secrets.token_hex(8)}"
-            await session.write_bytes(seed_path, secrets.token_bytes(64))
-            result = await session.exec(
-                f"cat {seed_path} > /dev/urandom && rm -f {seed_path}",
-                timeout_s=10,
-            )
-            if result.exit_code != 0:
-                raise RuntimeError(f"Restored sandbox entropy reseed failed: {result.stderr.strip()}.")
-        except BaseException:
-            try:
-                await session.terminate()
-            except BaseException:
-                pass
-            raise
+        """
+        Reset stale transports and mix host entropy into a restored microVM.
+        """
+        await session.refresh_transport()
+        if not policy.reseed_after_restore:
+            return
+        seed_path = f"/tmp/psrl-branch-seed-{secrets.token_hex(8)}"
+        await session.write_bytes(seed_path, secrets.token_bytes(64))
+        result = await session.exec(
+            f"cat {seed_path} > /dev/urandom && rm -f {seed_path}",
+            timeout_s=10,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(f"Restored sandbox entropy reseed failed: {result.stderr.strip()}.")
 
     async def delete_snapshot(self, snapshot: SnapshotRef) -> None:
-        """Delete a snapshot through its owning backend."""
+        """
+        Delete a snapshot through its owning backend.
+        """
         await self.backend(snapshot.backend).delete_snapshot(snapshot)
 
     @staticmethod
     def _resources_from_snapshot(snapshot: SnapshotRef) -> ResourceSpec:
-        """Recover the original resource request recorded by checkpoint()."""
+        """
+        Recover the original resource request recorded by checkpoint().
+        """
         return ResourceSpec(
             cpu_count=snapshot.metadata.get("psrl.cpu_count"),
             memory_mb=snapshot.metadata.get("psrl.memory_mb"),
@@ -607,42 +757,76 @@ class SandboxManager:
         )
 
     async def release(self, lease: SandboxLease) -> None:
-        """Release one lease and remove it from worker ownership."""
+        """
+        Release one lease and remove it from worker ownership.
+        """
         await lease.release()
 
     def metrics_snapshot(self) -> dict[str, SandboxMetricsSnapshot]:
-        """Return one metrics snapshot per configured backend."""
+        """
+        Return one metrics snapshot per configured backend.
+        """
         return {name: backend.metrics_snapshot() for name, backend in self._backends.items()}
 
+    def ownership_snapshot(self) -> dict[str, int]:
+        """
+        Report worker ownership, including cleanup that still holds capacity.
+        """
+        return {
+            "leases": len(self._leases),
+            "provisioning": len(self._provision_tasks),
+            "pending_releases": len(self._pending_releases),
+            "pending_capacity": len(self._pending_capacity),
+            "max_release_attempts": max(self._release_attempts.values(), default=0),
+        }
+
     async def shutdown(self) -> None:
-        """Terminate unreleased leases and close all backends."""
-        if self._closed:
-            return
-        self._closed = True
-        async with self._create_lock:
-            create_tasks = [
-                *(create_task.task for create_task in self._create_tasks.values()),
-                *self._anonymous_create_tasks,
-            ]
-        leases = list(self._leases)
-        results = await asyncio.gather(*(lease.release() for lease in leases), return_exceptions=True)
-        # A create may wait for capacity held by an existing lease. Free those leases before
-        # joining creates, then reclaim anything admitted while shutdown was in progress.
-        create_results = await asyncio.gather(*create_tasks, return_exceptions=True)
-        new_leases = self._leases.difference(leases)
-        results.extend(await asyncio.gather(*(lease.release() for lease in new_leases), return_exceptions=True))
-        self._leases.clear()
-        self._workflow_leases.clear()
-        self._idempotent_leases.clear()
-        self._create_tasks.clear()
-        self._anonymous_create_tasks.clear()
-        backend_results = await asyncio.gather(
-            *(backend.shutdown() for backend in self._backends.values()),
-            return_exceptions=True,
+        """
+        Cancel admission, reclaim owned sessions, and close backend transports.
+        """
+        if self._shutdown_task is None:
+            self._closed = True
+            self._shutdown_task = asyncio.create_task(self._shutdown())
+        await complete_cleanup(self._shutdown_task)
+
+    async def _shutdown(self) -> None:
+        tasks = list(self._provision_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
+            await asyncio.gather(self._reaper_task, return_exceptions=True)
+        results = await asyncio.gather(*(lease.release() for lease in list(self._leases)), return_exceptions=True)
+        results.extend(
+            await asyncio.gather(
+                *(backend.shutdown() for backend in self._backends.values()),
+                return_exceptions=True,
+            )
         )
-        shutdown_results = [*create_results, *results, *backend_results]
+        # Backend shutdown may have completed a previously failed destruction.
+        results.extend(
+            await asyncio.gather(*(lease.release() for lease in list(self._leases)), return_exceptions=True)
+        )
+        results.extend(
+            await asyncio.gather(
+                *(self._retry_capacity(lease_id) for lease_id in list(self._pending_capacity)),
+                return_exceptions=True,
+            )
+        )
         if self._capacity_coordinator is not None:
-            shutdown_results.extend(await asyncio.gather(self._close_capacity(), return_exceptions=True))
-        errors = [result for result in shutdown_results if isinstance(result, BaseException)]
-        if errors:
-            raise RuntimeError(f"Sandbox manager shutdown had {len(errors)} failure(s).") from errors[0]
+            if self._leases:
+                # Keep reservations charged until owner expiry if destruction is unconfirmed.
+                if self._capacity_heartbeat_task is not None:
+                    self._capacity_heartbeat_task.cancel()
+                    await asyncio.gather(self._capacity_heartbeat_task, return_exceptions=True)
+            else:
+                results.extend(await asyncio.gather(self._close_capacity(), return_exceptions=True))
+        self._create_tasks.clear()
+        self._provision_tasks.clear()
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors or self._leases or self._pending_capacity:
+            raise RuntimeError(
+                f"Sandbox shutdown has {len(errors)} failure(s), {len(self._leases)} unreclaimed lease(s), "
+                f"and {len(self._pending_capacity)} pending capacity return(s)."
+            ) from (errors[0] if errors else None)

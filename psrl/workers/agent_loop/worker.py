@@ -141,9 +141,7 @@ class PSRL_AgentLoopWorker:
             capacity_coordinator=capacity_coordinator,
             owner_id=self._actor_id,
         )
-        # Resolved once per worker from the same ladder the loops and the manager use, so the
-        # liveness heartbeat and the stall threshold can never be derived from different
-        # numbers.
+        # Worker heartbeats and manager stall detection share the same deadline ladder.
         self.timeouts = resolve_from_config(config)
 
         n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
@@ -276,9 +274,9 @@ class PSRL_AgentLoopWorker:
             await asyncio.gather(*self.agent_programs, return_exceptions=True)
         metrics = {name: snapshot.as_dict() for name, snapshot in self.sandbox_manager.metrics_snapshot().items()}
         psrl_logger.info(
-            "Final sandbox lifecycle metrics: %s. hold_and_wait_observed=%d.",
+            "Final sandbox lifecycle metrics: %s. Ownership: %s.",
             metrics,
-            self.sandbox_manager.hold_and_wait_observed,
+            self.sandbox_manager.ownership_snapshot(),
         )
         await self.sandbox_manager.shutdown()
 
@@ -471,9 +469,7 @@ class PSRL_AgentLoopWorker:
                             batch, raise_on_error=raise_on_error
                         )
                     except asyncio.CancelledError:
-                        # Teardown or caller cancellation. Log the label and let it propagate
-                        # unchanged: awaiting the manager here would delay shutdown, and asking
-                        # for a refill while the run is ending is wasted work.
+                        # Propagate cancellation without requesting a refill during teardown.
                         psrl_logger.warning(
                             "Agent loop cancelled: request_ids=%s, validate=%s.",
                             request_ids,
@@ -583,10 +579,7 @@ class PSRL_AgentLoopWorker:
                     ):
                         await self.postprocess_output(output, batch, terminate_reason)
                 else:
-                    # PSManager refuses the update when it already aborted this request, which
-                    # happens once a sibling failed and the entry was cleared. The trajectory is
-                    # real but cannot be committed, and dropping it silently once cost a full
-                    # buffer's worth of completed episodes with no trace in the metrics.
+                    # An aborted sibling can invalidate a completed trajectory before commit.
                     psrl_logger.warning(
                         "Discarding completed trajectory: request_ids=%s, reason=%s, prompt_index=%s. "
                         "PSManager already aborted this request, so its data cannot be committed.",

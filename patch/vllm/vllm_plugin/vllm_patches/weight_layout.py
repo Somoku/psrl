@@ -1337,8 +1337,11 @@ def build_auto_weight_layout(
     Traverses the module tree and generates rules for standard vLLM layer types:
     - QKVParallelLinear → qkv transform
     - MergedColumnParallelLinear → merged_column transform
-    - FusedMoE / SharedFusedMoE → fused_moe transform
     - ColumnParallelLinear / RowParallelLinear / ReplicatedLinear → identity
+
+    Fused MoE experts are skipped here because they need an explicit expert
+    mapping. Models that declare a `build_weight_layout()` plan own their MoE
+    rules instead.
 
     Sub-modules that implement build_weight_layout() are mounted automatically.
     """
@@ -1346,14 +1349,6 @@ def build_auto_weight_layout(
         MergedColumnParallelLinear,
         QKVParallelLinear,
     )
-
-    try:
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-
-        has_fused_moe = True
-    except ImportError:
-        FusedMoE = None  # type: ignore[assignment, misc]
-        has_fused_moe = False
 
     builder = WeightLayoutBuilder(model)
     if name_map:
@@ -1410,8 +1405,5 @@ def build_auto_weight_layout(
                         WeightTransform.merged_column([(n + ".bias", None) for n in spec]),
                         match=MatchMode.EXACT,
                     )
-        elif has_fused_moe and isinstance(mod, FusedMoE):
-            # FusedMoE requires explicit expert mapping - skip auto for now
-            pass
 
     return builder.build()

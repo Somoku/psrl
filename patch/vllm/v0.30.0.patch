@@ -1,0 +1,93 @@
+From 8b30fb5e78f200ffac112680f7b32d13c212ec8f Mon Sep 17 00:00:00 2001
+From: PSRL <psrl@local>
+Date: Wed, 23 Sep 2026 13:44:08 +0800
+Subject: [PATCH] v0.30.0 patch
+
+Narrow PSRL source patch for vLLM v0.30.0.
+
+v0.30.0 already contains the upstream NCCL communicator sleep-mode work
+(PR #51485), so this patch drops the backport that the v0.29.0 patch carried
+(pynccl/pynccl_wrapper, parallel_state, cuda_communicator,
+base_device_communicator, gpu_worker, config/model, engine/arg_utils and the
+associated tests) and keeps only the PSRL-specific changes:
+
+- vllm/v1/metrics/stats.py: declare the PSRL SchedulerStats fields
+  (req_id_to_prompt_token_num, req_id_to_response_token_num,
+  preemption_req_ids). SchedulerStats travels from the EngineCore process to
+  the API-server process inside the msgspec EngineCoreOutputs struct, so the
+  frontend can only see fields that are declared on the class.
+- vllm/v1/worker/gpu_model_runner.py: clamp the cached request block IDs to the
+  block-table row capacity. A sync KV-load failure under the recompute policy
+  truncates num_computed_tokens without going through the
+  resumed_from_preemption replace path, while the runner only ever extends its
+  own block IDs, so repeated rollbacks can overflow `append_row`.
+---
+ vllm/v1/metrics/stats.py           | 12 ++++++++++++
+ vllm/v1/worker/gpu_model_runner.py | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 40 insertions(+)
+
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index 24e07e57cc..9108fc2207 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -213,6 +213,18 @@ class SchedulerStats:
+ 
+     perf_stats: PerfStats | None = None
+ 
++    # PSRL additions. These ride inside `EngineCoreOutputs` (a msgspec.Struct)
++    # from the EngineCore process to the API-server process, so they must be
++    # declared on the class rather than attached dynamically: the frontend
++    # decodes back into `SchedulerStats` and would discard undeclared fields.
++    req_id_to_prompt_token_num: dict[str, int] | None = None
++    """Per-request prompt token counts, used for DP load balancing."""
++    req_id_to_response_token_num: dict[str, int] | None = None
++    """Per-request generated token counts, used for DP load balancing."""
++    preemption_req_ids: list[str] = field(default_factory=list)
++    """Request IDs preempted while the waiting queue exceeded the configured
++    threshold, forwarded to an external gateway for global re-scheduling."""
++
+ 
+ @dataclass
+ class RequestStateStats:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 97a59bd273..e2e41d44f5 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1470,6 +1470,34 @@ class GPUModelRunner(
+                 # Replace the existing block IDs with the new ones.
+                 req_state.block_ids = new_block_ids
+ 
++            # Resync the cached block IDs to the scheduler's authoritative
++            # length. When a sync KV load fails and the recompute policy keeps
++            # the request RUNNING, the scheduler truncates num_computed_tokens
++            # and frees the orphaned tail blocks, but that path does not go
++            # through the `resumed_from_preemption` replace above (and the
++            # `del req_state.output_token_ids[...]` alignment further down only
++            # fixes the token ids). The runner only ever extends its own block
++            # IDs, so repeated rollbacks leave them longer than the scheduler's
++            # block list; the surplus then overflows the block-table row when
++            # `append_row` writes `block_table.np[row, start:start+n] = ids`.
++            # The surplus is always a dead tail -- positions beyond
++            # `max_model_len` are never addressed -- so clamp each group to the
++            # row capacity.
++            block_tables = self.input_batch.block_table.block_tables
++            if len(req_state.block_ids) == len(block_tables):
++                for group_block_ids, block_table in zip(
++                    req_state.block_ids, block_tables
++                ):
++                    # Block IDs are KV-manager blocks while the row width is
++                    # counted in kernel blocks, so convert back to KV-block
++                    # capacity.
++                    capacity = (
++                        block_table.max_num_blocks_per_req
++                        // block_table.blocks_per_kv_block
++                    )
++                    if len(group_block_ids) > capacity:
++                        del group_block_ids[capacity:]
++
+             if req_index is None:
+                 # The request is not in the persistent batch.
+                 # The request was either preempted and resumed later, or was not
+-- 
+2.43.0
+

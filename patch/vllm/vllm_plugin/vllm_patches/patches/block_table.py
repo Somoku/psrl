@@ -18,7 +18,7 @@ def apply_block_table_clamp_patch() -> None:
     routing through `resumed_from_preemption` -- so repeated rollbacks push the
     accumulated offset past the row width. v2 catches that with an explicit
     `RuntimeError`; the v1 runner has the equivalent guard as a source patch
-    (see `patch/vllm/v0.29.0.patch`, `gpu_model_runner.py`).
+    (see `patch/vllm/v0.30.0.patch`, `gpu_model_runner.py`).
 
     This patch pre-truncates the incoming block IDs to the remaining row
     capacity so both runners drop the same dead tail instead of failing the

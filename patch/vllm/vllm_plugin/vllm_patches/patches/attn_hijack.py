@@ -21,7 +21,7 @@ def apply_attn_hijack_patch() -> None:
 
     Gated at runtime by the environment variable, so there is no cost when the
     flag is off. The ``forward`` body below mirrors
-    ``vllm/model_executor/models/qwen2.py`` at v0.29.0 with a single extra
+    ``vllm/model_executor/models/qwen2.py`` at v0.30.0 with a single extra
     branch; re-derive it on every vLLM bump.
 
     Only ``Qwen2Attention`` is affected, matching the previous source patch.

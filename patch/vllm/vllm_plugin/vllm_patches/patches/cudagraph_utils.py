@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import ExitStack
 
 import torch
 from torch_memory_saver import torch_memory_saver
@@ -10,7 +11,6 @@ from vllm.distributed.device_communicators.pynccl_allocator import set_graph_poo
 from vllm.distributed.parallel_state import graph_capture, is_global_first_rank
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import current_stream
 from vllm.v1.worker.gpu.cudagraph_utils import CreateForwardFn, CudaGraphManager
 
 from vllm_patches.core import min_vllm_version, vLLMPatch
@@ -19,7 +19,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@min_vllm_version("0.29.0")
+@min_vllm_version("0.30.0")
 class TMSCudaGraphManagerPatch(vLLMPatch[CudaGraphManager]):
     """Capture the v2 model runner's CUDA graphs inside a TMS region.
 
@@ -31,7 +31,7 @@ class TMSCudaGraphManagerPatch(vLLMPatch[CudaGraphManager]):
     `CudaGraphManager.capture`, which holds the only `torch.cuda.graph(...)` site
     in the v2 tree.
 
-    Mirrors `CudaGraphManager.capture` from vLLM 0.29.0 with a single change:
+    Mirrors `CudaGraphManager.capture` from vLLM 0.30.0 with a single change:
     the FULL capture is entered through
     `torch_memory_saver.cuda_graph(..., tag="graph")` instead of
     `torch.cuda.graph(...)`, so the capture pool becomes part of the `graph`
@@ -61,7 +61,10 @@ class TMSCudaGraphManagerPatch(vLLMPatch[CudaGraphManager]):
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
         """
-        with graph_capture(device=self.device):
+        with graph_capture(device=self.device), ExitStack() as stack:
+            if self.ubatch_runner is not None:
+                # Join parked threads on failure to avoid blocking later captures.
+                stack.callback(self.ubatch_runner.abort_pending_run)
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -109,7 +112,7 @@ class TMSCudaGraphManagerPatch(vLLMPatch[CudaGraphManager]):
                         with torch_memory_saver.cuda_graph(
                             graph,
                             pool=self.pool,
-                            stream=current_stream(),
+                            stream=self._capture_stream(desc),
                             tag="graph",
                         ):
                             forward_fn(CUDAGraphMode.NONE)

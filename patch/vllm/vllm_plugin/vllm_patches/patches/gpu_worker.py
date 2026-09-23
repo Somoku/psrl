@@ -10,7 +10,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@min_vllm_version("0.29.0")
+@min_vllm_version("0.30.0")
 class TMSMemoryPoolPatch(vLLMPatch[Worker]):
     """Route vLLM's sleep-mode allocations through torch_memory_saver.
 

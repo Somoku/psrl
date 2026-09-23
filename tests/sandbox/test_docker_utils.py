@@ -112,9 +112,8 @@ def test_failed_docker_query_is_not_reported_as_idle(monkeypatch, tmp_path) -> N
     assert remaining is None
 
 
-def test_sweep_reaps_a_stopped_sandbox_even_while_its_owner_lives(monkeypatch, tmp_path) -> None:
-    # A container that exited can never serve another command, so an OOM-killed one
-    # must not hold its name and disk until its owner happens to exit.
+def test_sweep_preserves_exit_diagnostics_within_the_grace_period(monkeypatch, tmp_path) -> None:
+    # The owning session reads OOMKilled off the stopped container before deleting it.
     heartbeat_dir = str(tmp_path / "hb")
     _write_heartbeat(heartbeat_dir, "live-owner", age_s=1)
     calls = _install_docker_list(
@@ -124,10 +123,137 @@ def test_sweep_reaps_a_stopped_sandbox_even_while_its_owner_lives(monkeypatch, t
             ("healthy", "live-owner", "running"),
         ],
     )
+    stopped_since: dict[str, float] = {}
 
-    reaped, remaining = docker_utils.sweep_stale_sandboxes(heartbeat_dir, ttl_s=900)
+    reaped, remaining = docker_utils.sweep_stale_sandboxes(
+        heartbeat_dir,
+        ttl_s=900,
+        stopped_since=stopped_since,
+        stopped_grace_s=300,
+    )
 
-    assert reaped == ["oom-killed"]
-    assert ["docker", "rm", "-f", "-v", "oom-killed"] in calls
-    assert remaining == 1
+    assert reaped == []
+    assert ["docker", "rm", "-f", "-v", "oom-killed"] not in calls
+    assert remaining == 2
+    assert set(stopped_since) == {"oom-killed"}
     assert os.path.exists(docker_utils.owner_heartbeat_path(heartbeat_dir, "live-owner"))
+
+
+def test_sweep_reaps_a_stopped_sandbox_once_its_grace_period_expires(monkeypatch, tmp_path) -> None:
+    # A stopped container can never serve another command, so a live owner that never
+    # removed it must not keep its name and writable layer forever.
+    heartbeat_dir = str(tmp_path / "hb")
+    _write_heartbeat(heartbeat_dir, "live-owner", age_s=1)
+    calls = _install_docker_list(
+        monkeypatch,
+        [
+            ("abandoned", "live-owner", "exited"),
+            ("healthy", "live-owner", "running"),
+        ],
+    )
+    stopped_since = {"abandoned": time.time() - 600}
+
+    reaped, remaining = docker_utils.sweep_stale_sandboxes(
+        heartbeat_dir,
+        ttl_s=900,
+        stopped_since=stopped_since,
+        stopped_grace_s=300,
+    )
+
+    assert reaped == ["abandoned"]
+    assert ["docker", "rm", "-f", "-v", "abandoned"] in calls
+    assert remaining == 1
+    assert stopped_since == {}
+
+
+def test_sweep_forgets_a_container_that_stopped_and_was_replaced(monkeypatch, tmp_path) -> None:
+    # A recycled id must not inherit the previous container's stopped clock.
+    heartbeat_dir = str(tmp_path / "hb")
+    _write_heartbeat(heartbeat_dir, "live-owner", age_s=1)
+    _install_docker_list(monkeypatch, [("reused", "live-owner", "running")])
+    stopped_since = {"reused": time.time() - 600}
+
+    reaped, _ = docker_utils.sweep_stale_sandboxes(
+        heartbeat_dir,
+        ttl_s=900,
+        stopped_since=stopped_since,
+        stopped_grace_s=300,
+    )
+
+    assert reaped == []
+    assert stopped_since == {}
+
+
+def test_grace_period_reaping_is_off_without_a_caller_owned_clock(monkeypatch, tmp_path) -> None:
+    heartbeat_dir = str(tmp_path / "hb")
+    _write_heartbeat(heartbeat_dir, "live-owner", age_s=1)
+    _install_docker_list(monkeypatch, [("stopped", "live-owner", "exited")])
+
+    reaped, _ = docker_utils.sweep_stale_sandboxes(heartbeat_dir, ttl_s=900)
+
+    assert reaped == []
+
+
+def test_run_gc_loop_refuses_a_grace_period_shorter_than_one_sweep(tmp_path) -> None:
+    with pytest.raises(ValueError):
+        docker_utils.run_gc_loop(str(tmp_path), ttl_s=900, interval_s=30, stopped_grace_s=30)
+
+
+def test_force_remove_container_ids_reports_only_confirmed_deletions(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "inspect":
+            # "wedged" survives the removal, "gone" does not.
+            return SimpleNamespace(returncode=0 if args[-1] == "wedged" else 1, stdout=b"", stderr=b"")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    removed = docker_utils.force_remove_container_ids(["gone", "wedged"])
+
+    assert removed == ["gone"]
+    assert calls[0] == ["docker", "rm", "-f", "-v", "gone", "wedged"]
+
+
+def test_the_collector_child_reads_every_argument_from_the_position_it_is_passed(monkeypatch) -> None:
+    # The collector is detached with its output discarded, so an argv index that shifts
+    # would corrupt the docker command silently instead of failing.
+    popen_argv: list[str] = []
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda args, **kwargs: popen_argv.extend(args) or SimpleNamespace(poll=lambda: None),
+    )
+    docker_utils.spawn_node_gc(
+        "/lease/store",
+        ttl_s=120,
+        interval_s=30,
+        idle_exit_cycles=7,
+        stopped_grace_s=333,
+        docker_command=("docker", "--host", "tcp://d:1"),
+    )
+
+    received: dict = {}
+
+    def capture(heartbeat_dir, ttl_s, interval_s, **kwargs):
+        received.update({"heartbeat_dir": heartbeat_dir, "ttl_s": ttl_s, "interval_s": interval_s, **kwargs})
+        return 0
+
+    monkeypatch.setattr(docker_utils, "run_gc_loop", capture)
+    # argv[0] is "-c" for `python -c CODE ...`, matching what the child sees.
+    monkeypatch.setattr("sys.argv", ["-c", *popen_argv[3:]])
+    # The child ends in `raise SystemExit(run_gc_loop(...))`, which is its exit status.
+    with pytest.raises(SystemExit) as exit_info:
+        exec(docker_utils._GC_CHILD_CODE, {})  # noqa: S102
+
+    assert exit_info.value.code == 0
+    assert received == {
+        "heartbeat_dir": "/lease/store",
+        "ttl_s": 120.0,
+        "interval_s": 30.0,
+        "idle_exit_cycles": 7,
+        "stopped_grace_s": 333.0,
+        "docker_command": ("docker", "--host", "tcp://d:1"),
+    }

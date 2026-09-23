@@ -78,6 +78,45 @@ def force_remove_containers_by_label(
         return []
 
 
+def force_remove_container_ids(
+    container_ids: Sequence[str],
+    *,
+    docker_command: Sequence[str] = ("docker",),
+) -> list[str]:
+    """Force-remove containers by id and return the ids Docker no longer lists.
+
+    The CLI is a last resort for a container the Engine API refuses to delete. It is a
+    separate code path, so it can succeed where the API keeps failing.
+    """
+    ids = [container_id for container_id in container_ids if container_id]
+    if not ids:
+        return []
+    try:
+        subprocess.run(
+            _command(docker_command, "rm", "-f", "-v", *ids),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        psrl_logger.warning(f"Failed to force-remove Docker containers {ids!r}: {exc}.")
+        return []
+    return [container_id for container_id in ids if not _container_exists(container_id, docker_command)]
+
+
+def _container_exists(container_id: str, docker_command: Sequence[str]) -> bool:
+    """Report whether Docker still lists one container, defaulting to present."""
+    try:
+        result = subprocess.run(
+            _command(docker_command, "inspect", "--format", "{{.Id}}", container_id),
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return result.returncode == 0
+
+
 def sanitize_compose_project_name(name: str) -> str:
     """
     Render a name the way Docker Compose derives a project name.
@@ -260,7 +299,7 @@ def owner_heartbeat_age_s(heartbeat_dir: str, owner_id: str, *, now: float | Non
     return max(0.0, current_time - modified_at)
 
 
-# Docker container states that can never serve another command.
+# Docker container states that can never serve another command again.
 _STOPPED_CONTAINER_STATES = frozenset({"exited", "dead"})
 
 
@@ -320,18 +359,53 @@ def _prune_owner_heartbeats(heartbeat_dir: str, live_owners: set[str], ttl_s: fl
                 continue
 
 
+def _stopped_past_grace(
+    containers: list[tuple[str, str, str]],
+    stopped_since: dict[str, float] | None,
+    grace_s: float,
+    now: float,
+) -> set[str]:
+    """Select stopped containers first observed stopped longer than the grace period.
+
+    The owning session inspects a stopped container to classify an OOM kill before it
+    deletes it, so reaping one immediately would race that diagnosis away. Two observations
+    separated by the grace period prove nobody is coming back for it.
+    """
+    if stopped_since is None:
+        return set()
+    stopped = {container_id for container_id, _, state in containers if state in _STOPPED_CONTAINER_STATES}
+    for container_id in stopped:
+        stopped_since.setdefault(container_id, now)
+    for container_id in set(stopped_since) - stopped:
+        stopped_since.pop(container_id, None)
+    return {container_id for container_id in stopped if now - stopped_since[container_id] > grace_s}
+
+
 def sweep_stale_sandboxes(
     heartbeat_dir: str,
     ttl_s: float,
     *,
     docker_command: Sequence[str] = ("docker",),
     now: float | None = None,
+    stopped_since: dict[str, float] | None = None,
+    stopped_grace_s: float = 300.0,
 ) -> tuple[list[str], int | None]:
     """Reap containers whose owner lease expired and return the remaining count.
 
     A `None` remaining count means Docker could not be queried. Collectors treat
     that as an unhealthy sweep, never as an idle node, so transient daemon
     failures cannot make crash recovery silently exit.
+
+    Args:
+        heartbeat_dir (str): Lease namespace shared by workers and this collector.
+        ttl_s (float): Owner heartbeat age that marks an owner dead.
+        docker_command (Sequence[str]): Docker CLI prefix.
+        now (float | None): Wall clock override for tests.
+        stopped_since (dict[str, float] | None): Caller-owned first-seen-stopped times.
+            Passing it enables grace-period reaping of a live owner's stopped containers,
+            which is the only path that reclaims one whose session never removed it.
+        stopped_grace_s (float): Time a container must stay stopped before it is reaped
+            despite a live owner. Must exceed one sweep interval.
     """
     current_time = time.time() if now is None else now
     store_id = lease_store_id(heartbeat_dir)
@@ -348,12 +422,11 @@ def sweep_stale_sandboxes(
             continue
         if age is None or age > ttl_s:
             stale_owners.add(owner_id)
-    # A stopped sandbox can never serve another command, so its owner's liveness must
-    # not keep it: an OOM-killed container would otherwise hold its name and disk.
+    abandoned = _stopped_past_grace(containers, stopped_since, stopped_grace_s, current_time)
     stale = [
         container_id
-        for container_id, owner_id, state in containers
-        if owner_id in stale_owners or state in _STOPPED_CONTAINER_STATES
+        for container_id, owner_id, _ in containers
+        if owner_id in stale_owners or container_id in abandoned
     ]
     removed: list[str] = []
     if stale:
@@ -379,6 +452,9 @@ def sweep_stale_sandboxes(
             psrl_logger.warning(f"Failed to reap stale sandboxes: {exc}.")
 
     removed_ids = set(removed)
+    if stopped_since is not None:
+        for container_id in removed_ids:
+            stopped_since.pop(container_id, None)
     remaining_containers = [item for item in containers if item[0] not in removed_ids]
     live_owners = {owner_id for _, owner_id, _ in remaining_containers}
     _prune_owner_heartbeats(heartbeat_dir, live_owners, ttl_s, current_time)
@@ -424,23 +500,30 @@ def run_gc_loop(
     interval_s: float,
     *,
     idle_exit_cycles: int = 10,
+    stopped_grace_s: float = 300.0,
     docker_command: Sequence[str] = ("docker",),
 ) -> int:
     """Sweep stale sandboxes periodically and exit after sustained node idleness."""
     if interval_s < 1 or ttl_s <= 0 or idle_exit_cycles < 1:
         raise ValueError("Node GC requires interval_s >= 1, ttl_s > 0, and idle_exit_cycles >= 1.")
+    if stopped_grace_s <= interval_s:
+        raise ValueError("Node GC requires stopped_grace_s > interval_s, or one sweep cannot grant a grace period.")
     lock_handle = _acquire_gc_lock(_gc_lock_path(heartbeat_dir))
     if lock_handle is None:
         return 0
     try:
         os.makedirs(heartbeat_dir, exist_ok=True)
         idle_cycles = 0
+        # Owned by this loop so a stopped container is reaped only after two observations.
+        stopped_since: dict[str, float] = {}
         while True:
             try:
                 _, remaining = sweep_stale_sandboxes(
                     heartbeat_dir,
                     ttl_s,
                     docker_command=docker_command,
+                    stopped_since=stopped_since,
+                    stopped_grace_s=stopped_grace_s,
                 )
             except Exception:
                 psrl_logger.warning("Node sandbox GC sweep failed. Retrying next interval.", exc_info=True)
@@ -461,7 +544,8 @@ _GC_CHILD_CODE = (
     "import sys; sys.path.insert(0, sys.argv[1]); "
     "from psrl.sandbox.utils.docker_utils import run_gc_loop; "
     "raise SystemExit(run_gc_loop(sys.argv[2], float(sys.argv[3]), float(sys.argv[4]), "
-    "idle_exit_cycles=int(sys.argv[5]), docker_command=tuple(sys.argv[6:])))"
+    "idle_exit_cycles=int(sys.argv[5]), stopped_grace_s=float(sys.argv[6]), "
+    "docker_command=tuple(sys.argv[7:])))"
 )
 
 
@@ -471,6 +555,7 @@ def spawn_node_gc(
     interval_s: float,
     *,
     idle_exit_cycles: int = 10,
+    stopped_grace_s: float = 300.0,
     docker_command: Sequence[str] = ("docker",),
 ) -> subprocess.Popen | None:
     """Start a detached collector that shares one advisory lock per lease store."""
@@ -488,6 +573,7 @@ def spawn_node_gc(
                 str(ttl_s),
                 str(interval_s),
                 str(idle_exit_cycles),
+                str(stopped_grace_s),
                 *docker_command,
             ],
             stdin=subprocess.DEVNULL,

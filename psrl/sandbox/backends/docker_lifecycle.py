@@ -7,14 +7,16 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from psrl.sandbox.utils.docker_utils import (
     force_remove_containers_by_label,
     remove_owner_heartbeat,
     spawn_node_gc,
+    sweep_stale_sandboxes,
     write_owner_heartbeat,
 )
 
@@ -33,6 +35,9 @@ class DockerLifecycleConfig:
     gc_interval_s: float = 30.0
     gc_idle_exit_cycles: int = 10
     gc_enabled: bool = True
+    # A stopped container is reaped despite a live owner once it stays stopped this long.
+    # Must outlast the session's own stop diagnosis, which takes seconds.
+    stopped_grace_s: float = 300.0
     docker_command: tuple[str, ...] = ("docker",)
 
     def __post_init__(self) -> None:
@@ -44,6 +49,11 @@ class DockerLifecycleConfig:
             raise ValueError("Docker heartbeat_interval_s must be smaller than lease_ttl_s.")
         if self.gc_interval_s < 1 or self.gc_idle_exit_cycles < 1:
             raise ValueError("Docker gc_interval_s and gc_idle_exit_cycles must be at least one.")
+        if self.stopped_grace_s <= self.gc_interval_s:
+            raise ValueError(
+                "Docker stopped_grace_s must exceed gc_interval_s, or a single sweep would reap a stopped "
+                "container before its owner can read the exit state."
+            )
         if not self.docker_command:
             raise ValueError("Docker docker_command cannot be empty.")
 
@@ -56,6 +66,8 @@ class DockerLifecycleConfig:
     ) -> DockerLifecycleConfig:
         """Normalize Hydra mappings and attach an explicit Docker endpoint."""
         if isinstance(value, cls):
+            if docker_host and value.docker_command == ("docker",):
+                return replace(value, docker_command=("docker", "--host", docker_host))
             return value
         normalized = dict(value or {})
         command: Sequence[str] = normalized.get("docker_command", ("docker",))
@@ -83,6 +95,8 @@ class DockerLifecycle:
         self._stop_event = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._gc_process = None
+        self._next_gc_probe = 0.0
+        self._startup_swept = False
         self._atexit_registered = False
         self._closed = False
 
@@ -107,24 +121,62 @@ class DockerLifecycle:
                     daemon=True,
                 )
                 self._heartbeat_thread.start()
-            if self._gc_process is None or self._gc_process.poll() is not None:
-                gc_process = spawn_node_gc(
-                    self.config.heartbeat_dir,
-                    self.config.lease_ttl_s,
-                    self.config.gc_interval_s,
-                    idle_exit_cycles=self.config.gc_idle_exit_cycles,
-                    docker_command=self.config.docker_command,
-                )
-                if gc_process is None:
-                    raise RuntimeError("Could not start Docker sandbox crash recovery.")
-                self._gc_process = gc_process
+            self._reclaim_previous_run()
+            self._ensure_gc()
+
+    def _reclaim_previous_run(self) -> None:
+        """Reap a previous run's abandoned containers before this one fills the node.
+
+        The collector would find them on its own, but not before this worker has already
+        been admitted against an envelope that does not know their memory is still spoken
+        for. Sweeping once here closes that over-commit window.
+        """
+        if self._startup_swept:
+            return
+        self._startup_swept = True
+        try:
+            reaped, _ = sweep_stale_sandboxes(
+                self.config.heartbeat_dir,
+                self.config.lease_ttl_s,
+                docker_command=self.config.docker_command,
+            )
+        except Exception:
+            psrl_logger.warning("Could not sweep abandoned Docker sandboxes at startup.", exc_info=True)
+            return
+        if reaped:
+            psrl_logger.info(f"Reclaimed {len(reaped)} abandoned Docker sandbox(es) left by an earlier run.")
+
+    def _ensure_gc(self) -> None:
+        """
+        Probe collector ownership at most once per sweep interval under the lock.
+        """
+        now = time.monotonic()
+        if now < self._next_gc_probe:
+            return
+        if self._gc_process is None or self._gc_process.poll() is not None:
+            gc_process = spawn_node_gc(
+                self.config.heartbeat_dir,
+                self.config.lease_ttl_s,
+                self.config.gc_interval_s,
+                idle_exit_cycles=self.config.gc_idle_exit_cycles,
+                stopped_grace_s=self.config.stopped_grace_s,
+                docker_command=self.config.docker_command,
+            )
+            if gc_process is None:
+                raise RuntimeError("Could not start Docker sandbox crash recovery.")
+            self._gc_process = gc_process
+        self._next_gc_probe = now + self.config.gc_interval_s
 
     def _heartbeat_loop(self) -> None:
         """Refresh the worker lease independently of the asyncio event loop."""
         while not self._stop_event.wait(self.config.heartbeat_interval_s):
             try:
                 write_owner_heartbeat(self.config.heartbeat_dir, self.owner_id)
-            except OSError as exc:
+                with self._lock:
+                    if self._closed:
+                        return
+                    self._ensure_gc()
+            except (OSError, RuntimeError) as exc:
                 psrl_logger.warning(f"Could not refresh Docker owner lease {self.owner_id!r}: {exc}.")
 
     def close(self) -> None:

@@ -79,10 +79,9 @@ def test_capacity_defaults_are_single_envelope_knobs() -> None:
         lease_ttl_s=180,
         heartbeat_interval_s=30,
     )
-    # An admission deadline and a recovery cap are on by default: without them an exhausted
-    # or leaking node makes the trainer wait forever instead of reporting a capacity fault.
+    # An admission deadline is on by default: without it an exhausted node makes the trainer
+    # wait forever instead of reporting a capacity fault.
     assert SandboxCapacityConfig().acquire_timeout_s is not None
-    assert SandboxCapacityConfig().lease_max_age_s is not None
 
 
 def test_shipped_rollout_yaml_declares_the_capacity_classes() -> None:
@@ -101,7 +100,6 @@ def test_shipped_rollout_yaml_declares_the_capacity_classes() -> None:
     assert capacity.classes["grader"].guaranteed_share == 0.25
     assert sum(share.guaranteed_share for share in capacity.classes.values()) < 1
     assert capacity.acquire_timeout_s is not None
-    assert capacity.lease_max_age_s is not None
 
 
 def test_capacity_classes_and_deadline_reach_the_manager_config() -> None:

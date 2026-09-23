@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 
 import pytest
 from psrl.sandbox.capacity import (
@@ -45,16 +44,6 @@ def test_explicit_capacity_must_be_positive() -> None:
         SandboxCapacityConfig(memory_mb=0)
     with pytest.raises(ValueError, match="cpu_cores"):
         SandboxCapacityConfig(cpu_cores=0)
-
-
-def test_lease_max_age_must_outlive_the_lease_ttl() -> None:
-    """The age cap may not reclaim a lease the heartbeat would still have renewed."""
-
-    with pytest.raises(ValueError, match="lease_max_age_s"):
-        SandboxCapacityConfig(lease_ttl_s=180, heartbeat_interval_s=30, lease_max_age_s=180)
-
-    # Null disables the age cap, which is a deliberate choice rather than a contradiction.
-    assert SandboxCapacityConfig(lease_ttl_s=180, heartbeat_interval_s=30, lease_max_age_s=None).lease_max_age_s is None
 
 
 @pytest.mark.asyncio
@@ -113,13 +102,11 @@ async def test_grader_class_is_admitted_while_rollouts_wait_to_borrow() -> None:
         )
     )
     admitted_rollouts = [
-        asyncio.create_task(coordinator.acquire(f"rollout-{index}", "owner", 100, 1, "rollout"))
-        for index in range(10)
+        asyncio.create_task(coordinator.acquire(f"rollout-{index}", "owner", 100, 1, "rollout")) for index in range(10)
     ]
     await asyncio.gather(*admitted_rollouts)
     extra_rollouts = [
-        asyncio.create_task(coordinator.acquire(f"waiting-{index}", "owner", 100, 1, "rollout"))
-        for index in range(4)
+        asyncio.create_task(coordinator.acquire(f"waiting-{index}", "owner", 100, 1, "rollout")) for index in range(4)
     ]
     grader = asyncio.create_task(coordinator.acquire("grader", "owner", 300, 1, "grader"))
     await asyncio.sleep(0)
@@ -327,7 +314,7 @@ async def test_class_guarantee_admits_the_larger_class_first() -> None:
     small = asyncio.create_task(coordinator.acquire("small", "owner", 10, 1, "small"))
     await asyncio.sleep(0)
 
-    assert small.done()
+    await asyncio.wait_for(small, timeout=0.5)
     await coordinator.shutdown()
 
 
@@ -391,60 +378,6 @@ async def test_expired_worker_lease_returns_capacity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_live_owner_lease_is_reclaimed_once_it_outlives_every_sandbox(caplog) -> None:
-    """The only recovery path for a lease whose release was missed.
-
-    A lease belonging to a worker that is still running is renewed forever, so owner
-    expiry can never reclaim it. Without an age cap the node stays charged for a sandbox
-    that no longer exists, every later request times out, and the trainer waits on a buffer
-    that cannot fill: that is the hang this cap exists to break.
-    """
-    coordinator = SandboxCapacityCoordinator(
-        SandboxCapacityConfig(
-            memory_mb=100,
-            cpu_cores=4,
-            utilization=1,
-            lease_ttl_s=0.05,
-            heartbeat_interval_s=0.01,
-            lease_max_age_s=0.15,
-        )
-    )
-    await coordinator.acquire("leaked", "live-worker", 100, 4)
-
-    async def heartbeat() -> None:
-        # Keep the owner alive, so the ordinary TTL path is never what frees the capacity.
-        while True:
-            await asyncio.sleep(0.01)
-            await coordinator.renew_owner("live-worker")
-
-    heartbeat_task = asyncio.create_task(heartbeat())
-    try:
-        # The root level, not the dashed path loggers use: `psrl_logger` is named after
-        # its source file, so targeting a dotted name would leave the emitter at whatever
-        # level an earlier test left the root logger on.
-        with caplog.at_level("WARNING"):
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                if (await coordinator.snapshot())["stale_leases_reclaimed"]:
-                    break
-                await asyncio.sleep(0.02)
-    finally:
-        heartbeat_task.cancel()
-        await asyncio.gather(heartbeat_task, return_exceptions=True)
-
-    snapshot = await coordinator.snapshot()
-    assert snapshot["stale_leases_reclaimed"] == 1, (
-        "A lease held by a live owner was never reclaimed, so the node stays full forever."
-    )
-    assert snapshot["allocations"] == 0
-    assert snapshot["available_capacity"] == {"memory_mb": 100, "cpu_millis": 4000}
-    assert any("never released" in record.getMessage() for record in caplog.records), (
-        "A silent capacity leak must be reported with the owner that leaked it."
-    )
-    await coordinator.shutdown()
-
-
-@pytest.mark.asyncio
 async def test_the_oldest_lease_age_exposes_a_leak_as_it_grows() -> None:
     """The snapshot has to show the leak before the cap reclaims it, not only after."""
     coordinator = SandboxCapacityCoordinator(
@@ -467,23 +400,24 @@ async def test_the_oldest_lease_age_exposes_a_leak_as_it_grows() -> None:
 
 
 @pytest.mark.asyncio
-async def test_nothing_is_reclaimed_while_the_age_cap_is_disabled() -> None:
-    """Null is the documented way to keep the old unbounded behavior."""
+async def test_live_owner_capacity_is_not_reclaimed_by_age() -> None:
+    """Live allocations remain charged regardless of age."""
     coordinator = SandboxCapacityCoordinator(
         SandboxCapacityConfig(
             memory_mb=100,
             cpu_cores=4,
             utilization=1,
-            lease_ttl_s=0.05,
-            heartbeat_interval_s=0.01,
-            lease_max_age_s=None,
+            # Ten renewals per lease lifetime, so event loop jitter cannot expire a live owner
+            # and make this flake.
+            lease_ttl_s=0.5,
+            heartbeat_interval_s=0.05,
         )
     )
     await coordinator.acquire("held", "live-worker", 100, 4)
 
     async def heartbeat() -> None:
         while True:
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
             await coordinator.renew_owner("live-worker")
 
     heartbeat_task = asyncio.create_task(heartbeat())
@@ -494,6 +428,128 @@ async def test_nothing_is_reclaimed_while_the_age_cap_is_disabled() -> None:
         await asyncio.gather(heartbeat_task, return_exceptions=True)
 
     snapshot = await coordinator.snapshot()
-    assert snapshot["stale_leases_reclaimed"] == 0
     assert snapshot["allocations"] == 1
     await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_two_borrowing_classes_make_progress_without_mutual_blocking():
+    coordinator = SandboxCapacityCoordinator(
+        SandboxCapacityConfig(
+            memory_mb=100,
+            cpu_cores=10,
+            utilization=1,
+            classes={"a": {"guaranteed_share": 0.1}, "b": {"guaranteed_share": 0.1}},
+        )
+    )
+    await coordinator.acquire("holder", "owner", 100, 10, "a")
+    first = asyncio.create_task(coordinator.acquire("a", "owner", 60, 6, "a"))
+    second = asyncio.create_task(coordinator.acquire("b", "owner", 60, 6, "b"))
+    await asyncio.sleep(0)
+    await coordinator.release("holder")
+    await asyncio.wait_for(first, timeout=0.5)
+    assert not second.done()
+    await coordinator.release("a")
+    await asyncio.wait_for(second, timeout=0.5)
+    await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_guaranteed_request_is_never_blocked_by_a_waiting_borrower():
+    """The guarantee is a contract, so a starved borrower cannot hold the node hostage.
+
+    Reserving released capacity for an oversized borrower would stall every class that fits
+    its own share, for as long as the longest running episode. That is a node-wide stall, so
+    the borrower is counted and left to the admission deadline instead.
+    """
+    coordinator = SandboxCapacityCoordinator(
+        SandboxCapacityConfig(
+            memory_mb=100,
+            cpu_cores=10,
+            utilization=1,
+            classes={"small": {"guaranteed_share": 0.5}, "large": {"guaranteed_share": 0.1}},
+        )
+    )
+    await coordinator.acquire("held", "owner", 60, 6, "blocker")
+    # 90 exceeds the large class guarantee of 10, so it can only borrow, and it does not fit.
+    large = asyncio.create_task(coordinator.acquire("large", "owner", 90, 9, "large"))
+    await asyncio.sleep(0)
+    for index in range(8):
+        await coordinator.acquire(f"small-{index}", "owner", 10, 1, "small")
+        await coordinator.release(f"small-{index}")
+
+    await asyncio.wait_for(coordinator.acquire("refill", "owner", 10, 1, "small"), timeout=0.5)
+
+    assert not large.done()
+    assert (await coordinator.snapshot())["max_borrow_bypasses"] >= 8
+    await coordinator.release("held")
+    await coordinator.release("refill")
+    await asyncio.wait_for(large, timeout=0.5)
+    await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_borrower_that_does_not_fit_does_not_block_one_that_does():
+    """Best-effort FIFO among borrowers, so head-of-line blocking cannot idle the envelope."""
+    coordinator = SandboxCapacityCoordinator(
+        SandboxCapacityConfig(
+            memory_mb=100,
+            cpu_cores=10,
+            utilization=1,
+            classes={"big": {"guaranteed_share": 0.1}, "small": {"guaranteed_share": 0.1}},
+        )
+    )
+    await coordinator.acquire("held", "owner", 70, 7, "blocker")
+    # Both exceed their guarantee, so both are borrowers. The older one cannot fit.
+    older = asyncio.create_task(coordinator.acquire("older", "owner", 60, 6, "big"))
+    await asyncio.sleep(0)
+    younger = asyncio.create_task(coordinator.acquire("younger", "owner", 20, 2, "small"))
+
+    await asyncio.wait_for(younger, timeout=0.5)
+
+    assert not older.done()
+    await coordinator.release("held")
+    await coordinator.release("younger")
+    await asyncio.wait_for(older, timeout=0.5)
+    await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_slack_is_reserved_for_a_guaranteed_request_that_does_not_fit():
+    """A borrower must not take capacity a queued guarantee is still short of."""
+    coordinator = SandboxCapacityCoordinator(
+        SandboxCapacityConfig(
+            memory_mb=100,
+            cpu_cores=10,
+            utilization=1,
+            classes={"rollout": {"guaranteed_share": 0.6}, "grader": {"guaranteed_share": 0.1}},
+        )
+    )
+    await coordinator.acquire("held", "owner", 80, 8, "blocker")
+    # Inside the rollout guarantee of 60, but only 20 is free.
+    guaranteed = asyncio.create_task(coordinator.acquire("guaranteed", "owner", 50, 5, "rollout"))
+    await asyncio.sleep(0)
+    # Exceeds the grader guarantee of 10, so it borrows, and it would fit the free 20.
+    borrower = asyncio.create_task(coordinator.acquire("borrower", "owner", 20, 2, "grader"))
+    await asyncio.sleep(0)
+
+    assert not guaranteed.done()
+    assert not borrower.done(), "The slack belongs to the queued guarantee."
+
+    await coordinator.release("held")
+    await asyncio.wait_for(guaranteed, timeout=0.5)
+    await asyncio.wait_for(borrower, timeout=0.5)
+    await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_wakes_queued_requests_and_refuses_new_admission():
+    coordinator = SandboxCapacityCoordinator(SandboxCapacityConfig(memory_mb=10, cpu_cores=1, utilization=1))
+    await coordinator.acquire("held", "owner", 10, 1)
+    waiting = asyncio.create_task(coordinator.acquire("waiting", "owner", 10, 1))
+    await asyncio.sleep(0)
+    await coordinator.shutdown()
+    with pytest.raises(RuntimeError, match="closed"):
+        await waiting
+    with pytest.raises(RuntimeError, match="closed"):
+        await coordinator.acquire("new", "owner", 1, 1)

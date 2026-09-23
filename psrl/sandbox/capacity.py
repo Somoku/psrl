@@ -23,7 +23,9 @@ _MEMORY_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([kmgt]?)b?")
 
 
 def parse_memory_mb(value: str | int | None) -> int | None:
-    """Parse a Docker memory value into whole MiB."""
+    """
+    Parse a Docker memory value into whole MiB.
+    """
     if value is None or value == "":
         return None
     if isinstance(value, int):
@@ -71,7 +73,9 @@ def _cgroup_paths(controller: str, filename: str) -> list[str]:
 
 @functools.lru_cache(maxsize=1)
 def detect_node_memory_mb() -> int | None:
-    """Return the local cgroup or machine memory limit in MiB."""
+    """
+    Return the local cgroup or machine memory limit in MiB.
+    """
     paths = _cgroup_paths("memory", "memory.max") + _cgroup_paths("memory", "memory.limit_in_bytes")
     paths += ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]
     for path in paths:
@@ -90,7 +94,9 @@ def detect_node_memory_mb() -> int | None:
 
 @functools.lru_cache(maxsize=1)
 def detect_node_cpu_cores() -> float | None:
-    """Return the local cgroup or CPU-affinity capacity in cores."""
+    """
+    Return the local cgroup or CPU-affinity capacity in cores.
+    """
     candidates: list[float] = []
     try:
         candidates.append(float(len(os.sched_getaffinity(0))))
@@ -119,13 +125,8 @@ def detect_node_cpu_cores() -> float | None:
 
 @dataclass(frozen=True)
 class ResourceClassShare:
-    """One sandbox resource class's slice of the node envelope.
-
-    ``guaranteed_share`` is reclaimed for this class whenever one of its requests
-    is queued, so a class can never be starved by a different class that arrives
-    first or asks for less. ``max_share`` optionally caps everything the class may
-    hold at once, which bounds how much of the elastic pool it can borrow. Both
-    are fractions of the resolved envelope.
+    """
+    Fractions of the node envelope used as admission priority and a hard ceiling.
     """
 
     guaranteed_share: float
@@ -141,7 +142,9 @@ class ResourceClassShare:
 def resolve_class_shares(
     value: Mapping[str, ResourceClassShare | Mapping[str, object]] | None,
 ) -> dict[str, ResourceClassShare]:
-    """Normalize a class mapping from typed values or a resolved Hydra config."""
+    """
+    Normalize a class mapping from typed values or a resolved Hydra config.
+    """
     if not value:
         return {}
     shares: dict[str, ResourceClassShare] = {}
@@ -155,25 +158,12 @@ def resolve_class_shares(
 
 @dataclass(frozen=True)
 class SandboxCapacityConfig:
-    """One node resource envelope shared by all local sandboxes.
+    """
+    One node resource envelope shared by local sandboxes.
 
-    Unset memory or CPU selects node-local auto-detection. ``utilization`` is the
-    only safety knob and applies to both resources.
-
-    ``classes`` gives each sandbox resource class a guaranteed share of the
-    envelope. The guarantees are deliberately allowed to sum to less than one:
-    what is left over is a single elastic pool that a class may borrow from only
-    while no other class has a request waiting. Keeping the sum below one is what
-    keeps every guarantee simultaneously satisfiable without preempting a running
-    sandbox, and it is why an admission preference for smaller requests is not
-    needed. ``acquire_timeout_s`` bounds how long a request may stay queued and
-    defaults to a finite value, so an under-provisioned node reports a capacity
-    fault instead of hanging.
-
-    ``classes`` is a builtin generic dict rather than a ``Mapping`` because
-    OmegaConf rejects ``Mapping`` annotations when it builds a structured schema
-    for this config, and a config that cannot be composed is a startup failure
-    rather than a runtime one.
+    Class guarantees prioritize requests within their share. Borrowers use FIFO
+    ordering with bounded bypass. Capacity remains charged until explicit release
+    or owner expiry, regardless of allocation age.
     """
 
     memory_mb: int | None = None
@@ -183,12 +173,6 @@ class SandboxCapacityConfig:
     heartbeat_interval_s: float = 30
     classes: dict[str, ResourceClassShare] = field(default_factory=dict)
     acquire_timeout_s: float | None = 1800.0
-    # Safety net for a lease whose release was missed. `lease_ttl_s` reclaims a lease of a
-    # worker that stopped renewing, which cannot happen while the worker is alive and leaking:
-    # the lease is renewed forever by an owner that will never release it again, so nothing
-    # else in the design can free it. This age cap is the only recovery path, and it must
-    # exceed the longest legitimate sandbox lifetime or it would reclaim a working sandbox.
-    lease_max_age_s: float | None = 6 * 3600.0
 
     def __post_init__(self) -> None:
         if self.memory_mb is not None and self.memory_mb <= 0:
@@ -209,24 +193,22 @@ class SandboxCapacityConfig:
             )
         if self.acquire_timeout_s is not None and self.acquire_timeout_s <= 0:
             raise ValueError("Sandbox capacity acquire_timeout_s must be greater than zero when configured.")
-        if self.lease_max_age_s is not None and self.lease_max_age_s <= self.lease_ttl_s:
-            raise ValueError(
-                f"Sandbox capacity lease_max_age_s={self.lease_max_age_s} must exceed lease_ttl_s="
-                f"{self.lease_ttl_s}, or a lease of a live worker could be reclaimed before its heartbeat "
-                "mechanism is given a chance to recover it."
-            )
 
 
 @dataclass(frozen=True)
 class ResourceQuantity:
-    """Integer resource quantity used for exact accounting."""
+    """
+    Integer resource quantity used for exact accounting.
+    """
 
     memory_mb: int
     cpu_millis: int
 
     @classmethod
     def from_spec(cls, resources: ResourceSpec) -> ResourceQuantity:
-        """Create a quantity from a complete sandbox resource request."""
+        """
+        Create a quantity from a complete sandbox resource request.
+        """
         if resources.memory_mb is None or resources.cpu_count is None:
             raise ValueError("Node-capacity admission requires sandbox memory_mb and cpu_count.")
         return cls(resources.memory_mb, math.ceil(resources.cpu_count * 1000))
@@ -243,7 +225,9 @@ class ResourceQuantity:
 
 @dataclass(frozen=True)
 class ResolvedSandboxCapacity:
-    """Resolved node envelope and its provenance."""
+    """
+    Resolved node envelope and its provenance.
+    """
 
     resources: ResourceQuantity
     memory_source: str
@@ -256,7 +240,9 @@ def resolve_sandbox_capacity(
     detected_memory_mb: int | None = None,
     detected_cpu_cores: float | None = None,
 ) -> ResolvedSandboxCapacity:
-    """Resolve and scale the node envelope once on the target node."""
+    """
+    Resolve and scale the node envelope once on the target node.
+    """
     memory_mb = config.memory_mb or detected_memory_mb or detect_node_memory_mb()
     cpu_cores = config.cpu_cores or detected_cpu_cores or detect_node_cpu_cores()
     if not memory_mb or not cpu_cores:
@@ -274,7 +260,9 @@ def resolve_sandbox_capacity(
 
 
 def _scaled(base: ResourceQuantity, share: float) -> ResourceQuantity:
-    """Return one share of an envelope, floored to whole units."""
+    """
+    Return one share of an envelope, floored to whole units.
+    """
     return ResourceQuantity(
         memory_mb=max(1, math.floor(base.memory_mb * share)),
         cpu_millis=max(1, math.floor(base.cpu_millis * share)),
@@ -300,21 +288,15 @@ class _Waiter:
     # Set by the sweeper when the owner lease expired, so `acquire` can report a
     # capacity fault instead of the bare cancellation that `future.cancel()` raises.
     expired: bool = False
+    bypasses: int = 0
 
 
 class SandboxCapacityCoordinator:
-    """Single-node, class-aware admission coordinator.
+    """
+    Admit complete CPU and memory vectors through per-class FIFO queues.
 
-    Every request names the resource class of the sandbox it will create. Each
-    class owns a FIFO queue and a guaranteed share of the envelope, so the order
-    classes happen to arrive in can never starve one of them: a request inside
-    its own guarantee is admitted as soon as the envelope has room, whatever the
-    other classes are doing. Guarantees leave an elastic pool when they sum to
-    less than one, and a class may borrow from that pool only while no other
-    class has a request waiting. A class that was never declared in
-    ``SandboxCapacityConfig.classes`` has no guarantee, so it can only use the
-    elastic pool; the coordinator warns once so the omission is visible instead
-    of silently starving that class.
+    Guaranteed requests have priority, with a bounded bypass count to let large
+    borrowers eventually drain the envelope. Active allocations are never preempted.
     """
 
     def __init__(self, config: SandboxCapacityConfig | dict) -> None:
@@ -324,8 +306,7 @@ class SandboxCapacityCoordinator:
         self._capacity = resolve_sandbox_capacity(config)
         self.available_capacity = self._capacity.resources
         self._guaranteed = {
-            name: _scaled(self._capacity.resources, share.guaranteed_share)
-            for name, share in config.classes.items()
+            name: _scaled(self._capacity.resources, share.guaranteed_share) for name, share in config.classes.items()
         }
         self._ceilings = {
             name: _scaled(self._capacity.resources, share.max_share)
@@ -341,12 +322,15 @@ class SandboxCapacityCoordinator:
         self._undeclared_classes: set[str] = set()
         self._lock = asyncio.Lock()
         self._sweeper: asyncio.Task[None] | None = None
+        self._closed = False
         self._granted = 0
         self._released = 0
         self._expired = 0
         self._wait_timeouts = 0
         self._expired_waiters = 0
-        self._stale_leases_reclaimed = 0
+        # Borrower starvation is only ever reported. A deadline, not a reservation, is what
+        # turns genuine starvation into a capacity fault the operator can act on.
+        self._max_bypasses = 0
         self._total_wait_s = 0.0
         self._granted_by_class: dict[str, int] = {}
         self._wait_s_by_class: dict[str, float] = {}
@@ -391,17 +375,22 @@ class SandboxCapacityCoordinator:
                 lease expired while the request was still queued.
             asyncio.CancelledError: When the caller cancelled the wait.
         """
+        if self._closed:
+            raise RuntimeError("Sandbox capacity coordinator is closed.")
         self._ensure_sweeper()
         resource_class = resource_class.strip()
         if not resource_class:
             raise ValueError("Sandbox capacity resource_class cannot be empty.")
-        resources = ResourceQuantity(memory_mb, math.ceil(cpu_count * 1000))
+        resources = ResourceQuantity.from_spec(ResourceSpec(memory_mb=memory_mb, cpu_count=cpu_count))
         if not resources.fits(self._capacity.resources):
             raise ValueError(
                 f"Sandbox request memory_mb={memory_mb}, cpu_count={cpu_count:g} exceeds node envelope "
                 f"memory_mb={self._capacity.resources.memory_mb}, "
                 f"cpu_cores={self._capacity.resources.cpu_millis / 1000:g}."
             )
+        ceiling = self._ceilings.get(resource_class)
+        if ceiling is not None and not resources.fits(ceiling):
+            raise ValueError(f"Sandbox request exceeds the ceiling for class {resource_class!r}.")
         deadline = self._config.acquire_timeout_s if timeout_s is None else timeout_s
         loop = asyncio.get_running_loop()
         waiter = _Waiter(
@@ -452,14 +441,18 @@ class SandboxCapacityCoordinator:
             raise
 
     async def release(self, lease_id: str) -> None:
-        """Release one admitted resource vector."""
+        """
+        Release one admitted resource vector.
+        """
         async with self._lock:
             if self._release_locked(lease_id):
                 self._released += 1
                 self._drain_waiters()
 
     async def cancel(self, lease_id: str) -> None:
-        """Remove a canceled request whether it is queued or already admitted."""
+        """
+        Remove a canceled request whether it is queued or already admitted.
+        """
         async with self._lock:
             waiter = self._waiters.pop(lease_id, None)
             if waiter is not None:
@@ -470,13 +463,17 @@ class SandboxCapacityCoordinator:
             self._drain_waiters()
 
     async def renew_owner(self, owner_id: str) -> None:
-        """Renew every active lease belonging to one worker."""
+        """
+        Renew every active lease belonging to one worker.
+        """
         async with self._lock:
             if owner_id in self._owners:
                 self._owners[owner_id] = time.monotonic() + self._config.lease_ttl_s
 
     async def release_owner(self, owner_id: str) -> None:
-        """Release all capacity held by a worker that is shutting down."""
+        """
+        Release all capacity held by a worker that is shutting down.
+        """
         async with self._lock:
             self._owners.pop(owner_id, None)
             lease_ids = [lease_id for lease_id, item in self._allocations.items() if item.owner_id == owner_id]
@@ -491,7 +488,9 @@ class SandboxCapacityCoordinator:
             self._drain_waiters()
 
     async def snapshot(self) -> dict:
-        """Return a compact accounting and queue snapshot."""
+        """
+        Return a compact accounting and queue snapshot.
+        """
         async with self._lock:
             return {
                 "capacity": asdict(self._capacity.resources),
@@ -507,20 +506,24 @@ class SandboxCapacityCoordinator:
                 "cpu_source": self._capacity.cpu_source,
                 "capacity_wait_timeouts": self._wait_timeouts,
                 "expired_waiters": self._expired_waiters,
-                "stale_leases_reclaimed": self._stale_leases_reclaimed,
+                "max_borrow_bypasses": self._max_bypasses,
                 "oldest_lease_age_s": self._oldest_lease_age_s(),
                 "per_class": self._class_snapshot(),
             }
 
     def _oldest_lease_age_s(self) -> float:
-        """Return the age of the longest-held lease, which exposes a leak as it grows."""
+        """
+        Return the age of the longest-held lease, which exposes a leak as it grows.
+        """
         if not self._allocations:
             return 0.0
         now = time.monotonic()
         return max(now - item.allocated_at for item in self._allocations.values())
 
     def _class_snapshot(self) -> dict[str, dict]:
-        """Return guarantee, usage, and queue depth for every class seen so far."""
+        """
+        Return guarantee, usage, and queue depth for every class seen so far.
+        """
         names = set(self._guaranteed) | set(self._used_by_class) | set(self._waiting_by_class)
         names |= self._undeclared_classes
         return {
@@ -540,37 +543,63 @@ class SandboxCapacityCoordinator:
         }
 
     async def shutdown(self) -> None:
-        """Stop background expiry work."""
+        """
+        Close admission and wake every queued caller before stopping expiry.
+        """
+        async with self._lock:
+            self._closed = True
+            for waiter in self._waiters.values():
+                if not waiter.future.done():
+                    waiter.future.set_exception(RuntimeError("Sandbox capacity coordinator is closed."))
+            self._waiters.clear()
+            self._class_queues.clear()
+            self._waiting_by_class.clear()
         if self._sweeper is not None:
             self._sweeper.cancel()
             await asyncio.gather(self._sweeper, return_exceptions=True)
 
     def _drain_waiters(self) -> None:
-        """Admit queued requests, class by class, each in FIFO order.
+        """Admit guarantees first, then let borrowers share the slack in arrival order.
 
-        A request is admitted when it fits the free envelope and either stays inside
-        its class guarantee or, when it would borrow, no other class has a request
-        waiting. The class order is fixed only for determinism: it cannot decide who
-        makes progress, because the borrow rule already stops a class from taking the
-        elastic pool while another class waits. One pass is enough, since a grant only
-        ever consumes capacity.
+        A request inside its class guarantee is the contract, so it is admitted whenever the
+        envelope has room and is never blocked by a borrower. When a guaranteed head does not
+        fit, the remaining slack is reserved for it rather than lent out. Borrowers otherwise
+        use best-effort FIFO: an oldest borrower that cannot fit does not block a younger one
+        that can, because head-of-line blocking would idle the node for the length of the
+        longest running episode.
         """
-        for resource_class in sorted(self._waiting_by_class):
-            while self._waiting_by_class.get(resource_class, 0) > 0:
-                waiter = self._head_waiter(resource_class)
-                if waiter is None:
-                    break
-                if not waiter.resources.fits(self.available_capacity):
-                    break
-                if not self._fits_guarantee(resource_class, waiter.resources):
-                    if self._other_classes_waiting(resource_class):
-                        break
-                    if not self._fits_ceiling(resource_class, waiter.resources):
-                        break
-                self._grant(waiter)
+        while True:
+            heads = [self._head_waiter(name) for name in self._class_queues]
+            eligible = [
+                head for head in heads if head is not None and self._fits_ceiling(head.resource_class, head.resources)
+            ]
+            if not eligible:
+                return
+            guaranteed = [head for head in eligible if self._fits_guarantee(head.resource_class, head.resources)]
+            fitting = [head for head in (guaranteed or eligible) if head.resources.fits(self.available_capacity)]
+            if not fitting:
+                # Hold the slack for a queued guarantee, or wait for a borrower to fit.
+                return
+            waiter = min(fitting, key=lambda item: item.queued_at)
+            self._count_bypasses(eligible, waiter)
+            self._grant(waiter)
+
+    def _count_bypasses(self, eligible: list[_Waiter], waiter: _Waiter) -> None:
+        """Record every request that a younger one was admitted ahead of.
+
+        Skipping is deliberate, so this is reported rather than acted on. A climbing count
+        means the class shares no longer match the workload, which `acquire_timeout_s`
+        eventually turns into a capacity fault.
+        """
+        for head in eligible:
+            if head.queued_at < waiter.queued_at:
+                head.bypasses += 1
+                self._max_bypasses = max(self._max_bypasses, head.bypasses)
 
     def _grant(self, waiter: _Waiter) -> None:
-        """Admit one waiter and charge its class."""
+        """
+        Admit one waiter and charge its class.
+        """
         now = time.monotonic()
         self._waiters.pop(waiter.lease_id)
         self._dequeue(waiter)
@@ -587,10 +616,13 @@ class SandboxCapacityCoordinator:
         wait_s = now - waiter.queued_at
         self._total_wait_s += wait_s
         self._wait_s_by_class[waiter.resource_class] = self._wait_s_by_class.get(waiter.resource_class, 0.0) + wait_s
-        waiter.future.set_result(None)
+        if not waiter.future.done():
+            waiter.future.set_result(None)
 
     def _head_waiter(self, resource_class: str) -> _Waiter | None:
-        """Return the oldest queued request of one class, pruning stale entries."""
+        """
+        Return the oldest queued request of one class, pruning stale entries.
+        """
         queue = self._class_queues.get(resource_class)
         if queue is None:
             return None
@@ -609,28 +641,28 @@ class SandboxCapacityCoordinator:
         )
 
     def _discard_waiter(self, lease_id: str) -> None:
-        """Drop a queued request, releasing capacity if it was granted meanwhile."""
+        """
+        Drop a queued request, releasing capacity if it was granted meanwhile.
+        """
         waiter = self._waiters.pop(lease_id, None)
         if waiter is not None:
             self._dequeue(waiter)
         if self._release_locked(lease_id):
             self._released += 1
 
-    def _other_classes_waiting(self, resource_class: str) -> bool:
-        """Whether any other class has a request queued."""
-        return any(
-            count > 0 and name != resource_class for name, count in self._waiting_by_class.items()
-        )
-
     def _fits_guarantee(self, resource_class: str, resources: ResourceQuantity) -> bool:
-        """Whether this request stays inside its class's guaranteed share."""
+        """
+        Whether this request stays inside its class's guaranteed share.
+        """
         guaranteed = self._guaranteed.get(resource_class)
         if guaranteed is None:
             return False
         return (self._usage(resource_class) + resources).fits(guaranteed)
 
     def _fits_ceiling(self, resource_class: str, resources: ResourceQuantity) -> bool:
-        """Whether this request stays under its class's optional total ceiling."""
+        """
+        Whether this request stays under its class's optional total ceiling.
+        """
         ceiling = self._ceilings.get(resource_class)
         if ceiling is None:
             return True
@@ -691,35 +723,5 @@ class SandboxCapacityCoordinator:
                     waiter.expired = True
                     waiter.future.cancel()
                 self._expired += len(expired_leases)
-                aged_leases = self._reclaim_aged_leases(now)
-                if expired_leases or expired_waiters or aged_leases:
+                if expired_leases or expired_waiters:
                     self._drain_waiters()
-
-    def _reclaim_aged_leases(self, now: float) -> list[str]:
-        """Reclaim leases that outlived every legitimate sandbox lifetime.
-
-        A lease a caller forgot to release is otherwise unreclaimable: its owner is alive and
-        renewing, so `lease_ttl_s` never expires it. Reclaiming it here converts a silent
-        capacity leak, which fills the node and blocks every later sandbox, into a warning
-        that names the owner and the size it was holding.
-        """
-        max_age = self._config.lease_max_age_s
-        if max_age is None:
-            return []
-        aged = [
-            (lease_id, item)
-            for lease_id, item in self._allocations.items()
-            if now - item.allocated_at > max_age
-        ]
-        for lease_id, item in aged:
-            self._release_locked(lease_id)
-            self._stale_leases_reclaimed += 1
-            psrl_logger.warning(
-                f"Reclaimed node capacity lease {lease_id!r} of resource_class={item.resource_class!r} after "
-                f"{now - item.allocated_at:.0f}s, which is longer than any sandbox may live "
-                f"(lease_max_age_s={max_age:g}). Its owner {item.owner_id!r} is still renewing, so the lease "
-                f"was never released: {item.resources} had been charged for a sandbox that is gone. Check for "
-                "a sandbox cleanup path that can be interrupted before it returns its capacity."
-            )
-        return [lease_id for lease_id, _ in aged]
-

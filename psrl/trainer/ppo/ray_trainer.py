@@ -100,7 +100,7 @@ from psrl.utils.server.command import Command, CommandType
 from psrl.utils.transferqueue_utils import PayloadState, clear_payload
 from psrl.workers.agent_loop.manager import PSRL_AgentLoopManager
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
-from psrl.workers.agent_loop.timeouts import resolve_from_config, validate_lease_max_age_s
+from psrl.workers.agent_loop.timeouts import resolve_from_config
 from psrl.workers.agent_loop.worker import PSRL_AgentLoopWorker
 from psrl.workers.config.reward_model import resolve_active_managers
 from psrl.workers.gen.rollout_coordination import RolloutCoordinator
@@ -128,21 +128,11 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 def _log_agent_loop_timeouts(config) -> None:
-    """Resolve and report the rollout deadline ladder, refusing a contradictory one.
-
-    Every internal deadline derives from the episode budget, so resolving the ladder here is
-    both the validation and the place a reader can see what the run will actually enforce.
-
-    The capacity lease age cap is checked against the same ladder, because it is the
-    last-resort recovery for a lease whose release was missed and therefore has to outlive
-    the longest sandbox a healthy run can hold.
+    """
+    Resolve and report the rollout deadline ladder.
     """
     ladder = resolve_from_config(config)
     psrl_logger.info("Rollout deadlines: %s.", ladder.describe())
-    validate_lease_max_age_s(
-        config.gen_actor_rollout_ref.rollout.agent.sandbox.capacity.get("lease_max_age_s"),
-        ladder,
-    )
 
 
 class ReplayBuffer:
@@ -2213,6 +2203,33 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.replay_buffer.start_polling()
         psrl_logger.info("ReplayBuffer polling started after init_workers() completed.")
 
+    def _sandbox_capacity_metrics(self) -> dict[str, float]:
+        """Report node sandbox admission per step, keyed by node.
+
+        `oldest_lease_age_s` growing without bound is how a reservation that was charged for
+        a container nobody can delete becomes visible. Nothing reclaims it by age, so this is
+        the signal an operator acts on.
+        """
+        coordinators = getattr(self, "sandbox_capacity_coordinators", None)
+        if not coordinators:
+            return {}
+        try:
+            snapshots = ray.get(
+                [coordinator.snapshot.remote() for coordinator in coordinators.values()],
+                timeout=10.0,
+            )
+        except Exception:
+            psrl_logger.warning("Could not read sandbox capacity snapshots for metrics.", exc_info=True)
+            return {}
+        reported = ("waiters", "allocations", "expired", "capacity_wait_timeouts", "oldest_lease_age_s")
+        metrics: dict[str, float] = {}
+        for node_id, snapshot in zip(coordinators, snapshots, strict=True):
+            for key in reported:
+                metrics[f"sandbox_capacity/{node_id}/{key}"] = float(snapshot.get(key, 0) or 0)
+            available = snapshot.get("available_capacity") or {}
+            metrics[f"sandbox_capacity/{node_id}/available_memory_mb"] = float(available.get("memory_mb", 0) or 0)
+        return metrics
+
     def switch_to_rollout_mode(self):
         """Switch the PSRL colocate part to rollout mode for validation.
 
@@ -3316,6 +3333,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 "training/num_turns/min": num_turns.min(),
             }
         )
+
+        metrics.update(self._sandbox_capacity_metrics())
 
         metrics.update(
             _compute_termination_metrics(

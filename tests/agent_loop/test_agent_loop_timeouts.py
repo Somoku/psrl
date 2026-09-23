@@ -12,7 +12,6 @@ from psrl.workers.agent_loop.timeouts import (
     DEFAULT_EPISODE_TIMEOUT_S,
     AgentLoopTimeouts,
     resolve_agent_loop_timeouts,
-    validate_lease_max_age_s,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -116,7 +115,6 @@ def test_the_shipped_configs_resolve_to_a_consistent_ladder() -> None:
 
     import yaml
     from omegaconf import OmegaConf
-
     from psrl.workers.agent_loop.timeouts import resolve_from_config
 
     rollout = yaml.safe_load(Path("psrl/trainer/config/rollout/psrl_rollout.yaml").read_text())
@@ -135,21 +133,3 @@ def test_the_shipped_configs_resolve_to_a_consistent_ladder() -> None:
     # The stall threshold is derived, and it no longer has to cover a whole episode.
     assert ladder.entry_stall_timeout_s < ladder.episode_timeout_s
     assert ladder.harness_exec_timeout_s > ladder.episode_timeout_s
-    # The recovery cap has to outlive a healthy sandbox, and the shipped value does.
-    validate_lease_max_age_s(rollout["agent"]["sandbox"]["capacity"]["lease_max_age_s"], ladder)
-
-
-def test_a_recovery_cap_shorter_than_a_healthy_sandbox_is_refused() -> None:
-    """The age cap is the only thing that reclaims a leaked lease, so it must not be eager.
-
-    A lease is renewed by its live owner, so the cap firing is the only feedback: by the
-    time it is too short, it has already taken capacity from a sandbox that was working.
-    """
-    ladder = resolve_agent_loop_timeouts(7200, 1800)
-
-    validate_lease_max_age_s(ladder.child_deadline_s + 1, ladder)
-    # Null disables the cap, which is a deliberate choice rather than a contradiction.
-    validate_lease_max_age_s(None, ladder)
-
-    with pytest.raises(ValueError, match="child deadline"):
-        validate_lease_max_age_s(ladder.child_deadline_s, ladder)

@@ -130,10 +130,8 @@ agent:
     # Class name of the custom async server class (e.g. AsyncvLLMServer).
     name: null
 
-  # Wall clock one episode may spend on agent work, measured from the moment its sandbox is
-  # ready so admission and preparation are not charged to it. It covers the whole episode:
-  # turns, patch collection, and grading. Every other deadline in the agent loop derives from
-  # this one, so there is no second place to set the episode length. Null uses the default.
+  # Episode seconds after provisioning, including turns, patch collection, and grading.
+  # Other deadlines derive from this budget. Null uses the default.
   trajectory_timeout: 7200
 
   # Environment configuration for the agent loop.
@@ -169,36 +167,18 @@ agent:
       cpu_cores: null
       utilization: 0.5
 
-      # Guaranteed slices of the envelope, one per sandbox resource class. A request inside
-      # its class guarantee is admitted as soon as the envelope has room, so a class can no
-      # longer be starved by another class that arrives first or asks for less. Keep the
-      # guarantees summing to less than one: the remainder is one elastic pool that a class
-      # may borrow from only while no other class has a request waiting, and that slack is
-      # what keeps every guarantee satisfiable at the same time without preempting anything.
-      #
-      # Size the shares from measurement, not intuition: the rollout share must cover
-      # (fraction of episode wall clock spent in the rollout phase) x (rollout footprint),
-      # and the grader share the complementary fraction x grader footprint. Both are in
-      # `reward_info.timing.elapsed_s` / `grading_s`, and `sandbox_peak_memory_mib` when
-      # sandbox_config.collect_resource_metrics is on.
+      # Guarantees must sum to below one. Size each share as (fraction of episode wall clock
+      # in that phase) x (its footprint), from `reward_info.timing` and `sandbox_peak_memory_mib`.
       classes:
-        # Only used by recipes that declare one class per role; both are ignored otherwise.
+        # Recipes declare the resource class for each phase.
         rollout:
           guaranteed_share: 0.60
         grader:
           guaranteed_share: 0.25
 
-      # How long a sandbox request may stay queued before it fails with a capacity fault.
-      # Must leave room for the episode inside the child deadline, which the agent loop checks
-      # at startup. Null waits forever.
+      # Maximum admission wait in seconds. Must leave room for the episode inside the child
+      # deadline, which the agent loop checks at startup. Null waits indefinitely.
       acquire_timeout_s: 1800
-
-      # Safety net for a lease whose release was missed. A lease belonging to a live worker is
-      # renewed forever, so neither its TTL nor anything else can reclaim it: this age cap is the
-      # only recovery path, and it is what keeps a single missed release from filling the node and
-      # blocking every later sandbox. Must exceed the longest legitimate sandbox lifetime, which
-      # the trainer verifies against the agent loop's child deadline at startup.
-      lease_max_age_s: 21600
 
     backends:
 
@@ -209,6 +189,10 @@ agent:
         # must be visible to every worker using the same daemon, and mounted when containerized.
         lifecycle:
           heartbeat_dir: /tmp/psrl-sandbox-heartbeats
+
+          # How long a container may stay stopped before the collector reaps it despite a live
+          # owner. Must outlast the owning session's exit diagnosis, which takes seconds.
+          stopped_grace_s: 300
 
         # Rootless is opt-in because existing clusters may still use a rootful
         # node-local daemon. Set require_rootless=true after daemon migration.

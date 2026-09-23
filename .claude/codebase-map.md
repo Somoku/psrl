@@ -561,6 +561,7 @@ HuggingFace (HF)  ←→  FSDP  ←→  vLLM
 | `HFConverter` | `utils/converter/hf_converter.py` |
 | Key mappings | `utils/converter/model_mappings.py` |
 | vLLM↔HF layout plugin | `utils/converter/weight_layout_{plan,transforms}.py` |
+| vLLM module introspection | `utils/converter/vllm_module_info.py` |
 
 Supports newer arches (DeepSeek-V2, Qwen3.5). Per-format loading in `converter/modeling/`.
 
@@ -593,8 +594,8 @@ tests/
 ├── trainer/          → step strategies, fine-grain overlap config, chunk manager,
 │                       main_ppo imports, PSRL_Role
 ├── config/           → reward config + YAML merge semantics
-├── converter/        → converter compat, model registry, vLLM weight-layout plugin, packing specs
-├── state_dict/       → FSDP1/FSDP2/vLLM converter round-trips (+ scripts/ launchers)
+├── converter/        → vLLM parameter mapping/splitting/sharding, model registry, weight-layout plugin
+├── state_dict/       → FSDP1/FSDP2 converter round-trips (+ scripts/ launchers)
 ├── nixl/             → comm planner, sharding, send/recv, e2e (+ config/nixl_e2e.yaml, scripts/)
 ├── parameter_server/ → PSManager, request status tracker
 ├── staleness/        → staleness controller

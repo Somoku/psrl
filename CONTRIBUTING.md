@@ -107,7 +107,6 @@ bash tests/nixl/scripts/test_nixl_e2e.sh
 bash tests/fsdp/scripts/test_fsdp1_load_model.sh
 bash tests/fsdp/scripts/test_fsdp2_load_model.sh
 bash tests/torch_dist/scripts/test_broadcast.sh
-bash tests/state_dict/scripts/test_vllm_converter_new_api.sh
 ```
 
 **NIXL send/recv test** (two nodes required — run on each node separately):

@@ -420,7 +420,7 @@ NCCL the option is a validated no-op, so enabling it is safe but has no effect.
 
 ## Model runner selection
 
-PSRL supports both of vLLM's model runners on vLLM 0.29: the v2 runner (vLLM's
+PSRL supports both of vLLM's model runners on vLLM 0.30: the v2 runner (vLLM's
 default on CUDA) and v1. Leave the choice to vLLM — do not set
 `VLLM_USE_V2_MODEL_RUNNER` via `engine_kwargs`. That variable short-circuits
 vLLM's own feature check, so setting it to `1` would force v2 onto a

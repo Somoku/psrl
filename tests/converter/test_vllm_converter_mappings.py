@@ -1,4 +1,4 @@
-"""Tests for VllmConverter spec-driven fast path and fallback."""
+"""Tests for VllmConverter parameter mapping, splitting and sharding."""
 
 from unittest.mock import MagicMock
 
@@ -7,59 +7,8 @@ import torch
 import torch.nn as nn
 from psrl.utils.converter.model_mappings import MappingType
 from psrl.utils.converter.vllm_converter import VllmConverter
-from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec, WeightLayoutSpec
 
 pytestmark = pytest.mark.cpu_test
-
-
-class FakeQwen2Model(nn.Module, SupportsWeightLayoutSpec):
-    supports_weight_layout_spec = True
-
-    def __init__(self):
-        super().__init__()
-        self.layer = nn.Linear(8, 8, bias=False)
-
-    def get_weight_layout_spec(self) -> WeightLayoutSpec:
-        return WeightLayoutSpec(
-            stacked_params=[
-                ("qkv_proj", "q_proj", "q"),
-                ("qkv_proj", "k_proj", "k"),
-                ("qkv_proj", "v_proj", "v"),
-                ("gate_up_proj", "gate_proj", 0),
-                ("gate_up_proj", "up_proj", 1),
-            ],
-            packing_metadata={"num_heads": 2, "num_kv_heads": 2, "head_size": 4, "intermediate_size": 8},
-        )
-
-
-class FakeMoEModel(nn.Module, SupportsWeightLayoutSpec):
-    supports_weight_layout_spec = True
-    NUM_EXPERTS = 2
-
-    def get_weight_layout_spec(self) -> WeightLayoutSpec:
-        expert_params = []
-        for eid in range(self.NUM_EXPERTS):
-            expert_params += [
-                ("experts.w13_", f"experts.{eid}.gate_proj.", eid, "w1"),
-                ("experts.w2_", f"experts.{eid}.down_proj.", eid, "w2"),
-                ("experts.w13_", f"experts.{eid}.up_proj.", eid, "w3"),
-            ]
-        return WeightLayoutSpec(
-            stacked_params=[("gate_up_proj", "gate_proj", 0), ("gate_up_proj", "up_proj", 1)],
-            packing_metadata={"intermediate_size": 8, "num_experts": self.NUM_EXPERTS},
-            expert_params=expert_params,
-        )
-
-
-class FakeOuterModel(nn.Module, SupportsWeightLayoutSpec):
-    supports_weight_layout_spec = True
-
-    def __init__(self):
-        super().__init__()
-        self.language_model = FakeQwen2Model()
-
-    def get_weight_layout_spec(self) -> WeightLayoutSpec:
-        return WeightLayoutSpec(stacked_params=[], packing_metadata={})
 
 
 class TestBuildFusedMappings:
@@ -154,134 +103,11 @@ class TestBuildFusedMappings:
         assert entry.is_full_path is False
 
 
-class TestBuildFromSpec:
-    def _make_converter(self):
-        return VllmConverter(parameter_mapping=None, tp_rank=0)
-
-    def test_builds_fused_mappings_from_spec_object(self):
-        """_build_from_spec takes a WeightLayoutSpec directly and returns fused_mappings."""
-        conv = self._make_converter()
-        spec = FakeQwen2Model().get_weight_layout_spec()
-        fused, metadata = conv._build_from_spec(spec)
-        assert "qkv_proj" in fused
-        assert "gate_up_proj" in fused
-        assert metadata["num_heads"] == 2
-
-    def test_no_double_counting_pattern1(self):
-        """Pattern A: ForCausalLM delegates to inner Model. The spec is applied once."""
-        conv = self._make_converter()
-
-        class InnerModel(nn.Module, SupportsWeightLayoutSpec):
-            supports_weight_layout_spec = True
-
-            def get_weight_layout_spec(self):
-                return WeightLayoutSpec(
-                    stacked_params=[
-                        ("qkv_proj", "q_proj", "q"),
-                        ("qkv_proj", "k_proj", "k"),
-                        ("qkv_proj", "v_proj", "v"),
-                    ],
-                    packing_metadata={"num_heads": 4, "num_kv_heads": 4, "head_size": 8, "intermediate_size": 16},
-                )
-
-        class OuterModel(nn.Module, SupportsWeightLayoutSpec):
-            supports_weight_layout_spec = True
-
-            def __init__(self):
-                super().__init__()
-                self.model = InnerModel()
-
-            def get_weight_layout_spec(self):
-                return self.model.get_weight_layout_spec()  # delegate
-
-        # Top-level returns non-empty spec → used directly, sub-module walk never runs
-        spec = OuterModel().get_weight_layout_spec()
-        fused, _ = conv._build_from_spec(spec)
-        assert len(fused["qkv_proj"].mappings) == 3  # exactly 3, not 6
-
-    # --- Pattern C/D routing is in convert_state_and_sharding_dict ---
-
-    def test_pattern_c_passthrough_preserves_param_names(self):
-        """Pattern C (Mamba, Qwen3): empty top-level spec → all weights pass through unchanged."""
-        conv = VllmConverter(parameter_mapping=None, tp_rank=0)
-
-        class SimpleMambaLike(nn.Module, SupportsWeightLayoutSpec):
-            supports_weight_layout_spec = True
-
-            def __init__(self):
-                super().__init__()
-                self.linear = nn.Linear(4, 4, bias=False)
-
-            def get_weight_layout_spec(self):
-                return WeightLayoutSpec(stacked_params=[], packing_metadata={})
-
-        model = SimpleMambaLike()
-        state_dict, _ = conv.convert_state_and_sharding_dict(model)
-        assert "linear.weight" in state_dict
-        assert state_dict["linear.weight"] is model.linear.weight
-
-    def test_pattern_d_empty_toplevel_uses_submodule_spec(self):
-        """Pattern D (KimiK25): empty top-level spec, sub-module has non-empty spec.
-
-        The sub-module's spec (with qkv_proj stacked_params) must drive the conversion:
-        a parameter named 'qkv_proj' in the sub-module must be split into q/k/v projections.
-        """
-        from vllm.model_executor.layers.linear import QKVParallelLinear
-
-        # Build a model whose top-level spec is empty but whose sub-module has a non-empty
-        # spec with qkv_proj stacked_params. The sub-module also owns a real qkv_proj param.
-        class InnerWithQKV(nn.Module, SupportsWeightLayoutSpec):
-            """Sub-module with qkv_proj spec AND a matching qkv_proj parameter."""
-
-            supports_weight_layout_spec = True
-
-            def __init__(self):
-                super().__init__()
-                # num_heads=2, num_kv_heads=2, head_size=4 → total=(2+2+2)*4=24 rows
-                mock_qkv = MagicMock(spec=QKVParallelLinear)
-                mock_qkv.tp_size = 1
-                mock_qkv.weight = nn.Parameter(torch.zeros(24, 8))
-                # Register the weight here so its qualified name exposes the projection suffix.
-                self.register_parameter("qkv_proj_weight", nn.Parameter(torch.zeros(24, 8)))
-
-            def get_weight_layout_spec(self) -> WeightLayoutSpec:
-                return WeightLayoutSpec(
-                    stacked_params=[
-                        ("qkv_proj_weight", "q_proj_weight", "q"),
-                        ("qkv_proj_weight", "k_proj_weight", "k"),
-                        ("qkv_proj_weight", "v_proj_weight", "v"),
-                    ],
-                    packing_metadata={"num_heads": 2, "num_kv_heads": 2, "head_size": 4, "intermediate_size": 8},
-                )
-
-        class OuterEmpty(nn.Module, SupportsWeightLayoutSpec):
-            supports_weight_layout_spec = True
-
-            def __init__(self):
-                super().__init__()
-                self.language_model = InnerWithQKV()
-
-            def get_weight_layout_spec(self) -> WeightLayoutSpec:
-                return WeightLayoutSpec(stacked_params=[], packing_metadata={})
-
-        conv = self._make_converter()
-        model = OuterEmpty()
-        state_dict, _ = conv.convert_state_and_sharding_dict(model)
-
-        # The sub-module's spec must have been used: qkv_proj_weight → q/k/v
-        assert "language_model.q_proj_weight" in state_dict, (
-            "Pattern D: sub-module spec must drive splitting of qkv_proj_weight → q/k/v"
-        )
-        assert "language_model.k_proj_weight" in state_dict
-        assert "language_model.v_proj_weight" in state_dict
-        assert "language_model.qkv_proj_weight" not in state_dict, "qkv_proj_weight must be split, not passed through"
-
-
 class TestVllmConverterIntegration:
     def test_raises_when_no_spec_and_no_mapping(self):
         conv = VllmConverter(parameter_mapping=None, tp_rank=0)
         model = nn.Linear(4, 4)
-        with pytest.raises(ValueError, match="does not implement SupportsWeightLayoutSpec"):
+        with pytest.raises(ValueError, match="does not implement SupportsWeightLayout"):
             conv.convert_state_and_sharding_dict(model)
 
     def test_fallback_to_parameter_mapping(self):
@@ -661,7 +487,7 @@ class TestConvertParameterSplitting:
 
     def test_fused_moe_w13_split_produces_per_expert_output(self):
         """Pattern A MoE: w13_weight is split into per-expert gate_proj and up_proj params."""
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.layers.fused_moe import RoutedExperts
 
         conv = self._make_converter()
 
@@ -678,7 +504,7 @@ class TestConvertParameterSplitting:
 
         # w13_weight shape: (num_experts, 2*intermediate, in_features)
         w13_param = nn.Parameter(torch.arange(2 * 2 * 4 * 2, dtype=torch.float32).reshape(2, 8, 2))
-        module = MagicMock(spec=FusedMoE)
+        module = MagicMock(spec=RoutedExperts)
         module.tp_size = 1
         module.ep_size = 1
 
@@ -704,7 +530,7 @@ class TestConvertParameterSplitting:
 
     def test_fused_moe_w2_split_produces_per_expert_output(self):
         """Pattern A MoE: w2_weight is split into per-expert down_proj params."""
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.layers.fused_moe import RoutedExperts
 
         conv = self._make_converter()
 
@@ -717,7 +543,7 @@ class TestConvertParameterSplitting:
 
         # w2_weight shape: (num_experts, in_features, intermediate)
         w2_param = nn.Parameter(torch.zeros(2, 2, 4))
-        module = MagicMock(spec=FusedMoE)
+        module = MagicMock(spec=RoutedExperts)
         module.tp_size = 1
         module.ep_size = 1
 

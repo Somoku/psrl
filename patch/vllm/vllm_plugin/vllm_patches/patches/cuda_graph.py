@@ -25,7 +25,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@min_vllm_version("0.29.0")
+@min_vllm_version("0.30.0")
 class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
     """Capture the v1 model runner's CUDA graphs inside a TMS region.
 
@@ -36,7 +36,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
     runtime and can fall back to v1 when a config enables a v2-unsupported
     feature.
 
-    Mirrors `CUDAGraphWrapper.__call__` from vLLM 0.29.0 with a single change:
+    Mirrors `CUDAGraphWrapper.__call__` from vLLM 0.30.0 with a single change:
     capture is entered through
     `torch_memory_saver.cuda_graph(..., tag="graph")` instead of
     `torch.cuda.graph(...)`, so the capture pool becomes part of the `graph`

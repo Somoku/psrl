@@ -3,11 +3,15 @@ from types import SimpleNamespace
 import pytest
 from psrl.workers.gen.smg_adapter import (
     CACHE_AWARE_METHODS,
+    LMCacheEventFlags,
     _cache_aware_cfg,
+    _lmcache_coordinator_addr,
     build_rollout_router_args,
     build_worker_registration_payload,
     get_trajectory_id_strategy,
     is_cache_aware_method,
+    lmcache_coordinator_required,
+    resolve_lmcache_event_flags,
 )
 
 
@@ -186,9 +190,8 @@ def test_policy_from_str_cache_aware_v1():
     assert policy_from_str("cache_aware") == PolicyType.CacheAware
 
 
-def _make_lmcache_config(**lmcache_overrides):
-    from types import SimpleNamespace
-
+def _make_lmcache_config(method="request_num_balance", lmcache_overlap_weight=0.0, **lmcache_overrides):
+    """Build a `psrl` config node with the LMCache and routing nodes SMG wiring reads."""
     lmcache = {
         "enable": True,
         "coordinator_host": "10.0.0.2",
@@ -196,26 +199,93 @@ def _make_lmcache_config(**lmcache_overrides):
         "coordinator_event_reporting": True,
         **lmcache_overrides,
     }
-    return SimpleNamespace(psrl=SimpleNamespace(lmcache=SimpleNamespace(**lmcache)))
+    routing_strategy = SimpleNamespace(
+        method=method,
+        cache_aware_policy=SimpleNamespace(lmcache_overlap_weight=lmcache_overlap_weight),
+    )
+    return SimpleNamespace(
+        psrl=SimpleNamespace(
+            lmcache=SimpleNamespace(**lmcache),
+            rollout_coordination=SimpleNamespace(routing_strategy=routing_strategy),
+        )
+    )
 
 
 @pytest.mark.unit
 def test_lmcache_coordinator_addr_derived_when_events_enabled():
-    from psrl.workers.gen.smg_adapter import _lmcache_coordinator_addr
-
     assert _lmcache_coordinator_addr(_make_lmcache_config()) == "http://10.0.0.2:9300"
 
 
 @pytest.mark.unit
 def test_lmcache_coordinator_addr_empty_when_events_disabled():
-    from psrl.workers.gen.smg_adapter import _lmcache_coordinator_addr
-
     assert _lmcache_coordinator_addr(_make_lmcache_config(enable=False)) == ""
     assert _lmcache_coordinator_addr(_make_lmcache_config(coordinator_event_reporting=False)) == ""
 
 
 @pytest.mark.unit
 def test_lmcache_coordinator_addr_empty_without_host():
-    from psrl.workers.gen.smg_adapter import _lmcache_coordinator_addr
-
     assert _lmcache_coordinator_addr(_make_lmcache_config(coordinator_host="")) == ""
+
+
+@pytest.mark.unit
+def test_lmcache_event_flags_follow_cache_aware_routing():
+    # A cache-aware method with a non-zero LMCache weight is what makes the
+    # off-GPU tier scoreable, so it turns the stream on by itself.
+    flags = resolve_lmcache_event_flags(
+        _make_lmcache_config(
+            method="cache_aware_v1",
+            lmcache_overlap_weight=0.5,
+            coordinator_event_reporting=False,
+        ).psrl
+    )
+    assert flags == LMCacheEventFlags(kv_events=True, coordinator_reporting=True)
+
+    # Without the weight nothing reads the stream, so it stays off.
+    flags = resolve_lmcache_event_flags(
+        _make_lmcache_config(
+            method="cache_aware_v1",
+            lmcache_overlap_weight=0.0,
+            coordinator_event_reporting=False,
+        ).psrl
+    )
+    assert flags == LMCacheEventFlags(kv_events=False, coordinator_reporting=False)
+
+
+@pytest.mark.unit
+def test_lmcache_event_flags_respect_explicit_stream_opt_in():
+    config = _make_lmcache_config(
+        method="request_num_balance",
+        enable_kv_events=True,
+        coordinator_event_reporting=False,
+    )
+    flags = resolve_lmcache_event_flags(config.psrl)
+    assert flags == LMCacheEventFlags(kv_events=True, coordinator_reporting=True)
+
+
+@pytest.mark.unit
+def test_lmcache_coordinator_required_follows_p2p_and_event_reporting():
+    # Nothing to discover without P2P or event reporting.
+    assert not lmcache_coordinator_required(
+        _make_lmcache_config(enable_p2p=False, coordinator_event_reporting=False).psrl
+    )
+    assert lmcache_coordinator_required(_make_lmcache_config(enable_p2p=True).psrl)
+    assert lmcache_coordinator_required(
+        _make_lmcache_config(
+            method="cache_aware",
+            lmcache_overlap_weight=0.5,
+            coordinator_event_reporting=False,
+        ).psrl
+    )
+    assert not lmcache_coordinator_required(_make_lmcache_config(enable=False).psrl)
+
+
+@pytest.mark.unit
+def test_lmcache_coordinator_addr_follows_cache_aware_routing():
+    # A router learns the stream URL only from coordinator registration, so the
+    # advertised address must follow the same predicate as the server.
+    config = _make_lmcache_config(
+        method="cache_aware",
+        lmcache_overlap_weight=0.5,
+        coordinator_event_reporting=False,
+    )
+    assert _lmcache_coordinator_addr(config) == "http://10.0.0.2:9300"

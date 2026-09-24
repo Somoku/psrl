@@ -65,7 +65,11 @@ from psrl.utils.logger import (
 )
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
-from psrl.workers.gen.smg_adapter import build_worker_registration_payload, cfg_get, is_cache_aware_method
+from psrl.workers.gen.smg_adapter import (
+    build_worker_registration_payload,
+    is_cache_aware_method,
+    resolve_lmcache_event_flags,
+)
 from psrl.workers.gen.stats_collector import DPLBStatCollector
 from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, TokenOutput
 from psrl.workers.gen.zmq_queue import ZMQPushQueue
@@ -210,29 +214,20 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # this replica from either its replica id or a single node id.
         lmcache_raw["replica_id"] = replica_id
 
-        if lmcache_raw.get("enable_p2p", False):
-            lmcache_raw.setdefault(
-                "coordinator_host",
-                str(self.psrl_config.get("ps_manager_ip", "127.0.0.1")),
+        # One shared resolver decides both flags, so the MP server, the
+        # coordinator launcher and the router agree on when the off-GPU tier is
+        # live.
+        flags = resolve_lmcache_event_flags(self.psrl_config)
+        lmcache_raw["enable_kv_events"] = flags.kv_events
+        lmcache_raw["coordinator_event_reporting"] = flags.coordinator_reporting
+        if lmcache_raw.get("enable_p2p", False) or flags.coordinator_reporting:
+            # MP servers must be reachable in the coordinator registry, both for
+            # P2P discovery and for a router to find the event stream. The YAML
+            # default already points at the PS manager; this fills the host back
+            # in when a config cleared it.
+            lmcache_raw["coordinator_host"] = lmcache_raw.get("coordinator_host") or str(
+                self.psrl_config.get("ps_manager_ip", "127.0.0.1")
             )
-
-        # Off-GPU cache scoring is fed only by the LMCache event stream, so
-        # enabling it implies coordinator event reporting.
-        lmcache_raw["enable_kv_events"] = bool(
-            lmcache_raw.get("enable", False)
-            and is_cache_aware_method(self.psrl_config.rollout_coordination.routing_strategy.method)
-            and float(
-                cfg_get(
-                    self.psrl_config,
-                    "rollout_coordination.routing_strategy.cache_aware_policy.lmcache_overlap_weight",
-                    0.0,
-                )
-            )
-            > 0.0
-        )
-        lmcache_raw["coordinator_event_reporting"] = bool(
-            lmcache_raw.get("coordinator_event_reporting", False) or lmcache_raw["enable_kv_events"]
-        )
 
         lmcache_cfg = LMCacheConfig(**lmcache_raw)
         if lmcache_cfg.n_servers > 1:

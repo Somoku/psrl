@@ -2,7 +2,7 @@ import argparse
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 psrl_logger = logging.getLogger(__name__)
 
@@ -45,6 +45,73 @@ def _cache_aware_cfg(config: Any, key: str, default: Any = None) -> Any:
     return default
 
 
+class LMCacheEventFlags(NamedTuple):
+    """
+    Resolved LMCache event-reporting behaviour for one rollout.
+
+    Attributes:
+        kv_events: Whether each MP server serves its off-GPU cache-event stream.
+        coordinator_reporting: Whether MP servers register with the coordinator
+            and report cache events to it, so a router can discover the stream
+            from the instance registry.
+    """
+
+    kv_events: bool
+    coordinator_reporting: bool
+
+
+def resolve_lmcache_event_flags(psrl_config: Any) -> LMCacheEventFlags:
+    """
+    Resolve the LMCache off-GPU event-reporting flags for one rollout.
+
+    The off-GPU tier is scored only from the LMCache event stream, so a
+    cache-aware routing method with a non-zero LMCache weight turns both flags
+    on without an explicit opt-in.
+
+    Args:
+        psrl_config: The `psrl` config node, not the top-level config.
+
+    Returns:
+        LMCacheEventFlags: The resolved flags, both False when LMCache is off.
+    """
+    if not cfg_get(psrl_config, "lmcache.enable", False):
+        return LMCacheEventFlags(kv_events=False, coordinator_reporting=False)
+
+    cache_aware = is_cache_aware_method(
+        str(cfg_get(psrl_config, "rollout_coordination.routing_strategy.method", "request_num_balance"))
+    )
+    weight = float(
+        cfg_get(
+            psrl_config,
+            "rollout_coordination.routing_strategy.cache_aware_policy.lmcache_overlap_weight",
+            0.0,
+        )
+    )
+    kv_events = bool(cfg_get(psrl_config, "lmcache.enable_kv_events", False) or (cache_aware and weight > 0.0))
+    return LMCacheEventFlags(
+        kv_events=kv_events,
+        coordinator_reporting=bool(cfg_get(psrl_config, "lmcache.coordinator_event_reporting", False) or kv_events),
+    )
+
+
+def lmcache_coordinator_required(psrl_config: Any) -> bool:
+    """
+    Whether an LMCache coordinator process must run for this rollout.
+
+    Args:
+        psrl_config: The `psrl` config node, not the top-level config.
+
+    Returns:
+        bool: True when MP servers must register with a coordinator, for P2P
+        transfer discovery or for off-GPU event reporting.
+    """
+    if not cfg_get(psrl_config, "lmcache.enable", False):
+        return False
+    if cfg_get(psrl_config, "lmcache.enable_p2p", False):
+        return True
+    return resolve_lmcache_event_flags(psrl_config).coordinator_reporting
+
+
 def _resolve_custom_chat_template(config: Any) -> str | None:
     """Resolve the actor chat template to a chat-template FILE PATH for SMG.
 
@@ -70,9 +137,7 @@ def _resolve_custom_chat_template(config: Any) -> str | None:
 
 def _lmcache_coordinator_addr(config: Any) -> str:
     """Base URL of the LMCache coordinator, or empty when off-GPU events are off."""
-    if not cfg_get(config, "psrl.lmcache.enable", False):
-        return ""
-    if not cfg_get(config, "psrl.lmcache.coordinator_event_reporting", False):
+    if not resolve_lmcache_event_flags(config.psrl).coordinator_reporting:
         return ""
     host = str(cfg_get(config, "psrl.lmcache.coordinator_host", ""))
     if not host:

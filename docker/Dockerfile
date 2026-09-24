@@ -287,9 +287,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         nixl.nixl_agent('psrl-build-check')"
 
 # vLLM is installed from a patched editable checkout. The source patch is kept
-# deliberately narrow: it adds the PSRL scheduler-stats fields and backports
-# upstream sleep-mode NCCL communicator release. All other PSRL behavior lives in
-# the vllm_patches plugin rather than in the vLLM source tree.
+# deliberately narrow: it declares the PSRL scheduler-stats fields and clamps the
+# v1 runner's cached block IDs. All other PSRL behavior lives in the vllm_patches
+# plugin rather than in the vLLM source tree.
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/vllm-project/vllm.git ${PSRL_THIRD_PARTY}/vllm && \
     git -C ${PSRL_THIRD_PARTY}/vllm checkout ${VLLM_REF} && \

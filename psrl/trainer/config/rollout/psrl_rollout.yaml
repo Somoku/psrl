@@ -167,6 +167,19 @@ agent:
       cpu_cores: null
       utilization: 0.5
 
+      # Accelerator devices and sandbox disk are declared, not detected: a device count
+      # cannot be inferred from a host, and devices are never overcommitted once running.
+      gpu_count: null
+      disk_mb: null
+
+      # Memory is the only dimension that can be admitted above its reservation, because a
+      # waiting agent's pages are reclaimable. Raise this only against the OOM counter.
+      memory_overcommit_ratio: 1.0
+
+      # Member requests wait this fraction of the deadline above, so a capacity shortage
+      # costs an episode retry instead of holding a whole phase.
+      acquire_deadline_fraction: 1.0
+
       # Guarantees must sum to below one. Size each share as (fraction of episode wall clock
       # in that phase) x (its footprint), from `reward_info.timing` and `sandbox_peak_memory_mib`.
       classes:
@@ -180,10 +193,38 @@ agent:
       # deadline, which the agent loop checks at startup. Null waits indefinitely.
       acquire_timeout_s: 1800
 
+    # Idle windows derive from the one number an operator can estimate: episode length.
+    # The pause, reap, and lifetime windows follow in order, or are asserted if named directly.
+    timing:
+      episode_deadline_s: null
+      pause_after_episodes: 2.0
+      reap_after_pause_windows: 3.0
+      lifetime_after_reap_windows: 4.0
+
     backends:
 
       docker:
         _target_: psrl.sandbox.backends.DockerBackend
+
+        # One exec interface, two strategies. A multi-turn harness keeps a login shell for
+        # stateful turns, while single-command workloads skip it. A spec may override this.
+        default_exec_mode: persistent
+
+        # Longest stretch with no output at all before a command is treated as stuck rather
+        # than slow. Null waits for the deadline only.
+        silence_timeout_s: 900
+
+        # Character budget for each end of an observation. The head carries the command echo
+        # and the early errors, the tail carries the final result. Zero keeps everything.
+        max_observation_chars: 20000
+
+        # Seconds to wait for a new sandbox to answer a command. A running container is not
+        # the same as a usable one.
+        startup_timeout_s: 300
+
+        # Host firewall command used to enforce a per-sandbox egress allowlist. Egress is
+        # declared only where it can be enforced, never started open.
+        egress_firewall_command: iptables
 
         # One owner lease per worker drives node-level garbage collection. The lease directory
         # must be visible to every worker using the same daemon, and mounted when containerized.
@@ -211,6 +252,13 @@ agent:
           # loopback proxy URLs reachable through one stable hostname.
           mini_swe:
             network_mode: bridge
+            host_gateway_alias: host.docker.internal
+            rewrite_loopback_proxies: true
+
+          # AIRS-Bench runs its services on the host, so the profile is host networking
+          # plus the loopback proxy rewrite the harness needs.
+          airs_bench:
+            network_mode: host
             host_gateway_alias: host.docker.internal
             rewrite_loopback_proxies: true
             # Allow setuid/sudo inside the task container. Linux capabilities

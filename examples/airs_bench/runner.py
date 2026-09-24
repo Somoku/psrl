@@ -95,7 +95,7 @@ def run_mlgym_agent(payload: dict[str, Any]) -> dict[str, Any]:
     Args:
         payload (dict[str, Any]): Everything the episode needs, including `base_url`,
             `model`, `sampling_params`, `task_config_path`, `runtime_config`,
-            `sandbox_handle`, `event_loop`, and `max_turns`.
+            `sandbox_session`, and `max_turns`.
 
     Returns:
         dict[str, Any]: Episode outcome with `exit_status`, graded scores, submit and
@@ -133,8 +133,7 @@ def run_mlgym_agent(payload: dict[str, Any]) -> dict[str, Any]:
         env_class = build_psrl_mlgym_env_class()
         env = env_class(
             env_args,
-            sandbox_handle=payload["sandbox_handle"],
-            loop=payload["event_loop"],
+            session=payload["sandbox_session"],
             per_action_timeout_s=runtime_config.per_action_timeout_s,
         )
 

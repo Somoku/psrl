@@ -14,7 +14,6 @@ import logging
 import os
 from typing import Any
 
-import ray
 from examples.airs_bench.config import AirsBenchRuntimeConfig, build_runtime_config
 from examples.airs_bench.runner import run_mlgym_agent
 
@@ -78,9 +77,6 @@ class MLGymAgentLoop(SessionAgentLoop):
         multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
         if not getattr(multi_turn, "enable", False):
             raise ValueError("The MLGym agent loop requires rollout.multi_turn.enable=True.")
-        if not context.config.psrl.env_worker.enable:
-            raise ValueError("The MLGym agent loop requires psrl.env_worker.enable=True.")
-        self._coordinator = ray.get_actor("env_worker_coordinator")
 
     def get_generate_fields(self) -> list[str]:
         """Include the AIRS-Bench task identity carried in the dataset row."""
@@ -114,8 +110,12 @@ class MLGymAgentLoop(SessionAgentLoop):
                 "psrl.airs_task_id": observation["airs_task_id"],
                 "psrl.airs_episode_id": observation["episode_id"],
             },
+            episode_id=observation["episode_id"],
         )
-        handle = await self._coordinator.create_sandbox.remote(spec)
+        # The lease is taken through the worker's own sandbox manager, so this episode's
+        # sandbox is admitted, owned, and reclaimed like every other sandbox in the run.
+        sync_sandbox = self.sandbox_manager.sync()
+        sandbox_session = sync_sandbox.create(spec)
         try:
             payload = {
                 "base_url": self.session_api_url(session_id),
@@ -123,8 +123,7 @@ class MLGymAgentLoop(SessionAgentLoop):
                 "sampling_params": self.get_session_sampling_params(request),
                 "task_config_path": observation["task_config_path"],
                 "runtime_config": self.runtime_config,
-                "sandbox_handle": handle,
-                "event_loop": asyncio.get_running_loop(),
+                "sandbox_session": sandbox_session,
                 "max_turns": self.max_turns,
                 "trajectory_id_strategy": self.trajectory_id_strategy,
             }
@@ -133,7 +132,8 @@ class MLGymAgentLoop(SessionAgentLoop):
                 timeout=self.runtime_config.episode_timeout_s,
             )
         finally:
-            await handle.destroy()
+            sandbox_session.close()
+            await sync_sandbox.aclose()
 
     async def run(
         self,

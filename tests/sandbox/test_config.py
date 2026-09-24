@@ -4,7 +4,29 @@ import pytest
 from omegaconf import OmegaConf
 from psrl.sandbox.backends import DockerBackend
 from psrl.sandbox.capacity import SandboxCapacityConfig
-from psrl.sandbox.config import build_sandbox_manager
+from psrl.sandbox.config import SandboxManagerConfig, build_sandbox_manager, placement_manager_config
+from psrl.sandbox.core import SandboxBackend, SandboxCapabilities
+
+
+class InjectedBackend(SandboxBackend):
+    """A backend a deployment can build in code, which is what a remote backend is."""
+
+    def __init__(self, name: str = "fake") -> None:
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities()
+
+    async def create(self, spec):  # pragma: no cover, since the manager under test never calls it
+        raise NotImplementedError
+
+    async def connect(self, sandbox_id):  # pragma: no cover, for the same reason
+        raise NotImplementedError
 
 
 def test_hydra_backend_registry_is_hot_pluggable() -> None:
@@ -126,3 +148,72 @@ def test_capacity_classes_and_deadline_reach_the_manager_config() -> None:
     assert manager._capacity_coordinator is not None
     assert config.capacity.classes.rollout.guaranteed_share == 0.6
     assert config.capacity.acquire_timeout_s == 900
+
+
+def test_a_backend_built_in_code_can_be_injected() -> None:
+    # A remote backend needs its transport, which Hydra cannot synthesize from YAML, so the
+    # manager has to accept one that a deployment built.
+    remote = InjectedBackend()
+    config = SandboxManagerConfig(default_backend="fake", backends={})
+
+    manager = build_sandbox_manager(config, extra_backends=[remote])
+
+    assert manager._backends == {"fake": remote}
+    assert manager.default_backend == "fake"
+
+
+def test_an_injected_backend_still_has_to_be_the_default_when_it_is_named() -> None:
+    remote = InjectedBackend()
+    config = SandboxManagerConfig(default_backend="docker", backends={})
+
+    with pytest.raises(ValueError, match="not configured"):
+        build_sandbox_manager(config, extra_backends=[remote])
+
+
+def test_a_backend_cannot_be_both_configured_and_injected() -> None:
+    # Both are keyed by the backend's own name, so one would silently shadow the other.
+    config = SandboxManagerConfig(
+        default_backend="fake",
+        backends={"fake": {"_target_": "tests.sandbox.test_config.InjectedBackend"}},
+    )
+
+    with pytest.raises(ValueError, match="both configured and built in code"):
+        build_sandbox_manager(config, extra_backends=[InjectedBackend()])
+
+
+def test_a_placing_worker_holds_no_local_backend_and_keeps_its_timing() -> None:
+    # A placed sandbox consumes another node's envelope, so a worker that also held the local
+    # backend would charge itself for containers it never runs.
+    config = OmegaConf.create(
+        {
+            "default_backend": "docker",
+            "backends": {"docker": {"_target_": "psrl.sandbox.backends.DockerBackend"}},
+            "capacity": {"utilization": 0.25, "acquire_timeout_s": 60},
+            "timing": {"episode_deadline_s": 120},
+        }
+    )
+
+    placed = placement_manager_config(config, backend_name="docker")
+
+    assert placed.backends == {}
+    assert placed.default_backend == "docker"
+    assert placed.capacity.utilization == 0.25
+    assert placed.capacity.acquire_timeout_s == 60
+    assert placed.timing.episode_deadline_s == 120
+
+
+def test_a_placing_worker_still_validates_the_timing_ladder() -> None:
+    # The orderings are asserted where the manager is built, and a placed manager is built
+    # the same way, so an inverted configuration fails here too.
+    config = OmegaConf.create(
+        {
+            "default_backend": "docker",
+            "backends": {},
+            "timing": {"pause_window_s": 600.0, "reap_window_s": 60.0},
+        }
+    )
+
+    placed = placement_manager_config(config, backend_name="docker")
+
+    with pytest.raises(ValueError, match="shorter than"):
+        build_sandbox_manager(placed, extra_backends=[InjectedBackend("docker")])

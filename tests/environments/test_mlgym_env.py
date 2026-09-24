@@ -4,27 +4,7 @@ from examples.airs_bench.config import build_runtime_config
 from psrl.environments.mlgym_env import (
     assert_default_history_processor,
     build_sandbox_spec,
-    sync_exec,
 )
-
-
-class FakeHandle:
-    """Record exec calls without a real container."""
-
-    def __init__(self, responses=None):
-        self.calls: list[tuple[str, float]] = []
-        self.responses = responses or {}
-        self.destroyed = False
-
-    async def exec(self, command, timeout_s, no_output_timeout_s=None):
-        from psrl.workers.env_worker.sandbox import ExecResult
-
-        self.calls.append((command, timeout_s))
-        payload = self.responses.get(command, "")
-        return ExecResult(stdout=payload, exit_code=0, timed_out=False, duration_s=0.01)
-
-    async def destroy(self):
-        self.destroyed = True
 
 
 @pytest.mark.cpu_test
@@ -51,14 +31,32 @@ def test_build_sandbox_spec_mounts_prepared_task_data_read_only():
         config,
         dataset_data_path="/shared/airs_prepared/GraphRegressionZincMae",
         labels={"psrl.airs_task_id": "t1"},
+        episode_id="ep-1",
     )
 
-    assert spec.memory == "32g"
-    assert spec.gpus == 0, "AIRS-Bench tasks are CPU graded."
-    mount_modes = {mode for _, _, mode in spec.mounts}
-    assert "ro" in mount_modes, "Task data must be mounted read only so labels cannot be edited."
-    assert any("airs_prepared" in host for host, _, _ in spec.mounts)
-    assert spec.labels["psrl.airs_task_id"] == "t1"
+    assert spec.resources.memory_mb == 32768
+    assert spec.resources.cpu_count == config.sandbox_cpus
+    assert spec.resources.gpu_count is None, "AIRS-Bench tasks are CPU graded."
+    assert spec.mounts[0].read_only, "Task data must be mounted read only so labels cannot be edited."
+    assert "airs_prepared" in spec.mounts[0].source
+    assert spec.metadata["psrl.airs_task_id"] == "t1"
+
+
+@pytest.mark.cpu_test
+def test_build_sandbox_spec_scopes_the_lease_to_one_episode():
+    """One sandbox per episode, so the episode is the phase the reservation protects."""
+    config = build_runtime_config(None)
+    spec = build_sandbox_spec(
+        config,
+        dataset_data_path="/shared/airs_prepared/SomeTask",
+        labels={},
+        episode_id="ep-7",
+    )
+
+    assert spec.workflow_id == "ep-7"
+    assert spec.idempotency_key == "ep-7:airs"
+    assert spec.policy_profile == "airs_bench"
+    assert spec.lifetime_timeout_s == config.episode_timeout_s
 
 
 @pytest.mark.cpu_test
@@ -92,27 +90,3 @@ def test_assert_default_history_processor_rejects_a_missing_key(tmp_path):
 def test_shipped_agent_config_pins_default_history_processor():
     """Guard the real config file, not just the checker."""
     assert_default_history_processor("examples/airs_bench/agent_config.yaml")
-
-
-@pytest.mark.cpu_test
-def test_sync_exec_bridges_async_handle_to_blocking_caller():
-    import asyncio
-
-    handle = FakeHandle(responses={"echo hi": "hi\n"})
-    loop = asyncio.new_event_loop()
-    thread_loop = _start_loop_in_thread(loop)
-    try:
-        result = sync_exec(handle, loop, "echo hi", timeout_s=5.0)
-        assert result.stdout == "hi\n"
-        assert handle.calls == [("echo hi", 5.0)]
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        thread_loop.join(timeout=5)
-
-
-def _start_loop_in_thread(loop):
-    import threading
-
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
-    return thread

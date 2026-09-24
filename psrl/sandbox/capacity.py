@@ -123,6 +123,33 @@ def detect_node_cpu_cores() -> float | None:
     return min(candidates) if candidates else None
 
 
+def read_cgroup_memory_mb(name: str | None = None) -> float | None:
+    """Return the memory a cgroup is actually holding, in MiB.
+
+    Used to report observed usage beside the charged envelope. A request is a
+    reservation. This is the footprint, and comparing them is what shows whether an
+    overcommit setting is honest.
+
+    Args:
+        name (str | None): A cgroup slice below the root, such as a sandbox parent.
+            None reads this process's own cgroup.
+
+    Returns:
+        float | None: Current usage in MiB, or None when the file is unavailable.
+    """
+    candidates: list[str] = []
+    suffix = f"/{name.strip('/')}" if name else ""
+    # cgroup v2 is one hierarchy with a single numeric file.
+    candidates.append(f"/sys/fs/cgroup{suffix}/memory.current")
+    # cgroup v1 puts memory under its own controller.
+    candidates.append(f"/sys/fs/cgroup/memory{suffix}/memory.usage_in_bytes")
+    for path in candidates:
+        value = _read_int(path)
+        if value is not None and value >= 0:
+            return value / _BYTES_PER_MIB
+    return None
+
+
 @dataclass(frozen=True)
 class ResourceClassShare:
     """
@@ -168,19 +195,40 @@ class SandboxCapacityConfig:
 
     memory_mb: int | None = None
     cpu_cores: float | None = None
+    # Devices are declared rather than detected: a device count cannot be estimated
+    # from a host, and an operator either owns them or does not.
+    gpu_count: int | None = None
+    disk_mb: int | None = None
     utilization: float = 0.5
+    # Memory is the one dimension a sandbox can be admitted against above its
+    # reservation, because a waiting agent's pages can be reclaimed, unlike CPU or a device.
+    memory_overcommit_ratio: float = 1.0
     lease_ttl_s: float = 180
     heartbeat_interval_s: float = 30
     classes: dict[str, ResourceClassShare] = field(default_factory=dict)
     acquire_timeout_s: float | None = 1800.0
+    # Member queue deadline as a fraction of the configured default. A capacity
+    # shortage costs an episode retry, and the fraction follows the episode length.
+    acquire_deadline_fraction: float = 1.0
 
     def __post_init__(self) -> None:
         if self.memory_mb is not None and self.memory_mb <= 0:
             raise ValueError("Sandbox capacity memory_mb must be greater than zero when configured.")
         if self.cpu_cores is not None and self.cpu_cores <= 0:
             raise ValueError("Sandbox capacity cpu_cores must be greater than zero when configured.")
+        if self.gpu_count is not None and self.gpu_count < 0:
+            raise ValueError("Sandbox capacity gpu_count must not be negative.")
+        if self.disk_mb is not None and self.disk_mb <= 0:
+            raise ValueError("Sandbox capacity disk_mb must be greater than zero when configured.")
         if not 0 < self.utilization <= 1:
             raise ValueError("Sandbox capacity utilization must be in (0, 1].")
+        if self.memory_overcommit_ratio < 1:
+            raise ValueError(
+                "Sandbox capacity memory_overcommit_ratio must be at least 1. A value below one would "
+                "under-admit the node rather than overcommit it."
+            )
+        if not 0 < self.acquire_deadline_fraction <= 1:
+            raise ValueError("Sandbox capacity acquire_deadline_fraction must be in (0, 1].")
         if self.lease_ttl_s <= 0 or not 0 < self.heartbeat_interval_s < self.lease_ttl_s:
             raise ValueError("Sandbox capacity heartbeat must be positive and shorter than lease_ttl_s.")
         object.__setattr__(self, "classes", resolve_class_shares(self.classes))
@@ -199,37 +247,87 @@ class SandboxCapacityConfig:
 class ResourceQuantity:
     """
     Integer resource quantity used for exact accounting.
+
+    Devices are counted rather than measured, because a node hands out specific
+    device indices and two sandboxes must never be granted the same one.
     """
 
     memory_mb: int
     cpu_millis: int
+    gpu_count: int = 0
+    disk_mb: int = 0
 
     @classmethod
     def from_spec(cls, resources: ResourceSpec) -> ResourceQuantity:
         """
         Create a quantity from a complete sandbox resource request.
+
+        An envelope needs a memory and a CPU number to be sound, so a request that
+        omits either is rejected rather than admitted against a guess. Device and
+        disk requests are optional and default to none.
         """
         if resources.memory_mb is None or resources.cpu_count is None:
             raise ValueError("Node-capacity admission requires sandbox memory_mb and cpu_count.")
-        return cls(resources.memory_mb, math.ceil(resources.cpu_count * 1000))
+        return cls(
+            resources.memory_mb,
+            math.ceil(resources.cpu_count * 1000),
+            resources.gpu_count or 0,
+            resources.disk_mb or 0,
+        )
 
     def fits(self, available_capacity: ResourceQuantity) -> bool:
-        return self.memory_mb <= available_capacity.memory_mb and self.cpu_millis <= available_capacity.cpu_millis
+        return (
+            self.memory_mb <= available_capacity.memory_mb
+            and self.cpu_millis <= available_capacity.cpu_millis
+            and self.gpu_count <= available_capacity.gpu_count
+            and self.disk_mb <= available_capacity.disk_mb
+        )
 
     def __add__(self, other: ResourceQuantity) -> ResourceQuantity:
-        return ResourceQuantity(self.memory_mb + other.memory_mb, self.cpu_millis + other.cpu_millis)
+        return ResourceQuantity(
+            self.memory_mb + other.memory_mb,
+            self.cpu_millis + other.cpu_millis,
+            self.gpu_count + other.gpu_count,
+            self.disk_mb + other.disk_mb,
+        )
 
     def __sub__(self, other: ResourceQuantity) -> ResourceQuantity:
-        return ResourceQuantity(self.memory_mb - other.memory_mb, self.cpu_millis - other.cpu_millis)
+        return ResourceQuantity(
+            self.memory_mb - other.memory_mb,
+            self.cpu_millis - other.cpu_millis,
+            self.gpu_count - other.gpu_count,
+            self.disk_mb - other.disk_mb,
+        )
+
+
+@dataclass(frozen=True)
+class CapacityGrant:
+    """
+    What admission granted for one sandbox.
+
+    The concrete device indices travel with the grant because only the node knows
+    which devices are free, and a sandbox must be given exactly the devices its
+    reservation was charged for.
+    """
+
+    lease_id: str
+    resources: ResourceQuantity
+    gpu_indices: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
 class ResolvedSandboxCapacity:
     """
     Resolved node envelope and its provenance.
+
+    `physical` is what the node actually has. `resources` is what admission may
+    charge, which is the physical envelope for every dimension except memory when
+    overcommit is configured. Reporting utilization against the physical envelope
+    is what shows whether an overcommit setting is honest.
     """
 
     resources: ResourceQuantity
+    physical: ResourceQuantity
     memory_source: str
     cpu_source: str
 
@@ -249,11 +347,21 @@ def resolve_sandbox_capacity(
         raise RuntimeError(
             "Sandbox node capacity could not be detected; configure memory_mb and cpu_cores explicitly."
         )
+    physical = ResourceQuantity(
+        memory_mb=max(1, math.floor(memory_mb * config.utilization)),
+        cpu_millis=max(1, math.floor(cpu_cores * 1000 * config.utilization)),
+        gpu_count=config.gpu_count or 0,
+        disk_mb=config.disk_mb or 0,
+    )
+    admissible = ResourceQuantity(
+        memory_mb=max(1, math.floor(physical.memory_mb * config.memory_overcommit_ratio)),
+        cpu_millis=physical.cpu_millis,
+        gpu_count=physical.gpu_count,
+        disk_mb=physical.disk_mb,
+    )
     return ResolvedSandboxCapacity(
-        resources=ResourceQuantity(
-            memory_mb=max(1, math.floor(memory_mb * config.utilization)),
-            cpu_millis=max(1, math.floor(cpu_cores * 1000 * config.utilization)),
-        ),
+        resources=admissible,
+        physical=physical,
         memory_source="configured" if config.memory_mb is not None else "detected",
         cpu_source="configured" if config.cpu_cores is not None else "detected",
     )
@@ -266,6 +374,8 @@ def _scaled(base: ResourceQuantity, share: float) -> ResourceQuantity:
     return ResourceQuantity(
         memory_mb=max(1, math.floor(base.memory_mb * share)),
         cpu_millis=max(1, math.floor(base.cpu_millis * share)),
+        gpu_count=base.gpu_count if share >= 1 else math.floor(base.gpu_count * share),
+        disk_mb=max(1, math.floor(base.disk_mb * share)) if base.disk_mb else 0,
     )
 
 
@@ -275,6 +385,7 @@ class _Allocation:
     resource_class: str
     resources: ResourceQuantity
     allocated_at: float
+    gpu_indices: tuple[int, ...] = ()
 
 
 @dataclass
@@ -283,7 +394,7 @@ class _Waiter:
     owner_id: str
     resource_class: str
     resources: ResourceQuantity
-    future: asyncio.Future[None]
+    future: asyncio.Future[CapacityGrant]
     queued_at: float
     # Set by the sweeper when the owner lease expired, so `acquire` can report a
     # capacity fault instead of the bare cancellation that `future.cancel()` raises.
@@ -305,6 +416,9 @@ class SandboxCapacityCoordinator:
         self._config = config
         self._capacity = resolve_sandbox_capacity(config)
         self.available_capacity = self._capacity.resources
+        # Devices are handed out by index, so the pool is the source of truth for which
+        # ones are free. Two sandboxes with one index would fight over a single device.
+        self._free_gpus: list[int] = list(range(self._capacity.resources.gpu_count))
         self._guaranteed = {
             name: _scaled(self._capacity.resources, share.guaranteed_share) for name, share in config.classes.items()
         }
@@ -340,10 +454,25 @@ class SandboxCapacityCoordinator:
         psrl_logger.info(
             f"Sandbox node envelope: memory_mb={self.available_capacity.memory_mb}, "
             f"cpu_cores={self.available_capacity.cpu_millis / 1000:g}, "
+            f"gpus={self.available_capacity.gpu_count}, disk_mb={self.available_capacity.disk_mb}, "
             f"sources={self._capacity.memory_source!r}/{self._capacity.cpu_source!r}, "
             f"class_guarantees={{{guaranteed_summary}}}, "
-            f"acquire_timeout_s={self._config.acquire_timeout_s!r}."
+            f"acquire_timeout_s={self.member_queue_deadline_s!r}."
         )
+
+    @property
+    def member_queue_deadline_s(self) -> float | None:
+        """
+        Return how long one request waits before it is a capacity fault.
+
+        Derived from the configured deadline rather than set separately, so an
+        operator states how long a phase may take and the queue inherits a
+        fraction of it. A member that cannot be admitted costs a retry instead of
+        holding the whole phase.
+        """
+        if self._config.acquire_timeout_s is None:
+            return None
+        return self._config.acquire_timeout_s * self._config.acquire_deadline_fraction
 
     def _ensure_sweeper(self) -> None:
         if self._sweeper is None:
@@ -357,7 +486,9 @@ class SandboxCapacityCoordinator:
         cpu_count: float,
         resource_class: str = "default",
         timeout_s: float | None = None,
-    ) -> None:
+        gpu_count: int = 0,
+        disk_mb: int = 0,
+    ) -> CapacityGrant:
         """Wait until this request's class can fit its complete resource vector.
 
         Args:
@@ -366,8 +497,13 @@ class SandboxCapacityCoordinator:
             memory_mb (int): Requested container memory in MiB.
             cpu_count (float): Requested container CPUs.
             resource_class (str): Role of the sandbox, used to pick its guarantee.
-            timeout_s (float | None): Queue deadline. ``None`` uses the configured
-                ``acquire_timeout_s``.
+            timeout_s (float | None): Queue deadline. ``None`` derives one from the
+                configured phase deadline.
+            gpu_count (int): Requested accelerator devices.
+            disk_mb (int): Requested sandbox disk in MiB.
+
+        Returns:
+            CapacityGrant: The admitted vector and the device indices it was charged for.
 
         Raises:
             ValueError: When the request exceeds the envelope or the lease id exists.
@@ -381,7 +517,14 @@ class SandboxCapacityCoordinator:
         resource_class = resource_class.strip()
         if not resource_class:
             raise ValueError("Sandbox capacity resource_class cannot be empty.")
-        resources = ResourceQuantity.from_spec(ResourceSpec(memory_mb=memory_mb, cpu_count=cpu_count))
+        # Built directly rather than through a spec: this is the caller's already
+        # resolved request, and a zero device or disk count means "none" here.
+        resources = ResourceQuantity(
+            memory_mb=memory_mb,
+            cpu_millis=math.ceil(cpu_count * 1000),
+            gpu_count=gpu_count,
+            disk_mb=disk_mb,
+        )
         if not resources.fits(self._capacity.resources):
             raise ValueError(
                 f"Sandbox request memory_mb={memory_mb}, cpu_count={cpu_count:g} exceeds node envelope "
@@ -391,7 +534,7 @@ class SandboxCapacityCoordinator:
         ceiling = self._ceilings.get(resource_class)
         if ceiling is not None and not resources.fits(ceiling):
             raise ValueError(f"Sandbox request exceeds the ceiling for class {resource_class!r}.")
-        deadline = self._config.acquire_timeout_s if timeout_s is None else timeout_s
+        deadline = self.member_queue_deadline_s if timeout_s is None else timeout_s
         loop = asyncio.get_running_loop()
         waiter = _Waiter(
             lease_id,
@@ -410,9 +553,8 @@ class SandboxCapacityCoordinator:
             self._drain_waiters()
         try:
             if deadline is None:
-                await waiter.future
-            else:
-                await asyncio.wait_for(waiter.future, timeout=deadline)
+                return await waiter.future
+            return await asyncio.wait_for(waiter.future, timeout=deadline)
         except asyncio.TimeoutError:
             waited = time.monotonic() - waiter.queued_at
             async with self._lock:
@@ -494,7 +636,10 @@ class SandboxCapacityCoordinator:
         async with self._lock:
             return {
                 "capacity": asdict(self._capacity.resources),
+                "physical_capacity": asdict(self._capacity.physical),
                 "available_capacity": asdict(self.available_capacity),
+                "free_gpus": len(self._free_gpus),
+                "memory_overcommit_ratio": self._config.memory_overcommit_ratio,
                 "allocations": len(self._allocations),
                 "owners": len(self._owners),
                 "waiters": len(self._waiters),
@@ -598,17 +743,19 @@ class SandboxCapacityCoordinator:
 
     def _grant(self, waiter: _Waiter) -> None:
         """
-        Admit one waiter and charge its class.
+        Admit one waiter, charge its class, and hand out its devices.
         """
         now = time.monotonic()
         self._waiters.pop(waiter.lease_id)
         self._dequeue(waiter)
+        gpu_indices = self._take_gpus(waiter.resources.gpu_count)
         self.available_capacity -= waiter.resources
         self._allocations[waiter.lease_id] = _Allocation(
             owner_id=waiter.owner_id,
             resource_class=waiter.resource_class,
             resources=waiter.resources,
             allocated_at=now,
+            gpu_indices=gpu_indices,
         )
         self._add_usage(waiter.resource_class, waiter.resources)
         self._granted += 1
@@ -617,7 +764,33 @@ class SandboxCapacityCoordinator:
         self._total_wait_s += wait_s
         self._wait_s_by_class[waiter.resource_class] = self._wait_s_by_class.get(waiter.resource_class, 0.0) + wait_s
         if not waiter.future.done():
-            waiter.future.set_result(None)
+            waiter.future.set_result(CapacityGrant(waiter.lease_id, waiter.resources, gpu_indices))
+
+    def _take_gpus(self, count: int) -> tuple[int, ...]:
+        """
+        Reserve the lowest free device indices for one sandbox.
+        """
+        if count <= 0:
+            return ()
+        if count > len(self._free_gpus):
+            # The admission check already proved the request fits, so reaching here
+            # means the pool and the envelope disagree. Fail rather than grant twice.
+            raise RuntimeError(
+                f"Sandbox capacity has {len(self._free_gpus)} free device(s) but the envelope admitted "
+                f"a request for {count}."
+            )
+        taken = tuple(self._free_gpus[:count])
+        del self._free_gpus[:count]
+        return taken
+
+    def _return_gpus(self, indices: tuple[int, ...]) -> None:
+        """
+        Return device indices to the pool.
+        """
+        for index in indices:
+            if index not in self._free_gpus:
+                self._free_gpus.append(index)
+        self._free_gpus.sort()
 
     def _head_waiter(self, resource_class: str) -> _Waiter | None:
         """
@@ -700,6 +873,7 @@ class SandboxCapacityCoordinator:
             return False
         self.available_capacity += allocation.resources
         self._sub_usage(allocation.resource_class, allocation.resources)
+        self._return_gpus(allocation.gpu_indices)
         return True
 
     async def _sweep_expired(self) -> None:

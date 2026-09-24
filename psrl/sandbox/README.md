@@ -1,208 +1,268 @@
 # PSRL sandboxes
 
-`SandboxManager` owns execution environments for one worker. Build a
+`SandboxManager` owns execution environments for one agent loop worker. Build a
 `SandboxSpec`, acquire a lease, and use its session for commands, binary file
 I/O, resource statistics, and capability-gated state operations. Release the
 lease when the trajectory or grading phase ends.
 
 Each trajectory gets a fresh writable filesystem. Cached image layers are
-shared, but mutable containers are never pooled between unrelated trajectories.
-For lifecycle invariants and implementation boundaries, see
-[Sandbox lifecycle](../../docs/design/sandbox_lifecycle.md).
+shared, and mutable containers are never pooled between unrelated trajectories.
 
-## Configuration
+- Lifecycle invariants and internal boundaries:
+  [sandbox_lifecycle](../../docs/design/sandbox_lifecycle.md)
+- Ownership, execution, and recovery behavior: [OPERATIONS.md](OPERATIONS.md)
+- Standing up a provider: [DEPLOY_AGENTENV.md](DEPLOY_AGENTENV.md) and
+  [DEPLOY_OPENSANDBOX.md](DEPLOY_OPENSANDBOX.md)
+- Why the module is shaped this way:
+  [sandbox_refactor](../../docs/design/sandbox_refactor.md)
 
-Configure Hydra targets under
-`gen_actor_rollout_ref.rollout.agent.sandbox.backends`. For example:
+## Pick a backend
+
+The three backends differ in who owns the machine that runs the sandbox, which
+decides where capacity is accounted and how much you deploy.
+
+| Backend | Runs on | Admission | Needs |
+|---|---|---|---|
+| `docker` | The worker's own node, one local daemon | PSRL, inside that node's envelope | A daemon per node, and a host firewall for egress |
+| `agentenv` | A provider, through its E2B-compatible SDK | The provider | The `sandbox-e2b` extra, and a template per task image |
+| `opensandbox` | A provider, through its lifecycle and sidecar HTTP APIs | The provider | Nothing extra |
+
+Choose `docker` to keep one deployment and run close to the trainer. Choose a
+provider when the task image is heavy, the workload wants a microVM boundary, or
+a sandbox must not consume trainer CPU and memory.
+
+Placeholders used below:
+
+| Placeholder | Meaning |
+|---|---|
+| `${SANDBOX_IMAGE}` | A task image reference, ideally pinned by digest |
+| `${PROVIDER_API_URL}` | A provider API base URL |
+| `${PROVIDER_API_KEY}` | A provider API key, read from the environment |
+| `${HEARTBEAT_DIR}` | A directory every worker sharing one daemon can see |
+| `${ENV_NODE_IP}` | The node that should host sandboxes |
+| `${TASK_ID}` | One AIRS-Bench task id |
+| `${AIRS_REPO}` | A clone of the AIRS-Bench repository |
+
+## Install
+
+```bash
+python -m pip install -e .
+```
+
+Only AgentEnv adds a dependency, because it drives the provider's own SDK:
+
+```bash
+python -m pip install -e ".[sandbox-e2b]"
+```
+
+OpenSandbox needs no package. Its lifecycle, `execd`, and egress planes are
+reached through the provider's endpoint resolution, so PSRL is not coupled to an
+SDK version.
+
+A provider backend also needs the provider itself, and each one has hard
+prerequisites that PSRL cannot work around. Read the deployment page before
+configuring one:
+
+| Backend | Read |
+|---|---|
+| `agentenv` | [DEPLOY_AGENTENV.md](DEPLOY_AGENTENV.md), which starts with the kernel and `/dev/kvm` the runtime needs |
+| `opensandbox` | [DEPLOY_OPENSANDBOX.md](DEPLOY_OPENSANDBOX.md), which covers the server, its runtime choice, and the two keys the egress features need |
+
+## Configure
+
+Declare backends under `gen_actor_rollout_ref.rollout.agent.sandbox.backends`.
+The manager instantiates each one with Hydra, so a block carries a `_target_` and
+stays declarative until a worker builds its manager. The shipped defaults are in
+`psrl/trainer/config/rollout/psrl_rollout.yaml`.
+
+### Docker
+
+The shipped block in `psrl_rollout.yaml` is the starting point. Five things in it
+are worth deciding rather than inheriting:
 
 ```yaml
 sandbox:
   default_backend: docker
   capacity:
-    memory_mb: null
-    cpu_cores: null
     utilization: 0.5
     classes:
-      rollout:
-        guaranteed_share: 0.60
-      grader:
-        guaranteed_share: 0.25
-    acquire_timeout_s: 1800
+      rollout: {guaranteed_share: 0.60}
+      grader: {guaranteed_share: 0.25}
+  timing:
+    episode_deadline_s: 1800
   backends:
     docker:
       _target_: psrl.sandbox.backends.DockerBackend
-      image_pull_concurrency: 2
-      connection_limit: 128
-      max_exec_output_bytes: 16777216
+      default_exec_mode: persistent
+      lifecycle:
+        heartbeat_dir: ${HEARTBEAT_DIR}
       security:
-        require_rootless: false
-        pids_limit: 4096
         cap_drop: [ALL]
         no_new_privileges: true
 ```
 
-Declare a sandbox's `resource_class` at the workload call site. The node
-coordinator admits its complete CPU and memory request atomically. Unset node
-limits use cgroup or machine detection, with `utilization` applied to both.
-Provider-managed microVMs do not consume the worker node's Docker envelope.
+`capacity.utilization` is the only safety margin on the node envelope, and a null
+limit uses the node's own cgroup or machine limit. `timing.episode_deadline_s`
+derives the idle pause window, the reap window, and the absolute lifetime in that
+order, so an inverted ordering cannot be configured. `heartbeat_dir` is what makes
+crash recovery work, and it has to be visible to every worker on the node.
 
-Class guarantees set admission priority, and optional `max_share` sets a hard
-ceiling. A request inside its class guarantee is admitted as soon as the envelope
-has room, whatever the other classes are waiting for. When a guaranteed request
-does not fit, the remaining slack is held for it instead of being lent out. Other
-requests borrow the slack in arrival order, and an older borrower that does not
-fit does not block a younger one that does. A request larger than its class
-ceiling or the node envelope fails immediately. Watch
-`max_borrow_bypasses`: a borrower that keeps being skipped means the class shares
-no longer match the workload, and `acquire_timeout_s` will report it as a
-capacity fault rather than hanging.
+Set `security.require_rootless: true` only after the daemon is rootless, and add
+`egress_firewall_command` where a host firewall can program an `egress` allowlist.
+The backend declares `EGRESS_POLICY` only where that command works, so a deployment
+without it refuses a policy it cannot enforce rather than starting a sandbox open.
 
-Use the same `workflow_id` for sequential rollout and grading phases. Release
-one phase before acquiring the next. The manager rejects a second reservation
-while the workflow still owns a sandbox or has provisioning in progress.
-`acquire_timeout_s` bounds admission independently of the episode's work budget.
+### AgentEnv
 
-Docker enforces CPU and memory limits and disables swap when memory is limited.
-It uses an init process, drops capabilities, and retains the daemon's seccomp
-profile. Rootless mode and a read-only root filesystem require compatible
-images and are opt-in. Kernel OOM priorities are left alone, because a negative
-`OomScoreAdj` is inherited by the whole container and only shifts the *host*
-ranking, which would make the kernel kill the trainer before a disposable
-sandbox. Set `security.oom_score_adj` when you want that trade.
-Image entrypoints are cleared so the configured keepalive command owns startup.
+```yaml
+sandbox:
+  default_backend: agentenv
+  backends:
+    agentenv:
+      _target_: psrl.sandbox.backends.AgentEnvBackend
+      api_url: ${oc.env:AGENTENV_API_URL}
+      api_key: ${oc.env:AGENTENV_API_KEY}
+      template_build_timeout_s: 1800
+      snapshot_request_timeout_s: 300
+```
 
-Use typed `policy_profiles` for workload overrides. MiniSWE's configured bridge
-profile maps `host.docker.internal` to the Docker host and rewrites loopback
-proxy URLs to that alias. Remote proxy URLs retain their original destination.
+AgentEnv creates a sandbox from a **template**, and an image becomes a template
+rather than a create-time source. So a rollout prepares one template per task
+image before it acquires anything, and a spec whose image was never prepared
+fails with the provider's missing-template error.
 
-## Ownership and cleanup
+The backend refuses a resource override, a host bind mount, and a provider volume,
+because the template's build fixes the first and a provider has no host for the
+second. Keep `lifetime_timeout_s` inside the provider's 24-hour cap on a sandbox's
+life. `snapshot_request_timeout_s` covers a snapshot, which the provider can take
+minutes over. [DEPLOY_AGENTENV.md](DEPLOY_AGENTENV.md) gives the reason for each
+refusal and the host prerequisites the runtime needs.
 
-A lease is released only after confirmed sandbox destruction and capacity
-return. Repeated cancellation waits for the complete ownership transition.
-If deletion or capacity return fails, the manager retains the lease and retries
-with exponential backoff up to 30 seconds. Completed episodes can return while
-cleanup is deferred, but the reservation remains charged.
+### OpenSandbox
 
-A partial creation failure can carry a session in `SandboxProvisionError`.
-Backend authors must use it when a runtime object might still exist. Ordinary
-creation failures must leave no allocated runtime behind. `terminate()` must
-raise when destruction cannot be confirmed.
+```yaml
+sandbox:
+  default_backend: opensandbox
+  backends:
+    opensandbox:
+      _target_: psrl.sandbox.backends.OpenSandboxBackend
+      config:
+        api_url: ${oc.env:OPENSANDBOX_API_URL}
+        api_key: ${oc.env:OPENSANDBOX_API_KEY}
+        namespace: psrl
+        egress_port: 18080
+        ready_timeout_s: 120
+        template_timeout_s: 1800
+        entrypoint: [tail, -f, /dev/null]
+        default_resources: {cpu: "1", memory: "2Gi"}
+        default_timeout_s: 3600
+```
 
-Identical idempotent requests share one provisioning task and lease. Cancelling
-one waiter leaves other waiters intact. When every waiter leaves, queued
-admission is withdrawn and any in-flight creation is settled and reclaimed.
-An idempotency key cannot be reused while its previous session is being reclaimed.
+OpenSandbox takes one typed `config` block rather than flat keyword arguments,
+because it has more deployment settings than fit on one line. AgentEnv takes
+flat keyword arguments.
 
-Shutdown rejects new work, cancels queued admission, settles provisioning,
-reclaims leases, and closes backend transports. Unconfirmed cleanup is reported
-as a shutdown error. Allocation age alone never releases capacity.
+Three of these keys are off by default because the provider does not serve what
+they unlock on every runtime, so each one also declares a capability:
+`isolation_runtime`, `template_publish`, and `warm_pool_ref`. Read
+[DEPLOY_OPENSANDBOX.md](DEPLOY_OPENSANDBOX.md) for what each one requires, and for
+which of the two runtimes can serve it. A spec requiring a capability the
+deployment does not declare is refused at admission rather than served without it.
 
-## Docker execution
+## Deploy across nodes
 
-Command streams and lifecycle operations use separate persistent HTTP connection
-pools, each bounded by `connection_limit`. A full set of long-running commands
-therefore cannot consume the connections required for inspection and deletion.
-Commands in one session are serialized. The command deadline covers waiting for
-that session, exec creation, streaming, and final exit-status inspection.
+**A sandbox runs on the node that hosts its agent loop worker.** The trainer places
+`agent.num_workers` workers across the allowed nodes, and each worker builds its own
+manager, so a `docker` sandbox lands on that worker's node and a provider sandbox is
+somewhere that node can reach.
 
-`max_exec_output_bytes` bounds the combined stdout and stderr payload. Docker
-frame headers do not consume this budget. Excess output is drained and reported
-with `ExecResult.truncated` plus a text marker. Incomplete or malformed framing
-is a transport failure. Store complete results in files and read them with
-`read_bytes` when truncation would lose task data.
+Start Ray across the nodes, then keep four things true:
 
-Timeout, cancellation, and transport failure destroy the disposable session:
-closing an exec connection does not establish that its process stopped.
-Container stops come from one shared Docker event stream, so an OOM kill
-interrupts its hung command within a beat instead of at the next poll. A daemon
-that will not serve `/events` falls back to inspect polling on
-`container_watch_interval_s`. Explicitly retained exit state distinguishes proven
-OOM failures through `SandboxOomError`. The container is removed after
-diagnostics. Exit code 137 alone is not proof of a container OOM.
+| Concern | What to do |
+|---|---|
+| Where sandboxes run | `gen_actor_rollout_ref.rollout.agent.node_ips="['${ENV_NODE_IP}']"` restricts worker placement, and the sandboxes follow. Empty allows every alive node |
+| The env node's resources | Fence it out of the Ray pool with `psrl.deployment.total_nnodes`, so rollout and training workers cannot land on it |
+| One daemon per node | Keep a local Docker daemon on every node that hosts a worker, because a remote daemon's containers are not in the worker's envelope |
+| Crash recovery | Point `lifecycle.heartbeat_dir` at `${HEARTBEAT_DIR}`, visible to every worker using that daemon, and mount it in containerized deployments. Use one directory per daemon |
 
-`idle_timeout_s` is an absolute Docker lifetime limit, not an inactivity timer.
-`request_timeout_s` bounds control-plane requests. Long command streams use the
-command deadline, so silent commands do not inherit a shorter HTTP total timeout.
-Binary file reads stream the archive through a spooled temporary file, so peak
-memory is one copy of the file rather than three.
+Run the sandboxes on the training nodes instead by clearing the pin, which is
+simpler to operate and competes with the trainer for CPU and memory:
 
-## Image preparation and locality
+```bash
+bash examples/airs_bench/run_qwen3-4b.sh \
+    gen_actor_rollout_ref.rollout.agent.node_ips=[] \
+    gen_actor_rollout_ref.rollout.agent.sandbox.capacity.utilization=0.5
+```
 
-`await manager.prepare(spec)` checks the daemon cache and pulls missing images
-when `auto_pull` is enabled. Acquisition also prepares the image before reserving
-CPU or memory. Concurrent requests share each image download, and
-`image_pull_concurrency` bounds distinct downloads per backend instance.
-Cancelling one waiter does not cancel a shared pull. Shutdown joins remaining
-preparation tasks.
+Every sandbox key hangs off `gen_actor_rollout_ref.rollout.agent.sandbox` in the
+composed config, because `psrl_rollout.yaml` is included there. A short path such as
+`sandbox.capacity.utilization=0.5` is not an alias for it: Hydra either rejects the
+override or, with `+`, writes a second top-level `sandbox` key that nothing reads.
 
-Use immutable image digests for reproducibility. Preparation does not refresh an
-already cached mutable tag. Private registries use the backend's `registry_auth`
-mapping with secret-backed Hydra interpolation.
+A provider backend ignores the node envelope, because the provider schedules the
+sandbox. `capacity.*` then bounds only the `docker` backend, so a mixed deployment
+sizes the envelope for Docker alone.
 
-Configure `disk_admission.path` to the daemon's data filesystem as visible to the
-worker, together with `min_free_mb` and `wait_timeout_s`, to reject creation when
-space remains low. This is a host headroom check, not a container disk quota.
-Portable `ResourceSpec.disk_mb` is unsupported by Docker.
+**To place sandboxes on other nodes**, turn on
+`psrl.deployment.sandbox_placement.enabled` and name the fleet in
+`gen_actor_rollout_ref.rollout.agent.node_ips`, which is required because defaulting
+to every alive node would put sandboxes on the GPU nodes. The trainer then creates one
+placement service and one node agent per node, and every worker places through them, so
+`capacity.*` is enforced where the containers run. See [OPERATIONS.md](OPERATIONS.md).
 
-Keep a local Docker daemon on each Ray worker node. A remote daemon's resources
-are not represented by the worker's node-capacity accounting. Prefetch the exact
-image subset for a run and place trajectories on nodes with warm images when
-image loading dominates setup time.
+## Run end to end
 
-## Crash recovery
+The AIRS-Bench recipe pins its sandboxes to an env node and trains on a compute
+node, and [its README](../../examples/airs_bench/README.md) covers the data it
+needs first:
 
-`DockerLifecycle` maintains one heartbeat thread per worker and one detached
-collector per heartbeat directory. Workers using one daemon must share the same
-absolute directory path and policy. Use a separate directory for each daemon,
-and mount the directory from the daemon host in containerized deployments.
-The collector filters by the directory's `psrl.lease_store` namespace.
+```bash
+bash examples/airs_bench/run_qwen3-4b.sh
+```
 
-The default Docker owner TTL is 120 seconds with a 30-second sweep interval.
-Capacity owner TTL is 180 seconds. Keep the capacity TTL above the Docker TTL
-plus a sweep interval. Unreadable heartbeat files do not prove owner death.
-A live owner's stopped container is reaped once it has stayed stopped for
-`stopped_grace_s` (300 seconds), which leaves the owning session time to read
-`OOMKilled` off it first.
+Check a deployment with one sandboxed episode, against a running Ray cluster,
+before committing to a full run. The script reads a prepared task from
+`${AIRS_DATA_ROOT}`, which has to hold `airs_prepared/${TASK_ID}` and
+`airs_configs/data/${TASK_ID}`:
 
-Each worker sweeps once at startup, before it creates its first sandbox, so a
-restarted run reclaims the previous run's containers instead of being admitted
-against an envelope that does not know their memory is still spoken for.
-Reclamation is driven by heartbeat age, not by owner identity, so the new run's
-different owner id does not matter.
+```bash
+python -m examples.airs_bench.scripted_episode --task-id "${TASK_ID}"
+```
 
-**Owner expiry assumes the node collector and daemon are healthy.** TTL ordering
-is not a physical fence during daemon failure or a prolonged cleanup backlog.
-Stop admission on an unhealthy node before resuming workloads. Shutdown errors
-and deferred-cleanup warnings must be monitored rather than treated as successful
-resource reclamation.
+Point a recipe at a provider by adding its block and switching the default. Edit the
+config for a permanent change, or pass the same keys as overrides. Hydra adds a
+missing key with `+`:
 
-## State operations
+```bash
+python -m psrl.trainer.main_ppo \
+    +gen_actor_rollout_ref.rollout.agent.sandbox.backends.agentenv._target_=psrl.sandbox.backends.AgentEnvBackend \
+    +gen_actor_rollout_ref.rollout.agent.sandbox.backends.agentenv.api_url="${PROVIDER_API_URL}" \
+    +gen_actor_rollout_ref.rollout.agent.sandbox.backends.agentenv.api_key="${PROVIDER_API_KEY}" \
+    gen_actor_rollout_ref.rollout.agent.sandbox.default_backend=agentenv
+```
 
-Snapshot, restore, and branch require backend capabilities and an enabled
-`SandboxStatePolicy`. Docker snapshots include only the writable filesystem.
-They do not include process memory, bind-mounted data, or remote side effects.
-Snapshot tags are unique, and temporary branch snapshots are deleted after use.
+An AgentEnv image source needs its template first, and the agent loop does that per
+task before it acquires anything, so no extra step is needed for a rollout. To check
+the import by hand, run the live conformance test below.
 
-Secret-bearing environment variables and post-command capture are rejected by
-default. Restored microVMs refresh transports and mix host entropy into the guest.
-A filesystem branch reuses the source spec, with a fresh idempotency key.
-A workflow restricted to one active sandbox cannot branch while retaining its
-parent. Use separate workflow identities for intentionally concurrent branches.
+## Gotchas
 
-| Backend | Source | Resource mapping | Authentication |
-|---|---|---|---|
-| Docker | OCI image | CPU and memory | Docker socket or endpoint permissions |
-| E2B | Template | Fixed by template | E2B API key |
-| AgentEnv | Template or OCI image | Cold images accept CPU, memory, disk | Provider API key |
-| CubeSandbox | Template or snapshot | CPU, memory, disk | Provider API key |
+- **A sandbox is admitted against the node envelope only on `docker`.** A provider
+  schedules its own sandbox, so `capacity.*` does not bound it and an overcommitted
+  provider quota shows up as a provider error, not a capacity timeout.
+- **A cross-node run reads a stale `/tmp`.** `/tmp` is node-local, so put
+  `${HEARTBEAT_DIR}` and any dataset on a path every worker can see, or a restarted
+  run reclaims nothing.
+- **A provider has prerequisites PSRL cannot work around.** An AgentEnv deployment
+  needs kernel 6.8+ and `/dev/kvm`, and an OpenSandbox template needs a fast-sandbox
+  runtime. Both are in the deployment pages.
+- **Sandboxes stop with the worker.** A preempted worker takes its local sandboxes
+  with it, and nothing resumes them. A resumable rollout is loop work, tracked as
+  L2 in the execution plan.
 
-For template-backed E2B or AgentEnv runs, set MiniSWE memory overrides to null.
-When selecting a microVM, set Docker-only `policy_profile` to null and provide
-the backend's template or image settings.
+## Verify
 
-## Verification
-
-Run unit and contract tests without a Docker daemon:
+Unit and contract tests need no daemon and no provider:
 
 ```bash
 python -m pytest tests/sandbox
@@ -211,15 +271,25 @@ python scripts/audit_prose_style.py psrl/sandbox tests/sandbox
 git diff --check
 ```
 
-Run real Docker conformance and collect reproducible latency samples:
+Exercise a real Docker daemon and record reproducible latency:
 
 ```bash
-PSRL_RUN_DOCKER_INTEGRATION=1 PSRL_DOCKER_TEST_IMAGE=python:3.11-slim \
+PSRL_RUN_DOCKER_INTEGRATION=1 PSRL_DOCKER_TEST_IMAGE=${SANDBOX_IMAGE} \
   python -m pytest tests/sandbox/test_docker_live.py
-python tests/sandbox/benchmark_docker_backend.py \
-  --image python:3.11-slim --iterations 100 --concurrency 16
+python -m tests.sandbox.benchmark_docker_backend \
+  --image ${SANDBOX_IMAGE} --iterations 100 --concurrency 16
 ```
 
-Compare runs on the same idle node with pre-pulled images. Report create and
-exec p50, p95, maximum latency, and peak session count. Unit tests establish
-failure semantics, not production throughput or GPU training convergence.
+Exercise a real Ray cluster, which is the only check that covers actor serialization,
+node affinity, and per-node liveness. It needs no Docker daemon:
+
+```bash
+python -m tests.sandbox.smoke_ray_plane
+```
+
+Exercise a real provider, which is the only check that the deployment is reachable
+and a template exists. Each deployment page carries that command with the environment
+variables its provider needs.
+
+Compare latency runs on the same idle node with pre-pulled images. Unit tests
+establish failure semantics, not production throughput or GPU convergence.

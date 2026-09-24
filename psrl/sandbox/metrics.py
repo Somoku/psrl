@@ -1,10 +1,27 @@
 """Low-overhead lifecycle and operation metrics for sandbox backends."""
 
+import math
 import threading
 import time
-from collections.abc import Iterator
+from collections import deque
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+
+# How many recent samples each operation keeps for its quantiles. A fixed count, not a
+# histogram: the decisions these feed need two numbers, not a distribution.
+_QUANTILE_SAMPLES = 512
+
+
+def _quantile(samples: Sequence[float], fraction: float) -> float:
+    """
+    Return the nearest-rank quantile of a sample set, or zero when it is empty.
+    """
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    rank = max(1, math.ceil(fraction * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
 
 
 @dataclass(frozen=True)
@@ -15,6 +32,8 @@ class OperationMetrics:
     failures: int = 0
     total_seconds: float = 0.0
     max_seconds: float = 0.0
+    p50_seconds: float = 0.0
+    p95_seconds: float = 0.0
 
     @property
     def mean_seconds(self) -> float:
@@ -42,6 +61,8 @@ class SandboxMetricsSnapshot:
                     "total_seconds": metric.total_seconds,
                     "mean_seconds": metric.mean_seconds,
                     "max_seconds": metric.max_seconds,
+                    "p50_seconds": metric.p50_seconds,
+                    "p95_seconds": metric.p95_seconds,
                 }
                 for name, metric in self.operations.items()
             },
@@ -58,6 +79,7 @@ class _MutableOperationMetrics:
     failures: int = 0
     total_seconds: float = 0.0
     max_seconds: float = 0.0
+    samples: deque[float] = field(default_factory=lambda: deque(maxlen=_QUANTILE_SAMPLES))
 
 
 class SandboxMetrics:
@@ -84,6 +106,16 @@ class SandboxMetrics:
         finally:
             self.record(operation, time.perf_counter() - started_at, failed=failed)
 
+    def count(self, operation: str) -> None:
+        """Record one occurrence of an operation that has no latency to measure.
+
+        Used for a policy application, such as an egress rule install, where the
+        fact that it happened is the whole signal.
+        """
+        with self._lock:
+            metric = self._operations.setdefault(operation, _MutableOperationMetrics())
+            metric.count += 1
+
     def record(self, operation: str, duration_s: float, *, failed: bool = False) -> None:
         """Record one completed operation."""
         with self._lock:
@@ -92,6 +124,7 @@ class SandboxMetrics:
             metric.failures += int(failed)
             metric.total_seconds += duration_s
             metric.max_seconds = max(metric.max_seconds, duration_s)
+            metric.samples.append(duration_s)
 
     def session_started(self) -> None:
         """Increment active and peak session counters."""
@@ -120,6 +153,8 @@ class SandboxMetrics:
                     failures=metric.failures,
                     total_seconds=metric.total_seconds,
                     max_seconds=metric.max_seconds,
+                    p50_seconds=_quantile(metric.samples, 0.5),
+                    p95_seconds=_quantile(metric.samples, 0.95),
                 )
                 for name, metric in self._operations.items()
             }

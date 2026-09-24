@@ -87,6 +87,8 @@ echo "env node: ${ENV_NODE_IP}"
 echo "image:    ${SANDBOX_IMAGE}"
 echo "rollouts: ${N_RESP_PER_PROMPT} per prompt, ${MAX_TURNS} max turns"
 
+# Sandboxes run through the agent loop worker's sandbox manager, so pinning the workers
+# to the env node puts them there. That node holds nothing else, so it admits to its whole limit.
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     --config-path="${PSRL_PATH}/psrl/trainer/config" \
     --config-name=ppo_megatron_trainer \
@@ -179,14 +181,8 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.n_validate_instances=${VAL_INSTANCES} \
     psrl.deployment.validate_nnodes_per_instance=1 \
     psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE} \
-    psrl.env_worker.enable=True \
-    psrl.env_worker.placement=dedicated \
-    psrl.env_worker.dedicated_node_ips="['${ENV_NODE_IP}']" \
-    psrl.env_worker.cpu_slots_per_worker=8 \
-    psrl.env_worker.gpu_slots_per_worker=0 \
-    psrl.env_worker.sandbox_cpus=8.0 \
-    psrl.env_worker.sandbox_memory=32g \
-    psrl.env_worker.routing.method=least_loaded \
+    gen_actor_rollout_ref.rollout.agent.sandbox.capacity.utilization=1.0 \
+    gen_actor_rollout_ref.rollout.agent.node_ips="['${ENV_NODE_IP}']" \
     psrl.group_post_process.processors="['dynamic_sampling_filter']" \
     psrl.rollout_gateway.trajectory_id_strategy=auto \
     psrl.rollout_coordination.routing_strategy.method=cache_aware \

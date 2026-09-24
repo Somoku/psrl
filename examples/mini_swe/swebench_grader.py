@@ -430,7 +430,7 @@ def grade_fresh_container(
         run_args.append(f"--memory={memory}")
     run_args += ["--label", grader_label]
     # Per-actor label consumed by the reaper sidecar in
-    # psrl.sandbox.utils.docker_utils.
+    # psrl.sandbox.backends.docker.cli.
     _actor_id = os.environ.get("PSRL_ACTOR_ID", "")
     if _actor_id:
         run_args += ["--label", f"psrl.actor_id={_actor_id}"]
@@ -543,7 +543,7 @@ def grade_fresh_container(
         # ``docker_env.cleanup`` has been observed to silently succeed without killing anything.
         if not uses_psrl_sandbox:
             try:
-                from psrl.sandbox.utils.docker_utils import force_remove_containers_by_label
+                from psrl.sandbox.backends.docker.cli import force_remove_containers_by_label
 
                 force_remove_containers_by_label("psrl.grader_task_id", grader_label.split("=", 1)[1])
             except Exception as sweep_exc:

@@ -68,6 +68,7 @@ from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import response_from_nested, response_to_nested
 
 from psrl.sandbox.capacity import SandboxCapacityCoordinator
+from psrl.sandbox.ray_plane import build_sandbox_plane
 from psrl.trainer.ppo.batch_schedule import (
     TRAJECTORY_AGG_MODE,
     BatchScheduleStep,
@@ -324,7 +325,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.rollout_coordinator = None
         self.reward_manager = None
         self.reward_loop_workers = []
-        self.env_worker_manager = None
 
         self.reward_gateways: dict[str, ray.actor.ActorHandle] = {}
         self.reward_gateway_urls: dict[str, str] = {}
@@ -1830,13 +1830,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.info(f"Rollout gateway launched at {self.rollout_gateway_url}.")
         psrl_logger.info(f"Session router launched at {self.session_router_url}.")
 
-        # Build env worker pool if enabled.
-        if self.config.psrl.env_worker.enable:
-            from psrl.workers.env_worker import EnvWorkerManager
-
-            self.env_worker_manager = EnvWorkerManager(self.config)
-            psrl_logger.info("Env worker pool built.")
-
         # create agent loop workers
         self.agent_loop_workers = []
         num_agent_workers = self.config.gen_actor_rollout_ref.rollout.agent.num_workers
@@ -1876,6 +1869,26 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Node-local capacity coordinators must share a node with their workers, and a soft
         # placement could fall back to an excluded node, so both need hard affinity.
         hard_affinity = bool(allowed_ips) or use_node_capacity
+        placement_config = self.config.psrl.deployment.get("sandbox_placement", None)
+        placement_enabled = bool(placement_config and placement_config.get("enabled", False))
+        if placement_enabled:
+            # A plane places every sandbox, so each node owns its own envelope and this worker
+            # holds no local backend. Keeping both would charge a node for containers another
+            # node runs.
+            use_node_capacity = False
+            capacity_config = None
+            hard_affinity = bool(allowed_ips)
+        sandbox_plane = self._build_sandbox_plane(placement_config, alive_nodes) if placement_enabled else None
+        worker_plane = (
+            sandbox_plane.handle(
+                backend_name=str(placement_config.backend_name),
+                rpc_timeout_s=float(placement_config.rpc_timeout_s),
+                required_label=placement_config.get("required_label", None),
+                callback_target=placement_config.get("callback_target", None),
+            )
+            if sandbox_plane is not None
+            else None
+        )
         capacity_coordinators = {}
         for i, node_id in enumerate(worker_node_ids):
             if use_node_capacity and node_id not in capacity_coordinators:
@@ -1903,6 +1916,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     worker_id=i,
                     worker_num=num_agent_workers,
                     capacity_coordinator=capacity_coordinator,
+                    sandbox_plane=worker_plane,
                 )
             )
             psrl_logger.info(
@@ -2203,32 +2217,209 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.replay_buffer.start_polling()
         psrl_logger.info("ReplayBuffer polling started after init_workers() completed.")
 
-    def _sandbox_capacity_metrics(self) -> dict[str, float]:
-        """Report node sandbox admission per step, keyed by node.
+    # Counters a bounded collection reports for itself, so a missing sample is visible
+    # rather than indistinguishable from a quiet step.
+    _SANDBOX_COLLECT_TIMEOUT_S = 10.0
 
-        `oldest_lease_age_s` growing without bound is how a reservation that was charged for
-        a container nobody can delete becomes visible. Nothing reclaims it by age, so this is
-        the signal an operator acts on.
+    # Worker keys that are ages, peaks, or maxima rather than counters. Summing one of
+    # these across workers would report a number no worker ever had.
+    _SANDBOX_WORKER_EXTREME_KEYS = frozenset(
+        {
+            "ownership/oldest_lease_state_age_s",
+            "ownership/max_release_attempts",
+            "admission/wait_s_mean",
+        }
+    )
+
+    def _sandbox_capacity_metrics(self) -> dict[str, float]:
+        """Report every sandbox plane on the training step axis.
+
+        Three families, in one bounded and failure tolerant read. Node admission comes
+        from the capacity coordinators, ownership and outcomes come from each agent loop
+        worker's manager, and the state of this collection comes from itself.
+
+        `oldest_lease_age_s` growing without bound is how a reservation charged for a
+        container nobody can delete becomes visible, and nothing reclaims it by age, so it
+        is the signal an operator acts on. A collection failure is counted rather than
+        raised, because a metric path that can stall a training step is worse than a
+        missing sample.
+        """
+        started_at = time.monotonic()
+        metrics: dict[str, float] = {}
+        node_metrics, node_failed = self._sandbox_node_admission_metrics()
+        metrics.update(node_metrics)
+        worker_metrics, worker_failed = self._sandbox_worker_plane_metrics()
+        metrics.update(worker_metrics)
+        placement_metrics, placement_failed = self._sandbox_placement_metrics()
+        metrics.update(placement_metrics)
+        metrics["meta/collect_failures"] = float(node_failed + worker_failed + placement_failed)
+        metrics["meta/collect_s"] = time.monotonic() - started_at
+        return metrics
+
+    def _build_sandbox_plane(self, placement_config, alive_nodes):
+        """Create the placement service and one node agent per sandbox node.
+
+        The fleet is `agent.node_ips`, which is already the allow list the workers are placed
+        by. It is required rather than defaulted to every alive node, because a sandbox on a
+        GPU node competes with the trainer for the machine it is training on.
+        """
+        allowed_ips = list(self.config.gen_actor_rollout_ref.rollout.agent.get("node_ips") or [])
+        if not allowed_ips:
+            raise ValueError(
+                "sandbox_placement.enabled requires agent.node_ips. Every alive node would put sandboxes "
+                "on the GPU nodes, so name the sandbox fleet explicitly."
+            )
+        node_ids = [node["NodeID"] for node in alive_nodes]
+        required_label = placement_config.get("required_label", None)
+        labels = [str(required_label)] if required_label else []
+        self.sandbox_plane = build_sandbox_plane(
+            self.config.gen_actor_rollout_ref.rollout.agent.sandbox,
+            node_ids,
+            node_ttl_s=float(placement_config.node_ttl_s),
+            reservation_ttl_s=float(placement_config.reservation_ttl_s),
+            sweep_interval_s=float(placement_config.sweep_interval_s),
+            heartbeat_interval_s=float(placement_config.heartbeat_interval_s),
+            labels=labels,
+        )
+        advertisements = self.sandbox_plane.register_nodes()
+        for node_id, advertisement in advertisements.items():
+            psrl_logger.info(f"Sandbox node {node_id!r} advertises {advertisement!r}.")
+        psrl_logger.info(
+            "Sandbox placement is on over %d node(s), declaring %s.",
+            len(node_ids),
+            sorted(feature.value for feature in self.sandbox_plane.capabilities.features),
+        )
+        return self.sandbox_plane
+
+    def stop_sandbox_plane(self) -> None:
+        """
+        Stop the placement service and every node agent, if a plane was built.
+        """
+        plane = getattr(self, "sandbox_plane", None)
+        if plane is None:
+            return
+        self.sandbox_plane = None
+        try:
+            plane.shutdown()
+        except Exception:
+            # The job is ending, so an unreachable plane is not worth failing the teardown for.
+            psrl_logger.warning("The sandbox plane did not shut down cleanly.", exc_info=True)
+
+    def _sandbox_placement_metrics(self) -> tuple[dict[str, float], int]:
+        """Report what placement decided, which is the plane no node can see on its own.
+
+        Locality in particular is answerable only here: it is the share of decisions where the
+        chosen node already held what the request would have pulled.
+        """
+        plane = getattr(self, "sandbox_plane", None)
+        if plane is None:
+            return {}, 0
+        try:
+            snapshot = plane.placement_snapshot()
+        except Exception:
+            psrl_logger.warning("Could not read the sandbox placement snapshot for metrics.", exc_info=True)
+            return {}, 1
+        return {key: float(value) for key, value in snapshot.as_dict().items()}, 0
+
+    def _sandbox_node_admission_metrics(self) -> tuple[dict[str, float], int]:
+        """Report node admission, as cluster aggregates and as the worst node.
+
+        Counts are summed across nodes and ages and peaks take the maximum, because a
+        cluster total over a per-node maximum would be a number no node ever had.
         """
         coordinators = getattr(self, "sandbox_capacity_coordinators", None)
         if not coordinators:
-            return {}
+            return {}, 0
         try:
             snapshots = ray.get(
                 [coordinator.snapshot.remote() for coordinator in coordinators.values()],
-                timeout=10.0,
+                timeout=self._SANDBOX_COLLECT_TIMEOUT_S,
             )
         except Exception:
             psrl_logger.warning("Could not read sandbox capacity snapshots for metrics.", exc_info=True)
-            return {}
-        reported = ("waiters", "allocations", "expired", "capacity_wait_timeouts", "oldest_lease_age_s")
+            return {}, 1
+        counted = ("waiters", "allocations", "expired", "capacity_wait_timeouts")
+        extremes = ("oldest_lease_age_s",)
         metrics: dict[str, float] = {}
+        totals = dict.fromkeys((*counted, *extremes), 0.0)
+        peaks = dict.fromkeys((*counted, *extremes), 0.0)
+        ratios: dict[str, list[float]] = {}
         for node_id, snapshot in zip(coordinators, snapshots, strict=True):
-            for key in reported:
-                metrics[f"sandbox_capacity/{node_id}/{key}"] = float(snapshot.get(key, 0) or 0)
+            for key in counted:
+                value = float(snapshot.get(key, 0) or 0)
+                metrics[f"sandbox_capacity/{node_id}/{key}"] = value
+                totals[key] += value
+                peaks[key] = max(peaks[key], value)
+            for key in extremes:
+                value = float(snapshot.get(key, 0) or 0)
+                metrics[f"sandbox_capacity/{node_id}/{key}"] = value
+                peaks[key] = max(peaks[key], value)
             available = snapshot.get("available_capacity") or {}
             metrics[f"sandbox_capacity/{node_id}/available_memory_mb"] = float(available.get("memory_mb", 0) or 0)
-        return metrics
+            metrics[f"sandbox_capacity/{node_id}/free_gpus"] = float(snapshot.get("free_gpus", 0) or 0)
+            for dimension, ratio in self._node_utilization(snapshot).items():
+                metrics[f"sandbox/utilization/{node_id}/{dimension}_ratio"] = ratio
+                ratios.setdefault(dimension, []).append(ratio)
+        for key in counted:
+            metrics[f"sandbox/admission/{key}_total"] = totals[key]
+            metrics[f"sandbox/admission/{key}_worst_node"] = peaks[key]
+        metrics["sandbox/admission/oldest_lease_age_s_worst_node"] = peaks["oldest_lease_age_s"]
+        for dimension, values in ratios.items():
+            metrics[f"sandbox/utilization/{dimension}_ratio_mean"] = sum(values) / len(values)
+            metrics[f"sandbox/utilization/{dimension}_ratio_max"] = max(values)
+        return metrics, 0
+
+    @staticmethod
+    def _node_utilization(snapshot: dict) -> dict[str, float]:
+        """Return the charged fraction of one node's physical envelope per dimension.
+
+        Reported against the physical envelope rather than the admissible one, which is
+        what shows whether a memory overcommit setting is honest.
+        """
+        physical = snapshot.get("physical_capacity") or snapshot.get("capacity") or {}
+        capacity = snapshot.get("capacity") or {}
+        available = snapshot.get("available_capacity") or {}
+        ratios: dict[str, float] = {}
+        for dimension, key in (("memory", "memory_mb"), ("cpu", "cpu_millis"), ("disk", "disk_mb")):
+            limit = float(physical.get(key, 0) or 0)
+            if limit <= 0:
+                continue
+            charged = float(capacity.get(key, 0) or 0) - float(available.get(key, 0) or 0)
+            ratios[dimension] = max(0.0, min(1.0, charged / limit))
+        devices = float(physical.get("gpu_count", 0) or 0)
+        if devices > 0:
+            ratios["gpu"] = max(0.0, min(1.0, (devices - float(snapshot.get("free_gpus", 0) or 0)) / devices))
+        return ratios
+
+    def _sandbox_worker_plane_metrics(self) -> tuple[dict[str, float], int]:
+        """Report the ownership and outcome planes of every agent loop worker.
+
+        Counters are summed and ages and peaks take the maximum, so one worker's stuck
+        lease is visible instead of being averaged away by its healthy peers.
+        """
+        workers = getattr(self, "agent_loop_workers", None)
+        if not workers:
+            return {}, 0
+        try:
+            snapshots = ray.get(
+                [worker.sandbox_metrics_snapshot.remote() for worker in workers],
+                timeout=self._SANDBOX_COLLECT_TIMEOUT_S,
+            )
+        except Exception:
+            psrl_logger.warning("Could not read sandbox worker snapshots for metrics.", exc_info=True)
+            return {}, 1
+        totals: dict[str, float] = {}
+        peaks: dict[str, float] = {}
+        for snapshot in snapshots:
+            for key, value in (snapshot or {}).items():
+                number = float(value or 0)
+                if key in self._SANDBOX_WORKER_EXTREME_KEYS:
+                    peaks[key] = max(peaks.get(key, 0.0), number)
+                    continue
+                totals[key] = totals.get(key, 0.0) + number
+        metrics = {f"sandbox/{key}_total": value for key, value in totals.items()}
+        metrics.update({f"sandbox/{key}_worst_worker": value for key, value in peaks.items()})
+        return metrics, 0
 
     def switch_to_rollout_mode(self):
         """Switch the PSRL colocate part to rollout mode for validation.
@@ -3566,10 +3757,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.elastic_executor is not None:
             ray.get(self.elastic_executor.stop_busy_loop.remote())
             self.elastic_executor = None
-        if self.env_worker_manager is not None:
-            self.env_worker_manager.shutdown()
-            self.env_worker_manager = None
         self.stop_ps_manager()
+        self.stop_sandbox_plane()
         self._shutdown_dump_executor()
 
         # Kill all PortScanner actors to free resources.

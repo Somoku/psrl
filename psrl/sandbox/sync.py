@@ -59,11 +59,18 @@ class SyncSandboxSession:
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
         timeout_s: float | None = None,
+        silence_timeout_s: float | None = None,
     ) -> ExecResult:
         """Execute a command on the event loop that owns the session."""
         return run_coroutine_on_loop(
             self._event_loop,
-            self._lease.session.exec(command, cwd=cwd, env=env, timeout_s=timeout_s),
+            self._lease.session.exec(
+                command,
+                cwd=cwd,
+                env=env,
+                timeout_s=timeout_s,
+                silence_timeout_s=silence_timeout_s,
+            ),
             timeout_s=None if timeout_s is None else timeout_s + 10,
         )
 

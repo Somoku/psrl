@@ -3,16 +3,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from psrl.sandbox.backends.docker_lifecycle import DockerLifecycle, DockerLifecycleConfig
+from psrl.sandbox.backends.docker.lifecycle import DockerLifecycle, DockerLifecycleConfig
 from psrl.sandbox.capacity import SandboxCapacityConfig
+from psrl.sandbox.reclaimer import ReclaimOutcome
 
 
 @pytest.fixture(autouse=True)
 def _no_real_startup_sweep(monkeypatch):
     """Keep the startup sweep off the real Docker daemon unless a test asks for it."""
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.sweep_stale_sandboxes",
-        lambda *args, **kwargs: ([], 0),
+        "psrl.sandbox.backends.docker.lifecycle.NodeReclaimer",
+        lambda *args, **kwargs: SimpleNamespace(sweep=lambda: ReclaimOutcome()),
     )
 
 
@@ -25,9 +26,9 @@ def test_lifecycle_restarts_an_idle_collector(monkeypatch, tmp_path) -> None:
         spawned.append(process)
         return process
 
-    monkeypatch.setattr("psrl.sandbox.backends.docker_lifecycle.spawn_node_gc", spawn)
+    monkeypatch.setattr("psrl.sandbox.backends.docker.lifecycle.spawn_node_reclaimer", spawn)
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.force_remove_containers_by_label",
+        "psrl.sandbox.backends.docker.lifecycle.force_remove_containers_by_label",
         lambda *args, **kwargs: removed.append((args, kwargs)),
     )
     lifecycle = DockerLifecycle(
@@ -69,7 +70,7 @@ def test_default_crash_recovery_precedes_capacity_expiry() -> None:
 
 
 def test_lifecycle_fails_when_crash_recovery_cannot_start(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr("psrl.sandbox.backends.docker_lifecycle.spawn_node_gc", lambda *args, **kwargs: None)
+    monkeypatch.setattr("psrl.sandbox.backends.docker.lifecycle.spawn_node_reclaimer", lambda *args, **kwargs: None)
     lifecycle = DockerLifecycle(
         "worker-1",
         DockerLifecycleConfig(heartbeat_dir=str(tmp_path)),
@@ -86,17 +87,19 @@ def test_startup_reclaims_an_earlier_run_before_this_one_is_admitted(monkeypatch
     # against an envelope that does not know their memory is still spoken for.
     sweeps: list[dict] = []
 
-    def sweep(heartbeat_dir, ttl_s, **kwargs):
+    def build_reclaimer(heartbeat_dir, ttl_s, runtime, **kwargs):
         sweeps.append({"heartbeat_dir": heartbeat_dir, "ttl_s": ttl_s, **kwargs})
-        return ["leftover-a", "leftover-b"], 0
+        return SimpleNamespace(
+            sweep=lambda: ReclaimOutcome(removed=("leftover-a", "leftover-b"), remaining=0)
+        )
 
-    monkeypatch.setattr("psrl.sandbox.backends.docker_lifecycle.sweep_stale_sandboxes", sweep)
+    monkeypatch.setattr("psrl.sandbox.backends.docker.lifecycle.NodeReclaimer", build_reclaimer)
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.spawn_node_gc",
+        "psrl.sandbox.backends.docker.lifecycle.spawn_node_reclaimer",
         lambda *args, **kwargs: SimpleNamespace(poll=lambda: None),
     )
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.force_remove_containers_by_label",
+        "psrl.sandbox.backends.docker.lifecycle.force_remove_containers_by_label",
         lambda *args, **kwargs: [],
     )
     lifecycle = DockerLifecycle("worker-1", DockerLifecycleConfig(heartbeat_dir=str(tmp_path)))
@@ -113,16 +116,16 @@ def test_startup_reclaims_an_earlier_run_before_this_one_is_admitted(monkeypatch
 
 
 def test_startup_sweep_failure_does_not_block_the_worker(monkeypatch, tmp_path) -> None:
-    def sweep(*args, **kwargs):
+    def build_reclaimer(*args, **kwargs):
         raise OSError("docker unreachable")
 
-    monkeypatch.setattr("psrl.sandbox.backends.docker_lifecycle.sweep_stale_sandboxes", sweep)
+    monkeypatch.setattr("psrl.sandbox.backends.docker.lifecycle.NodeReclaimer", build_reclaimer)
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.spawn_node_gc",
+        "psrl.sandbox.backends.docker.lifecycle.spawn_node_reclaimer",
         lambda *args, **kwargs: SimpleNamespace(poll=lambda: None),
     )
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.force_remove_containers_by_label",
+        "psrl.sandbox.backends.docker.lifecycle.force_remove_containers_by_label",
         lambda *args, **kwargs: [],
     )
     lifecycle = DockerLifecycle("worker-1", DockerLifecycleConfig(heartbeat_dir=str(tmp_path)))
@@ -139,11 +142,11 @@ def test_stopped_grace_must_outlast_one_sweep_interval() -> None:
 def test_the_collector_receives_the_configured_grace_period(monkeypatch, tmp_path) -> None:
     spawned: list[dict] = []
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.spawn_node_gc",
+        "psrl.sandbox.backends.docker.lifecycle.spawn_node_reclaimer",
         lambda *args, **kwargs: spawned.append(kwargs) or SimpleNamespace(poll=lambda: None),
     )
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.force_remove_containers_by_label",
+        "psrl.sandbox.backends.docker.lifecycle.force_remove_containers_by_label",
         lambda *args, **kwargs: [],
     )
     lifecycle = DockerLifecycle(

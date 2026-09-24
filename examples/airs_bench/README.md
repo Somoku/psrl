@@ -79,16 +79,21 @@ The image is saved to shared storage once, then loaded in parallel on each targe
 The `total_nnodes=1` setting tells PSRL's excess-node reserver to fence the env node out of
 the Ray resource pool, so train and rollout workers never land on it.
 
-**To use colocated placement instead** (single-node, sandboxes share GPU nodes with PSRL):
+Sandboxes run on whichever node hosts their agent loop worker, so
+`gen_actor_rollout_ref.rollout.agent.node_ips` pins those workers to the env node and the
+sandboxes follow them.
+
+**To run the sandboxes on the training nodes instead** (single-node, no dedicated env node):
 
 ```bash
 bash examples/airs_bench/run_qwen3-4b.sh \
-    psrl.env_worker.placement=colocated \
-    ++psrl.env_worker.dedicated_node_ips=[]
+    gen_actor_rollout_ref.rollout.agent.node_ips=[] \
+    gen_actor_rollout_ref.rollout.agent.sandbox.capacity.utilization=0.5
 ```
 
-Colocated placement puts env workers on every alive Ray node alongside train and rollout.
-It is simpler to operate but the training node's CPU and memory compete with running sandboxes.
+Sandboxes then share the training nodes, which is simpler to operate but competes with the
+trainer for CPU and memory. A dedicated env node is the default because AIRS-Bench sandboxes
+are CPU heavy.
 
 ## Running the Training
 
@@ -178,14 +183,13 @@ notice shows how many characters were omitted.
 
 ### 3. `--gpus` is replaced by device passthrough and driver bind-mounts
 
-The NVIDIA Container Toolkit (`--gpus all`) is absent on this cluster. Instead, the sandbox
-builder in `sandbox.py` exposes individual `/dev/nvidiaN` character devices and bind-mounts
-the driver libraries (`libcuda.so.1`, `libnvidia-ml.so.1`) from the host. This was verified
-to work on H20 nodes. The implementation is in `build_gpu_argv` and `build_docker_run_argv`
-in `psrl/workers/env_worker/sandbox.py`.
+The NVIDIA Container Toolkit (`--gpus all`) is absent on this cluster. Instead, the Docker
+backend exposes individual `/dev/nvidiaN` character devices and bind-mounts the driver
+libraries (`libcuda.so.1`, `libnvidia-ml.so.1`) from the host. The implementation is in
+`psrl/sandbox/backends/docker/devices.py`.
 
-AIRS-Bench grades on CPU (no GPU tasks in the current 20-task set), so `gpu_slots_per_worker`
-is set to 0 in this recipe and no device passthrough occurs during normal training. The GPU
+AIRS-Bench grades on CPU (no GPU tasks in the current 20-task set), so this recipe requests
+no devices and no passthrough occurs during normal training. The GPU
 path is exercised by MLGym's native tasks and is ready for future use.
 
 ### 4. `cache_baseline_scores` is disabled

@@ -1,10 +1,10 @@
 """
-MLGym environment backed by the PSRL env worker pool.
+MLGym environment backed by a PSRL sandbox lease.
 
 MLGym's `BaseAgent` is used unmodified. It reaches its environment only through
 `MLGymEnv.communicate()` and `MLGymEnv.step()`, both of which funnel into the
 low-level `_communicate`. Subclassing lets us replace the container and its shell
-with a remote sandbox while every other MLGym behavior, including workspace setup,
+with a leased sandbox while every other MLGym behavior, including workspace setup,
 conda activation, baseline scoring, and submission grading, is inherited intact.
 """
 
@@ -15,7 +15,6 @@ import logging
 import os
 import time
 import uuid
-from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +23,14 @@ from examples.airs_bench.config import AirsBenchRuntimeConfig, build_runtime_con
 from omegaconf import DictConfig
 
 from psrl.environments.base import Environment, EnvStepOutput
-from psrl.workers.env_worker.sandbox import ExecResult, SandboxSpec
+from psrl.sandbox import (
+    MountSpec,
+    ResourceSpec,
+    SandboxSource,
+    SandboxSpec,
+    SyncSandboxSession,
+)
+from psrl.sandbox.capacity import parse_memory_mb
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -66,20 +72,27 @@ def build_sandbox_spec(
     runtime_config: AirsBenchRuntimeConfig,
     dataset_data_path: str,
     labels: dict[str, str],
+    *,
+    episode_id: str,
 ) -> SandboxSpec:
     """
-    Build the sandbox description for one AIRS-Bench episode.
+    Build the portable sandbox request for one AIRS-Bench episode.
 
     Task data is mounted read only so the agent cannot reach the hidden test labels
     by editing them, while still letting the in-sandbox `evaluate.py` read them.
 
+    `airs_bench` is a policy profile rather than a spec field, because host
+    networking and loopback proxy rewriting are node policy and not a portable
+    property of the workload.
+
     Args:
         runtime_config (AirsBenchRuntimeConfig): Recipe runtime settings.
         dataset_data_path (str): Host path to this task's prepared data.
-        labels (dict[str, str]): Docker labels for cleanup and diagnostics.
+        labels (dict[str, str]): Container labels for cleanup and diagnostics.
+        episode_id (str): Episode identity, which also scopes the sandbox lease.
 
     Returns:
-        SandboxSpec: Spec ready for the coordinator.
+        SandboxSpec: Spec ready for the sandbox manager.
     """
     proxy_env = {
         key: os.environ[key]
@@ -87,46 +100,22 @@ def build_sandbox_spec(
         if key in os.environ
     }
     return SandboxSpec(
-        image=runtime_config.image,
-        cpus=runtime_config.sandbox_cpus,
-        memory=runtime_config.sandbox_memory,
-        gpus=0,
-        mounts=((dataset_data_path, f"{AGENT_WORKSPACE}/data", "ro"),),
+        source=SandboxSource.image(runtime_config.image),
+        resources=ResourceSpec(
+            cpu_count=runtime_config.sandbox_cpus,
+            memory_mb=parse_memory_mb(runtime_config.sandbox_memory),
+        ),
+        mounts=(MountSpec(source=dataset_data_path, target=f"{AGENT_WORKSPACE}/data", read_only=True),),
         env=proxy_env,
-        network="host",
-        labels=labels,
-        startup_timeout_s=runtime_config.startup_timeout_s,
-        idle_timeout_s=runtime_config.episode_timeout_s,
+        metadata=labels,
+        policy_profile="airs_bench",
+        # One sandbox per episode, so the episode is the workflow phase that the
+        # reservation protects.
+        workflow_id=episode_id,
+        idempotency_key=f"{episode_id}:airs",
+        # An AIRS-Bench episode is long and its cap is the wall clock, not idleness.
+        lifetime_timeout_s=runtime_config.episode_timeout_s,
     )
-
-
-def sync_exec(
-    handle: Any,
-    loop: asyncio.AbstractEventLoop,
-    command: str,
-    timeout_s: float,
-    no_output_timeout_s: float | None = None,
-) -> ExecResult:
-    """
-    Run one sandbox command from synchronous code.
-
-    MLGym's agent is synchronous and runs on a worker thread, while the sandbox
-    handle is async and owned by the agent loop's event loop. This bridges the two
-    by scheduling onto that loop and blocking the calling thread.
-
-    Args:
-        handle (Any): Sandbox handle.
-        loop (asyncio.AbstractEventLoop): The loop the handle belongs to.
-        command (str): Shell command.
-        timeout_s (float): Seconds allowed for the command.
-        no_output_timeout_s (float | None): Silent-seconds allowance.
-
-    Returns:
-        ExecResult: Command outcome.
-    """
-    future: Future = asyncio.run_coroutine_threadsafe(handle.exec(command, timeout_s, no_output_timeout_s), loop)
-    # Add slack so the local wait never fires before the remote timeout reports.
-    return future.result(timeout=timeout_s + 120.0)
 
 
 def build_psrl_mlgym_env_class() -> type:
@@ -143,18 +132,16 @@ def build_psrl_mlgym_env_class() -> type:
     from mlgym.environment.env import MLGymEnv
 
     class PSRLMLGymEnv(MLGymEnv):  # type: ignore[misc]
-        """MLGym environment whose container lives in a PSRL env worker sandbox."""
+        """MLGym environment whose container lives in a leased PSRL sandbox."""
 
         def __init__(
             self,
             args: Any,
-            sandbox_handle: Any,
-            loop: asyncio.AbstractEventLoop,
+            session: SyncSandboxSession,
             per_action_timeout_s: float,
             **kwargs: Any,
         ):
-            self._sandbox_handle = sandbox_handle
-            self._loop = loop
+            self._session = session
             self._per_action_timeout_s = per_action_timeout_s
             super().__init__(args, devices=["cpu_0"], **kwargs)
 
@@ -162,15 +149,15 @@ def build_psrl_mlgym_env_class() -> type:
             """
             Adopt the already-running sandbox instead of starting a local container.
 
-            The sandbox and its shell are created by the env worker before the agent
-            starts, so there is nothing to launch here. `container` and `container_obj`
-            are set to None because every consumer of them is routed through
-            `_communicate` in this subclass.
+            The lease is taken by the agent loop before the agent starts, so there is
+            nothing to launch here. `container` and `container_obj` are set to None
+            because every consumer of them is routed through `_communicate` in this
+            subclass.
             """
             self.container = None
             self.container_obj = None
-            self.container_name = self._sandbox_handle.sandbox_id
-            psrl_logger.info(f"Adopted sandbox {self._sandbox_handle.sandbox_id!r} for MLGym.")
+            self.container_name = self._session.ref.sandbox_id
+            psrl_logger.info(f"Adopted sandbox {self._session.ref.sandbox_id!r} for MLGym.")
 
         def _communicate(
             self,
@@ -179,30 +166,33 @@ def build_psrl_mlgym_env_class() -> type:
             no_output_timeout_duration: float = 25,
         ) -> str:
             """
-            Execute one command in the remote sandbox shell.
+            Execute one command in the leased sandbox.
 
             Overriding this single method reroutes every MLGym code path that talks to
             the container, because `communicate`, `step`, workspace setup, and grading
-            all funnel through here.
+            all funnel through here. The sync facade schedules onto the loop that owns
+            the sandbox and blocks this thread, which is what makes a synchronous agent
+            usable against an asynchronous session.
             """
             timeout_s = min(float(timeout_duration), self._per_action_timeout_s)
-            result = sync_exec(
-                self._sandbox_handle,
-                self._loop,
-                input,
-                timeout_s=timeout_s,
-                no_output_timeout_s=float(no_output_timeout_duration),
-            )
-            self.returncode = result.exit_code
-            if result.timed_out:
+            try:
+                result = self._session.exec(
+                    input,
+                    timeout_s=timeout_s,
+                    silence_timeout_s=float(no_output_timeout_duration),
+                )
+            except TimeoutError as exc:
                 # MLGym's own contract: a training command that overruns raises here and
                 # the agent sees a timeout observation rather than losing the episode.
-                raise TimeoutError(f"Sandbox command exceeded {timeout_s}s: {input[:120]!r}.")
-            return result.stdout
+                raise TimeoutError(f"Sandbox command exceeded {timeout_s}s: {input[:120]!r}.") from exc
+            self.returncode = result.exit_code
+            # MLGym reads one combined stream, so a provider that separates the two is
+            # joined here rather than losing the diagnostics.
+            return result.stdout + result.stderr
 
         def close(self) -> None:
-            """Release the sandbox. The handle owns container teardown."""
-            psrl_logger.info(f"Closing MLGym env for sandbox {self._sandbox_handle.sandbox_id!r}.")
+            """Report closure. The lease owns container teardown."""
+            psrl_logger.info(f"Closing MLGym env for sandbox {self._session.ref.sandbox_id!r}.")
 
     return PSRLMLGymEnv
 
@@ -270,7 +260,7 @@ class MLGymEnvironment(Environment[dict, None]):
         """Force-remove any container still labelled with this episode id."""
         if self._episode_id is None:
             return
-        from psrl.sandbox.utils.docker_utils import force_remove_containers_by_label
+        from psrl.sandbox.backends.docker.cli import force_remove_containers_by_label
 
         await asyncio.to_thread(force_remove_containers_by_label, "psrl.airs_episode_id", self._episode_id)
 

@@ -110,3 +110,45 @@ heterogeneous_rollout:
 
   # Pipeline model parallel size for each rollout instance.
   pipeline_model_parallel_size_per_instance: []
+
+# Place sandboxes on other nodes instead of the worker's own.
+#
+# Enabled, the trainer creates one placement service for the job and one sandbox node agent
+# per node in `agent.node_ips`, and every agent loop worker places its sandboxes through
+# them. A node agent owns its node's Docker daemon and its capacity envelope, so `capacity.*`
+# is enforced where the containers actually run.
+sandbox_placement:
+
+  # Off uses the local backend each worker already runs. `agent.node_ips` is required when
+  # this is on, because "every alive node" would put sandboxes on the GPU nodes.
+  enabled: False
+
+  # The backend the fleet runs, which is also the placement filter and the name a task asks
+  # for. It has to be a name the nodes advertise.
+  backend_name: docker
+
+  # A node that has missed this long is drained rather than trusted.
+  node_ttl_s: 120.0
+
+  # How long a reservation survives without being renewed. The caller renews at a third of
+  # it, so one lost round trip does not cost the slot.
+  reservation_ttl_s: 60.0
+
+  # The sweep enforces the reservation TTL, so it has to be the shorter of the two.
+  sweep_interval_s: 10.0
+
+  # How often a node reports that it is still there. Keep it well inside `node_ttl_s`.
+  heartbeat_interval_s: 30.0
+
+  # Deadline for one call to a node agent or the placement service. Without it a partitioned
+  # node blocks its caller for the rest of the run.
+  rpc_timeout_s: 60.0
+
+  # A node label every sandbox node carries, so a request can pin itself to a dedicated node.
+  # Null accepts any node in the fleet.
+  required_label: null
+
+  # The host:port a node opens a forwarder to, so a sandbox on another node reaches this
+  # worker's own session server. Null leaves callback URLs alone, which is enough for a task
+  # whose sandbox never calls back into the worker.
+  callback_target: null

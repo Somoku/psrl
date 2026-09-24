@@ -6,7 +6,14 @@ import os
 import uuid
 
 import pytest
-from psrl.sandbox import SandboxManager, SandboxSource, SandboxSpec, SandboxStatePolicy, SnapshotKind
+from psrl.sandbox import (
+    SandboxManager,
+    SandboxSource,
+    SandboxSourceKind,
+    SandboxSpec,
+    SandboxStatePolicy,
+    SnapshotKind,
+)
 from psrl.sandbox.backends.e2b import AgentEnvBackend, CubeSandboxBackend
 
 _BACKEND = os.getenv("PSRL_LIVE_MICROVM_BACKEND", "")
@@ -34,15 +41,18 @@ async def test_live_microvm_snapshot_restore_and_transport_refresh() -> None:
     )
     policy = SandboxStatePolicy(enabled=True)
     snapshot = None
+    spec = SandboxSpec(
+        source,
+        idempotency_key=f"microvm-live-{uuid.uuid4().hex}",
+        idle_timeout_s=300,
+        state_policy=policy,
+    )
     try:
-        lease = await manager.acquire(
-            SandboxSpec(
-                source,
-                idempotency_key=f"microvm-live-{uuid.uuid4().hex}",
-                idle_timeout_s=300,
-                state_policy=policy,
-            )
-        )
+        if source.kind is SandboxSourceKind.IMAGE:
+            # An image becomes a template before a sandbox can be created from it, so the
+            # live check runs the same prepare-then-acquire flow a rollout uses.
+            await manager.prepare(spec)
+        lease = await manager.acquire(spec)
         await lease.session.write_bytes("/tmp/psrl-baseline", b"clean")
         snapshot = await manager.checkpoint(lease.session, SnapshotKind.FULL_STATE)
         restored = await manager.restore(snapshot, state_policy=policy)

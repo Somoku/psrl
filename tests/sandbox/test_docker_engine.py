@@ -4,7 +4,7 @@ import tracemalloc
 from types import SimpleNamespace
 
 import pytest
-from psrl.sandbox.backends.docker_engine import DockerEngineClient, DockerEngineError, DockerExecStream
+from psrl.sandbox.backends.docker.engine import DockerEngineClient, DockerEngineError, DockerExecStream
 
 
 def _frame(stream: int, payload: bytes) -> bytes:

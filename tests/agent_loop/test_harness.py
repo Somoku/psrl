@@ -28,8 +28,9 @@ from psrl.sandbox import (
     SandboxStatePolicy,
     SandboxStatus,
 )
-from psrl.sandbox.backends.docker import DockerBackend, DockerPolicyProfile
-from psrl.sandbox.backends.docker_session import DockerSession
+from psrl.sandbox.backends.docker import DockerBackend
+from psrl.sandbox.backends.docker.policy import DockerPolicyProfile
+from psrl.sandbox.backends.docker.session import DockerSession
 from psrl.workers.agent_loop.harness import (
     HarnessCompactionConfig,
     HarnessConfig,

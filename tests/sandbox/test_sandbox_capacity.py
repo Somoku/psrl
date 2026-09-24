@@ -57,7 +57,7 @@ async def test_multi_resource_admission_blocks_until_complete_request_fits() -> 
 
     assert not waiting.done()
     snapshot = await coordinator.snapshot()
-    assert snapshot["available_capacity"] == {"memory_mb": 20, "cpu_millis": 3000}
+    assert snapshot["available_capacity"] == {"memory_mb": 20, "cpu_millis": 3000, "gpu_count": 0, "disk_mb": 0}
     assert snapshot["waiters"] == 1
 
     await coordinator.release("large")
@@ -76,10 +76,12 @@ async def test_different_request_sizes_share_capacity_without_static_pools() -> 
     await asyncio.gather(*(coordinator.acquire(lease_id, "worker", memory, cpu) for lease_id, memory, cpu in requests))
 
     snapshot = await coordinator.snapshot()
-    assert snapshot["available_capacity"] == {"memory_mb": 0, "cpu_millis": 1000}
+    assert snapshot["available_capacity"] == {"memory_mb": 0, "cpu_millis": 1000, "gpu_count": 0, "disk_mb": 0}
     assert snapshot["allocations"] == 3
     await coordinator.release_owner("worker")
-    assert (await coordinator.snapshot())["available_capacity"] == {"memory_mb": 100, "cpu_millis": 10000}
+    assert (await coordinator.snapshot())["available_capacity"] == {
+        "memory_mb": 100, "cpu_millis": 10000, "gpu_count": 0, "disk_mb": 0,
+    }
     await coordinator.shutdown()
 
 
@@ -121,7 +123,9 @@ async def test_grader_class_is_admitted_while_rollouts_wait_to_borrow() -> None:
 
     await asyncio.wait_for(grader, timeout=1)
     snapshot = await coordinator.snapshot()
-    assert snapshot["per_class"]["grader"]["used"] == {"memory_mb": 300, "cpu_millis": 1000}
+    assert snapshot["per_class"]["grader"]["used"] == {
+        "memory_mb": 300, "cpu_millis": 1000, "gpu_count": 0, "disk_mb": 0,
+    }
 
     await coordinator.release_owner("owner")
     for task in extra_rollouts:
@@ -155,8 +159,12 @@ async def test_class_guarantees_are_satisfiable_together() -> None:
     await asyncio.wait_for(asyncio.gather(*requests), timeout=0.5)
 
     snapshot = await coordinator.snapshot()
-    assert snapshot["per_class"]["rollout"]["used"] == {"memory_mb": 500, "cpu_millis": 5000}
-    assert snapshot["per_class"]["grader"]["used"] == {"memory_mb": 300, "cpu_millis": 1000}
+    assert snapshot["per_class"]["rollout"]["used"] == {
+        "memory_mb": 500, "cpu_millis": 5000, "gpu_count": 0, "disk_mb": 0,
+    }
+    assert snapshot["per_class"]["grader"]["used"] == {
+        "memory_mb": 300, "cpu_millis": 1000, "gpu_count": 0, "disk_mb": 0,
+    }
     await coordinator.shutdown()
 
 
@@ -177,8 +185,10 @@ async def test_elastic_pool_is_borrowable_while_no_other_class_waits() -> None:
     await asyncio.gather(*(coordinator.acquire(f"rollout-{index}", "owner", 100, 1, "rollout") for index in range(9)))
 
     snapshot = await coordinator.snapshot()
-    assert snapshot["available_capacity"] == {"memory_mb": 100, "cpu_millis": 1000}
-    assert snapshot["per_class"]["rollout"]["used"] == {"memory_mb": 900, "cpu_millis": 9000}
+    assert snapshot["available_capacity"] == {"memory_mb": 100, "cpu_millis": 1000, "gpu_count": 0, "disk_mb": 0}
+    assert snapshot["per_class"]["rollout"]["used"] == {
+        "memory_mb": 900, "cpu_millis": 9000, "gpu_count": 0, "disk_mb": 0,
+    }
     await coordinator.shutdown()
 
 
@@ -202,8 +212,12 @@ async def test_class_ceiling_bounds_borrowing() -> None:
         await coordinator.acquire("over-ceiling", "owner", 100, 1, "rollout", timeout_s=0.05)
 
     snapshot = await coordinator.snapshot()
-    assert snapshot["per_class"]["rollout"]["used"] == {"memory_mb": 300, "cpu_millis": 3000}
-    assert snapshot["per_class"]["rollout"]["ceiling"] == {"memory_mb": 300, "cpu_millis": 3000}
+    assert snapshot["per_class"]["rollout"]["used"] == {
+        "memory_mb": 300, "cpu_millis": 3000, "gpu_count": 0, "disk_mb": 0,
+    }
+    assert snapshot["per_class"]["rollout"]["ceiling"] == {
+        "memory_mb": 300, "cpu_millis": 3000, "gpu_count": 0, "disk_mb": 0,
+    }
     await coordinator.shutdown()
 
 
@@ -237,7 +251,9 @@ async def test_undeclared_class_has_no_guarantee_and_warns_once(caplog) -> None:
     warnings = [record for record in caplog.records if "mystery" in record.getMessage()]
     assert len(warnings) == 1
     snapshot = await coordinator.snapshot()
-    assert snapshot["per_class"]["mystery"]["guaranteed"] == {"memory_mb": 0, "cpu_millis": 0}
+    assert snapshot["per_class"]["mystery"]["guaranteed"] == {
+        "memory_mb": 0, "cpu_millis": 0, "gpu_count": 0, "disk_mb": 0,
+    }
     await coordinator.shutdown()
 
 

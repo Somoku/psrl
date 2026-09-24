@@ -481,26 +481,5 @@ def validate_config(
                 "Use reward_normalization='group' for exact equivalence with the full-batch path."
             )
 
-    # env worker checks
-    env_worker_config = config.psrl.env_worker
-    if env_worker_config.enable:
-        if env_worker_config.placement not in ("colocated", "dedicated"):
-            raise ValueError(
-                f"psrl.env_worker.placement must be colocated or dedicated, got {env_worker_config.placement!r}."
-            )
-        if env_worker_config.placement == "dedicated" and not env_worker_config.dedicated_node_ips:
-            raise ValueError(
-                "psrl.env_worker.placement=dedicated requires a non-empty psrl.env_worker.dedicated_node_ips list."
-            )
-        if env_worker_config.routing.method not in ("least_loaded", "round_robin", "random"):
-            raise ValueError(
-                f"psrl.env_worker.routing.method must be least_loaded, round_robin, or random, "
-                f"got {env_worker_config.routing.method!r}."
-            )
-        if int(env_worker_config.cpu_slots_per_worker) <= 0:
-            raise ValueError(
-                f"psrl.env_worker.cpu_slots_per_worker must be positive, "
-                f"got {env_worker_config.cpu_slots_per_worker!r}."
-            )
 
     print("[validate_config] All configuration checks passed successfully!")

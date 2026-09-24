@@ -78,6 +78,22 @@ Sandbox ownership, node capacity admission, and Docker failure semantics, with t
 invariants that keep resource accounting aligned with running containers.
 :::
 
+:::{grid-item-card} {octicon}`tools;1.5em` Sandbox Refactor Plan
+:link: sandbox_refactor
+:link-type: doc
+
+The thin control plane target, the phased migration order, multi node placement,
+and the backend set the module runs on.
+:::
+
+:::{grid-item-card} {octicon}`checklist;1.5em` Sandbox Execution Plan
+:link: sandbox_execution_plan
+:link-type: doc
+
+The ordered work breakdown for the refactor, with an exit criterion, a rollback
+note, and a decision trace for every step.
+:::
+
 ::::
 
 ---
@@ -95,4 +111,12 @@ staleness_control
 kv_cache
 resource_elasticity
 sandbox_lifecycle
+sandbox_architecture
+sandbox_refactor
+sandbox_execution_plan
+sandbox_external_backends
+sandbox_backend_integration
+sandbox_agentenv
+sandbox_opensandbox
+sandbox_snapshot_store
 ```

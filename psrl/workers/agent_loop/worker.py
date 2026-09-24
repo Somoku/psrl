@@ -24,7 +24,8 @@ from verl.utils.tokenizer import (
 from verl.workers.config.model import HFModelConfig
 
 from psrl.sandbox import SandboxCapacityTimeout
-from psrl.sandbox.config import build_sandbox_manager
+from psrl.sandbox.config import build_sandbox_manager, placement_manager_config
+from psrl.sandbox.ray_plane import SandboxPlaneHandle
 from psrl.utils.common.chat_template import resolve_chat_template_value
 from psrl.utils.common.http_io_thread import init_http_io_thread
 from psrl.utils.common.http_utils import configure_distributed_post, init_http_client
@@ -93,6 +94,7 @@ class PSRL_AgentLoopWorker:
         worker_id: int = 0,
         worker_num: int = 1,
         capacity_coordinator: ray.actor.ActorHandle | None = None,
+        sandbox_plane: SandboxPlaneHandle | None = None,
     ):
         """Initialize agent loop worker.
 
@@ -103,7 +105,10 @@ class PSRL_AgentLoopWorker:
             session_router_url (str): URL of the session router.
             worker_id (int): Unique identifier for this worker instance.
             worker_num (int): Total number of worker instances.
-            capacity_coordinator: Node-local sandbox capacity coordinator.
+            capacity_coordinator: Node-local sandbox capacity coordinator. Given when this
+                worker runs its own sandboxes, and absent when a plane places them.
+            sandbox_plane: Handles to the job's placement service and node agents. Given
+                when this worker places its sandboxes on other nodes.
         """
 
         # The sandbox lease uses this id to attribute containers to this worker.
@@ -136,11 +141,7 @@ class PSRL_AgentLoopWorker:
         self.agent_loop_manager = None
         self.reward_manager = None
         sandbox_config = config.gen_actor_rollout_ref.rollout.agent.sandbox
-        self.sandbox_manager = build_sandbox_manager(
-            sandbox_config,
-            capacity_coordinator=capacity_coordinator,
-            owner_id=self._actor_id,
-        )
+        self.sandbox_manager = self._build_sandbox_manager(sandbox_config, capacity_coordinator, sandbox_plane)
         # Worker heartbeats and manager stall detection share the same deadline ladder.
         self.timeouts = resolve_from_config(config)
 
@@ -259,6 +260,24 @@ class PSRL_AgentLoopWorker:
         self.busy_loop_task = self.running_loop.create_task(self._launch_agent_loop())
         self.busy_loop_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
 
+    def _build_sandbox_manager(self, sandbox_config, capacity_coordinator, sandbox_plane):
+        """Build this worker's sandbox manager, local or placed.
+
+        The two are exclusive by construction. A placed sandbox consumes another node's
+        envelope, so this worker holds no local backend and no local capacity accounting;
+        otherwise it would charge itself for containers it never runs, and a task that did
+        not name the remote backend would fall back to an unaccounted local daemon.
+        """
+        if sandbox_plane is None:
+            return build_sandbox_manager(
+                sandbox_config,
+                capacity_coordinator=capacity_coordinator,
+                owner_id=self._actor_id,
+            )
+        remote = sandbox_plane.remote_backend(owner_id=self._actor_id)
+        placed_config = placement_manager_config(sandbox_config, backend_name=sandbox_plane.backend_name)
+        return build_sandbox_manager(placed_config, extra_backends=[remote])
+
     async def stop_busy_loop(self):
         """Stop the busy loop and wait for the current task to complete."""
         if self.busy_loop_task and not self.busy_loop_task.done():
@@ -272,6 +291,11 @@ class PSRL_AgentLoopWorker:
                 self.busy_loop_task.cancel()
         if self.agent_programs:
             await asyncio.gather(*self.agent_programs, return_exceptions=True)
+        # This worker's runs end with it, so a run-scoped snapshot retention has its
+        # signal here rather than waiting for a TTL that never counts down.
+        forgotten = self.sandbox_manager.end_run()
+        if forgotten:
+            psrl_logger.info("A worker's run ended, forgetting %d run-scoped snapshot(s).", len(forgotten))
         metrics = {name: snapshot.as_dict() for name, snapshot in self.sandbox_manager.metrics_snapshot().items()}
         psrl_logger.info(
             "Final sandbox lifecycle metrics: %s. Ownership: %s.",
@@ -279,6 +303,17 @@ class PSRL_AgentLoopWorker:
             self.sandbox_manager.ownership_snapshot(),
         )
         await self.sandbox_manager.shutdown()
+
+    def sandbox_metrics_snapshot(self) -> dict[str, float]:
+        """Return this worker's sandbox plane metrics for the trainer's per-step hook.
+
+        The planes report and never log, and the trainer is the only reader, so the
+        sandbox metric group lands on the same step axis as reward and timing
+        without a second pipeline.
+        """
+        if self.sandbox_manager is None:
+            return {}
+        return self.sandbox_manager.snapshot()
 
     async def _launch_agent_loop(self):
         """Main loop that processes agent programs from the pending queue."""

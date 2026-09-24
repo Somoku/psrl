@@ -9,8 +9,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 from psrl.sandbox import ResourceSpec, SandboxOomError, SandboxSource, SandboxSpec
-from psrl.sandbox.backends.docker import DockerBackend, DockerSecurityConfig
-from psrl.sandbox.backends.docker_engine import DockerEngineError
+from psrl.sandbox.backends.docker import DockerBackend
+from psrl.sandbox.backends.docker.engine import DockerEngineError
+from psrl.sandbox.backends.docker.policy import DockerSecurityConfig
+from psrl.sandbox.core import ExecMode
 
 from tests.sandbox.test_docker_backend import FakeDockerEngine
 
@@ -35,13 +37,17 @@ class TestOomScoreAdj:
 
     async def test_the_default_leaves_host_oom_priorities_alone(self):
         engine = FakeDockerEngine()
-        await _session(engine, DockerBackend(engine=engine))
+        await _session(engine, DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine))
 
         assert "OomScoreAdj" not in engine.config["HostConfig"]
 
     async def test_deprioritizing_the_sandbox_is_opt_in(self):
         engine = FakeDockerEngine()
-        backend = DockerBackend(engine=engine, security=DockerSecurityConfig(oom_score_adj=-500))
+        backend = DockerBackend(
+            default_exec_mode=ExecMode.ONE_SHOT,
+            engine=engine,
+            security=DockerSecurityConfig(oom_score_adj=-500),
+        )
         await _session(engine, backend)
 
         assert engine.config["HostConfig"]["OomScoreAdj"] == -500
@@ -49,6 +55,7 @@ class TestOomScoreAdj:
     async def test_a_policy_override_wins(self):
         engine = FakeDockerEngine()
         backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
             engine=engine,
             policy_profiles={"mini_swe": {"oom_score_adj": 250}},
         )
@@ -66,7 +73,7 @@ class TestOomDetection:
 
     async def test_an_oom_killed_container_raises_a_sandbox_oom_error(self, monkeypatch):
         engine = FakeDockerEngine()
-        session = await _session(engine, DockerBackend(engine=engine))
+        session = await _session(engine, DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine))
         engine.exec = AsyncMock(side_effect=DockerEngineError(500, "exec stream died"))
         monkeypatch.setattr(engine, "inspect_container", AsyncMock(return_value=_OOM_KILLED))
 
@@ -77,7 +84,8 @@ class TestOomDetection:
 
     async def test_the_error_names_the_memory_limit(self, monkeypatch):
         engine = FakeDockerEngine()
-        session = await _session(engine, DockerBackend(engine=engine), memory_mb=16384)
+        backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
+        session = await _session(engine, backend, memory_mb=16384)
         engine.exec = AsyncMock(side_effect=DockerEngineError(500, "exec stream died"))
         monkeypatch.setattr(engine, "inspect_container", AsyncMock(return_value=_OOM_KILLED))
 
@@ -86,7 +94,7 @@ class TestOomDetection:
 
     async def test_an_ordinary_stop_is_reported_as_a_stop(self, monkeypatch):
         engine = FakeDockerEngine()
-        session = await _session(engine, DockerBackend(engine=engine))
+        session = await _session(engine, DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine))
         engine.exec = AsyncMock(side_effect=DockerEngineError(500, "exec stream died"))
         monkeypatch.setattr(engine, "inspect_container", AsyncMock(return_value=_STOPPED))
 
@@ -97,7 +105,7 @@ class TestOomDetection:
         # The container is alive, so the stream failure is the real story and must
         # not be rewritten as a container fault.
         engine = FakeDockerEngine()
-        session = await _session(engine, DockerBackend(engine=engine))
+        session = await _session(engine, DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine))
         engine.exec = AsyncMock(side_effect=DockerEngineError(500, "boom"))
         monkeypatch.setattr(engine, "inspect_container", AsyncMock(return_value=_RUNNING))
 
@@ -110,7 +118,7 @@ class TestContainerWatcher:
 
     async def test_a_command_is_aborted_when_its_container_dies(self, monkeypatch):
         engine = FakeDockerEngine()
-        backend = DockerBackend(engine=engine, container_watch_interval_s=0.01)
+        backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine, container_watch_interval_s=0.01)
         session = await _session(engine, backend)
 
         died = {"value": False}
@@ -132,7 +140,7 @@ class TestContainerWatcher:
 
     async def test_a_command_that_ends_normally_is_untouched(self, monkeypatch):
         engine = FakeDockerEngine()
-        backend = DockerBackend(engine=engine, container_watch_interval_s=0.01)
+        backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine, container_watch_interval_s=0.01)
         session = await _session(engine, backend)
         engine.exec = AsyncMock(return_value=(0, b"ok", b"", False))
         monkeypatch.setattr(engine, "inspect_container", AsyncMock(return_value=_RUNNING))

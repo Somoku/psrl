@@ -11,13 +11,20 @@ silently become successful cleanup or model-quality observations.
 | `core.py` | Portable specs, results, capabilities, and provisioning failure ownership |
 | `manager.py` | Admission, workflow reservations, lease delivery, rollback, reclamation, shutdown |
 | `capacity.py` | Node CPU and memory accounting, class FIFO queues, admission deadlines |
-| `docker.py` | Docker policy, image preparation, named provisioning, backend ownership |
-| `docker_policy.py` | Typed security, workload policy, and disk admission configuration |
-| `docker_session.py` | Command lifecycle, stop detection, exit classification, session destruction |
-| `docker_events.py` | One shared container event stream and its reconnect gap recovery |
-| `docker_engine.py` | HTTP pools, Docker protocol, incremental output decoding, file archives |
-| `docker_lifecycle.py` | Worker heartbeat and detached collector lifecycle |
+| `backends/docker/backend.py` | Docker policy assembly, image preparation, named provisioning, backend ownership |
+| `backends/docker/session.py` | Command lifecycle, stop detection, exit classification, session destruction |
+| `backends/docker/engine.py` | HTTP pools, Docker protocol, incremental output decoding, file archives |
+| `backends/docker/exec.py` | The one-shot and persistent-shell command strategies |
+| `backends/docker/events.py` | One shared container event stream and its reconnect gap recovery |
+| `backends/docker/lifecycle.py` | Worker heartbeat and detached collector lifecycle |
+| `backends/docker/policy.py` | Typed security, workload policy, and disk admission configuration |
+| `backends/docker/cli.py` | Docker CLI housekeeping: force removal, label sweeps, image pruning |
+| `backends/e2b.py` | The E2B, AgentEnv, and CubeSandbox backends over the provider SDK |
+| `backends/opensandbox.py` | The OpenSandbox backend over its lifecycle, execd, and egress planes |
 | `async_utils.py` | Repeated-cancellation protection for ownership transitions |
+| `placement.py`, `node_agent.py`, `remote.py` | The cross-node reservation and remote-session protocol |
+| `reclaimer.py` | Node-level orphan reclamation by heartbeat age |
+| `snapshot_store.py`, `task_snapshot.py` | The durable snapshot store and per-task capture reuse |
 
 The synchronous facade submits work to the owning worker event loop. It does
 not instantiate another backend, connection pool, or capacity manager.
@@ -157,11 +164,11 @@ live manager. Provider-managed backends retain their provider's crash semantics.
 | A file read costs one copy of the file | `tests/sandbox/test_docker_engine.py` |
 | Control and stream pools have separate connectors | `tests/sandbox/test_docker_reliability.py` |
 | Event stops, gap recovery, and the polling fallback | `tests/sandbox/test_docker_reliability.py` |
-| OOM diagnosis precedes container deletion | `tests/sandbox/test_docker_oom.py`, `test_docker_utils.py` |
-| A stopped container outlives diagnosis, then is reaped | `tests/sandbox/test_docker_utils.py` |
+| OOM diagnosis precedes container deletion | `tests/sandbox/test_docker_oom.py`, `test_docker_cli.py` |
+| A stopped container outlives diagnosis, then is reaped | `tests/sandbox/test_docker_cli.py` |
 | A restarted run reclaims an earlier run's containers | `tests/sandbox/test_docker_lifecycle.py` |
 
 Real Docker conformance and performance commands are in the
-[sandbox README](../../psrl/sandbox/README.md#verification). Remote RL acceptance
+[sandbox README](../../psrl/sandbox/README.md#verify). Remote RL acceptance
 must also exercise sustained rollout and grading concurrency, worker termination,
 daemon interruption, and full resource recovery after the run.

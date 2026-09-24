@@ -8,9 +8,10 @@ from typing import Any
 import pytest
 from psrl.sandbox import MountSpec, PauseMode, SandboxFeature, SandboxSource, SandboxSpec
 from psrl.sandbox.backends.docker import DockerBackend
-from psrl.sandbox.backends.docker_engine import DockerEngineError
-from psrl.sandbox.backends.docker_session import DockerSession
-from psrl.sandbox.utils import docker_utils
+from psrl.sandbox.backends.docker.engine import DockerEngineError
+from psrl.sandbox.backends.docker.session import DockerSession
+from psrl.sandbox.core import ExecMode
+from psrl.sandbox.reclaimer import owner_heartbeat_path
 
 
 class FakeDockerEngine:
@@ -101,6 +102,7 @@ class FakeDockerEngine:
 async def test_docker_create_maps_spec_and_secure_defaults() -> None:
     engine = FakeDockerEngine()
     backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
         engine=engine,
         security={"require_rootless": True},
         policy_profiles={
@@ -144,6 +146,7 @@ async def test_docker_create_maps_spec_and_secure_defaults() -> None:
 async def test_docker_bridge_exposes_host_gateway_and_rewrites_loopback_proxy() -> None:
     engine = FakeDockerEngine()
     backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
         engine=engine,
         policy_profiles={
             "mini_swe": {
@@ -181,6 +184,7 @@ async def test_docker_bridge_exposes_host_gateway_and_rewrites_loopback_proxy() 
 async def test_docker_policy_can_enable_suid_without_granting_extra_capabilities() -> None:
     engine = FakeDockerEngine()
     backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
         engine=engine,
         policy_profiles={"root_task": {"no_new_privileges": False}},
     )
@@ -200,7 +204,7 @@ async def test_docker_policy_can_enable_suid_without_granting_extra_capabilities
 @pytest.mark.asyncio
 async def test_docker_create_recovers_idempotent_conflict(monkeypatch) -> None:
     engine = FakeDockerEngine()
-    backend = DockerBackend(engine=engine)
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
     spec = SandboxSpec(SandboxSource.image("image"), idempotency_key="same-request")
     expected_config = backend._build_container_config(spec, backend._resolve_policy(spec))
     engine.config = expected_config
@@ -217,7 +221,7 @@ async def test_docker_create_recovers_idempotent_conflict(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_docker_idempotent_retry_waits_for_concurrent_start(monkeypatch) -> None:
     engine = FakeDockerEngine()
-    backend = DockerBackend(engine=engine)
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
     spec = SandboxSpec(SandboxSource.image("image"), idempotency_key="same-request")
     engine.config = backend._build_container_config(spec, backend._resolve_policy(spec))
     engine.state = "created"
@@ -242,6 +246,7 @@ async def test_docker_idempotent_retry_waits_for_concurrent_start(monkeypatch) -
 async def test_docker_auto_pull_forwards_registry_auth(monkeypatch) -> None:
     engine = FakeDockerEngine()
     backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
         engine=engine,
         registry_auth={"username": "robot", "password": "token"},
     )
@@ -266,7 +271,7 @@ async def test_docker_auto_pull_forwards_registry_auth(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_docker_auto_pull_can_join_an_idempotent_concurrent_create(monkeypatch) -> None:
     engine = FakeDockerEngine()
-    backend = DockerBackend(engine=engine)
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
     spec = SandboxSpec(SandboxSource.image("image"), idempotency_key="same-request")
     engine.config = backend._build_container_config(spec, backend._resolve_policy(spec))
     attempts = 0
@@ -290,7 +295,7 @@ async def test_docker_auto_pull_can_join_an_idempotent_concurrent_create(monkeyp
 async def test_docker_connect_resumes_frozen_container() -> None:
     engine = FakeDockerEngine()
     engine.state = "paused"
-    backend = DockerBackend(engine=engine)
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
 
     session = await backend.connect("container-id")
 
@@ -301,7 +306,7 @@ async def test_docker_connect_resumes_frozen_container() -> None:
 @pytest.mark.asyncio
 async def test_docker_files_stats_metrics_and_idempotent_terminate() -> None:
     engine = FakeDockerEngine()
-    backend = DockerBackend(engine=engine)
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
     session = await backend.create(SandboxSpec(SandboxSource.image("image")))
     payload = b"\x00\xffbinary\n"
 
@@ -324,7 +329,7 @@ async def test_docker_files_stats_metrics_and_idempotent_terminate() -> None:
 
 @pytest.mark.asyncio
 async def test_docker_rejects_hibernation() -> None:
-    backend = DockerBackend(engine=FakeDockerEngine())
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=FakeDockerEngine())
     session = DockerSession(backend, "container-id")
 
     with pytest.raises(Exception, match="hibernation"):
@@ -334,9 +339,11 @@ async def test_docker_rejects_hibernation() -> None:
 @pytest.mark.asyncio
 async def test_docker_command_timeout_terminates_disposable_sandbox() -> None:
     engine = FakeDockerEngine()
-    engine.exec_timeout = True
-    backend = DockerBackend(engine=engine)
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
     session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+    # Armed after creation: the readiness probe runs first, and the point of this
+    # test is a command that times out in an otherwise healthy sandbox.
+    engine.exec_timeout = True
 
     with pytest.raises(TimeoutError):
         await session.exec("sleep 100", timeout_s=0.01)
@@ -347,7 +354,7 @@ async def test_docker_command_timeout_terminates_disposable_sandbox() -> None:
 @pytest.mark.asyncio
 async def test_docker_cancelled_exec_terminates_disposable_sandbox(monkeypatch) -> None:
     engine = FakeDockerEngine()
-    backend = DockerBackend(engine=engine)
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
     session = await backend.create(SandboxSpec(SandboxSource.image("image")))
 
     async def cancelled_exec(*args, **kwargs):
@@ -363,10 +370,10 @@ async def test_docker_cancelled_exec_terminates_disposable_sandbox(monkeypatch) 
 @pytest.mark.asyncio
 async def test_docker_lifetime_timeout_reclaims_container() -> None:
     engine = FakeDockerEngine()
-    backend = DockerBackend(engine=engine)
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
 
     await backend.create(
-        SandboxSpec(SandboxSource.image("image"), idle_timeout_s=0.01),
+        SandboxSpec(SandboxSource.image("image"), lifetime_timeout_s=0.01),
     )
     await asyncio.sleep(0.03)
 
@@ -378,15 +385,16 @@ async def test_docker_lifetime_timeout_reclaims_container() -> None:
 async def test_docker_owner_lease_is_shared_and_removed_on_shutdown(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("PSRL_ACTOR_ID", "w0-host-999999-abcdef12")
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.spawn_node_gc",
+        "psrl.sandbox.backends.docker.lifecycle.spawn_node_reclaimer",
         lambda *args, **kwargs: SimpleNamespace(poll=lambda: None),
     )
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.force_remove_containers_by_label",
+        "psrl.sandbox.backends.docker.lifecycle.force_remove_containers_by_label",
         lambda *args, **kwargs: [],
     )
     engine = FakeDockerEngine()
     backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
         engine=engine,
         lifecycle={
             "heartbeat_dir": str(tmp_path),
@@ -396,7 +404,7 @@ async def test_docker_owner_lease_is_shared_and_removed_on_shutdown(monkeypatch,
     )
 
     session = await backend.create(SandboxSpec(SandboxSource.image("image")))
-    heartbeat = docker_utils.owner_heartbeat_path(str(tmp_path), backend.owner_id)
+    heartbeat = owner_heartbeat_path(str(tmp_path), backend.owner_id)
     assert os.path.exists(heartbeat)
     first_mtime = os.stat(heartbeat).st_mtime
 
@@ -412,7 +420,9 @@ async def test_docker_owner_lease_is_shared_and_removed_on_shutdown(monkeypatch,
 @pytest.mark.asyncio
 async def test_docker_passes_opaque_cgroup_parent_to_engine() -> None:
     engine = FakeDockerEngine()
-    backend = DockerBackend(engine=engine, cgroup_parent="system.slice/psrl.slice")
+    backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT, engine=engine, cgroup_parent="system.slice/psrl.slice"
+    )
 
     await backend.create(SandboxSpec(SandboxSource.image("image")))
     assert engine.config is not None
@@ -422,11 +432,12 @@ async def test_docker_passes_opaque_cgroup_parent_to_engine() -> None:
 @pytest.mark.asyncio
 async def test_docker_disk_admission_blocks_when_free_space_is_low(monkeypatch) -> None:
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker.shutil.disk_usage",
+        "psrl.sandbox.backends.docker.backend.shutil.disk_usage",
         lambda path: SimpleNamespace(total=0, used=0, free=1024 * 1024),  # 1 MiB free
     )
     engine = FakeDockerEngine()
     backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
         engine=engine,
         disk_admission={"path": "/dockerdata", "min_free_mb": 1024, "wait_timeout_s": 0},
     )
@@ -439,11 +450,15 @@ async def test_docker_disk_admission_blocks_when_free_space_is_low(monkeypatch) 
 @pytest.mark.asyncio
 async def test_docker_disk_admission_allows_ample_free_space(monkeypatch) -> None:
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker.shutil.disk_usage",
+        "psrl.sandbox.backends.docker.backend.shutil.disk_usage",
         lambda path: SimpleNamespace(total=0, used=0, free=4096 * 1024 * 1024),
     )
     engine = FakeDockerEngine()
-    backend = DockerBackend(engine=engine, disk_admission={"path": "/dockerdata", "min_free_mb": 1024})
+    backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
+        engine=engine,
+        disk_admission={"path": "/dockerdata", "min_free_mb": 1024},
+    )
 
     session = await backend.create(SandboxSpec(SandboxSource.image("image")))
 
@@ -455,8 +470,9 @@ async def test_docker_disk_admission_fails_when_path_cannot_be_inspected(monkeyp
     def fail_disk_usage(path: str):
         raise OSError("not mounted")
 
-    monkeypatch.setattr("psrl.sandbox.backends.docker.shutil.disk_usage", fail_disk_usage)
+    monkeypatch.setattr("psrl.sandbox.backends.docker.backend.shutil.disk_usage", fail_disk_usage)
     backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
         engine=FakeDockerEngine(),
         disk_admission={"path": "/dockerdata", "min_free_mb": 1024},
     )
@@ -470,11 +486,13 @@ async def test_docker_without_owner_skips_lease_and_node_gc(monkeypatch, tmp_pat
     monkeypatch.delenv("PSRL_ACTOR_ID", raising=False)
     spawned: list[str] = []
     monkeypatch.setattr(
-        "psrl.sandbox.backends.docker_lifecycle.spawn_node_gc",
+        "psrl.sandbox.backends.docker.lifecycle.spawn_node_reclaimer",
         lambda *args, **kwargs: spawned.append("gc"),
     )
     engine = FakeDockerEngine()
-    backend = DockerBackend(engine=engine, lifecycle={"heartbeat_dir": str(tmp_path)})
+    backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT, engine=engine, lifecycle={"heartbeat_dir": str(tmp_path)}
+    )
 
     session = await backend.create(SandboxSpec(SandboxSource.image("image")))
 

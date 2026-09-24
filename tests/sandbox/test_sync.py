@@ -37,6 +37,7 @@ class FakeSession(SandboxSession):
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
         timeout_s: float | None = None,
+        silence_timeout_s: float | None = None,
     ) -> ExecResult:
         await asyncio.sleep(0)
         return ExecResult(0, command, cwd or "")

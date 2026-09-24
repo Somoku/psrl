@@ -21,6 +21,7 @@ from typing import Any
 
 from examples.airs_bench.config import AirsBenchRuntimeConfig, build_runtime_config
 from psrl.environments.mlgym_env import AGENT_WORKSPACE, build_sandbox_spec
+from psrl.sandbox.config import build_sandbox_manager
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -123,7 +124,7 @@ SCRIPTED_ACTIONS: list[str] = [
 async def run_scripted_episode(
     task_id: str,
     runtime_config: AirsBenchRuntimeConfig,
-    coordinator: Any,
+    manager: Any,
 ) -> dict[str, Any]:
     """
     Drive one sandbox through the scripted action sequence.
@@ -131,7 +132,7 @@ async def run_scripted_episode(
     Args:
         task_id (str): AIRS-Bench task identifier.
         runtime_config (AirsBenchRuntimeConfig): Recipe runtime settings.
-        coordinator (Any): Env worker coordinator actor handle.
+        manager (SandboxManager): The sandbox manager this episode leases from.
 
     Returns:
         dict[str, Any]: Result with `actions_run`, `submission_found`, `score`, and
@@ -143,8 +144,10 @@ async def run_scripted_episode(
         runtime_config,
         dataset_data_path=dataset_data_path,
         labels={"psrl.airs_task_id": task_id, "psrl.airs_scripted": "true"},
+        episode_id=f"scripted-{task_id}",
     )
-    handle = await coordinator.create_sandbox.remote(spec)
+    lease = await manager.acquire(spec)
+    session = lease.session
 
     observations: list[dict[str, Any]] = []
     submission_found = False
@@ -156,34 +159,33 @@ async def run_scripted_episode(
             if fname.endswith(".py"):
                 fpath = os.path.join(task_config_dir, fname)
                 with open(fpath, "rb") as fh:
-                    await handle.write_file(f"{AGENT_WORKSPACE}/{fname}", fh.read())
+                    await session.write_bytes(f"{AGENT_WORKSPACE}/{fname}", fh.read())
                 psrl_logger.info(f"[{task_id}] Uploaded workspace file: {fname!r}.")
 
         # Write the submission generator script before running the action sequence.
-        await handle.write_file(f"{AGENT_WORKSPACE}/_make_submission.py", _MAKE_SUBMISSION_SRC.encode())
+        await session.write_bytes(f"{AGENT_WORKSPACE}/_make_submission.py", _MAKE_SUBMISSION_SRC.encode())
 
         for action in SCRIPTED_ACTIONS:
-            result = await handle.exec(action, runtime_config.per_action_timeout_s)
+            try:
+                result = await session.exec(action, timeout_s=runtime_config.per_action_timeout_s)
+            except TimeoutError as exc:
+                raise RuntimeError(f"Scripted action timed out: {action!r}.") from exc
             observations.append(
                 {
                     "action": action,
                     "exit_code": result.exit_code,
-                    "timed_out": result.timed_out,
+                    "timed_out": False,
                     "stdout_tail": result.stdout[-400:],
                 }
             )
-            psrl_logger.info(
-                f"[{task_id}] action exit={result.exit_code} timed_out={result.timed_out}: {action[:70]!r}"
-            )
-            if result.timed_out:
-                raise RuntimeError(f"Scripted action timed out: {action!r}.")
+            psrl_logger.info(f"[{task_id}] action exit={result.exit_code}: {action[:70]!r}")
 
-        check = await handle.exec(f"test -f {AGENT_WORKSPACE}/submission.csv", 60.0)
+        check = await session.exec(f"test -f {AGENT_WORKSPACE}/submission.csv", timeout_s=60.0)
         submission_found = check.exit_code == 0
 
-        eval_result = await handle.exec(
+        eval_result = await session.exec(
             f"cd {AGENT_WORKSPACE} && {_PYTHON} evaluate.py --submission-file submission.csv",
-            runtime_config.per_action_timeout_s,
+            timeout_s=runtime_config.per_action_timeout_s,
         )
         psrl_logger.info(f"[{task_id}] evaluate.py exit={eval_result.exit_code}.")
         try:
@@ -200,7 +202,7 @@ async def run_scripted_episode(
             psrl_logger.error(f"[{task_id}] evaluate.py did not emit JSON: {eval_result.stdout[-400:]!r}")
             score = None
     finally:
-        await handle.destroy()
+        await lease.release()
 
     return {
         "task_id": task_id,
@@ -214,39 +216,35 @@ async def run_scripted_episode(
 async def _main_async(task_id: str) -> None:
     import ray
     from omegaconf import OmegaConf
-    from psrl.workers.env_worker.manager import EnvWorkerManager
 
     ray.init(address="auto", ignore_reinit_error=True)
     runtime_config = build_runtime_config(None)
     config = OmegaConf.create(
         {
-            "psrl": {
-                "env_worker": {
-                    "enable": True,
-                    "placement": "colocated",
-                    "dedicated_node_ips": [],
-                    "workers_per_node": 1,
-                    "cpu_slots_per_worker": 2,
-                    "gpu_slots_per_worker": 0,
-                    "worker_num_cpus": 1,
-                    "routing": {"method": "least_loaded"},
-                    "idle_sandbox_timeout_s": 7200,
-                    "exec_default_timeout_s": 3600,
-                    "max_observation_chars": 8000,
-                    "coordinator_max_concurrency": 16,
+            "default_backend": "docker",
+            "backends": {
+                "docker": {
+                    "_target_": "psrl.sandbox.backends.DockerBackend",
+                    "policy_profiles": {
+                        "airs_bench": {
+                            "network_mode": "host",
+                            "host_gateway_alias": "host.docker.internal",
+                            "rewrite_loopback_proxies": True,
+                        }
+                    },
                 }
-            }
+            },
         }
     )
-    manager = EnvWorkerManager(config)
+    manager = build_sandbox_manager(config)
     try:
-        result = await run_scripted_episode(task_id, runtime_config, manager.coordinator_handle())
+        result = await run_scripted_episode(task_id, runtime_config, manager)
         print(json.dumps({k: v for k, v in result.items() if k != "observations"}, indent=2))
         assert result["submission_found"], "The scripted episode produced no submission.csv."
         assert result["score"] is not None, "The task's evaluate.py did not return a score."
         print("SCRIPTED EPISODE OK")
     finally:
-        manager.shutdown()
+        await manager.shutdown()
 
 
 def main() -> None:

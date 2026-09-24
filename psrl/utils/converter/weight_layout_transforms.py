@@ -14,6 +14,7 @@ from vllm_patches.weight_layout import (
     WeightTransform,
 )
 
+from psrl.utils.converter.vllm_module_info import get_module_ep_size
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 
@@ -320,7 +321,7 @@ class TransformExecutor:
         num_experts = int(num_experts)
 
         # Determine local expert range for EP
-        ep_size = getattr(module, "ep_size", 1) if module is not None else 1
+        ep_size = get_module_ep_size(module)
         if ep_aware and ep_size > 1:
             ep_rank = self.ep_rank
             num_local = num_experts // ep_size
@@ -366,7 +367,7 @@ class TransformExecutor:
         """
         expert_mapping = transform.metadata.get("expert_mapping", [])
 
-        ep_size = getattr(module, "ep_size", 1) if module is not None else 1
+        ep_size = get_module_ep_size(module)
         num_experts = len(set(eid for _, _, eid, _ in expert_mapping))
 
         if ep_size > 1:

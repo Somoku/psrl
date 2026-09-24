@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 
 import torch
 from torch.nn import Parameter
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -31,6 +30,11 @@ from psrl.utils.converter.model_mappings import (
     slice_in_proj_qkvz,
     slice_qkv_proj,
     slice_qwen3_5_in_proj_qkv,
+)
+from psrl.utils.converter.vllm_module_info import (
+    get_module_ep_size,
+    get_module_tp_size,
+    is_moe_experts_module,
 )
 from psrl.utils.converter.weight_layout_plan import PlanExecutor
 from psrl.utils.nixl.nixl_spec import NIXLSharding
@@ -169,7 +173,7 @@ class VllmConverter(BaseConverter):
                             vision_head_size=self.model_info.get("vision_head_size"),
                         )
                         sharding = make_visual_qkv_tp_sharding(
-                            tp_size=getattr(module, "tp_size", 1),
+                            tp_size=get_module_tp_size(module),
                             tp_rank=self.tp_rank or 0,
                         )
                     sharding = self._adjust_kv_sharding(converted_name, sharding, module, self.model_info)
@@ -250,7 +254,7 @@ class VllmConverter(BaseConverter):
                 for new_param_name, new_param in new_params.items():
                     if "visual.blocks" in new_param_name and "qkv" in new_param_name:
                         sharding = make_visual_qkv_tp_sharding(
-                            tp_size=getattr(module, "tp_size", 1),
+                            tp_size=get_module_tp_size(module),
                             tp_rank=self.tp_rank or 0,
                         )
                     adjusted_sharding = self._adjust_kv_sharding(new_param_name, sharding, module, model_info)
@@ -287,7 +291,7 @@ class VllmConverter(BaseConverter):
         Convert the parameter, may need to split inplace
         if it matches a split mapping type (e.g., qkv_proj, gate_up_proj).
         """
-        tp_size = getattr(module, "tp_size", 1)
+        tp_size = get_module_tp_size(module)
         for vllm_name, entry in fused_mappings.items():
             mapping_type = entry.mapping_type
             mappings = entry.mappings
@@ -405,7 +409,7 @@ class VllmConverter(BaseConverter):
                 except Exception as e:
                     raise ValueError(f"Failed to slice w13_weight parameter {full_name}: {e}") from e
                 out = {}
-                ep_size = getattr(module, "ep_size", 1)
+                ep_size = get_module_ep_size(module)
                 # NOTE(zym): The `ep_rank` value is unreliable with DP one, so use `tp_rank`.
                 ep_rank = self.tp_rank if ep_size > 1 else 0
                 num_experts = model_info["num_experts"]
@@ -430,7 +434,7 @@ class VllmConverter(BaseConverter):
                 except Exception as e:
                     raise ValueError(f"Failed to slice w2_weight parameter {full_name}: {e}") from e
                 out = {}
-                ep_size = getattr(module, "ep_size", 1)
+                ep_size = get_module_ep_size(module)
                 ep_rank = self.tp_rank if ep_size > 1 else 0
                 num_experts = model_info["num_experts"]
                 num_experts_per_ep_rank = num_experts // ep_size
@@ -490,7 +494,7 @@ class VllmConverter(BaseConverter):
 
         num_heads = model_info.get("num_heads")
         num_kv_heads = model_info.get("num_kv_heads")
-        tp_size = getattr(module, "tp_size", 1)
+        tp_size = get_module_tp_size(module)
         if num_heads is None or num_kv_heads is None or tp_size <= 1:
             return sharding
 
@@ -513,7 +517,7 @@ class VllmConverter(BaseConverter):
         Generate sharding info for a parameter given its module and tp_rank.
         Returns a NIXLSharding object.
         """
-        tp_size = getattr(module, "tp_size", 1)
+        tp_size = get_module_tp_size(module)
         if tp_size > 1:
             assert tp_size > self.tp_rank, (
                 f"Tensor parallel size ({tp_size}) must be "
@@ -539,11 +543,11 @@ class VllmConverter(BaseConverter):
                     shard_dim = 0
                 else:
                     shard_dim = 1
-            elif isinstance(module, FusedMoE):
+            elif is_moe_experts_module(module):
                 if "w13" in param_name:
                     shard_dim = 0
                 else:
-                    assert "w2" in param_name, f"FusedMoE param can only be w13 and w2, but get {param_name}"
+                    assert "w2" in param_name, f"MoE expert param can only be w13 or w2, got {param_name!r}."
                     shard_dim = 1
             elif isinstance(module, ReplicatedLinear):
                 # NOTE(zym): `ReplicatedLinear` carries the global TP size despite

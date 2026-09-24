@@ -10,7 +10,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import compute_iteration_details
 
@@ -303,22 +303,17 @@ class RolloutScheduler(AsyncScheduler):
         psrl_logger.debug(f"[LMCache] Scheduler GPU unpin-all: blocks={freed}.")
         return freed
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
+    def _preempt_request(self, request: Request, timestamp: float, drop_stale_output: bool = False) -> None:
         """Preempt a request and put it back to the waiting queue.
+
+        The base method owns block freeing, in-flight output invalidation and
+        the waiting-queue requeue. PSRL layers its own requeue bookkeeping on
+        top.
 
         NOTE: The request should be popped from the running queue outside of this
         method.
         """
-        assert request.status == RequestStatus.RUNNING, "Only running requests can be preempted"
-        self.kv_cache_manager.free(request)
-        self.encoder_cache_manager.free(request)
-        request.status = RequestStatus.PREEMPTED
-        request.num_computed_tokens = 0
-        if request.spec_token_ids:
-            request.spec_token_ids = []
-        request.num_preemptions += 1
-        if self.log_stats:
-            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+        super()._preempt_request(request, timestamp, drop_stale_output)
 
         # NOTE(claude): Record `QUEUED` immediately after `PREEMPTED` so resumed
         # scheduler wait time starts at requeue.
@@ -328,8 +323,6 @@ class RolloutScheduler(AsyncScheduler):
         # NOTE(claude): Save output count to detect the first decode token after preemption.
         request._psrl_cycle_output_token_baseline = request.num_output_tokens
 
-        # Put the request back to the waiting queue.
-        self.waiting.prepend_request(request)
         # Notify the gateway when the waiting queue is already congested. The
         # threshold is a dynamic SchedulerConfig attribute, hence the getattr.
         threshold = getattr(self.scheduler_config, "preemption_notification_threshold", None)

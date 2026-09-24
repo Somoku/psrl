@@ -20,9 +20,9 @@ def apply_prompt_token_clamp_patch() -> None:
     correctness is unaffected because the affected tokens are recomputed
     regardless. Only the reported metric value is clamped.
 
-    The v0.29 accounting is additive-only and ``PrefillStats`` asserts
-    ``num_external_computed_tokens > 0``, so this is defensive: remove it if a
-    repro shows the negative delta can no longer occur.
+    The v0.30 accounting is additive-only (``PromptTokenStats.update_from_output``
+    only accumulates), so this is defensive: remove it if a repro shows the
+    negative delta can no longer occur.
     """
     _patch_get_by_source()
 

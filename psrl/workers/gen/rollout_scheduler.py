@@ -40,8 +40,10 @@ class RolloutScheduler(AsyncScheduler):
             self._pcomp_logger.setLevel(logging.INFO)
             self._pcomp_logger.addHandler(FileOnlyHandler(logging_path, f"Prefill_I{replica_idx}"))
 
-    def schedule(self) -> SchedulerOutput:
-        sched_out = super().schedule()
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # `EngineCore.step` passes the DP prefill-cadence flag positionally, so
+        # the override must accept it or every step raises TypeError.
+        sched_out = super().schedule(throttle_prefills)
         if self._pcomp_enable:
             self._pcomp_pending[id(sched_out)] = (sched_out, time.perf_counter())
         return sched_out

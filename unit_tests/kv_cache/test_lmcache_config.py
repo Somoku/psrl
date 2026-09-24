@@ -297,7 +297,13 @@ class TestKVCacheManager:
         assert config.event_stream_url == "http://10.0.0.1:8080/cache/events/stream"
 
     def test_event_stream_flags(self):
-        argv = _runtime_config(coordinator_event_reporting=True, enable_kv_events=True).to_server_argv()
+        # The stream URL is registration metadata, so `to_server_argv` only
+        # emits it when the server has a coordinator to register with.
+        argv = _runtime_config(
+            coordinator_host="10.0.0.9",
+            coordinator_event_reporting=True,
+            enable_kv_events=True,
+        ).to_server_argv()
         assert "--coordinator-event-reporting" in argv
         assert "--coordinator-event-stream-enable" in argv
         metadata = json.loads(argv[argv.index("--coordinator-metadata") + 1])

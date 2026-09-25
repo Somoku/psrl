@@ -7,6 +7,7 @@ to settle rather than assuming the transition happened.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from urllib.parse import unquote, urlsplit
 
@@ -316,6 +317,72 @@ async def test_the_exec_endpoint_is_resolved_on_the_port_execd_listens_on() -> N
     assert any("/endpoints/44772" in url for _, url, _, _ in provider.calls)
 
 
+async def test_a_resolved_proxy_route_is_not_used_as_the_plane_base() -> None:
+    # A real server answers with `host:port/proxy/44772`, and the plane's own API is at
+    # the root. Keeping the suffix sends every call somewhere that is not an endpoint.
+    provider = FakeProvider()
+    provider.endpoint = "execd-1:44772/proxy/44772"
+
+    session = await _backend(provider).create(_spec())
+    await session.exec("echo hi")
+
+    assert any(url == "http://execd-1:44772/session" for _, url, _, _ in provider.calls)
+    assert not any("/proxy/" in url for _, url, _, _ in provider.calls if "execd-1" in url)
+
+
+async def test_an_endpoint_without_headers_is_still_usable() -> None:
+    # The Docker runtime returns an endpoint and no headers at all, so a backend that
+    # required one would refuse every sandbox that deployment creates.
+    provider = FakeProvider()
+    provider.exec_headers = {}
+
+    session = await _backend(provider).create(_spec())
+
+    assert (await session.exec("echo hi")).exit_code == 0
+
+
+async def test_the_default_deployment_builds_its_own_exec_transport() -> None:
+    # A deployment configures a URL and a key and nothing else. Leaving this unset raised
+    # on the first command, which no test saw because each injected a factory.
+    backend = OpenSandboxBackend(_config())
+
+    assert callable(backend._exec_transport_factory)
+    assert backend._exec_transport_factory() is not None
+
+
+async def test_an_upload_sends_its_metadata_as_a_file_part() -> None:
+    # The server reads `metadata` as a file part and answers INVALID_FILE_METADATA for a
+    # plain field, so the filename is what makes the request well formed.
+    from psrl.sandbox.backends.opensandbox import AiohttpTransport
+
+    sent: dict[str, object] = {}
+
+    class RecordingForm:
+        def add_field(self, name, value, **kwargs):
+            sent[name] = kwargs
+
+    transport = AiohttpTransport()
+
+    class Session:
+        def post(self, url, data=None, headers=None):
+            raise AssertionError("The form is inspected before the request is made.")
+
+    async def fake_session():
+        return Session()
+
+    transport._get_session = fake_session
+    import aiohttp
+
+    original, aiohttp.FormData = aiohttp.FormData, RecordingForm
+    try:
+        with contextlib.suppress(AssertionError):
+            await transport.upload_file("http://execd/files/upload", b"x", metadata={"path": "/tmp/a.txt"})
+    finally:
+        aiohttp.FormData = original
+
+    assert sent["metadata"]["filename"] == "metadata.json"
+
+
 async def test_a_prepared_template_is_what_a_create_admits_against() -> None:
     # prepare builds the template off the critical path and create uses it. The provider
     # mints the id, so the build is found by listing and matching its source image.
@@ -405,9 +472,7 @@ def _vault_spec(**overrides) -> SandboxSpec:
     payload = {
         "credentials": (CredentialRef(source_env="PSRL_TEST_SECRET", target_env="API_TOKEN"),),
         "egress": EgressPolicy(rules=(EgressRule(EgressAction.ALLOW, "api.example.com"),)),
-        "credential_bindings": (
-            CredentialBinding(name="api", hosts=("api.example.com",), credential="API_TOKEN"),
-        ),
+        "credential_bindings": (CredentialBinding(name="api", hosts=("api.example.com",), credential="API_TOKEN"),),
     }
     payload.update(overrides)
     return _spec(**payload)
@@ -807,15 +872,15 @@ async def test_files_move_through_the_execution_plane() -> None:
     assert await session.read_bytes("/work/out.txt") == b"payload"
 
 
-async def test_metrics_map_onto_the_portable_usage() -> None:
+async def test_usage_is_unknown_because_the_plane_measures_the_host() -> None:
+    # `GET /metrics` reports the node the plane runs on rather than the sandbox, so an
+    # operator sizing an envelope from it would be wrong by orders of magnitude.
     provider = FakeProvider()
     session = await _backend(provider).create(_spec())
 
     usage = await session.stats()
 
-    assert usage.memory_bytes == 4096 * 1024 * 1024
-    # The provider reports neither a peak nor a cumulative CPU time, so both stay
-    # unknown rather than reading as a measured zero.
+    assert usage.memory_bytes is None
     assert usage.peak_memory_bytes is None
     assert usage.cpu_total_ns is None
 

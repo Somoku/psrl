@@ -37,12 +37,14 @@ from urllib.parse import quote
 
 import aiohttp
 
+from psrl.sandbox.async_utils import acquire_nowait
 from psrl.sandbox.core import (
     ExecMode,
     ExecResult,
     PauseMode,
     ResumeLevel,
     SandboxBackend,
+    SandboxBusyError,
     SandboxCapabilities,
     SandboxDiagnostics,
     SandboxExitReason,
@@ -236,10 +238,19 @@ class AiohttpTransport:
         The metadata part is JSON and comes first, then the file bytes, which is the
         order the server reads them in. aiohttp sets the multipart boundary, so the
         caller's headers must not carry a content type.
+
+        Both parts are sent with a filename. The server reads `metadata` as a file part
+        and answers `INVALID_FILE_METADATA` for a plain field, so the filename is what
+        makes the request well formed rather than a cosmetic detail.
         """
         session = await self._get_session()
         form = aiohttp.FormData()
-        form.add_field("metadata", json.dumps(dict(metadata)), content_type="application/json")
+        form.add_field(
+            "metadata",
+            json.dumps(dict(metadata)),
+            filename="metadata.json",
+            content_type="application/json",
+        )
         form.add_field(
             "file",
             data,
@@ -265,8 +276,7 @@ class AiohttpTransport:
         async with session.request(method, url, json=payload, headers=dict(headers or {})) as response:
             if response.status != 200:
                 raise OpenSandboxError(
-                    f"OpenSandbox stream returned HTTP {response.status} for {url}: "
-                    f"{(await response.text()).strip()}."
+                    f"OpenSandbox stream returned HTTP {response.status} for {url}: {(await response.text()).strip()}."
                 )
             async for line in response.content:
                 if line.strip():
@@ -519,6 +529,27 @@ def _status_from(value: Any) -> SandboxStatus:
     Map a provider state onto the portable one.
     """
     return _STATUS_MAP.get(str(value).lower(), SandboxStatus.UNKNOWN)
+
+
+def _plane_base_url(address: str, port: int) -> str:
+    """Return the base a plane's own API is served from.
+
+    A resolved endpoint may end in the lifecycle server's `/proxy/<port>` route, which
+    reaches a service inside the sandbox rather than being the plane's root. Keeping it
+    would send every request to `/proxy/<port>/session` instead of `/session`.
+
+    Args:
+        address (str): The resolved endpoint, with a scheme.
+        port (int): The container port that was resolved.
+
+    Returns:
+        str: The address to build this plane's request URLs from.
+    """
+    suffix = f"/proxy/{port}"
+    trimmed = address.rstrip("/")
+    if trimmed.endswith(suffix):
+        return trimmed[: -len(suffix)]
+    return trimmed
 
 
 class OpenSandboxControlClient:
@@ -844,7 +875,12 @@ class OpenSandboxControlClient:
 
         Resolved rather than configured, because the address is transport state: a
         resume can land the sandbox somewhere else. The provider returns the headers a
-        caller has to forward, so they are carried rather than guessed.
+        caller has to forward when it needs any, so they are carried rather than guessed.
+
+        The resolved value can carry a `/proxy/<port>` path. That path is the lifecycle
+        server's own route for reaching a service inside the sandbox, and the plane's
+        API is served at the root of the address, so treating the whole value as a base
+        would prefix every call with a route that is not a plane.
         """
         response = await self.request("GET", f"/v1/sandboxes/{sandbox_id}/endpoints/{port}")
         payload = response or {}
@@ -854,11 +890,10 @@ class OpenSandboxControlClient:
                 f"OpenSandbox did not return an endpoint for sandbox {sandbox_id!r} on port {port}."
             )
         address = str(endpoint)
+        if not address.startswith("http"):
+            address = f"http://{address}"
         headers = {str(name): str(value) for name, value in (payload.get("headers") or {}).items()}
-        return SandboxEndpoint(
-            address=address if address.startswith("http") else f"http://{address}",
-            headers=headers,
-        )
+        return SandboxEndpoint(address=_plane_base_url(address, port), headers=headers)
 
     async def exec_endpoint(self, sandbox_id: str) -> SandboxEndpoint:
         """
@@ -1160,6 +1195,9 @@ class OpenSandboxSession(SandboxSession):
         self._busy = False
         self._last_activity_at: float | None = None
         self._terminate_lock = asyncio.Lock()
+        # Commands serialize on this, which is also the in-flight signal a pause reads.
+        # Without it two overlapping commands share one provider shell.
+        self._exec_lock = asyncio.Lock()
         self._exit_reason = SandboxExitReason.UNKNOWN
 
     @property
@@ -1202,28 +1240,32 @@ class OpenSandboxSession(SandboxSession):
         """Run one command, through the mode the spec selected.
 
         The execution plane offers both modes natively, so the persistent shell is
-        the provider's own shell rather than a protocol PSRL emulates.
+        the provider's own shell rather than a protocol PSRL emulates. Commands are
+        serialized, which the session contract states as a promise: on the persistent
+        path two overlapping commands would interleave in one provider shell, and the
+        `busy` an idle pass reads would mean nothing.
         """
         del silence_timeout_s  # The provider owns progress reporting in the guest.
-        self._command_count += 1
-        self._busy = True
-        self._last_activity_at = time.monotonic()
-        try:
-            client = await self._client()
-            if self._exec_mode() is ExecMode.ONE_SHOT:
-                return await client.run_command(command, cwd=cwd, env=env, timeout_s=timeout_s)
-            session_id = await self._shell(client)
-            if env:
-                # The session run has no environment field, so the environment becomes part of
-                # the command. POSIX quoting, not a Python repr: `'it\'s'` is a shell quoting error.
-                prefix = "".join(f"export {key}={shlex.quote(value)};" for key, value in env.items())
-                command = prefix + command
-            # A working directory does have a field on the run, so it is not faked with a
-            # `cd` the caller cannot see.
-            return await client.run_in_session(session_id, command, cwd=cwd, timeout_s=timeout_s)
-        finally:
-            self._busy = False
+        async with self._exec_lock:
+            self._command_count += 1
+            self._busy = True
             self._last_activity_at = time.monotonic()
+            try:
+                client = await self._client()
+                if self._exec_mode() is ExecMode.ONE_SHOT:
+                    return await client.run_command(command, cwd=cwd, env=env, timeout_s=timeout_s)
+                session_id = await self._shell(client)
+                if env:
+                    # The session run has no environment field, so the environment becomes part of
+                    # the command. POSIX quoting, not a Python repr: `'it\'s'` is a shell quoting error.
+                    prefix = "".join(f"export {key}={shlex.quote(value)};" for key, value in env.items())
+                    command = prefix + command
+                # A working directory does have a field on the run, so it is not faked with a
+                # `cd` the caller cannot see.
+                return await client.run_in_session(session_id, command, cwd=cwd, timeout_s=timeout_s)
+            finally:
+                self._busy = False
+                self._last_activity_at = time.monotonic()
 
     def _exec_mode(self) -> ExecMode:
         """
@@ -1263,22 +1305,20 @@ class OpenSandboxSession(SandboxSession):
         return _status_from(state)
 
     async def stats(self):
-        """Return the provider's resource telemetry in portable terms.
+        """Return the sandbox's resource usage, which this plane cannot measure.
 
-        The provider reports what is used right now: memory in MiB and CPU as a share of
-        the cores. It reports neither a memory peak nor a cumulative CPU time, so those
-        are left unknown rather than reported as a measured zero.
+        `GET /metrics` on the execution plane reports the **host** it runs on rather
+        than the sandbox: it answers with the node's whole core count and memory, not
+        the sandbox's limit or footprint. Reporting that as a sandbox figure would make
+        every sandbox look like it used the entire node, and an operator sizing an
+        envelope from it would be wrong by orders of magnitude.
+
+        Every field is therefore unknown, which is what the contract's None means. A
+        measured value needs a provider metric that is scoped to one sandbox.
         """
-        client = await self._client()
-        metrics = await client.metrics()
         from psrl.sandbox.core import ResourceUsage
 
-        used_mib = metrics.get("mem_used_mib")
-        return ResourceUsage(
-            memory_bytes=int(float(used_mib) * _BYTES_PER_MIB) if used_mib is not None else None,
-            peak_memory_bytes=None,
-            cpu_total_ns=None,
-        )
+        return ResourceUsage()
 
     async def diagnostics(self) -> SandboxDiagnostics:
         """Return read-only evidence, from the provider rather than a local daemon."""
@@ -1293,7 +1333,16 @@ class OpenSandboxSession(SandboxSession):
     async def pause(self, mode: PauseMode) -> None:
         if mode is not PauseMode.HIBERNATE:
             raise RuntimeError("OpenSandbox pause releases compute, so it is a hibernation rather than a freeze.")
-        await self.backend.control.pause(self.sandbox_id)
+        # Pausing with a command in flight stops the guest halfway through it. The lock is
+        # taken without waiting, because waiting would hold an idle pass open for that command.
+        if not await acquire_nowait(self._exec_lock):
+            raise SandboxBusyError(
+                f"OpenSandbox sandbox {self.sandbox_id!r} has a command in flight, so it is not idle."
+            )
+        try:
+            await self.backend.control.pause(self.sandbox_id)
+        finally:
+            self._exec_lock.release()
         self._state = "paused"
         self._shell_session_id = None
         self._exec_client = None
@@ -1374,7 +1423,9 @@ class OpenSandboxBackend(SandboxBackend):
         self._name = name
         self.control = OpenSandboxControlClient(self.config, transport=transport)
         self._transport = transport
-        self._exec_transport_factory = exec_transport_factory
+        # Each data plane gets its own pool, so a saturated command stream cannot starve
+        # lifecycle calls. Leaving it unset raised on the first command instead.
+        self._exec_transport_factory = exec_transport_factory or AiohttpTransport
         self.snapshot_name_prefix = snapshot_name_prefix
         from psrl.sandbox.metrics import SandboxMetrics
 
@@ -1509,12 +1560,13 @@ class OpenSandboxBackend(SandboxBackend):
         return OpenSandboxSession(self, sandbox_id, spec=spec)
 
     async def _await_ready(self, sandbox_id: str) -> None:
-        """Wait until the execution endpoint is published and the sandbox is running.
+        """Wait until the execution plane answers, not merely until it has an address.
 
-        The provider publishes an endpoint asynchronously, so a create that returned is
-        not yet a sandbox a caller can command. Waiting here keeps a startup failure in
-        the create rather than turning it into a confusing first command, which is the
-        same reason the internal backend probes a container before handing it out.
+        The provider publishes the endpoint asynchronously and the `execd` process
+        inside the sandbox starts listening after that, so a resolved address is not yet
+        a sandbox a caller can command. Probing the plane itself keeps a startup failure
+        in the create rather than turning it into a confusing first command, which is
+        the same reason the internal backend runs a command before handing a container out.
         """
         deadline = time.monotonic() + self.config.ready_timeout_s
         state = "unknown"
@@ -1522,19 +1574,42 @@ class OpenSandboxBackend(SandboxBackend):
             state = await self.control.state(sandbox_id)
             if state in {"failed", "terminated"}:
                 raise OpenSandboxError(f"OpenSandbox sandbox {sandbox_id!r} reached {state!r} while starting.")
-            if state == "running":
-                try:
-                    await self.control.exec_endpoint(sandbox_id)
-                    return
-                except OpenSandboxError:
-                    # Running but not yet routable: the endpoint is published separately.
-                    pass
+            if state == "running" and await self._exec_plane_answers(sandbox_id):
+                return
             if time.monotonic() >= deadline:
                 raise OpenSandboxError(
                     f"OpenSandbox sandbox {sandbox_id!r} was still {state!r} without a reachable execution "
                     f"endpoint after {self.config.ready_timeout_s:g}s."
                 )
             await asyncio.sleep(self.config.poll_interval_s)
+
+    async def _exec_plane_answers(self, sandbox_id: str) -> bool:
+        """Return whether the sandbox's execution plane is serving requests.
+
+        Any answer proves the plane is listening, including one that reports an error,
+        so the status is not inspected. What is being ruled out is a connection that is
+        refused or reset, which is what an unstarted `execd` does.
+        """
+        try:
+            endpoint = await self.control.exec_endpoint(sandbox_id)
+        except OpenSandboxError:
+            # Running but not yet routable: the endpoint is published separately.
+            return False
+        client = OpenSandboxExecClient(
+            endpoint.address,
+            headers=endpoint.headers,
+            transport=self._exec_transport_factory(),
+        )
+        try:
+            await client.metrics()
+        except OpenSandboxError:
+            # The plane answered and refused, which still proves it is listening.
+            return True
+        except Exception:
+            return False
+        finally:
+            await client.close()
+        return True
 
     @staticmethod
     def _environment_for(spec: SandboxSpec) -> dict[str, str]:

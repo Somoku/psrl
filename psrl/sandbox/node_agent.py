@@ -120,8 +120,7 @@ class CallbackForwarder:
             raise RuntimeError("Sandbox callback forwarder could not bind a listening port.")
         self.port = int(sockets[0].getsockname()[1])
         psrl_logger.info(
-            f"Sandbox callback forwarder on this node is listening on port {self.port} for "
-            f"{self.target.as_str()}."
+            f"Sandbox callback forwarder on this node is listening on port {self.port} for {self.target.as_str()}."
         )
         return self.port
 
@@ -449,6 +448,7 @@ class SandboxNodeAgent:
             raise ValueError("Sandbox node liveness_interval_s must be greater than zero.")
         self.liveness_reporter: Callable[[], Awaitable[None]] | None = None
         self.liveness_interval_s = liveness_interval_s
+        self._require_admission()
         self._liveness_task: asyncio.Task[None] | None = None
         self._handles: dict[tuple[str, str], Any] = {}
         # Containers this node asked the runtime to destroy and could not. While any are
@@ -457,6 +457,28 @@ class SandboxNodeAgent:
         # One forwarder per caller session server, so every sandbox a worker places on
         # this node reaches the worker that owns its trajectory.
         self._forwarders: dict[str, CallbackForwarder] = {}
+
+    def _require_admission(self) -> None:
+        """Refuse a node that would admit sandboxes against an unbounded envelope.
+
+        A backend whose sandboxes consume this node needs an envelope guarding the
+        daemon it shares. Without one the node takes every request its callers make,
+        advertises no devices so a device request is never placed, and prunes no
+        snapshot cache. None of those announce themselves, so the node fails here
+        rather than running as a silently unbounded one.
+
+        Raises:
+            ValueError: When a capacity-consuming backend has no admission envelope.
+        """
+        if getattr(self.manager, "_capacity_coordinator", None) is not None:
+            return
+        local = sorted(name for name, backend in self.manager._backends.items() if backend.uses_node_capacity)
+        if local:
+            raise ValueError(
+                f"Sandbox node {self.node_id!r} runs backend(s) {local} that consume this node, but it has "
+                "no capacity envelope. Give the node's manager a capacity coordinator, or it admits every "
+                "sandbox against a daemon nobody is accounting for."
+            )
 
     def start_liveness(self) -> None:
         """Start reporting that this node is still there.

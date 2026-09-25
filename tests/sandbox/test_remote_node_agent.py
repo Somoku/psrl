@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 from psrl.sandbox import (
+    ResourceSpec,
     SandboxFeature,
     SandboxManager,
     SandboxSession,
@@ -17,6 +18,7 @@ from psrl.sandbox import (
     SandboxStatus,
     SnapshotKind,
 )
+from psrl.sandbox.capacity import SandboxCapacityConfig, SandboxCapacityCoordinator
 from psrl.sandbox.core import ResumeLevel
 from psrl.sandbox.node_agent import SandboxNodeAgent, spec_from_payload, spec_to_payload
 from psrl.sandbox.placement import NoPlacementCandidate, PlacementService
@@ -41,13 +43,29 @@ class FailingBackend(FakeBackend):
         raise RuntimeError("image is missing")
 
 
+def _node_manager(backend: FakeBackend) -> SandboxManager:
+    """Build one node's manager, with an envelope when its backend consumes the node.
+
+    A capacity-consuming backend on a node with no envelope is refused, because that
+    node would admit every request against a daemon nobody is accounting for.
+    """
+    if not backend.uses_node_capacity:
+        return SandboxManager({backend.name: backend}, backend.name)
+    return SandboxManager(
+        {backend.name: backend},
+        backend.name,
+        capacity_coordinator=SandboxCapacityCoordinator(
+            SandboxCapacityConfig(memory_mb=8192, cpu_cores=8, gpu_count=2)
+        ),
+        capacity_owner_id="node-owner",
+        capacity_heartbeat_interval_s=30.0,
+    )
+
+
 def _cluster(*backends: tuple[str, FakeBackend]) -> tuple[PlacementService, RemoteSandboxBackend, dict]:
     """Build a placement service, node agents, and the caller's remote backend."""
     placement = PlacementService(node_ttl_s=100.0, reservation_ttl_s=20.0)
-    agents = {
-        node_id: SandboxNodeAgent(SandboxManager({backend.name: backend}, backend.name), node_id=node_id)
-        for node_id, backend in backends
-    }
+    agents = {node_id: SandboxNodeAgent(_node_manager(backend), node_id=node_id) for node_id, backend in backends}
     transport = InProcessTransport(placement, agents)
     remote = RemoteSandboxBackend(transport, name="fake", owner_id="worker-1")
     return placement, remote, agents
@@ -83,7 +101,14 @@ async def test_a_caller_acquires_and_drives_a_remote_sandbox() -> None:
     transport = remote.transport
     await _registered(placement, agents, transport)
 
-    session = await remote.create(_spec(required_features=frozenset({SandboxFeature.RESTORE})))
+    # A backend that consumes its node is admitted against that node's envelope, which
+    # needs a complete resource vector rather than a guess.
+    session = await remote.create(
+        _spec(
+            required_features=frozenset({SandboxFeature.RESTORE}),
+            resources=ResourceSpec(cpu_count=1, memory_mb=512),
+        )
+    )
 
     result = await session.exec("echo hi")
     assert result.stdout == "echo hi"
@@ -319,9 +344,7 @@ async def test_a_prefetch_warms_only_the_candidate_nodes() -> None:
     warmed = await remote.prefetch_images(["python:3.11"], nodes=1)
 
     assert warmed == 1
-    warmed_nodes = [
-        node_id for node_id, agent in agents.items() if agent.manager._backends["fake"].prefetched
-    ]
+    warmed_nodes = [node_id for node_id, agent in agents.items() if agent.manager._backends["fake"].prefetched]
     assert warmed_nodes == ["node-a"]
     await remote.shutdown()
 
@@ -655,6 +678,23 @@ async def test_a_placement_that_refuses_a_report_does_not_stop_the_node() -> Non
 
     assert len(attempts) >= 2, "The loop must keep trying after a failed report."
     await agent.shutdown()
+
+
+def test_a_node_hosting_its_own_sandboxes_needs_an_envelope() -> None:
+    # An unbounded node admits every request against a daemon nobody accounts for and
+    # advertises no devices. Neither announces itself, so the node refuses to exist.
+    manager = SandboxManager({"fake": FakeBackend(set(), uses_node_capacity=True)}, "fake")
+
+    with pytest.raises(ValueError, match="no capacity envelope"):
+        SandboxNodeAgent(manager, node_id="node-a")
+
+
+def test_a_node_that_only_places_provider_sandboxes_needs_no_envelope() -> None:
+    # A provider schedules its own sandbox and consumes nothing here, so requiring an
+    # envelope would refuse a node that is correct as it stands.
+    manager = SandboxManager({"fake": FakeBackend(set())}, "fake")
+
+    assert SandboxNodeAgent(manager, node_id="node-a").node_id == "node-a"
 
 
 async def test_a_node_without_a_reporter_reports_nothing() -> None:

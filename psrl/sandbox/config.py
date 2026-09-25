@@ -132,8 +132,13 @@ def _config_section(config: DictConfig | SandboxManagerConfig, name: str):
     return getattr(config, name, None)
 
 
-def _resolve_capacity(config: DictConfig | SandboxManagerConfig) -> SandboxCapacityConfig:
-    """Normalize the capacity envelope from a Hydra config or a typed value."""
+def resolve_capacity(config: DictConfig | SandboxManagerConfig) -> SandboxCapacityConfig:
+    """Normalize the capacity envelope from a Hydra config or a typed value.
+
+    Public because a node agent builds its own envelope from the same sandbox config
+    a worker does. Deriving it there rather than passing it separately is what stops
+    a node from being created with no admission at all.
+    """
     capacity = _config_section(config, "capacity")
     if isinstance(capacity, DictConfig):
         capacity = OmegaConf.to_container(capacity, resolve=True)
@@ -175,7 +180,7 @@ def placement_manager_config(
     return SandboxManagerConfig(
         default_backend=backend_name,
         backends={},
-        capacity=_resolve_capacity(config),
+        capacity=resolve_capacity(config),
         timing=_resolve_timing(config),
     )
 
@@ -220,7 +225,7 @@ def build_sandbox_manager(
         backends[name] = backend
     if config.default_backend not in backends:
         raise ValueError(f"Default sandbox backend {config.default_backend!r} is not configured.")
-    capacity = _resolve_capacity(config)
+    capacity = resolve_capacity(config)
     timing = _resolve_timing(config)
     if capacity_coordinator is not None and not owner_id:
         raise ValueError("Sandbox capacity coordinator requires a non-empty owner_id.")

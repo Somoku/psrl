@@ -30,7 +30,7 @@ import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from psrl.sandbox.capacity import SandboxCapacityCoordinator
-from psrl.sandbox.config import build_sandbox_manager
+from psrl.sandbox.config import build_sandbox_manager, resolve_capacity
 from psrl.sandbox.core import SandboxCapabilities
 from psrl.sandbox.node_agent import SandboxNodeAgent
 from psrl.sandbox.placement import NodeCapabilities, PlacementService, fleet_capabilities
@@ -101,9 +101,13 @@ class SandboxNodeActor:
     ) -> None:
         self.node_id = node_id or ray.get_runtime_context().get_node_id()
         self.placement = placement
+        # Derived from the sandbox config this node already holds rather than passed
+        # separately, so a node can never be built without an admission envelope.
         coordinator = capacity_coordinator
-        if coordinator is None and capacity_config is not None:
-            coordinator = SandboxCapacityCoordinator(capacity_config)
+        if coordinator is None:
+            coordinator = SandboxCapacityCoordinator(
+                capacity_config if capacity_config is not None else resolve_capacity(sandbox_config)
+            )
         self.capacity = coordinator
         self.manager = build_sandbox_manager(
             sandbox_config,
@@ -168,15 +172,18 @@ class SandboxNodeActor:
         return await self._call("connect", lambda: self.agent.connect(backend, sandbox_id))
 
     async def exec(self, backend, sandbox_id, command, *, cwd=None, env=None, timeout_s=None, silence_timeout_s=None):
-        return await self._call("exec", lambda: self.agent.exec(
-            backend,
-            sandbox_id,
-            command,
-            cwd=cwd,
-            env=env,
-            timeout_s=timeout_s,
-            silence_timeout_s=silence_timeout_s,
-        ))
+        return await self._call(
+            "exec",
+            lambda: self.agent.exec(
+                backend,
+                sandbox_id,
+                command,
+                cwd=cwd,
+                env=env,
+                timeout_s=timeout_s,
+                silence_timeout_s=silence_timeout_s,
+            ),
+        )
 
     async def read_bytes(self, backend: str, sandbox_id: str, path: str) -> bytes:
         return await self._call("read_bytes", lambda: self.agent.read_bytes(backend, sandbox_id, path))
@@ -253,9 +260,7 @@ class RayNodeAgentTransport:
         """
         handle = self.agents.get(node_id)
         if handle is None:
-            raise KeyError(
-                f"Sandbox node {node_id!r} is not part of this plane. Known nodes: {sorted(self.agents)}."
-            )
+            raise KeyError(f"Sandbox node {node_id!r} is not part of this plane. Known nodes: {sorted(self.agents)}.")
         return handle
 
     async def register_node(self, node_id: str) -> None:
@@ -524,10 +529,14 @@ def build_sandbox_plane(
         raise ValueError("A sandbox plane needs at least one node.")
     # The placement service holds a cache and rebuilds from the nodes, so losing it is
     # recoverable. A node whose report reaches the empty replacement announces itself again.
-    placement = ray.remote(PlacementService).options(num_cpus=0, max_restarts=2).remote(
-        node_ttl_s=node_ttl_s,
-        reservation_ttl_s=reservation_ttl_s,
-        sweep_interval_s=sweep_interval_s,
+    placement = (
+        ray.remote(PlacementService)
+        .options(num_cpus=0, max_restarts=2)
+        .remote(
+            node_ttl_s=node_ttl_s,
+            reservation_ttl_s=reservation_ttl_s,
+            sweep_interval_s=sweep_interval_s,
+        )
     )
     agents: dict[str, Any] = {}
     for node_id in node_ids:

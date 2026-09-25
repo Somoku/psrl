@@ -39,8 +39,12 @@ class FakeShell:
         replies: int | None = None,
         first_body: str = "ready 4242",
         first_exit_code: int = 0,
+        terminator: str = "\n",
     ) -> None:
         self.body = body
+        # What the command's own output ends with, before the sentinel. `echo` leaves a
+        # newline and `printf` leaves nothing, and both must come back unchanged.
+        self.terminator = terminator
         # The probe runs before any command, so the first reply is the shell
         # answering readiness and every later one is a command's output.
         self.first_body = first_body
@@ -63,8 +67,11 @@ class FakeShell:
         first = not self.written[:-1]
         status = self.first_exit_code if first else self.exit_code
         body = self.first_body if first else self.body
+        # The probe uses `echo`, so its reply always ends in a newline whatever the
+        # command under test emits.
+        terminator = "\n" if first else self.terminator
         sentinel = f"{_MARKER_PREFIX}{status}?{_token_for(text)}{_MARKER_SUFFIX}"
-        self._pending += f"{body}\n{sentinel}\n".encode()
+        self._pending += f"{body}{terminator}{sentinel}\n".encode()
 
     def poll(self) -> int | None:
         return self._shell_exit_code
@@ -140,6 +147,8 @@ async def test_one_shot_applies_the_observation_budget_to_both_streams() -> None
 
 
 async def test_the_persistent_shell_returns_the_body_and_the_exit_status() -> None:
+    # Asserted exactly rather than stripped. The sentinel's own `printf` ends in a newline,
+    # and folding it into the body appends one the workload never emitted.
     shell = FakeShell(body="first line")
     strategy = PersistentShellExec(lambda: shell)
     await strategy.start(timeout_s=1)
@@ -147,8 +156,18 @@ async def test_the_persistent_shell_returns_the_body_and_the_exit_status() -> No
     result = await strategy.run("echo first line")
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "first line"
+    assert result.stdout == "first line\n"
     assert shell.written
+
+
+async def test_the_persistent_shell_keeps_output_that_ends_without_a_newline() -> None:
+    # `printf psrl` emits no trailing newline, so a shell that reports one has invented
+    # output. A caller comparing this against the same command run elsewhere would differ.
+    shell = FakeShell(body="psrl", terminator="")
+    strategy = PersistentShellExec(lambda: shell)
+    await strategy.start(timeout_s=1)
+
+    assert (await strategy.run("printf psrl")).stdout == "psrl"
 
 
 async def test_the_persistent_shell_reports_a_non_zero_exit_status() -> None:

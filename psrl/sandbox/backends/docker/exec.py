@@ -39,7 +39,10 @@ _MARKER_PREFIX = "///PSRL-DONE:"
 _MARKER_SUFFIX = ":PSRL-DONE///"
 # The status is captured loosely on purpose. A shell can leave the variable unexpanded, and
 # a digits-only pattern would never see that sentinel, leaving the loop waiting for a line.
-_SENTINEL_RE = re.compile(rf"{re.escape(_MARKER_PREFIX)}(.*?)\?(\w+){re.escape(_MARKER_SUFFIX)}")
+#
+# The trailing newline is matched because the sentinel's own `printf` writes it. Leaving
+# it out appends a newline the workload never emitted to every observation.
+_SENTINEL_RE = re.compile(rf"{re.escape(_MARKER_PREFIX)}(.*?)\?(\w+){re.escape(_MARKER_SUFFIX)}\r?\n?")
 
 # How long one read waits before the loop rechecks the silence and total clocks.
 _READ_SLICE_S = 0.2
@@ -370,8 +373,7 @@ class PersistentShellExec:
             if result.exit_code != 0 or _READINESS_MARKER not in output:
                 await self.close()
                 raise RuntimeError(
-                    f"Docker sandbox shell did not become ready within {timeout_s:g}s: "
-                    f"{output.strip()[:200]!r}."
+                    f"Docker sandbox shell did not become ready within {timeout_s:g}s: {output.strip()[:200]!r}."
                 )
             self._remote_pid = _parse_shell_pid(output)
 
@@ -412,8 +414,7 @@ class PersistentShellExec:
             prefix.append(f"cd {_quote(cwd)} || exit 200;")
         body = command if command.endswith("\n") else command + "\n"
         sentinel = (
-            f"__psrl_rc=$?; sleep 0.01; "
-            f"printf '{_MARKER_PREFIX}%s?{self._token}{_MARKER_SUFFIX}\\n' \"$__psrl_rc\"\n"
+            f"__psrl_rc=$?; sleep 0.01; printf '{_MARKER_PREFIX}%s?{self._token}{_MARKER_SUFFIX}\\n' \"$__psrl_rc\"\n"
         )
         return "".join(prefix) + body + sentinel
 

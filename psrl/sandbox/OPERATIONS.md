@@ -19,7 +19,7 @@ deployment. Invariants are in
 | `config.py` | Configuration into a manager, with every timeout ordering asserted |
 | `metrics.py` | Latency, memory, and quantile observations |
 | `snapshot_store.py`, `task_snapshot.py` | The durable store, and per-task capture reuse |
-| `placement.py`, `node_agent.py`, `remote.py` | The cross-node reservation and remote-session protocol, not yet wired into a trainer |
+| `placement.py`, `node_agent.py`, `remote.py` | The cross-node reservation and remote-session protocol |
 | `reclaimer.py` | Node-level orphan reclamation, with its own entry point |
 | `backends/docker/` | The Docker backend, one module per concern |
 | `backends/e2b.py` | E2B, AgentEnv, and CubeSandbox |
@@ -124,7 +124,7 @@ Three opt-in keys bound work the daemon would otherwise repeat:
 | Key | What it does |
 |---|---|
 | `warm_pool` | Keeps `depth_fraction x batch_size` prepared containers, capped by `max_entries`, each with its own `ttl_s`. A create adopts one instead of pulling and starting |
-| `snapshot_store` | Publishes a committed filesystem snapshot to an OCI registry so another node can restore it. `retention` is an intent such as `one_run` or `one_day`, not a TTL |
+| `snapshot_store` | Publishes a committed filesystem snapshot to an OCI registry so another node can restore it, and is what makes the backend declare `RESUME_ANYWHERE`. `retention` is an intent such as `one_run` or `one_day`, not a TTL |
 | `snapshot_local_cache_fraction` | The share of the node's sandbox disk the local snapshot cache may hold, evicted least-recently-used first |
 
 `manager.prefetch(plan)` warms a run's working set ahead of rollout. The plan is
@@ -135,8 +135,9 @@ runs.
 
 **No caller invokes it yet.** The mechanism and its metrics are implemented and tested,
 but nothing in a trainer or worker calls `manager.prefetch`, so coverage stays at zero
-in a real run. Only the unwired remote path narrows the nodes a task is likely to land
-on. The step is tracked in the execution plan.
+in a real run. Only the remote path narrows the nodes a task is likely to land on, and
+it narrows them for a prefetch nobody triggers. The step is tracked in the execution
+plan.
 
 Keep a local Docker daemon on each Ray worker node, because a daemon reached over
 TCP has resources that are not in the caller's node-capacity accounting.
@@ -172,7 +173,13 @@ What the plane requires of a deployment:
   node would put sandboxes on the nodes the trainer is training on.
 - **A cross-node resume needs a shared snapshot store**, because the internal backend
   publishes a snapshot to a registry and re-creates from the digest reference. A node
-  that cannot reach the store cannot restore a snapshot taken elsewhere.
+  that cannot reach the store cannot restore a snapshot taken elsewhere. Without one
+  the backend does not declare `RESUME_ANYWHERE`, so such a spec is refused at
+  admission rather than failing when it checkpoints.
+- **Each node agent derives its envelope from `capacity.*`.** The node builds it from
+  the same sandbox config a worker reads, and an agent whose backend consumes the node
+  refuses to start without one, because an unbounded node admits every request against
+  a daemon nobody is accounting for and advertises no devices.
 - **A sandbox that calls back into the worker needs `callback_target`.** Without it the
   node does not open a forwarder, so a loopback URL inside the sandbox reaches the
   sandbox rather than the worker that owns the trajectory.

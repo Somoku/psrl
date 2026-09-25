@@ -23,8 +23,12 @@ Placeholders:
 
 ### 1. Install the server
 
+Pin the version. The `1.1.0` wheel does not import, because it ships without
+`opensandbox_server.services.fast_sandbox.generated`, so a plain install fails at
+startup rather than at install time:
+
 ```bash
-python -m pip install opensandbox-server
+python -m pip install "opensandbox-server==0.2.3"
 ```
 
 Requirements, from the provider's own installation page:
@@ -36,6 +40,19 @@ Requirements, from the provider's own installation page:
 | Kubernetes, for the Kubernetes runtime | 1.21.1 or newer |
 | Host OS | Linux, macOS, or Windows with WSL2 |
 
+### 1b. Pre-pull the execution sidecar
+
+Every sandbox runs an `execd` sidecar, and the server pulls its image on the first
+create. Pull it ahead of the run, or the first acquire pays the pull inside its own
+readiness deadline and times out:
+
+```bash
+docker pull "$(grep -oP '(?<=^execd_image = ")[^"]+' ~/.sandbox.toml)"
+```
+
+The image reference is `[runtime].execd_image` in the config written by step 2, so
+run this after that step.
+
 ### 2. Write a configuration
 
 ```bash
@@ -45,13 +62,14 @@ opensandbox-server init-config ~/.sandbox.toml --example docker
 Use `--example k8s` for the Kubernetes runtime. The server reads `~/.sandbox.toml`
 by default, and `SANDBOX_CONFIG_PATH` or `--config` overrides the path.
 
-Two keys decide whether this deployment can serve what a recipe asks for, and an
-unset one makes the corresponding feature impossible rather than merely slow:
+Two keys decide whether this deployment can serve what a recipe asks for. The
+example config sets `[egress].image` already and defaults `[egress].mode` to `dns`,
+so the one to change is the mode:
 
 | Key | What it enables | Without it |
 |---|---|---|
 | `[egress].image` | `networkPolicy` enforcement, and the credential vault | A create that carries a policy is not enforced |
-| `[egress].mode = "dns+nft"` | Credential injection | The vault refuses to activate. DNS-only mode cannot stop a direct-IP connection from bypassing DNS policy |
+| `[egress].mode = "dns+nft"` | Credential injection | The vault refuses to activate. The default `dns` mode cannot stop a direct-IP connection from bypassing DNS policy |
 
 Set `[server].api_key`. With it empty the server runs unauthenticated, and a
 non-interactive environment needs `OPENSANDBOX_INSECURE_SERVER=YES` to acknowledge
@@ -168,6 +186,14 @@ Server-side facts that constrain a multi-node deployment:
 
 ## Gotchas
 
+- **A non-zero exit code is reported as 1.** The `execd` stream carries no exit code,
+  so a grader that branches on one has to write the status to a file and read it back.
+- **`stats()` reports nothing.** `GET /metrics` on `execd` describes the host rather
+  than the sandbox, so every field is left unknown instead of reporting the node's
+  memory as one sandbox's footprint. Size an envelope from the `docker` backend.
+- **An `execd` sidecar answers a moment after the sandbox is `Running`.** The backend
+  waits for the plane itself rather than for the state, so a create returns a sandbox
+  that can take a command. A caller driving the lifecycle API by hand has to wait too.
 - **The URL a worker uses is not the URL a laptop uses.** `127.0.0.1` reaches the
   server only from the node it runs on. Give every worker a routable
   `${OPENSANDBOX_URL}`, or run a node-local server per node.

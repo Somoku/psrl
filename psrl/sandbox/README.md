@@ -259,6 +259,14 @@ the import by hand, run the live conformance test below.
 - **Sandboxes stop with the worker.** A preempted worker takes its local sandboxes
   with it, and nothing resumes them. A resumable rollout is loop work, tracked as
   L2 in the execution plan.
+- **A cross-node resume needs `snapshot_store.registry`.** Without it the `docker`
+  backend does not declare `RESUME_ANYWHERE` at all, so a spec that requires one is
+  refused at admission rather than failing at checkpoint time. That refusal is the
+  intended answer: a commit lives on one daemon until a store publishes it.
+- **`opensandbox` reports every non-zero exit as 1.** Its execution stream carries no
+  exit code, so a grader that branches on one must write the status to a file and read
+  it back. `stats()` is unknown there for the same kind of reason: the provider's
+  metrics describe the host rather than the sandbox.
 
 ## Verify
 
@@ -267,11 +275,18 @@ Unit and contract tests need no daemon and no provider:
 ```bash
 python -m pytest tests/sandbox
 ruff check psrl/sandbox tests/sandbox
+ruff format --check psrl/sandbox tests/sandbox
 python scripts/audit_prose_style.py psrl/sandbox tests/sandbox
 git diff --check
 ```
 
-Exercise a real Docker daemon and record reproducible latency:
+`tests/sandbox` is not in any CI job, so run it locally before a change lands.
+Run it on a node that has a Docker client, because several reliability tests reach
+the CLI cleanup path and pass vacuously where `docker` is absent.
+
+Exercise a real Docker daemon and record reproducible latency. The image needs the
+configured `command_interpreter`, which is `bash` by default, so a BusyBox-based
+image fails the readiness probe rather than the test:
 
 ```bash
 PSRL_RUN_DOCKER_INTEGRATION=1 PSRL_DOCKER_TEST_IMAGE=${SANDBOX_IMAGE} \

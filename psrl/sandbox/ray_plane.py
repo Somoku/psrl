@@ -20,6 +20,7 @@ sandbox on another node look like a local one to everything above it.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import pickle
 from collections.abc import Mapping, Sequence
@@ -126,6 +127,10 @@ class SandboxNodeActor:
     async def _call(self, operation: str, call: Any) -> Any:
         """Run one node operation and make sure its failure can cross the boundary.
 
+        The agent's surface is mostly coroutines and a few plain calls, such as the
+        metric snapshot. Awaiting the result only when it is awaitable keeps this one
+        adapter over both, rather than raising a `TypeError` on the synchronous ones.
+
         The failure is raised outside the handler on purpose. Python sets an exception's
         context to whatever was being handled when it was raised, and a context is pickled
         with the exception, so raising inside the handler would re-attach the very error
@@ -133,7 +138,8 @@ class SandboxNodeActor:
         """
         failure: BaseException | None = None
         try:
-            return await call()
+            result = call()
+            return await result if inspect.isawaitable(result) else result
         except Exception as error:
             failure = _wire_safe(operation, self.node_id, error)
         raise failure

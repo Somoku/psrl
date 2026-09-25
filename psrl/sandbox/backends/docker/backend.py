@@ -523,14 +523,17 @@ class DockerBackend(SandboxBackend):
 
     @property
     def capabilities(self) -> SandboxCapabilities:
-        """
-        Return the declared feature set, including egress only where it can be enforced.
+        """Return the declared feature set, with each conditional feature earned.
 
-        A destination allowlist needs a host firewall, so a node without one must not
-        advertise the feature: a spec that requires containment would otherwise be
-        admitted into a sandbox that is open.
+        A capability is declared only where this node can honour it. A destination
+        allowlist needs a host firewall, and a resume on another node needs a snapshot
+        store: without one a commit lives on this daemon alone, so a spec requiring a
+        cross-node resume would be admitted and then fail at checkpoint time, halfway
+        through an episode, rather than being refused up front.
         """
         features = _DOCKER_FEATURES | {SandboxFeature.CREDENTIAL_INJECTION}
+        if self.snapshot_store is None:
+            features = features - {SandboxFeature.RESUME_ANYWHERE}
         if self.egress.available():
             features = features | {SandboxFeature.EGRESS_POLICY}
         if self.isolation_runtime is not None:
@@ -539,7 +542,10 @@ class DockerBackend(SandboxBackend):
             # A recipe can ask for a warm start on this backend or on a provider, so
             # the same intent has to be expressible on both.
             features = features | {SandboxFeature.WARM_POOL}
-        return SandboxCapabilities(features, resume_level=ResumeLevel.FILESYSTEM)
+        # The level describes a resume elsewhere, so it is reported only when this node
+        # can actually perform one. The two cannot contradict each other.
+        level = ResumeLevel.FILESYSTEM if SandboxFeature.RESUME_ANYWHERE in features else None
+        return SandboxCapabilities(features, resume_level=level)
 
     @property
     def uses_node_capacity(self) -> bool:

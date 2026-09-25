@@ -69,7 +69,13 @@ class ConformanceEngine(FakeDockerEngine):
 def _docker_backend() -> SandboxBackend:
     from psrl.sandbox.backends.docker import DockerBackend
 
-    return DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=ConformanceEngine())
+    # A store is what makes a commit reachable from another node, so the backend only
+    # declares RESUME_ANYWHERE with one and the fixture has to earn that declaration.
+    return DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
+        engine=ConformanceEngine(),
+        snapshot_store={"registry": "registry.invalid:5000"},
+    )
 
 
 def _agentenv_backend() -> SandboxBackend:
@@ -197,9 +203,7 @@ async def test_a_cross_node_resume_promises_the_level_it_declares(backend: Sandb
 
     assert snapshot.resume_level is level
 
-    restored = await manager.restore(
-        snapshot, _spec(state_policy=_RESTORE_POLICY), state_policy=_RESTORE_POLICY
-    )
+    restored = await manager.restore(snapshot, _spec(state_policy=_RESTORE_POLICY), state_policy=_RESTORE_POLICY)
 
     assert restored.ref.backend == backend.name
     assert (await restored.session.exec("echo restored")).exit_code is not None
@@ -260,6 +264,27 @@ async def test_a_backend_that_cannot_serve_a_spec_is_refused_at_selection() -> N
             _spec(
                 required_features=frozenset({SandboxFeature.RESUME_ANYWHERE}),
                 required_resume_level=ResumeLevel.FULL_STATE,
+            )
+        )
+
+    await manager.shutdown()
+
+
+async def test_a_node_without_a_store_does_not_promise_a_resume_elsewhere() -> None:
+    # A commit lives on one daemon, so without a store a cross-node resume is impossible.
+    # Declaring it anyway admits the spec and fails mid-episode at checkpoint time.
+    from psrl.sandbox.backends.docker import DockerBackend
+
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=ConformanceEngine())
+    manager = SandboxManager({backend.name: backend}, backend.name)
+
+    assert SandboxFeature.RESUME_ANYWHERE not in backend.capabilities.features
+    assert backend.capabilities.resume_level is None
+    with pytest.raises(Exception, match="resume_anywhere|no configured"):
+        manager.select_backend(
+            _spec(
+                required_features=frozenset({SandboxFeature.RESUME_ANYWHERE}),
+                required_resume_level=ResumeLevel.FILESYSTEM,
             )
         )
 

@@ -165,9 +165,7 @@ async def test_the_first_caller_pays_the_setup_and_later_callers_reuse_it(tmp_pa
     cache = _cache(tmp_path)
     spec = _spec()
 
-    first = await manager.acquire_prepared(
-        spec, task_id="task-1", cache=cache, setup="prepare", state_policy=_POLICY
-    )
+    first = await manager.acquire_prepared(spec, task_id="task-1", cache=cache, setup="prepare", state_policy=_POLICY)
 
     assert len(cache.records) == 1
     assert setup_calls == ["prepare"]
@@ -175,9 +173,7 @@ async def test_the_first_caller_pays_the_setup_and_later_callers_reuse_it(tmp_pa
     # The workflow holds one sandbox phase at a time, so the capture is what a later
     # phase restores rather than something two phases hold at once.
     await first.release()
-    second = await manager.acquire_prepared(
-        spec, task_id="task-1", cache=cache, setup="prepare", state_policy=_POLICY
-    )
+    second = await manager.acquire_prepared(spec, task_id="task-1", cache=cache, setup="prepare", state_policy=_POLICY)
 
     # The second caller restored the capture instead of paying the setup again, and the sandbox
     # came from the restore path, which is what proves the capture was used.
@@ -191,9 +187,7 @@ async def test_a_different_task_does_not_reuse_the_capture(tmp_path) -> None:
     manager = SandboxManager({"fake": backend}, "fake")
     cache = _cache(tmp_path)
 
-    await manager.acquire_prepared(
-        _spec(), task_id="task-1", cache=cache, setup="prepare", state_policy=_POLICY
-    )
+    await manager.acquire_prepared(_spec(), task_id="task-1", cache=cache, setup="prepare", state_policy=_POLICY)
     await manager.acquire_prepared(
         _spec(workflow_id="task-2#0"), task_id="task-2", cache=cache, setup="prepare", state_policy=_POLICY
     )
@@ -224,9 +218,7 @@ async def test_a_failed_setup_captures_nothing_and_leaves_no_sandbox(tmp_path) -
     cache = _cache(tmp_path)
 
     with pytest.raises(SandboxSetupError, match="no network"):
-        await manager.acquire_prepared(
-            _spec(), task_id="task-1", cache=cache, setup="prepare", state_policy=_POLICY
-        )
+        await manager.acquire_prepared(_spec(), task_id="task-1", cache=cache, setup="prepare", state_policy=_POLICY)
 
     assert cache.records == ()
     assert manager.ownership_snapshot()["leases"] == 0
@@ -245,3 +237,33 @@ async def test_a_capture_without_an_enabled_policy_is_refused(tmp_path) -> None:
             state_policy=SandboxStatePolicy(),
         )
     await manager.shutdown()
+
+
+def test_a_capture_remembers_which_backend_owns_it(tmp_path) -> None:
+    # A restore is routed by the reference's backend. Losing it sent every hit to the
+    # default, so a mixed deployment trained on the wrong environment.
+    cache = _cache(tmp_path)
+    cache.put(
+        task_id="task-1",
+        image="img",
+        setup="prepare",
+        snapshot=SnapshotRef(backend="agentenv", snapshot_id="snap-1", kind=SnapshotKind.FILESYSTEM),
+    )
+
+    assert cache.get(task_id="task-1", image="img", setup="prepare").backend == "agentenv"
+
+
+def test_a_capture_still_names_its_backend_after_a_restart(tmp_path) -> None:
+    # The index is what a later step reads, so the routing has to survive the file and
+    # not only the object that wrote it.
+    _cache(tmp_path).put(
+        task_id="task-1",
+        image="img",
+        setup="prepare",
+        snapshot=SnapshotRef(backend="agentenv", snapshot_id="snap-1", kind=SnapshotKind.FILESYSTEM),
+    )
+
+    reloaded = _cache(tmp_path).get(task_id="task-1", image="img", setup="prepare")
+
+    assert reloaded.backend == "agentenv"
+    assert reloaded.metadata["psrl.docker.image"] == "snap-1"

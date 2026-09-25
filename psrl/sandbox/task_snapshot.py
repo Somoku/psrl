@@ -58,6 +58,9 @@ class TaskSnapshotRecord:
     task_id: str
     image: str
     snapshot_id: str
+    # The backend that owns the capture, because a restore is routed by it. Losing it
+    # sends a provider's capture to whichever backend happens to be the default.
+    backend: str = ""
     # The node that holds the local image. Empty when the snapshot was published, in
     # which case any node can restore it.
     node_id: str = ""
@@ -135,10 +138,17 @@ class TaskSnapshotCache:
             return None
         self._hits += 1
         return SnapshotRef(
-            backend="",
+            backend=record.backend,
             snapshot_id=record.snapshot_id,
             kind=SnapshotKind.FILESYSTEM,
-            metadata={"psrl.task_snapshot.key": key, "psrl.task_snapshot.image": record.image},
+            metadata={
+                "psrl.task_snapshot.key": key,
+                "psrl.task_snapshot.image": record.image,
+                # A Docker restore reads the image from here, so a capture that survived
+                # a restart still names what to create from.
+                "psrl.docker.image": record.snapshot_id,
+                "psrl.snapshot.published": record.published,
+            },
         )
 
     def put(
@@ -161,6 +171,7 @@ class TaskSnapshotCache:
             task_id=task_id,
             image=image,
             snapshot_id=snapshot.snapshot_id,
+            backend=snapshot.backend,
             node_id=node_id,
             published=bool(snapshot.metadata.get("psrl.snapshot.published")),
             created_at=time.time() if now is None else now,

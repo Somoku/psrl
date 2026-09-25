@@ -399,11 +399,22 @@ class SandboxManager:
         self._pending_workflows.add(workflow_id)
 
     def backend(self, name: str | None = None) -> SandboxBackend:
+        """Resolve a configured backend by name or use the default backend.
+
+        None means the default. An empty name is a caller that lost the name it meant
+        to pass, so it is refused rather than falling through to the default, which
+        would restore one backend's snapshot on another.
+
+        Raises:
+            ValueError: When the name is empty.
+            KeyError: When no backend is registered under the name.
         """
-        Resolve a configured backend by name or use the default backend.
-        """
-        backend_name = name or self.default_backend
-        return self._backends[backend_name]
+        if name is not None and not name.strip():
+            raise ValueError(
+                "A sandbox backend name cannot be empty. Pass None for the default, because an empty name "
+                "is a lost reference rather than a request for the default."
+            )
+        return self._backends[name or self.default_backend]
 
     def select_backend(self, spec: SandboxSpec, name: str | None = None) -> SandboxBackend:
         """Choose the backend that will serve a spec.
@@ -763,9 +774,7 @@ class SandboxManager:
         try:
             children = list(await parent.session.fork(child_count))
             if len(children) != child_count:
-                raise RuntimeError(
-                    f"Sandbox fork produced {len(children)} child(ren) for a group of {len(members)}."
-                )
+                raise RuntimeError(f"Sandbox fork produced {len(children)} child(ren) for a group of {len(members)}.")
             try:
                 for member, child in zip(members, children, strict=False):
                     # A fork clones memory, so a child that skipped sanitization would
@@ -869,8 +878,7 @@ class SandboxManager:
                 result = await lease.session.exec(setup, timeout_s=setup_timeout_s)
                 if result.exit_code != 0:
                     raise SandboxSetupError(
-                        f"Sandbox setup for task {task_id!r} exited {result.exit_code}: "
-                        f"{result.stderr.strip()[:400]}"
+                        f"Sandbox setup for task {task_id!r} exited {result.exit_code}: {result.stderr.strip()[:400]}"
                     )
             snapshot = await self.checkpoint(lease.session, SnapshotKind.FILESYSTEM, policy)
         except BaseException:
@@ -1469,9 +1477,7 @@ class SandboxManager:
         ownership = self.ownership_snapshot()
         metrics: dict[str, float] = {f"ownership/{key}": float(value) for key, value in ownership.items()}
         metrics["admission/waits"] = float(self._wait_samples)
-        metrics["admission/wait_s_mean"] = (
-            self._cumulative_wait_s / self._wait_samples if self._wait_samples else 0.0
-        )
+        metrics["admission/wait_s_mean"] = self._cumulative_wait_s / self._wait_samples if self._wait_samples else 0.0
         metrics.update({key: float(value) for key, value in self._counters.items()})
         metrics.update(self._backend_plane_metrics())
         return metrics

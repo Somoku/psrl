@@ -69,11 +69,11 @@ def test_the_visibility_variable_pins_the_workload_to_its_grant() -> None:
 
 
 def test_a_mount_already_requested_is_not_duplicated() -> None:
-    # A duplicated bind mount makes the daemon reject the create, which surfaces as
-    # an unrelated provisioning failure.
+    # A duplicated bind mount makes the daemon reject the create. The host's own driver
+    # files are excluded, so a GPU node and a laptop agree.
     existing = [{"Type": "bind", "Source": "/dev/nvidia0", "Target": "/dev/nvidia0"}]
 
-    mounts, added = resolve_device_mounts((0,), existing=existing)
+    mounts, added = resolve_device_mounts((0,), existing=existing, exists=lambda path: False)
 
     assert added == []
     assert len(mounts) == 1

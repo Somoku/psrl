@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 import time
 import uuid
@@ -14,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 import aiohttp
 
 from psrl.sandbox.async_utils import acquire_nowait, complete_cleanup
-from psrl.sandbox.backends.docker.cli import CLEANUP_EXECUTOR, force_remove_container_ids
 from psrl.sandbox.backends.docker.exec import ExecBudget, ExecStrategy, OneShotExec
 from psrl.sandbox.backends.docker.policy import DockerPolicyProfile
 from psrl.sandbox.core import (
@@ -463,8 +461,7 @@ class DockerSession(SandboxSession):
             watcher.cancel()
             await complete_cleanup(asyncio.gather(exec_task, watcher, return_exceptions=True))
         message = (
-            f"Docker sandbox {self.sandbox_id} stopped a command that overran its "
-            f"{timeout_s!r}s deadline."
+            f"Docker sandbox {self.sandbox_id} stopped a command that overran its {timeout_s!r}s deadline."
             if preserved
             else f"Docker sandbox {self.sandbox_id} was destroyed by a command that overran its "
             f"{timeout_s!r}s deadline, because this exec mode cannot stop a running command."
@@ -636,14 +633,7 @@ class DockerSession(SandboxSession):
             if await self._container_is_gone():
                 return
             # The CLI is a separate code path and can succeed where the API keeps failing.
-            removed = await asyncio.get_running_loop().run_in_executor(
-                CLEANUP_EXECUTOR,
-                functools.partial(
-                    force_remove_container_ids,
-                    [self.sandbox_id],
-                    docker_command=self.backend.lifecycle.config.docker_command,
-                ),
-            )
+            removed = await self.backend.force_remove(self.sandbox_id)
             if removed or await self._container_is_gone():
                 psrl_logger.warning(
                     f"Docker sandbox {self.sandbox_id} needed a CLI force-remove after the Engine API "

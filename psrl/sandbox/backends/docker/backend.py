@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -19,7 +20,11 @@ from typing import Any
 import aiohttp
 
 from psrl.sandbox.async_utils import complete_cleanup
-from psrl.sandbox.backends.docker.cli import signal_container_process_group
+from psrl.sandbox.backends.docker.cli import (
+    CLEANUP_EXECUTOR,
+    force_remove_container_ids,
+    signal_container_process_group,
+)
 from psrl.sandbox.backends.docker.devices import gpu_visibility_env, resolve_device_mounts
 from psrl.sandbox.backends.docker.egress import (
     ISOLATED_NETWORK_MODE,
@@ -150,6 +155,7 @@ class DockerBackend(SandboxBackend):
         default_exec_mode: ExecMode = ExecMode.PERSISTENT,
         shell_factory: Callable[[str], ShellProcess] | None = None,
         engine: DockerEngine | None = None,
+        cli_force_remove: Callable[[Sequence[str]], Sequence[str]] | None = None,
     ) -> None:
         self._name = name
         self.docker_host = docker_host
@@ -199,6 +205,11 @@ class DockerBackend(SandboxBackend):
             connection_limit=connection_limit,
             max_exec_output_bytes=max_exec_output_bytes,
         )
+        # The CLI fallback reaches this host's daemon, so it is only correct when this
+        # backend drives that daemon. An injected engine points somewhere else.
+        self._cli_force_remove = cli_force_remove
+        if self._cli_force_remove is None and engine is None:
+            self._cli_force_remove = self._force_remove_through_cli
         if not 0 < snapshot_local_cache_fraction <= 1:
             raise ValueError("Docker snapshot_local_cache_fraction must be in (0, 1].")
         self.snapshot_local_cache_fraction = snapshot_local_cache_fraction
@@ -1043,6 +1054,38 @@ class DockerBackend(SandboxBackend):
         if self.snapshot_store is None:
             return []
         return self.snapshot_store.collect(now=now)
+
+    def _force_remove_through_cli(self, container_ids: Sequence[str]) -> Sequence[str]:
+        """
+        Force-remove containers with this node's Docker client, returning what went.
+        """
+        return force_remove_container_ids(
+            list(container_ids),
+            docker_command=self.lifecycle.config.docker_command,
+        )
+
+    async def force_remove(self, container_id: str) -> tuple[str, ...]:
+        """Ask the Docker client to delete a container the Engine API would not.
+
+        The CLI is a separate code path and can succeed where the API keeps failing.
+        A deployment that injected its own engine has no CLI that reaches the same
+        daemon, so it gets no fallback rather than one aimed at the wrong daemon.
+
+        Args:
+            container_id (str): The container to remove.
+
+        Returns:
+            tuple[str, ...]: The ids the client confirmed are gone, which is empty
+                when no fallback is available.
+        """
+        remover = self._cli_force_remove
+        if remover is None:
+            return ()
+        removed = await asyncio.get_running_loop().run_in_executor(
+            CLEANUP_EXECUTOR,
+            functools.partial(remover, [container_id]),
+        )
+        return tuple(removed or ())
 
     async def release_egress(self, container_id: str) -> None:
         """

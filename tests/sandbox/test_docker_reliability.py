@@ -494,23 +494,22 @@ async def test_a_removal_error_for_a_container_that_is_already_gone_is_success(m
 
 async def test_the_cli_is_the_last_hop_when_the_engine_api_refuses_to_delete(monkeypatch):
     engine = FakeDockerEngine()
-    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
-    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
     requested: list[list[str]] = []
 
-    async def always_fail(container_id):
-        raise DockerEngineError(500, "unlinkat: device or resource busy")
-
-    def cli_remove(ids, **kwargs):
+    def cli_remove(ids):
         requested.append(list(ids))
         engine.state = "removed"
         return list(ids)
 
+    # Injected rather than patched, because the fallback has to reach the same daemon
+    # the engine does and the host's own client does not.
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine, cli_force_remove=cli_remove)
+    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+
+    async def always_fail(container_id):
+        raise DockerEngineError(500, "unlinkat: device or resource busy")
+
     monkeypatch.setattr(engine, "remove_container", always_fail)
-    monkeypatch.setattr(
-        "psrl.sandbox.backends.docker.session.force_remove_container_ids",
-        cli_remove,
-    )
 
     await session.terminate()
 
@@ -519,9 +518,22 @@ async def test_the_cli_is_the_last_hop_when_the_engine_api_refuses_to_delete(mon
     await backend.shutdown()
 
 
+async def test_an_injected_engine_gets_no_cli_fallback_aimed_at_another_daemon():
+    # The CLI reaches this host's daemon, and an injected engine points somewhere else,
+    # so a fallback would delete a container this backend never created.
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=FakeDockerEngine())
+
+    assert await backend.force_remove("container-id") == ()
+    await backend.shutdown()
+
+
 async def test_a_container_neither_api_nor_cli_can_delete_keeps_its_reservation(monkeypatch):
     engine = FakeDockerEngine()
-    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
+    backend = DockerBackend(
+        default_exec_mode=ExecMode.ONE_SHOT,
+        engine=engine,
+        cli_force_remove=lambda ids: [],
+    )
     manager = SandboxManager({"docker": backend}, "docker")
     lease = await manager.acquire(SandboxSpec(SandboxSource.image("image")))
 
@@ -529,10 +541,6 @@ async def test_a_container_neither_api_nor_cli_can_delete_keeps_its_reservation(
         raise DockerEngineError(500, "unlinkat: device or resource busy")
 
     monkeypatch.setattr(engine, "remove_container", always_fail)
-    monkeypatch.setattr(
-        "psrl.sandbox.backends.docker.session.force_remove_container_ids",
-        lambda ids, **kwargs: [],
-    )
 
     await lease.release()
 

@@ -100,6 +100,7 @@ def resolve_device_mounts(
     *,
     policy_mounts: tuple[dict[str, object], ...] = (),
     existing: list[dict[str, object]] | None = None,
+    exists=None,
 ) -> tuple[list[dict[str, object]], list[str]]:
     """
     Merge device mounts into a container's mount list without duplicating a path.
@@ -111,6 +112,9 @@ def resolve_device_mounts(
         indices (tuple[int, ...]): Granted device indices.
         policy_mounts (tuple[dict[str, object], ...]): Device mounts from policy.
         existing (list[dict[str, object]] | None): Mounts already requested.
+        exists: Existence predicate, forwarded to `gpu_device_arguments`. It is
+            injectable here too, because which driver files a host happens to have
+            would otherwise decide the result and a caller could not pin it.
 
     Returns:
         tuple[list[dict[str, object]], list[str]]: The merged mounts and the target
@@ -119,7 +123,7 @@ def resolve_device_mounts(
     mounts = list(existing or [])
     targets = {str(mount.get("Target")) for mount in mounts}
     added: list[str] = []
-    for mount in (*policy_mounts, *gpu_device_arguments(indices)):
+    for mount in (*policy_mounts, *gpu_device_arguments(indices, exists=exists)):
         target = str(mount.get("Target"))
         if target in targets:
             continue

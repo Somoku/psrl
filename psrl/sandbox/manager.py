@@ -1450,16 +1450,22 @@ class SandboxManager:
         return await self._capacity_coordinator.snapshot()
 
     def ownership_snapshot(self) -> dict[str, int]:
-        """
-        Report worker ownership, including cleanup that still holds capacity.
+        """Report worker ownership, including cleanup that still holds capacity.
+
+        `holding_resources` counts the leases that still own a runtime object or a
+        reservation, which is the question an operator actually asks: a lease in a
+        terminal state costs nothing, and one stuck in reclaiming costs a slot.
         """
         by_state: dict[str, int] = {state.value: 0 for state in LeaseState}
         oldest_idle = 0.0
+        holding = 0
         for lease in self._leases:
             by_state[lease.state.value] = by_state.get(lease.state.value, 0) + 1
             oldest_idle = max(oldest_idle, lease.state_machine.age_s)
+            holding += int(lease.state_machine.holds_resources)
         return {
             "leases": len(self._leases),
+            "holding_resources": holding,
             "provisioning": len(self._provision_tasks),
             "pending_releases": len(self._pending_releases),
             "pending_capacity": len(self._pending_capacity),

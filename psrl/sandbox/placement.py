@@ -166,6 +166,7 @@ class _NodeRecord:
     load: int = 0
     seen_at: float = 0.0
 
+
 @dataclass
 class _Reservation:
     reservation_id: str
@@ -254,9 +255,7 @@ class PlacementSnapshot:
             "placement/no_candidate": float(self.no_candidate),
             "placement/oldest_reservation_age_s": self.oldest_reservation_age_s,
             "placement/decision_s_mean": self.mean_decision_s,
-            "image/locality_hit_ratio": (
-                self.locality_hits / self.locality_asked if self.locality_asked else 0.0
-            ),
+            "image/locality_hit_ratio": (self.locality_hits / self.locality_asked if self.locality_asked else 0.0),
             **{f"placement/{key}": float(value) for key, value in self.counters.items()},
         }
 
@@ -294,6 +293,9 @@ class PlacementService:
         self.sweep_interval_s = sweep_interval_s
         self._nodes: dict[str, _NodeRecord] = {}
         self._reservations: dict[str, _Reservation] = {}
+        # How reservations ended, counted apart. A cancel is a provision that never
+        # happened and a release is a sandbox that ran, and an operator acts on each.
+        self._outcomes: dict[str, int] = {}
         self._swept = 0
         self._rejections = 0
         self._no_candidate = 0
@@ -330,9 +332,7 @@ class PlacementService:
         """
         self._nodes.pop(node_id, None)
         for reservation_id in [
-            reservation.reservation_id
-            for reservation in self._reservations.values()
-            if reservation.node_id == node_id
+            reservation.reservation_id for reservation in self._reservations.values() if reservation.node_id == node_id
         ]:
             self._reservations.pop(reservation_id, None)
 
@@ -432,23 +432,28 @@ class PlacementService:
 
     def release(self, reservation_id: str) -> None:
         """
-        Return a reservation whose sandbox has ended.
+        Return a reservation whose sandbox ran and finished.
         """
-        reservation = self._reservations.pop(reservation_id, None)
-        if reservation is None:
-            return
-        self._decrement(reservation.node_id)
+        self._retire(reservation_id, "released")
 
     def cancel(self, reservation_id: str) -> None:
         """Withdraw a reservation whose provision never happened.
 
-        Separate from release because the two mean different things to an operator:
-        a cancel is a request the caller gave up on, and a release is a sandbox that
-        ran and finished.
+        Separate from release because the two mean different things to an operator: a
+        cancel is a request the caller gave up on, and a release is a sandbox that ran.
+        They are counted apart for that reason, so a cluster losing reservations to
+        failed provisions is distinguishable from one doing ordinary work.
+        """
+        self._retire(reservation_id, "cancelled")
+
+    def _retire(self, reservation_id: str, outcome: str) -> None:
+        """
+        Drop one reservation and record how it ended.
         """
         reservation = self._reservations.pop(reservation_id, None)
         if reservation is None:
             return
+        self._outcomes[outcome] = self._outcomes.get(outcome, 0) + 1
         self._decrement(reservation.node_id)
 
     def sweep(self, *, now: float | None = None) -> list[str]:
@@ -492,6 +497,7 @@ class PlacementService:
                 default=0.0,
             ),
             mean_decision_s=self._total_decision_s / self._decisions if self._decisions else 0.0,
+            counters=dict(self._outcomes),
         )
 
     def nodes(self) -> tuple[NodeCapabilities, ...]:

@@ -151,20 +151,24 @@ class CallbackForwarder:
                 self._pumps.discard(task)
 
     async def close(self) -> None:
+        """Stop listening and drop the connections in flight.
+
+        The pumps are cancelled before the server is awaited, because
+        `wait_closed` waits for every live handler and a pump is parked on a read
+        that only the peer can end. Awaiting first would hang until the sandbox on
+        the other side happened to disconnect, which is never during a shutdown.
         """
-        Stop listening and drop the connections in flight.
-        """
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-            self.port = None
         pumps = list(self._pumps)
         for task in pumps:
             task.cancel()
         if pumps:
             await asyncio.gather(*pumps, return_exceptions=True)
         self._pumps.clear()
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+            self.port = None
 
 
 def spec_to_payload(spec: SandboxSpec) -> dict[str, Any]:

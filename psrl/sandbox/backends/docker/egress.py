@@ -165,9 +165,7 @@ class DockerEgressEnforcer:
                 # A hostname has to be resolved before a rule can name it, and the
                 # resolver blocks, so it runs off the event loop.
                 resolved = await asyncio.to_thread(_normalize_destination, destination)
-                rules.arguments.append(
-                    await self._insert(self._allow_arguments(address, resolved, plan.ports))
-                )
+                rules.arguments.append(await self._insert(self._allow_arguments(address, resolved, plan.ports)))
         except BaseException:
             await self.remove(rules)
             raise
@@ -258,8 +256,9 @@ def _normalize_destination(destination: str) -> str:
     try:
         return str(ipaddress.ip_address(entry))
     except ValueError as exc:
-        raise EgressEnforcementError(f"Sandbox egress destination {entry!r} is not an address, a network, or a "
-                                     "resolvable hostname.") from exc
+        raise EgressEnforcementError(
+            f"Sandbox egress destination {entry!r} is not an address, a network, or a resolvable hostname."
+        ) from exc
 
 
 def _is_domain(entry: str) -> bool:

@@ -127,8 +127,7 @@ async def _run_checks() -> list[str]:
         # A failure has to arrive as its own diagnosis. An unpicklable exception crosses as a
         # serialization error instead, which hides what actually went wrong on the node.
         assert not isinstance(created, ray.exceptions.UnserializableException), (
-            "A provisioning failure must cross the actor boundary with its own diagnosis: "
-            f"{created!r}"
+            f"A provisioning failure must cross the actor boundary with its own diagnosis: {created!r}"
         )
         await remote.shutdown()
         passed.append(f"a create that fails on the node leaves no reservation behind ({type(created).__name__})")
@@ -156,13 +155,13 @@ async def _run_checks() -> list[str]:
 
         # A stale node is drained rather than trusted, which is the backstop when a node really
         # goes away. Registered directly, since reporting is what this check withholds.
-        stale = ray.remote(PlacementService).options(num_cpus=0).remote(
-            node_ttl_s=0.5, reservation_ttl_s=0.2, sweep_interval_s=0.1
+        stale = (
+            ray.remote(PlacementService)
+            .options(num_cpus=0)
+            .remote(node_ttl_s=0.5, reservation_ttl_s=0.2, sweep_interval_s=0.1)
         )
         await stale.register.remote(_capabilities_from(advertisements[node_id]))
-        drained = await stale.candidates.remote(
-            PlacementRequest(backend="docker"), now=time.monotonic() + 10.0
-        )
+        drained = await stale.candidates.remote(PlacementRequest(backend="docker"), now=time.monotonic() + 10.0)
         assert drained == [], drained
         await stale.shutdown.remote()
         passed.append("a node nobody has heard from past its TTL is drained")

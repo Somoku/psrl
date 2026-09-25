@@ -143,9 +143,7 @@ class DockerLifecycle:
             psrl_logger.warning("Could not sweep abandoned Docker sandboxes at startup.", exc_info=True)
             return
         if outcome.removed:
-            psrl_logger.info(
-                f"Reclaimed {len(outcome.removed)} abandoned Docker sandbox(es) left by an earlier run."
-            )
+            psrl_logger.info(f"Reclaimed {len(outcome.removed)} abandoned Docker sandbox(es) left by an earlier run.")
 
     def _reclaimer(self) -> NodeReclaimer:
         """

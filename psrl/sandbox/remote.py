@@ -261,6 +261,7 @@ class InProcessTransport:
 
     async def release_reservation(self, reservation_id: str) -> None:
         self.placement.release(reservation_id)
+
     async def acquire(
         self,
         node_id: str,
@@ -357,9 +358,7 @@ class BoundedTransport:
         try:
             return await asyncio.wait_for(call(), timeout=self.timeout_s)
         except asyncio.TimeoutError as exc:
-            raise NodeAgentTimeout(
-                f"Sandbox node call {name!r} did not answer within {self.timeout_s:g}s."
-            ) from exc
+            raise NodeAgentTimeout(f"Sandbox node call {name!r} did not answer within {self.timeout_s:g}s.") from exc
 
     async def choose(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         return await self._bounded("choose", lambda: self.transport.choose(request))
@@ -437,9 +436,7 @@ class BoundedTransport:
         )
 
     async def read_bytes(self, node_id: str, backend: str, sandbox_id: str, path: str) -> bytes:
-        return await self._bounded(
-            "read_bytes", lambda: self.transport.read_bytes(node_id, backend, sandbox_id, path)
-        )
+        return await self._bounded("read_bytes", lambda: self.transport.read_bytes(node_id, backend, sandbox_id, path))
 
     async def write_bytes(self, node_id: str, backend: str, sandbox_id: str, path: str, data: bytes) -> None:
         await self._bounded(
@@ -455,9 +452,7 @@ class BoundedTransport:
         )
 
     async def diagnostics(self, node_id: str, backend: str, sandbox_id: str) -> Mapping[str, Any]:
-        return await self._bounded(
-            "diagnostics", lambda: self.transport.diagnostics(node_id, backend, sandbox_id)
-        )
+        return await self._bounded("diagnostics", lambda: self.transport.diagnostics(node_id, backend, sandbox_id))
 
     async def pause(self, node_id: str, backend: str, sandbox_id: str, mode: str) -> None:
         await self._bounded("pause", lambda: self.transport.pause(node_id, backend, sandbox_id, mode))
@@ -558,9 +553,7 @@ class RemoteSandboxSession:
         return await self.transport.read_bytes(self.remote.node_id, self.remote.backend, self.remote.sandbox_id, path)
 
     async def write_bytes(self, path: str, data: bytes) -> None:
-        await self.transport.write_bytes(
-            self.remote.node_id, self.remote.backend, self.remote.sandbox_id, path, data
-        )
+        await self.transport.write_bytes(self.remote.node_id, self.remote.backend, self.remote.sandbox_id, path, data)
 
     async def status(self) -> SandboxStatus:
         if self._terminated:
@@ -569,9 +562,7 @@ class RemoteSandboxSession:
         return _status_from(raw)
 
     async def diagnostics(self) -> SandboxDiagnostics:
-        payload = await self.transport.diagnostics(
-            self.remote.node_id, self.remote.backend, self.remote.sandbox_id
-        )
+        payload = await self.transport.diagnostics(self.remote.node_id, self.remote.backend, self.remote.sandbox_id)
         usage = payload.get("usage") or {}
         from psrl.sandbox.core import ResourceUsage
 
@@ -589,9 +580,7 @@ class RemoteSandboxSession:
         )
 
     async def pause(self, mode: PauseMode) -> None:
-        await self.transport.pause(
-            self.remote.node_id, self.remote.backend, self.remote.sandbox_id, mode.value
-        )
+        await self.transport.pause(self.remote.node_id, self.remote.backend, self.remote.sandbox_id, mode.value)
 
     async def resume(self) -> None:
         await self.transport.resume(self.remote.node_id, self.remote.backend, self.remote.sandbox_id)

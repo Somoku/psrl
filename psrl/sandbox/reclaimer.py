@@ -194,9 +194,7 @@ class NodeReclaimer:
         stale_owners = self._stale_owners(containers, current_time)
         abandoned = self._stopped.select(containers, self.stopped_grace_s, current_time) if containers else set()
         doomed = [
-            item.container_id
-            for item in containers
-            if item.owner_id in stale_owners or item.container_id in abandoned
+            item.container_id for item in containers if item.owner_id in stale_owners or item.container_id in abandoned
         ]
         removed, unremovable = self._remove(doomed)
         if removed:

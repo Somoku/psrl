@@ -23,6 +23,7 @@ def allowlist(*rules: EgressRule):
     """Return the plan for a deny-by-default policy carrying the given allow rules."""
     return plan_egress(EgressPolicy(rules=rules))
 
+
 pytestmark = pytest.mark.cpu_test
 
 

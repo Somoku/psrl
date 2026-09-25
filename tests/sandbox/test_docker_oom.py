@@ -55,7 +55,7 @@ class TestOomScoreAdj:
     async def test_a_policy_override_wins(self):
         engine = FakeDockerEngine()
         backend = DockerBackend(
-        default_exec_mode=ExecMode.ONE_SHOT,
+            default_exec_mode=ExecMode.ONE_SHOT,
             engine=engine,
             policy_profiles={"mini_swe": {"oom_score_adj": 250}},
         )

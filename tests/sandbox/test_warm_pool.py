@@ -125,9 +125,7 @@ def test_a_spec_that_holds_a_control_open_is_not_pooled() -> None:
     assert not plain.warm_pool.poolable(
         _spec(egress=EgressPolicy(rules=(EgressRule(EgressAction.ALLOW, "10.0.0.5"),)))
     )
-    assert not plain.warm_pool.poolable(
-        _spec(credentials=(CredentialRef(source_env="A", target_env="B"),))
-    )
+    assert not plain.warm_pool.poolable(_spec(credentials=(CredentialRef(source_env="A", target_env="B"),)))
 
 
 async def test_prepare_fills_the_pool_and_a_create_adopts_an_entry() -> None:

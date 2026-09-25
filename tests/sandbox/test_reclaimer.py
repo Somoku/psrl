@@ -281,6 +281,7 @@ def test_the_spawned_collector_receives_every_argument_it_needs(monkeypatch, tmp
 
     assert process is not None
     assert popen_argv[1:3] == ["-m", "psrl.sandbox.reclaimer"]
+
     def value_after(option: str) -> str:
         return popen_argv[popen_argv.index(option) + 1]
 

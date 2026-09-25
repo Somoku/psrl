@@ -437,9 +437,10 @@ def test_candidates_ranks_the_nodes_a_request_could_use() -> None:
     service.register(_node("node-a", image_references=["base:latest"]), now=1000.0)
     service.register(_node("node-b"), now=1000.0)
 
-    assert service.candidates(
-        PlacementRequest(backend="docker", image_references=["base:latest"]), now=1000.0
-    ) == ["node-a", "node-b"]
+    assert service.candidates(PlacementRequest(backend="docker", image_references=["base:latest"]), now=1000.0) == [
+        "node-a",
+        "node-b",
+    ]
     assert service.candidates(PlacementRequest(backend="docker"), now=1000.0, limit=1) == ["node-a"]
 
 

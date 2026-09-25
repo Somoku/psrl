@@ -89,9 +89,7 @@ def test_startup_reclaims_an_earlier_run_before_this_one_is_admitted(monkeypatch
 
     def build_reclaimer(heartbeat_dir, ttl_s, runtime, **kwargs):
         sweeps.append({"heartbeat_dir": heartbeat_dir, "ttl_s": ttl_s, **kwargs})
-        return SimpleNamespace(
-            sweep=lambda: ReclaimOutcome(removed=("leftover-a", "leftover-b"), remaining=0)
-        )
+        return SimpleNamespace(sweep=lambda: ReclaimOutcome(removed=("leftover-a", "leftover-b"), remaining=0))
 
     monkeypatch.setattr("psrl.sandbox.backends.docker.lifecycle.NodeReclaimer", build_reclaimer)
     monkeypatch.setattr(

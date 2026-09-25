@@ -80,9 +80,7 @@ class FakeSession(SandboxSession):
         return SnapshotRef(self.backend.name, f"snapshot-{self.sandbox_id}", kind)
 
     async def fork(self, count: int = 1) -> list[SandboxSession]:
-        return [
-            FakeSession(self.backend, f"fork-{self.sandbox_id}-{index}", self._spec) for index in range(count)
-        ]
+        return [FakeSession(self.backend, f"fork-{self.sandbox_id}-{index}", self._spec) for index in range(count)]
 
 
 class FakeBackend(SandboxBackend):

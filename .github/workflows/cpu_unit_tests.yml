@@ -38,6 +38,17 @@ jobs:
             --cov-report=xml \
             tests/staleness/test_staleness_controller.py \
             tests/elastic_rm/test_scaling_policy_instance_id.py
+      # Run the directory rather than the marker: half of these files carry no
+      # `cpu_test` mark, and a marker selection would skip them without saying so.
+      # The timeout is the point of the job as much as the assertions are, because a
+      # sandbox test that hangs is the failure mode this suite exists to catch.
+      - name: Run sandbox suite
+        timeout-minutes: 5
+        run: |
+          pytest tests/sandbox \
+            --cov=psrl/sandbox \
+            --cov-append \
+            --cov-report=xml
       - name: Upload coverage report
         uses: codecov/codecov-action@v4
         with:

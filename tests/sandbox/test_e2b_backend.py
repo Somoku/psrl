@@ -298,9 +298,7 @@ async def test_agentenv_refuses_what_the_template_owns() -> None:
     factory = FakeAgentEnvFactory()
 
     with pytest.raises(RuntimeError, match="resources are fixed"):
-        await factory.create(
-            SandboxSpec(SandboxSource.image("image"), resources=ResourceSpec(cpu_count=4))
-        )
+        await factory.create(SandboxSpec(SandboxSource.image("image"), resources=ResourceSpec(cpu_count=4)))
     with pytest.raises(RuntimeError, match="no host bind mount"):
         await factory.create(
             SandboxSpec(SandboxSource.image("image"), mounts=(MountSpec(source="/host", target="/work"),))
@@ -379,9 +377,7 @@ async def test_a_resume_carries_the_life_the_caller_asked_for() -> None:
         client_factory=factory,
         state_driver=AgentEnvStateDriver(factory),
     )
-    session = await backend.create(
-        SandboxSpec(SandboxSource.template("base"), lifetime_timeout_s=7200)
-    )
+    session = await backend.create(SandboxSpec(SandboxSource.template("base"), lifetime_timeout_s=7200))
 
     await session.resume()
 
@@ -400,9 +396,7 @@ async def test_a_fork_carries_the_life_the_members_asked_for() -> None:
         client_factory=factory,
         state_driver=AgentEnvStateDriver(factory),
     )
-    session = await backend.create(
-        SandboxSpec(SandboxSource.template("base"), lifetime_timeout_s=7200)
-    )
+    session = await backend.create(SandboxSpec(SandboxSource.template("base"), lifetime_timeout_s=7200))
 
     await session.fork(2)
 
@@ -468,6 +462,35 @@ async def test_a_pause_refuses_while_a_command_is_in_flight() -> None:
 
     with pytest.raises(SandboxBusyError, match="not idle"):
         await session.pause(PauseMode.HIBERNATE)
+
+    await busy.release()
+
+
+@pytest.mark.asyncio
+async def test_an_idle_provider_sandbox_can_be_seen_as_idle() -> None:
+    # Idle is two conditions, and a session reporting no activity fails the second forever.
+    # That made the pause releasing a provider's compute dead on this backend.
+    from psrl.sandbox.manager import SandboxManager
+
+    backend = _agentenv(FakeControl(), FakeFactory())
+    session = await backend.create(SandboxSpec(SandboxSource.template("base")))
+
+    assert session.last_activity_at is not None
+    assert SandboxManager._is_idle(session, 1.0, session.last_activity_at + 3600)
+    # The window still has to elapse, and a command in flight still outranks it.
+    assert not SandboxManager._is_idle(session, 1.0, session.last_activity_at)
+
+
+@pytest.mark.asyncio
+async def test_a_running_command_is_never_idle_however_old_the_stamp() -> None:
+    # A stamp written only when a command returns stays stale for the whole of a long
+    # command, so age alone would pause a sandbox that is working.
+    backend = _agentenv(FakeControl(), FakeFactory())
+    session = await backend.create(SandboxSpec(SandboxSource.template("base")))
+    busy = await _hold_open(session)
+    from psrl.sandbox.manager import SandboxManager
+
+    assert not SandboxManager._is_idle(session, 1.0, session.last_activity_at + 3600)
 
     await busy.release()
 

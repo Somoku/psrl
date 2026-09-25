@@ -1080,6 +1080,9 @@ class E2BSession(SandboxSession):
         # so taking it without waiting is what tells either of them that the guest is busy.
         self._exec_lock = asyncio.Lock()
         self._busy = False
+        # Idle is two conditions, and this is the second. A session reporting no activity
+        # at all is never idle, so the pause that releases a provider's compute never fires.
+        self._last_activity_at = time.monotonic()
 
     @property
     def busy(self) -> bool:
@@ -1087,6 +1090,16 @@ class E2BSession(SandboxSession):
         Return whether a command is executing right now.
         """
         return self._busy
+
+    @property
+    def last_activity_at(self) -> float | None:
+        """Return the time of the last command boundary, or the session's creation.
+
+        Stamped at both the start and the return of a command, because a stamp written
+        only on return stays stale for the whole of a long command and an idle pass
+        reading it would pause a sandbox that is working.
+        """
+        return self._last_activity_at
 
     @property
     def ref(self) -> SandboxRef:
@@ -1118,10 +1131,12 @@ class E2BSession(SandboxSession):
         async with self._exec_lock:
             self._command_count += 1
             self._busy = True
+            self._last_activity_at = time.monotonic()
             try:
                 return await self._exec_locked(command, cwd=cwd, env=env, timeout_s=timeout_s)
             finally:
                 self._busy = False
+                self._last_activity_at = time.monotonic()
 
     async def _exec_locked(
         self,
@@ -1201,9 +1216,7 @@ class E2BSession(SandboxSession):
         # Pausing with a command in flight would freeze the guest halfway through it, so the
         # lock is taken without waiting and a busy guest is reported instead.
         if not await acquire_nowait(self._exec_lock):
-            raise SandboxBusyError(
-                f"Provider sandbox {self.sandbox_id!r} has a command in flight, so it is not idle."
-            )
+            raise SandboxBusyError(f"Provider sandbox {self.sandbox_id!r} has a command in flight, so it is not idle.")
         try:
             with self.backend.metrics.measure("pause"):
                 await self.backend.state_driver.pause(self, mode)

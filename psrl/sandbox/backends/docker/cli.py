@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import concurrent.futures
 import logging
 import re
@@ -22,10 +23,14 @@ _PRUNE_BATCH_SIZE = 200
 
 # Cleanup runs here rather than on asyncio's default executor, whose small shared
 # pool stalls episode I/O when many `docker rm` calls block on a loaded daemon.
+#
+# One pool per process, shut down at exit so a worker that never reached its own
+# shutdown still exits rather than waiting on a cleanup thread.
 CLEANUP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=4,
     thread_name_prefix="psrl-docker-cleanup",
 )
+atexit.register(CLEANUP_EXECUTOR.shutdown, wait=False)
 
 
 def _command(docker_command: Sequence[str], *args: str) -> list[str]:
@@ -216,9 +221,7 @@ class DockerContainerRuntime:
             container_id, _, remainder = line.partition("\t")
             owner_id, _, state = remainder.partition("\t")
             if container_id.strip() and owner_id.strip():
-                containers.append(
-                    OwnedContainer(container_id.strip(), owner_id.strip(), state.strip().lower())
-                )
+                containers.append(OwnedContainer(container_id.strip(), owner_id.strip(), state.strip().lower()))
         return containers
 
     def remove_containers(self, container_ids: Sequence[str]) -> Sequence[str]:

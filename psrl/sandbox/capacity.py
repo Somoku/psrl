@@ -368,13 +368,17 @@ def resolve_sandbox_capacity(
 
 
 def _scaled(base: ResourceQuantity, share: float) -> ResourceQuantity:
-    """
-    Return one share of an envelope, floored to whole units.
+    """Return one share of an envelope, floored to whole units.
+
+    A device is indivisible, so a class holding any share of a node that has devices
+    is guaranteed at least one. Flooring instead would hand a small class zero, and a
+    guarantee of zero devices is one no device request can ever fit inside, so that
+    class could only ever borrow and its share would silently not apply to devices.
     """
     return ResourceQuantity(
         memory_mb=max(1, math.floor(base.memory_mb * share)),
         cpu_millis=max(1, math.floor(base.cpu_millis * share)),
-        gpu_count=base.gpu_count if share >= 1 else math.floor(base.gpu_count * share),
+        gpu_count=base.gpu_count if share >= 1 else min(base.gpu_count, max(1, math.floor(base.gpu_count * share))),
         disk_mb=max(1, math.floor(base.disk_mb * share)) if base.disk_mb else 0,
     )
 

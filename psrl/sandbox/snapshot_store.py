@@ -72,10 +72,10 @@ class SnapshotStoreConfig:
     # Retention intent, or an explicit ttl_s.
     retention: str = "one_run"
     ttl_s: float | None = None
-    # Share of the node's sandbox disk allowance the local snapshot cache may hold.
-    # A fraction, because an operator can estimate a split and not a byte count.
-    local_cache_fraction: float = 0.3
     # Where the publish record lives, so a collector can expire what it owns.
+    #
+    # The local cache's share of a node's disk belongs to the node, so it lives on the
+    # backend that owns the daemon as `snapshot_local_cache_fraction` and not here.
     index_path: str | None = None
 
     def __post_init__(self) -> None:
@@ -88,8 +88,6 @@ class SnapshotStoreConfig:
             )
         if self.ttl_s is not None and self.ttl_s <= 0:
             raise ValueError("Snapshot store ttl_s must be greater than zero when set.")
-        if not 0 < self.local_cache_fraction <= 1:
-            raise ValueError("Snapshot store local_cache_fraction must be in (0, 1].")
 
     @property
     def ttl_seconds(self) -> float | None:
@@ -286,8 +284,7 @@ class RegistrySnapshotStore:
         digest = _select_digest(digests, repository)
         if digest is None:
             raise SnapshotPublishError(
-                f"Snapshot push to {tag_ref} reported no digest, so the store cannot name what it "
-                "published."
+                f"Snapshot push to {tag_ref} reported no digest, so the store cannot name what it published."
             )
         digest_ref = f"{repository}@{digest}"
         self._forget(tag_ref)
@@ -346,11 +343,7 @@ class RegistrySnapshotStore:
         """
         if self._config.ttl_seconds is not None:
             return []
-        dropped = [
-            record.digest_ref
-            for record in self._records.values()
-            if run_id is None or record.run_id == run_id
-        ]
+        dropped = [record.digest_ref for record in self._records.values() if run_id is None or record.run_id == run_id]
         for digest_ref in dropped:
             self._forget(digest_ref)
         return dropped

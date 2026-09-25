@@ -80,7 +80,10 @@ async def test_different_request_sizes_share_capacity_without_static_pools() -> 
     assert snapshot["allocations"] == 3
     await coordinator.release_owner("worker")
     assert (await coordinator.snapshot())["available_capacity"] == {
-        "memory_mb": 100, "cpu_millis": 10000, "gpu_count": 0, "disk_mb": 0,
+        "memory_mb": 100,
+        "cpu_millis": 10000,
+        "gpu_count": 0,
+        "disk_mb": 0,
     }
     await coordinator.shutdown()
 
@@ -124,7 +127,10 @@ async def test_grader_class_is_admitted_while_rollouts_wait_to_borrow() -> None:
     await asyncio.wait_for(grader, timeout=1)
     snapshot = await coordinator.snapshot()
     assert snapshot["per_class"]["grader"]["used"] == {
-        "memory_mb": 300, "cpu_millis": 1000, "gpu_count": 0, "disk_mb": 0,
+        "memory_mb": 300,
+        "cpu_millis": 1000,
+        "gpu_count": 0,
+        "disk_mb": 0,
     }
 
     await coordinator.release_owner("owner")
@@ -160,10 +166,16 @@ async def test_class_guarantees_are_satisfiable_together() -> None:
 
     snapshot = await coordinator.snapshot()
     assert snapshot["per_class"]["rollout"]["used"] == {
-        "memory_mb": 500, "cpu_millis": 5000, "gpu_count": 0, "disk_mb": 0,
+        "memory_mb": 500,
+        "cpu_millis": 5000,
+        "gpu_count": 0,
+        "disk_mb": 0,
     }
     assert snapshot["per_class"]["grader"]["used"] == {
-        "memory_mb": 300, "cpu_millis": 1000, "gpu_count": 0, "disk_mb": 0,
+        "memory_mb": 300,
+        "cpu_millis": 1000,
+        "gpu_count": 0,
+        "disk_mb": 0,
     }
     await coordinator.shutdown()
 
@@ -187,7 +199,10 @@ async def test_elastic_pool_is_borrowable_while_no_other_class_waits() -> None:
     snapshot = await coordinator.snapshot()
     assert snapshot["available_capacity"] == {"memory_mb": 100, "cpu_millis": 1000, "gpu_count": 0, "disk_mb": 0}
     assert snapshot["per_class"]["rollout"]["used"] == {
-        "memory_mb": 900, "cpu_millis": 9000, "gpu_count": 0, "disk_mb": 0,
+        "memory_mb": 900,
+        "cpu_millis": 9000,
+        "gpu_count": 0,
+        "disk_mb": 0,
     }
     await coordinator.shutdown()
 
@@ -213,10 +228,16 @@ async def test_class_ceiling_bounds_borrowing() -> None:
 
     snapshot = await coordinator.snapshot()
     assert snapshot["per_class"]["rollout"]["used"] == {
-        "memory_mb": 300, "cpu_millis": 3000, "gpu_count": 0, "disk_mb": 0,
+        "memory_mb": 300,
+        "cpu_millis": 3000,
+        "gpu_count": 0,
+        "disk_mb": 0,
     }
     assert snapshot["per_class"]["rollout"]["ceiling"] == {
-        "memory_mb": 300, "cpu_millis": 3000, "gpu_count": 0, "disk_mb": 0,
+        "memory_mb": 300,
+        "cpu_millis": 3000,
+        "gpu_count": 0,
+        "disk_mb": 0,
     }
     await coordinator.shutdown()
 
@@ -252,7 +273,10 @@ async def test_undeclared_class_has_no_guarantee_and_warns_once(caplog) -> None:
     assert len(warnings) == 1
     snapshot = await coordinator.snapshot()
     assert snapshot["per_class"]["mystery"]["guaranteed"] == {
-        "memory_mb": 0, "cpu_millis": 0, "gpu_count": 0, "disk_mb": 0,
+        "memory_mb": 0,
+        "cpu_millis": 0,
+        "gpu_count": 0,
+        "disk_mb": 0,
     }
     await coordinator.shutdown()
 

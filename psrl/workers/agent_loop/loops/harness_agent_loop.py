@@ -17,6 +17,7 @@ from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.harness import (
     Harness,
     HarnessConfig,
+    HarnessExecBudgetExpired,
     HarnessResult,
     HarnessRuntime,
     HarnessTaskContext,
@@ -67,6 +68,10 @@ class HarnessAgentLoop(SessionAgentLoop):
         # Set by a task hook when grading never ran, so the completed trajectory is kept
         # and reported as ungraded instead of being discarded or scored as a measured zero.
         self.grader_unavailable = False
+        # Narrower than `grader_unavailable`: set only when the grader sandbox was never
+        # admitted, so the manager's capacity breaker can count the fault instead of reading
+        # it as a generic grader failure.
+        self.grader_capacity_timeout = False
         multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
         if not getattr(multi_turn, "enable", False):
             raise ValueError("Harness training requires rollout.multi_turn.enable=True.")
@@ -267,7 +272,7 @@ class HarnessAgentLoop(SessionAgentLoop):
             harness_started = time.perf_counter()
             try:
                 harness_result = await harness.run(task.prompt, harness_runtime)
-            except TimeoutError as expired:
+            except HarnessExecBudgetExpired as expired:
                 # The harness exec backstop fired, which means the episode budget did not.
                 # Record the cause: without it the manager can only report that some
                 # exception happened, with no exception to show.
@@ -282,6 +287,21 @@ class HarnessAgentLoop(SessionAgentLoop):
                     self.timeouts.episode_timeout_s,
                 )
                 return None, TerminateReason.TRAJECTORY_TIMEOUT
+            except TimeoutError as downstream:
+                # Some call inside the episode timed out without the exec budget expiring, so
+                # the sandbox or the daemon behind it is the fault and the episode budget is
+                # not. Reporting TRAJECTORY_TIMEOUT here would misattribute the cause and let
+                # `is_timeout` suppress the retry an infrastructure fault needs.
+                self._record_error(downstream)
+                psrl_logger.error(
+                    "Harness %s hit an infrastructure timeout for session %s that was not its "
+                    "%.0fs exec budget: %r.",
+                    self.harness_config.kind,
+                    session_id,
+                    self.harness_config.time_budget_s,
+                    downstream,
+                )
+                return None, TerminateReason.DOWNSTREAM_TIMEOUT
             timing["assistant_s"] = time.perf_counter() - harness_started
             if harness_result.exit_code != 0:
                 # The CLI can die without stopping the container, for example when the kernel
@@ -570,8 +590,12 @@ class HarnessAgentLoop(SessionAgentLoop):
 
         An ungraded trajectory reports `VERIFIER_ERROR` even when it finished early,
         because that flag is what stops a reward nobody measured from being trained as
-        a measured zero.
+        a measured zero. When the grader sandbox was never admitted it reports
+        `GRADER_CAPACITY_TIMEOUT` instead, which is ungraded for the same reason but also
+        tells the manager's capacity breaker that grading is starved rather than broken.
         """
+        if self.grader_capacity_timeout:
+            return TerminateReason.GRADER_CAPACITY_TIMEOUT
         if self.grader_unavailable:
             return TerminateReason.VERIFIER_ERROR
         if any(len(item["prompt_ids"]) + len(item["response_ids"]) > self.rollout_budget for item in training_data):

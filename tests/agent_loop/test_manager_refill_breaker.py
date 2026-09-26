@@ -87,6 +87,7 @@ class FakeManager:
         self._capacity_failure_streak = 0
         self._group_failure_reasons: Counter = Counter()
         self._coordination_failures: Counter = Counter()
+        self._grading_capacity_faults: set[int] = set()
         self._shutting_down = False
         self._refill_breaker_diagnosis: str | None = None
 

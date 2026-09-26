@@ -12,11 +12,17 @@ _BUDGET = 65536
 _MAX_TURNS = 80
 
 
-def _reason(training_data: list[dict], *, grader_unavailable: bool = False) -> TerminateReason:
+def _reason(
+    training_data: list[dict],
+    *,
+    grader_unavailable: bool = False,
+    grader_capacity_timeout: bool = False,
+) -> TerminateReason:
     loop = SimpleNamespace(
         rollout_budget=_BUDGET,
         max_turns=_MAX_TURNS,
         grader_unavailable=grader_unavailable,
+        grader_capacity_timeout=grader_capacity_timeout,
     )
     return HarnessAgentLoop.get_harness_terminate_reason(loop, training_data)
 
@@ -82,3 +88,20 @@ def test_an_ungraded_episode_reports_verifier_error() -> None:
 
     assert _reason(data, grader_unavailable=True) is TerminateReason.VERIFIER_ERROR
     assert _reason(data, grader_unavailable=True) is not TerminateReason.FINISHED
+
+
+def test_a_grader_that_was_never_admitted_reports_the_capacity_reason() -> None:
+    # Also ungraded, but the cause is node capacity rather than a broken grader, and only
+    # the narrower reason lets the manager's capacity breaker see grading starvation.
+    # Both flags are set together by the task hook, so the narrower one must win.
+    data = [_item(prompt_tokens=1000, response_tokens=1000, num_turns=10)]
+
+    reason = _reason(data, grader_unavailable=True, grader_capacity_timeout=True)
+
+    assert reason is TerminateReason.GRADER_CAPACITY_TIMEOUT
+    # Ungraded keeps the trajectory and masks its reward; the capacity flag is what
+    # additionally routes it to the breaker rather than to the harness-fault streak.
+    assert reason.is_ungraded
+    assert reason.is_successful
+    assert reason.is_coordination_fault
+    assert not reason.counts_toward_refill_breaker()

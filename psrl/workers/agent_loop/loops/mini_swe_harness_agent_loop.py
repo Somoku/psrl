@@ -214,8 +214,11 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
                 # The grader sandbox was never admitted. The rollout itself is complete and
                 # valid, so keep it and report it as ungraded: discarding it would throw away
                 # the whole episode, and scoring it zero would train the absence of a
-                # measurement as a measured failure.
+                # measurement as a measured failure. The narrower flag is what lets the
+                # manager's capacity breaker see a starved grading class rather than read
+                # this as one more generic grader failure.
                 self.grader_unavailable = True
+                self.grader_capacity_timeout = True
                 grader_result = self._grader_unavailable_result(swe_problem)
                 psrl_logger.error(
                     "Grader sandbox was never admitted for task %r; keeping the trajectory as ungraded.",

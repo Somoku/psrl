@@ -230,6 +230,10 @@ class PSRL_AgentLoopManager:
         self._capacity_failure_streak = 0
         self._group_failure_reasons: Counter = Counter()
         self._coordination_failures: Counter = Counter()
+        # Groups with at least one sample whose grader was never admitted, keyed by parent
+        # id. A group occupies only on its last-arriving sample, so the fault has to be
+        # remembered per group: the sample that trips the breaker is rarely the starved one.
+        self._grading_capacity_faults: set[int] = set()
         self._shutting_down = False
         # Set once the breaker trips. `wait_for_training_batch` turns it into the
         # exception that ends the run.
@@ -541,17 +545,48 @@ class PSRL_AgentLoopManager:
         self._request_counter += len(data)
         return len(data)
 
-    def _reset_group_failure_streak(self) -> None:
+    def _reset_group_failure_streak(self, *, capacity_fault: bool = False) -> None:
         """Clear the refill breaker's failure streaks after a group is occupied.
 
         One occupied group proves the rollout pipeline can still produce trainable
         data, so the preceding failures were sporadic rather than deterministic.
         Resetting here is what keeps a long run from tripping on accumulated noise.
+
+        A group that occupied but was never graded proves nothing about capacity, so it
+        must not clear the capacity streak. Sustained grading starvation has to keep
+        accumulating across those groups until the breaker can name it; otherwise every
+        starved group erases the evidence of the one before it and the run grinds on
+        producing unmeasured trajectories indefinitely.
         """
-        self._capacity_failure_streak = 0
+        if not capacity_fault:
+            self._capacity_failure_streak = 0
         if self._consecutive_group_failures:
             self._consecutive_group_failures = 0
             self._group_failure_reasons.clear()
+
+    def _note_grading_capacity_fault(self, prompt_id: int, terminate_reason: TerminateReason | None) -> None:
+        """Remember that one sample of this group was never graded for lack of capacity.
+
+        Recorded on arrival rather than at occupation, because a group occupies only on its
+        last-arriving sample and that is usually not the starved one. The flag is cleared
+        when the group occupies or fails, so it lives exactly as long as its group.
+        """
+        if terminate_reason is TerminateReason.GRADER_CAPACITY_TIMEOUT:
+            self._grading_capacity_faults.add(prompt_id)
+
+    def _account_grading_capacity_fault(self, prompt_id: int | None) -> bool:
+        """Charge a group's recorded grading-capacity fault once it reaches OCCUPIED.
+
+        Returns whether this group was starved, so the caller can keep the capacity streak
+        from being cleared by a group that proves nothing about capacity.
+        """
+        starved = prompt_id in self._grading_capacity_faults
+        self._grading_capacity_faults.discard(prompt_id)
+        if starved:
+            reason = TerminateReason.GRADER_CAPACITY_TIMEOUT.value
+            self._coordination_failures[reason] += 1
+            self._record_capacity_failure(reason, phase="grading admission")
+        return starved
 
     def _record_group_failure(self, terminate_reason: TerminateReason | None) -> None:
         """Account one failed training group against the run's breakers.
@@ -583,7 +618,7 @@ class PSRL_AgentLoopManager:
             return
         if terminate_reason is TerminateReason.SANDBOX_CAPACITY_TIMEOUT:
             self._coordination_failures[reason] += 1
-            self._record_capacity_failure(reason)
+            self._record_capacity_failure(reason, phase="rollout admission")
             return
         counted = terminate_reason is None or terminate_reason.counts_toward_refill_breaker()
         if not counted:
@@ -605,13 +640,15 @@ class PSRL_AgentLoopManager:
                 f"psrl.agentic_rl.refill_failure_threshold only if these failures are genuinely sporadic."
             )
 
-    def _record_capacity_failure(self, reason: str) -> None:
-        """Account a group lost because no sandbox could be admitted, and bound the wait.
+    def _record_capacity_failure(self, reason: str, *, phase: str) -> None:
+        """Account one training group lost to node capacity admission, and bound the wait.
 
-        Each of these already cost a full `acquire_timeout_s`, and the replacement group
-        will pay it again. Once the threshold is reached the run cannot make progress: stop
-        with the capacity diagnosis, which says what to look at, instead of refilling for
-        hours. Set `capacity_failure_threshold` to zero to wait indefinitely.
+        `phase` names where the starvation was observed. A starved rollout admission costs a
+        full `acquire_timeout_s` before the group is replaced; a starved grading admission
+        costs the same before the episode is kept ungraded. Either way, once the threshold
+        is reached the run cannot make progress: stop with the capacity diagnosis, which
+        says what to look at, instead of grinding for hours. Set
+        `capacity_failure_threshold` to zero to wait indefinitely.
         """
         if self.capacity_failure_threshold <= 0:
             self._report_coordination_failures()
@@ -621,14 +658,14 @@ class PSRL_AgentLoopManager:
             return
         breakdown = ", ".join(f"{name}={count}" for name, count in self._coordination_failures.most_common())
         self._trip_refill_breaker(
-            f"{self._capacity_failure_streak} consecutive rollout groups were lost because no sandbox could be "
-            f"admitted (threshold={self.capacity_failure_threshold}). Every attempt waited the full "
-            f"{self.timeouts.admission_timeout_s:.0f}s "
-            f"acquisition deadline, so no episode ever started and the buffer could never fill. Coordination "
-            f"reasons: {breakdown}. This is a capacity planning fault, not a harness fault: check that node "
-            "capacity leases are actually returned (a lease held without a sandbox keeps the node full), that "
-            "the envelope and `capacity.classes` match the workloads, and that the node has the disk and "
-            "memory those sandboxes need."
+            f"{self._capacity_failure_streak} consecutive training groups could not get a sandbox during "
+            f"{phase} (threshold={self.capacity_failure_threshold}). Every attempt waited the full "
+            f"{self.timeouts.admission_timeout_s:.0f}s admission deadline, so the buffer could never fill. "
+            f"Coordination reasons: {breakdown}. This is a capacity planning fault, not a harness fault: "
+            "check that node capacity leases are actually returned (a lease held without a sandbox keeps the "
+            "node full), that the node has the disk and memory those sandboxes need, and that the envelope "
+            "and `capacity.classes` match the workloads — a class's guarantee is reserved for it, so an "
+            "undersized guarantee starves that class even while another class uses the rest of the node."
         )
 
     def _report_coordination_failures(self) -> None:
@@ -951,6 +988,9 @@ class PSRL_AgentLoopManager:
                 )
                 return
             failed_group_ids.add(parent_id)
+            # A failed group's samples are discarded, so a grading fault recorded against it
+            # must not be charged to the replacement group that reuses this parent id.
+            self._grading_capacity_faults.discard(parent_id)
 
             all_child_uids = [parent_id * rollout_n + i for i in range(rollout_n)]
             sibling_uids = [uid for uid in all_child_uids if uid != failed_uid]
@@ -1106,6 +1146,7 @@ class PSRL_AgentLoopManager:
         version_tag: int | list[int],
         n_trajectory: int | list[int] = 1,
         is_validate: bool = False,
+        terminate_reason: TerminateReason | list[TerminateReason | None] | None = None,
     ) -> list[PayloadState]:
         """Flat-arg RPC invoked by rollout workers once a request finishes.
 
@@ -1131,6 +1172,11 @@ class PSRL_AgentLoopManager:
                 version_tag,
             )
             n_trajectories = n_trajectory if isinstance(n_trajectory, list) else [n_trajectory] * len(request_ids)
+            termination_reasons = (
+                terminate_reason
+                if isinstance(terminate_reason, list)
+                else [terminate_reason] * len(request_ids)
+            )
         else:
             request_ids, prompt_ids, rollout_instance_ids, version_tags, n_trajectories = (
                 [request_id],
@@ -1139,9 +1185,16 @@ class PSRL_AgentLoopManager:
                 [version_tag],
                 [n_trajectory],
             )
+            termination_reasons = [terminate_reason]
 
         if not request_ids:
             return []
+
+        if not is_validate:
+            # Recorded before the lock, because a group occupies on its last-arriving sample
+            # and the starved one may have arrived several calls earlier.
+            for prompt_seq, reason_seq in zip(prompt_ids, termination_reasons, strict=True):
+                self._note_grading_capacity_fault(prompt_seq, reason_seq)
 
         async with AsyncBusyPollingRayLock(self.ps_manager_handle):
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
@@ -1344,9 +1397,12 @@ class PSRL_AgentLoopManager:
                 for job_position in job_positions:
                     dispositions[job_position] = PayloadState.OCCUPIED
                 if not is_validate:
-                    # A group reaching OCCUPIED is the only proof that rollouts can
-                    # still produce trainable data, so it is the breaker's reset point.
-                    self._reset_group_failure_streak()
+                    # A group reaching OCCUPIED is the only proof that rollouts can still
+                    # produce trainable data, so it is the breaker's reset point — unless
+                    # grading was starved for it, which proves nothing about capacity.
+                    occupied_prompt = prompt_ids[job_positions[0]] if job_positions else None
+                    starved = self._account_grading_capacity_fault(occupied_prompt)
+                    self._reset_group_failure_streak(capacity_fault=starved)
 
                 psrl_logger.debug(
                     f"Occupied prompt: entry={prompt_entry_info!r}, buffer_id={buffer_id}, occupy_num={occupy_num}."

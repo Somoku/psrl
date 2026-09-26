@@ -4,6 +4,7 @@ from psrl.workers.agent_loop.harness.base import (
     Harness,
     HarnessCompactionConfig,
     HarnessConfig,
+    HarnessExecBudgetExpired,
     HarnessResult,
     HarnessRuntime,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "Harness",
     "HarnessCompactionConfig",
     "HarnessConfig",
+    "HarnessExecBudgetExpired",
     "HarnessResult",
     "HarnessRuntime",
     "HarnessTaskContext",

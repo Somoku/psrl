@@ -86,12 +86,26 @@ def test_the_ladder_describes_itself_for_the_startup_log() -> None:
     assert "stall=" in described
 
 
-def test_a_long_admission_wait_is_reported_without_failing_the_run() -> None:
-    """Legal but worth saying out loud: queueing longer than working is rarely intended."""
-    ladder = resolve_agent_loop_timeouts(600, 5000)
+def test_an_admission_wait_that_outlasts_the_episode_is_refused() -> None:
+    """A request that queues longer than it would work is a capacity fault, not a wait.
 
-    assert ladder.admission_timeout_s == 5000
-    assert ladder.child_deadline_s > 5000
+    This was a warning once, which meant a misconfigured node reported the inversion as a
+    slow trickle of capacity timeouts hours into a run instead of at startup. Raising the
+    deadline past the work it precedes cannot fix it either: a node that cannot admit
+    inside one episode cannot admit inside two.
+    """
+    with pytest.raises(ValueError, match="longer waiting for a sandbox than working"):
+        resolve_agent_loop_timeouts(600, 5000)
+
+    # Equal is refused too: the queue would consume the entire budget before work began.
+    with pytest.raises(ValueError, match="longer waiting for a sandbox than working"):
+        resolve_agent_loop_timeouts(600, 600)
+
+    # Just inside the budget stays legal, so the check bounds the ladder without
+    # narrowing the range an operator can actually use.
+    ladder = resolve_agent_loop_timeouts(600, 599)
+    assert ladder.admission_timeout_s == 599
+    assert ladder.child_deadline_s > 599
 
 
 def test_zero_valued_fields_are_rejected_by_the_value_object() -> None:

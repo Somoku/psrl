@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
-
-psrl_logger = logging.getLogger(__file__)
 
 # The budget covers agent turns, patch collection, and grading after provisioning.
 DEFAULT_EPISODE_TIMEOUT_S = 7200.0
@@ -123,15 +120,36 @@ def resolve_agent_loop_timeouts(
         heartbeat_interval_s=heartbeat,
         entry_stall_timeout_s=stall,
     )
-    if admission > episode:
-        # Legal, but it means a queued rollout spends longer waiting for a sandbox than it
-        # spends working in one, which is almost never what the operator intended.
-        psrl_logger.warning(
-            f"Sandbox admission may wait {admission:g}s while the episode budget is only {episode:g}s, "
-            "so a rollout can spend longer queueing than working. Raise trajectory_timeout or lower "
-            "capacity.acquire_timeout_s if that is not intended."
-        )
+    validate_agent_loop_timeouts(ladder)
     return ladder
+
+
+def validate_agent_loop_timeouts(ladder: AgentLoopTimeouts) -> None:
+    """Refuse a ladder whose admission deadline outlasts the episode it precedes.
+
+    The rest of the ladder cannot disagree with itself: every other deadline is derived
+    from the episode budget, and the value object refuses a non-positive allowance, so the
+    ordering is a property of the construction rather than a setting. The admission
+    deadline is the one number that comes from configuration, and the one that can
+    silently invert the ladder. A queued rollout allowed to wait past its own episode
+    budget is starved by definition: the queue, not the work, has become the run's
+    dominant cost, and the run discovers it only as a slow trickle of capacity faults.
+
+    That makes this a capacity planning fault, so it is refused here rather than papered
+    over by raising the number past the work it precedes: a node that cannot admit inside
+    one episode cannot admit inside two either.
+
+    Raises:
+        ValueError: When the admission deadline is at or beyond the episode budget.
+    """
+    if ladder.admission_timeout_s >= ladder.episode_timeout_s:
+        raise ValueError(
+            f"Sandbox admission may wait {ladder.admission_timeout_s:g}s while the episode budget is only "
+            f"{ladder.episode_timeout_s:g}s, so a queued rollout would spend longer waiting for a sandbox "
+            "than working in one. Give the node more admittable capacity (raise the envelope, lower "
+            "capacity.utilization, rebalance capacity.classes, or shrink the per-sandbox reservation) "
+            "instead of raising this deadline, or lower trajectory_timeout if episodes really are that short."
+        )
 
 
 def resolve_from_config(config) -> AgentLoopTimeouts:

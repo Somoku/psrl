@@ -165,7 +165,10 @@ agent:
     capacity:
       memory_mb: null
       cpu_cores: null
-      utilization: 0.5
+      # Raised together with the class guarantees below: a queued class's guarantee is held
+      # out of a borrower's reach, so reserving 45% for grading only leaves the rollout
+      # class enough absolute room if the envelope itself is larger.
+      utilization: 0.8
 
       # Accelerator devices and sandbox disk are declared, not detected: a device count
       # cannot be inferred from a host, and devices are never overcommitted once running.
@@ -180,17 +183,28 @@ agent:
       # costs an episode retry instead of holding a whole phase.
       acquire_deadline_fraction: 1.0
 
-      # Guarantees must sum to below one. Size each share as (fraction of episode wall clock
-      # in that phase) x (its footprint), from `reward_info.timing` and `sandbox_peak_memory_mib`.
+      # Guarantees must sum to below one; what is left over is the elastic pool, and it is
+      # the only capacity a class may borrow. A class can never take another class's unused
+      # guarantee, so an undersized share starves that class even while the node looks busy
+      # rather than full.
+      #
+      # Size the shares from measurement, not intuition. When both roles request the same
+      # per-sandbox reservation, which is the usual case, a share is just the number of
+      # sandboxes that phase needs at once: size it from phase concurrency, not phase
+      # footprint. Both are in `reward_info.timing.elapsed_s` / `grading_s`, and
+      # `sandbox_peak_memory_mib` when sandbox_config.collect_resource_metrics is on.
       classes:
-        # Recipes declare the resource class for each phase.
+        # Recipes declare the resource class for each phase. Rollout is the long phase and
+        # runs at the agent loop's full concurrency; grading is brief but arrives in bursts
+        # as a batch finishes together, so it needs a real reserve rather than a remainder.
         rollout:
-          guaranteed_share: 0.60
+          guaranteed_share: 0.45
         grader:
-          guaranteed_share: 0.25
+          guaranteed_share: 0.45
 
-      # Maximum admission wait in seconds. Must leave room for the episode inside the child
-      # deadline, which the agent loop checks at startup. Null waits indefinitely.
+      # Maximum admission wait in seconds. The agent loop refuses a deadline at or above
+      # `trajectory_timeout`, because a request that queues longer than it would work is a
+      # capacity fault rather than a wait. Null waits indefinitely.
       acquire_timeout_s: 1800
 
     # Idle windows derive from the one number an operator can estimate: episode length.

@@ -118,9 +118,13 @@ def test_shipped_rollout_yaml_declares_the_capacity_classes() -> None:
     capacity = SandboxCapacityConfig(**cfg["agent"]["sandbox"]["capacity"])
 
     assert set(capacity.classes) == {"rollout", "grader"}
-    assert capacity.classes["rollout"].guaranteed_share == 0.6
-    assert capacity.classes["grader"].guaranteed_share == 0.25
+    # Assert the properties the coordinator relies on, not the exact shares: the split is
+    # tuned from measured phase concurrency and is expected to move, while a grader left
+    # without a real reserve is starved behind a rollout flood and a total at or above one
+    # makes the guarantees unsatisfiable at the same time.
     assert sum(share.guaranteed_share for share in capacity.classes.values()) < 1
+    assert capacity.classes["grader"].guaranteed_share > 0
+    assert capacity.classes["rollout"].guaranteed_share > 0
     assert capacity.acquire_timeout_s is not None
 
 

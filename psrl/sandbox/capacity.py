@@ -283,6 +283,21 @@ class ResourceQuantity:
             and self.disk_mb <= available_capacity.disk_mb
         )
 
+    def clamped_non_negative(self) -> ResourceQuantity:
+        """
+        Floor every component at zero, for an unused guarantee or leftover headroom.
+
+        Subtracting a usage from a guarantee goes negative once a class has borrowed
+        past its share, and a negative remainder would cancel out another class's
+        reservation instead of contributing nothing to it.
+        """
+        return ResourceQuantity(
+            max(0, self.memory_mb),
+            max(0, self.cpu_millis),
+            max(0, self.gpu_count),
+            max(0, self.disk_mb),
+        )
+
     def __add__(self, other: ResourceQuantity) -> ResourceQuantity:
         return ResourceQuantity(
             self.memory_mb + other.memory_mb,
@@ -412,6 +427,23 @@ class SandboxCapacityCoordinator:
 
     Guaranteed requests have priority, with a bounded bypass count to let large
     borrowers eventually drain the envelope. Active allocations are never preempted.
+
+    A guarantee is a floor rather than a partition, but it is reserved as soon as the
+    class it belongs to has a request queued. While a class is idle its share is
+    borrowable, so nothing is stranded; once it queues, the coordinator maintains::
+
+        available >= max(0, guarantee(other) - usage(other))   for every queued other
+
+    and only the remainder is borrowable. That ordering matters because admission is
+    non-preemptive: if a borrower could take the share of a class that is already
+    waiting, the waiting class would have to wait for an episode to finish, which can
+    exceed its whole ``acquire_timeout_s``. That is how a short, bursty grading class
+    ends up starved behind a long rollout flood.
+
+    The reservation is not free: it is what a class gives up to bound another class's
+    wait, so the shares and ``utilization`` have to be sized together. Guarantees that
+    sum close to one leave almost no elastic pool, and a queued class then holds back
+    capacity a borrower could have used.
     """
 
     def __init__(self, config: SandboxCapacityConfig | dict) -> None:
@@ -431,6 +463,19 @@ class SandboxCapacityCoordinator:
             for name, share in config.classes.items()
             if share.max_share is not None
         }
+        # The reservation invariant needs every guarantee to be simultaneously satisfiable.
+        # Shares are validated to sum within one, but `_scaled` rounds each up to a whole
+        # unit, which can overshoot a very small envelope. Refuse it here rather than let
+        # `_reserved_others` reserve more than the node has and wedge every borrower.
+        guaranteed_total = ResourceQuantity(0, 0)
+        for guarantee in self._guaranteed.values():
+            guaranteed_total = guaranteed_total + guarantee
+        if not guaranteed_total.fits(self._capacity.resources):
+            raise ValueError(
+                f"Scaled sandbox class guarantees {guaranteed_total} exceed the node envelope "
+                f"{self._capacity.resources}, so they cannot all be reserved at once. Raise the envelope "
+                "(sandbox capacity memory_mb/cpu_cores or utilization) or reduce capacity.classes."
+            )
         self._allocations: dict[str, _Allocation] = {}
         self._used_by_class: dict[str, ResourceQuantity] = {}
         self._owners: dict[str, float] = {}
@@ -708,7 +753,7 @@ class SandboxCapacityCoordinator:
             await asyncio.gather(self._sweeper, return_exceptions=True)
 
     def _drain_waiters(self) -> None:
-        """Admit guarantees first, then let borrowers share the slack in arrival order.
+        """Admit guarantees first, then let borrowers share the elastic pool in arrival order.
 
         A request inside its class guarantee is the contract, so it is admitted whenever the
         envelope has room and is never blocked by a borrower. When a guaranteed head does not
@@ -716,6 +761,12 @@ class SandboxCapacityCoordinator:
         use best-effort FIFO: an oldest borrower that cannot fit does not block a younger one
         that can, because head-of-line blocking would idle the node for the length of the
         longest running episode.
+
+        A borrower is additionally held to the reservation rule: it may not take capacity
+        that another *queued* class's guarantee is still short of. Without that, a class
+        with a busy queue drains the envelope and the class waiting beside it has to wait
+        for an episode to end, which can outlast its whole `acquire_timeout_s`. The rule is
+        scoped to queued classes on purpose, so an idle class strands nothing.
         """
         while True:
             heads = [self._head_waiter(name) for name in self._class_queues]
@@ -725,13 +776,47 @@ class SandboxCapacityCoordinator:
             if not eligible:
                 return
             guaranteed = [head for head in eligible if self._fits_guarantee(head.resource_class, head.resources)]
-            fitting = [head for head in (guaranteed or eligible) if head.resources.fits(self.available_capacity)]
+            # A guaranteed request draws on its own reservation, so only a borrower has to
+            # leave the other classes' unused guarantees untouched.
+            fitting = (
+                [head for head in guaranteed if head.resources.fits(self.available_capacity)]
+                if guaranteed
+                else [head for head in eligible if self._borrowable(head)]
+            )
             if not fitting:
                 # Hold the slack for a queued guarantee, or wait for a borrower to fit.
                 return
             waiter = min(fitting, key=lambda item: item.queued_at)
             self._count_bypasses(eligible, waiter)
             self._grant(waiter)
+
+    def _borrowable(self, waiter: _Waiter) -> bool:
+        """
+        Whether this request fits the envelope without taking a reserved guarantee.
+        """
+        claim = waiter.resources + self._reserved_others(waiter.resource_class)
+        return claim.fits(self.available_capacity)
+
+    def _reserved_others(self, resource_class: str) -> ResourceQuantity:
+        """Return capacity set aside for other classes' unmet guarantees.
+
+        Only a class that currently has a request *queued* reserves anything. Reserving
+        against an idle class instead would strand its whole share for as long as it has
+        nothing to run, and would make a request larger than the leftover permanently
+        inadmissible rather than merely delayed — the envelope would have shrunk to
+        `total - sum(other guarantees)` for every borrower, forever.
+
+        What is reserved is the part of a queued class's guarantee it does not already hold.
+        Each component is floored at zero, so a class at or past its guarantee reserves
+        nothing further and cannot offset another class's reservation, and a class with no
+        declared guarantee reserves nothing at all.
+        """
+        reserved = ResourceQuantity(0, 0)
+        for name, guarantee in self._guaranteed.items():
+            if name == resource_class or self._waiting_by_class.get(name, 0) <= 0:
+                continue
+            reserved = reserved + (guarantee - self._usage(name)).clamped_non_negative()
+        return reserved
 
     def _count_bypasses(self, eligible: list[_Waiter], waiter: _Waiter) -> None:
         """Record every request that a younger one was admitted ahead of.

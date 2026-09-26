@@ -99,6 +99,10 @@ class DockerSession(SandboxSession):
         self._command_count = 0
         self._terminate_lock = asyncio.Lock()
         self._terminated = False
+        # Set at the start of teardown, while `_terminated` is set only once it finished.
+        # A command must be refused from the first moment, but the lifetime reaper's retry
+        # of a failed destroy must still be let through.
+        self._closed_to_callers = False
         self._exec_lock = asyncio.Lock()
         self._exec_strategy = exec_strategy or OneShotExec(
             backend.engine,
@@ -344,7 +348,10 @@ class DockerSession(SandboxSession):
         """
         Run one command under the exec lock its caller already holds.
         """
-        if self._terminated:
+        # Tested against the start of teardown rather than its completion, so a command
+        # that arrives while the sandbox is being destroyed is refused as what it is
+        # instead of failing later on the shell teardown already under way.
+        if self._closed_to_callers:
             raise RuntimeError("Docker sandbox is terminated.")
         self._command_count += 1
         self._busy = True
@@ -640,9 +647,23 @@ class DockerSession(SandboxSession):
         async with self._terminate_lock:
             if self._terminated:
                 return
+            # Close the session to callers before any teardown starts. Otherwise the window
+            # between closing the shell and the end of this method leaves a session that
+            # `_track_session` still hands out and whose guard has not tripped: the next
+            # command finds no shell and fails, instead of being refused as a use of a
+            # terminated sandbox.
+            #
+            # Tracked separately from `_terminated`, which means teardown *finished*: the
+            # lifetime reaper retries `terminate` after a failed destroy, and that retry has
+            # to be allowed back in or the container leaks.
+            self._closed_to_callers = True
             await complete_cleanup(self._exec_strategy.close())
             await complete_cleanup(self.backend.release_egress(self.sandbox_id))
             with self.backend.metrics.measure("terminate"):
+                # Raises when the container survives, which leaves this session registered
+                # on purpose: a container that is still alive must keep an owner that can
+                # destroy it, and dropping it here would free its capacity slot while it
+                # still holds the node's memory.
                 await self._destroy_container()
             if self._exit_reason is SandboxExitReason.UNKNOWN:
                 self._exit_reason = SandboxExitReason.RELEASED

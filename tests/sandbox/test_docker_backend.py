@@ -328,6 +328,39 @@ async def test_docker_files_stats_metrics_and_idempotent_terminate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_command_during_teardown_is_refused_as_terminated() -> None:
+    """Teardown closes the session to callers before it starts dismantling it.
+
+    The registry still holds the session while the shell is being closed and the
+    container destroyed, so a command arriving in that window used to reach a strategy
+    whose shell was already gone and fail with "shell is not started". It must be
+    refused as what it is: a use of a sandbox that is going away.
+    """
+    engine = FakeDockerEngine()
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
+    session = await backend.create(SandboxSpec(SandboxSource.image("image")))
+
+    await session.terminate()
+
+    with pytest.raises(RuntimeError, match="terminated"):
+        await session.exec("echo late", timeout_s=5)
+
+
+@pytest.mark.asyncio
+async def test_a_reconnected_session_can_run_a_command() -> None:
+    # `connect` hands out a session the caller cannot tell from a created one, so it owes
+    # the same readiness guarantee: it is probed here rather than on the caller's first
+    # command. One-shot keeps the probe on the fake engine instead of spawning a real
+    # `docker exec`, which a fake container cannot answer.
+    engine = FakeDockerEngine()
+    backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
+
+    session = await backend.connect("container-id")
+
+    assert (await session.exec("echo hello", timeout_s=5)).exit_code == 0
+
+
+@pytest.mark.asyncio
 async def test_docker_rejects_hibernation() -> None:
     backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=FakeDockerEngine())
     session = DockerSession(backend, "container-id")

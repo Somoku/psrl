@@ -906,6 +906,7 @@ class DockerBackend(SandboxBackend):
             lambda: self._shell_factory(container_id),
             max_observation_chars=self.max_observation_chars,
             kill_group=lambda pid: self._signal_shell_group(container_id, pid),
+            startup_timeout_s=self.startup_timeout_s,
         )
 
     async def _resolve_command_prefix(self, container_id: str) -> tuple[str, ...]:
@@ -981,7 +982,7 @@ class DockerBackend(SandboxBackend):
             session = self._track_session(adopted, spec, policy)
             try:
                 await self._enforce_egress(adopted, egress)
-                await self._await_ready(session, spec)
+                await self._await_ready(session)
             except BaseException as error:
                 # An unusable claimed entry must not be handed out, and one that cannot be
                 # destroyed must still report cleanup: a bare raise would leak the slot.
@@ -996,7 +997,7 @@ class DockerBackend(SandboxBackend):
         session = self._track_session(container_id, spec, policy)
         try:
             await self._enforce_egress(container_id, egress)
-            await self._await_ready(session, spec)
+            await self._await_ready(session)
         except BaseException as error:
             # An unusable or uncontained sandbox must not be handed out, since the caller
             # cannot tell it from a working one. The cleanup failure rides in the error.
@@ -1007,7 +1008,7 @@ class DockerBackend(SandboxBackend):
             raise
         return session
 
-    async def _await_ready(self, session: DockerSession, spec: SandboxSpec) -> None:
+    async def _await_ready(self, session: DockerSession) -> None:
         """
         Confirm the sandbox answers before it is handed to a caller.
 
@@ -1223,6 +1224,12 @@ class DockerBackend(SandboxBackend):
             return await self._create_and_start(name, config)
 
     async def connect(self, sandbox_id: str) -> SandboxSession:
+        """Adopt a container this backend did not create, and prove it answers.
+
+        A reconnected session is handed to a caller that cannot tell it from a created
+        one, so it owes the same readiness guarantee: running is not the same as able to
+        run a command, and a persistent shell adopted here has never been started.
+        """
         if self._closed:
             raise RuntimeError("Docker backend is closed.")
         session = self._track_session(sandbox_id)
@@ -1231,6 +1238,7 @@ class DockerBackend(SandboxBackend):
             await session.resume()
         elif status != SandboxStatus.RUNNING:
             raise RuntimeError(f"Docker sandbox {sandbox_id!r} is not running (status={status.value}).")
+        await self._await_ready(session)
         return session
 
     async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> SandboxSession:

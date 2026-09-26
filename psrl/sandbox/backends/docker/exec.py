@@ -344,6 +344,7 @@ class PersistentShellExec:
         *,
         max_observation_chars: int = 0,
         kill_group: Any = None,
+        startup_timeout_s: float = 300.0,
     ) -> None:
         self._spawn = spawn
         self.max_observation_chars = max_observation_chars
@@ -353,6 +354,8 @@ class PersistentShellExec:
         self._last_activity_at: float | None = None
         self._token = os.urandom(6).hex()
         self._remote_pid: int | None = None
+        # Deadline for the implicit start a command performs when it finds no shell.
+        self._startup_timeout_s = startup_timeout_s
 
     @property
     def remote_pid(self) -> int | None:
@@ -447,10 +450,21 @@ class PersistentShellExec:
         env: Mapping[str, str] | None = None,
         budget: ExecBudget | None = None,
     ) -> ExecResult:
-        # Starting implicitly would consume the shell's probe reply as this command's output,
-        # so the session starts it first. An exited shell still buffers, so check attached, not live.
+        # Hold a shell, starting one if this strategy has none. Being started is a property
+        # of running a command, not of the one creation path that used to do it: a session
+        # reached through `connect`, or reused from the backend registry after a timeout or
+        # an abort closed its shell, would otherwise refuse every command it was handed.
+        #
+        # `start` takes `_start_lock` and returns early when a live shell is already held,
+        # so this is idempotent and safe under concurrent commands. It also drains its own
+        # probe reply before returning, which is what keeps that reply out of this command's
+        # output — the hazard that a start inlined into the read loop below would create.
+        #
+        # The test is "attached", not "live", deliberately. A shell that exited still holds
+        # buffered output belonging to this command, and the read loop reports it against
+        # the shell's exit code; replacing it here would throw that evidence away.
         if self._process is None:
-            raise RuntimeError("Docker sandbox shell is not started.")
+            await self.start(timeout_s=self._startup_timeout_s)
         self._last_activity_at = time.monotonic()
         try:
             return await self._run_inner(command, cwd=cwd, env=env, budget=budget)

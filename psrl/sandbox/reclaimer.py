@@ -112,6 +112,20 @@ class SandboxContainerRuntime(Protocol):
         Force-remove containers and return the ids the runtime still lists.
         """
 
+    def reclaim_orphan_tasks(self, *, min_age_s: float) -> Sequence[str]:
+        """Reclaim runtime tasks whose container record is already gone.
+
+        A container runtime can keep per-container helper processes alive after the
+        container itself has been deleted, and those hold the container's cgroups and the
+        memory accounted to them. Nothing in the container listing can see them, which is
+        why this is a separate question from `list_owned`.
+
+        Only tasks older than ``min_age_s`` may be reclaimed, so one that belongs to a
+        container still being created or torn down is never interrupted. Returns the
+        container ids whose tasks were reclaimed. A runtime with no such concept returns
+        an empty sequence.
+        """
+
 
 @dataclass(frozen=True)
 class ReclaimOutcome:
@@ -123,6 +137,10 @@ class ReclaimOutcome:
     # Containers the reclaimer asked the runtime to destroy and could not. A node that
     # still holds one of these still holds its memory, so it must not take new work.
     unremovable: tuple[str, ...] = ()
+    # Containers whose runtime task outlived its container record and was reclaimed. Kept
+    # apart from `removed`, which counts containers: these were already deleted, and what
+    # this freed is the cgroups their leftover task still held.
+    orphan_tasks: tuple[str, ...] = ()
     # None means the runtime could not be queried. Collectors treat that as an unhealthy
     # sweep, not an idle node, so a transient daemon failure cannot silently exit recovery.
     remaining: int | None = None
@@ -169,6 +187,7 @@ class NodeReclaimer:
         runtime: SandboxContainerRuntime,
         *,
         stopped_grace_s: float = 300.0,
+        orphan_task_min_age_s: float = 300.0,
     ) -> None:
         if not heartbeat_dir:
             raise ValueError("Node reclaimer heartbeat_dir cannot be empty.")
@@ -176,10 +195,13 @@ class NodeReclaimer:
             raise ValueError("Node reclaimer lease_ttl_s must be greater than zero.")
         if stopped_grace_s <= 0:
             raise ValueError("Node reclaimer stopped_grace_s must be greater than zero.")
+        if orphan_task_min_age_s <= 0:
+            raise ValueError("Node reclaimer orphan_task_min_age_s must be greater than zero.")
         self.heartbeat_dir = heartbeat_dir
         self.lease_ttl_s = lease_ttl_s
         self.runtime = runtime
         self.stopped_grace_s = stopped_grace_s
+        self.orphan_task_min_age_s = orphan_task_min_age_s
         self.lease_store = lease_store_id(heartbeat_dir)
         self._stopped = _StoppedTracker()
 
@@ -199,11 +221,36 @@ class NodeReclaimer:
         removed, unremovable = self._remove(doomed)
         if removed:
             self._stopped.forget(removed)
+        # Runs after the removal, and independently of it: an orphan task is one whose
+        # container record is already gone, so no container listing can account for it and
+        # only this reclaims the cgroups it still holds.
+        orphan_tasks = self._reclaim_orphan_tasks()
         # Re-list after a removal so a container the runtime refused to delete is
         # still counted, and the collector never mistakes it for a clean node.
         remaining = self._count_remaining(containers, removed)
         self._prune_owner_heartbeats(remaining, current_time)
-        return ReclaimOutcome(removed=removed, unremovable=unremovable, remaining=remaining)
+        return ReclaimOutcome(
+            removed=removed,
+            unremovable=unremovable,
+            orphan_tasks=orphan_tasks,
+            remaining=remaining,
+        )
+
+    def _reclaim_orphan_tasks(self) -> tuple[str, ...]:
+        """
+        Reclaim leftover runtime tasks, treating any failure as nothing reclaimed.
+        """
+        try:
+            reclaimed = tuple(self.runtime.reclaim_orphan_tasks(min_age_s=self.orphan_task_min_age_s))
+        except Exception:
+            psrl_logger.warning("Sandbox reclaimer could not reclaim orphan runtime tasks.", exc_info=True)
+            return ()
+        if reclaimed:
+            psrl_logger.info(
+                f"Reclaimed {len(reclaimed)} orphan runtime task(s) whose container was already gone: "
+                f"{list(reclaimed)}."
+            )
+        return reclaimed
 
     def _stale_owners(self, containers: Sequence[OwnedContainer], now: float) -> set[str]:
         """Read each lease once, because a filesystem error is not evidence of death."""
@@ -391,6 +438,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--interval-s", type=float, required=True)
     parser.add_argument("--idle-exit-cycles", type=int, default=10)
     parser.add_argument("--stopped-grace-s", type=float, default=300.0)
+    parser.add_argument("--orphan-task-min-age-s", type=float, default=300.0)
     parser.add_argument("--runtime", default="docker")
     parser.add_argument("--docker-command", nargs="+", default=["docker"])
     arguments = parser.parse_args(argv)
@@ -400,6 +448,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments.lease_ttl_s,
         _build_runtime(arguments.runtime, arguments.docker_command),
         stopped_grace_s=arguments.stopped_grace_s,
+        orphan_task_min_age_s=arguments.orphan_task_min_age_s,
     )
     return run_reclaimer_loop(
         reclaimer,
@@ -415,6 +464,7 @@ def spawn_node_reclaimer(
     *,
     idle_exit_cycles: int = 10,
     stopped_grace_s: float = 300.0,
+    orphan_task_min_age_s: float = 300.0,
     docker_command: Sequence[str] = ("docker",),
 ) -> subprocess.Popen | None:
     """
@@ -439,6 +489,8 @@ def spawn_node_reclaimer(
                 str(idle_exit_cycles),
                 "--stopped-grace-s",
                 str(stopped_grace_s),
+                "--orphan-task-min-age-s",
+                str(orphan_task_min_age_s),
                 "--docker-command",
                 *docker_command,
             ],

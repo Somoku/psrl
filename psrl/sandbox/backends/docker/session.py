@@ -28,6 +28,7 @@ from psrl.sandbox.core import (
     SandboxOomError,
     SandboxRef,
     SandboxSession,
+    SandboxSessionLostError,
     SandboxSpec,
     SandboxStatus,
     SandboxTransportError,
@@ -414,7 +415,7 @@ class DockerSession(SandboxSession):
         if watcher in done:
             reason = watcher.result()
             await complete_cleanup(self._abort_command(exec_task, watcher))
-            raise self._stopped_error(reason)
+            raise await self._stopped_error(reason)
         if exec_task not in done:
             return await complete_cleanup(self._command_overran(exec_task, watcher, timeout_s))
         try:
@@ -429,7 +430,7 @@ class DockerSession(SandboxSession):
         except (aiohttp.ClientError, SandboxTransportError) as exc:
             reason = await complete_cleanup(self._abort_command(exec_task, watcher, diagnose=True))
             if reason is not None:
-                raise self._stopped_error(reason) from exc
+                raise await self._stopped_error(reason) from exc
             raise
 
     async def _command_overran(
@@ -455,7 +456,7 @@ class DockerSession(SandboxSession):
         if not preserved:
             reason = await complete_cleanup(self._abort_command(exec_task, watcher, diagnose=True))
             if reason is not None:
-                raise self._stopped_error(reason)
+                raise await self._stopped_error(reason)
         else:
             exec_task.cancel()
             watcher.cancel()
@@ -527,14 +528,46 @@ class DockerSession(SandboxSession):
             return None
         return "oom_killed" if state.get("OOMKilled") else "exited"
 
-    def _stopped_error(self, reason: str) -> RuntimeError:
+    async def _stopped_error(self, reason: str) -> RuntimeError:
+        """Build the error for a container that stopped under a running command.
+
+        The diagnostics are read here, once, rather than at each detection site: a stop can
+        be noticed either by the daemon's event stream or by the inspect poll, and only the
+        exit status tells a signal apart from a clean exit or a daemon-side removal. This
+        runs only when a container has already died, so the extra inspect is not on any hot
+        path, and it is best-effort because a daemon that cannot answer must not replace the
+        stop with a transport error.
+        """
         self._exit_reason = _STOP_REASONS.get(reason, SandboxExitReason.UNKNOWN)
         if reason == "oom_killed":
             memory_mb = self._spec.resources.memory_mb if self._spec is not None else None
             return SandboxOomError(
                 f"Docker sandbox {self.sandbox_id!r} was OOM-killed during a command. memory_limit_mb={memory_mb}."
             )
-        return RuntimeError(f"Docker sandbox {self.sandbox_id!r} stopped ({reason}) while a command was running.")
+        state: Mapping[str, Any] = {}
+        try:
+            inspection = await self.backend.engine.inspect_container(self.sandbox_id)
+            state = (inspection or {}).get("State") or {}
+        except (aiohttp.ClientError, SandboxTransportError, TimeoutError, asyncio.TimeoutError):
+            state = {}
+        exit_code = state.get("ExitCode")
+        exit_code = int(exit_code) if isinstance(exit_code, int) else None
+        state_error = str(state.get("Error") or "")
+        finished_at = str(state.get("FinishedAt") or "")
+        diagnostics = f"exit_code={exit_code}"
+        if finished_at:
+            diagnostics += f", finished_at={finished_at}"
+        if state_error:
+            diagnostics += f", state_error={state_error!r}"
+        return SandboxSessionLostError(
+            f"Docker sandbox {self.sandbox_id!r} stopped ({reason}) while a command was running, so the "
+            f"command never completed ({diagnostics}).",
+            sandbox_id=self.sandbox_id,
+            exit_reason=self._exit_reason,
+            exit_code=exit_code,
+            state_error=state_error,
+            finished_at=finished_at,
+        )
 
     async def read_bytes(self, path: str) -> bytes:
         with self.backend.metrics.measure("read_bytes"):

@@ -53,6 +53,15 @@ class TerminateReason(Enum):
     # configured deadline. Distinct from every other failure because no task code executed,
     # so it says nothing about the model or the harness.
     SANDBOX_CAPACITY_TIMEOUT = "sandbox_capacity_timeout"
+    # The episode ran and its trajectory is trainable, but the grader sandbox was never
+    # admitted, so no verifier ever scored it. Kept separate from `VERIFIER_ERROR` so the
+    # capacity breaker can count the fault, and from `SANDBOX_CAPACITY_TIMEOUT` because the
+    # episode itself completed and its data is kept.
+    GRADER_CAPACITY_TIMEOUT = "grader_capacity_timeout"
+    # The episode's sandbox stopped on its own while a command was running, so the work in
+    # it was lost. A lifecycle or host fault rather than evidence about the model or the
+    # harness: the group must be replaced, but it must not be counted against the harness.
+    CONTAINER_LOST = "container_lost"
     # The episode was cancelled from outside, typically while the run was shutting down.
     # Kept apart from `ROLLOUT_ERROR` so teardown cannot be mistaken for a rollout fault.
     ROLLOUT_CANCELLED = "rollout_cancelled"
@@ -79,6 +88,7 @@ class TerminateReason(Enum):
             TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
             TerminateReason.AGENT_TIMEOUT,
             TerminateReason.VERIFIER_ERROR,
+            TerminateReason.GRADER_CAPACITY_TIMEOUT,
             TerminateReason.ENV_TIMEOUT,
         )
 
@@ -95,8 +105,11 @@ class TerminateReason(Enum):
         the same GRPO group split 0.0 against 1.0 purely on whether a container timed
         out, which is a gradient of pure infrastructure noise pointing in a direction
         the policy cannot influence.
+
+        `GRADER_CAPACITY_TIMEOUT` is ungraded for the same reason: the grader sandbox was
+        never admitted, so its zero would also be the absence of a measurement.
         """
-        return self is TerminateReason.VERIFIER_ERROR
+        return self in (TerminateReason.VERIFIER_ERROR, TerminateReason.GRADER_CAPACITY_TIMEOUT)
 
     @property
     def is_budget_truncated(self) -> bool:
@@ -144,6 +157,7 @@ class TerminateReason(Enum):
             TerminateReason.ROLLOUT_ERROR,
             TerminateReason.DOWNSTREAM_TIMEOUT,
             TerminateReason.SANDBOX_CAPACITY_TIMEOUT,
+            TerminateReason.CONTAINER_LOST,
             TerminateReason.ROLLOUT_CANCELLED,
             TerminateReason.ROLLOUT_DEADLINE_EXCEEDED,
             TerminateReason.UNKNOWN,
@@ -153,10 +167,12 @@ class TerminateReason(Enum):
     def is_coordination_fault(self) -> bool:
         """Return whether scheduling or teardown ended the episode, not the rollout.
 
-        `SANDBOX_CAPACITY_TIMEOUT` means the sandbox was never admitted, so no episode
-        ran at all; `ROLLOUT_CANCELLED` means something outside the episode stopped it,
-        usually shutdown. Neither is evidence about the model, the harness, or the task,
-        so neither may be retried in place nor counted as a rollout failure.
+        `SANDBOX_CAPACITY_TIMEOUT` means the sandbox was never admitted, so no episode ran
+        at all; `GRADER_CAPACITY_TIMEOUT` means grading never ran, so the reward was never
+        measured; `CONTAINER_LOST` means the sandbox stopped out from under a running
+        command; `ROLLOUT_CANCELLED` means something outside the episode stopped it, usually
+        shutdown. None is evidence about the model, the harness, or the task, so none may be
+        retried in place nor counted as a rollout failure.
 
         `ROLLOUT_DEADLINE_EXCEEDED` is deliberately not one of them: provisioning beyond the
         whole setup allowance says the environment could not deliver a sandbox on time, which
@@ -164,6 +180,8 @@ class TerminateReason(Enum):
         """
         return self in (
             TerminateReason.SANDBOX_CAPACITY_TIMEOUT,
+            TerminateReason.GRADER_CAPACITY_TIMEOUT,
+            TerminateReason.CONTAINER_LOST,
             TerminateReason.ROLLOUT_CANCELLED,
         )
 

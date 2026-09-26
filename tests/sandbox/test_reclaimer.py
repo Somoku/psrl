@@ -31,11 +31,20 @@ class FakeRuntime:
         self.removed: list[str] = []
         self.unremovable: set[str] = set()
         self.list_error: Exception | None = None
+        self.orphan_tasks: list[str] = []
+        self.orphan_task_error: Exception | None = None
+        self.orphan_task_min_age_s: float | None = None
 
     def list_owned(self, lease_store: str):
         if self.list_error is not None:
             raise self.list_error
         return None if self.containers is None else list(self.containers)
+
+    def reclaim_orphan_tasks(self, *, min_age_s: float):
+        self.orphan_task_min_age_s = min_age_s
+        if self.orphan_task_error is not None:
+            raise self.orphan_task_error
+        return list(self.orphan_tasks)
 
     def remove_containers(self, container_ids):
         ids = list(container_ids)

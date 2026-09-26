@@ -132,6 +132,7 @@ class DockerBackend(SandboxBackend):
         policy_profiles: Mapping[str, DockerPolicyProfile | Mapping[str, Any]] | None = None,
         security: DockerSecurityConfig | Mapping[str, Any] | None = None,
         keepalive_command: Sequence[str] = ("tail", "-f", "/dev/null"),
+        command_prefix: Sequence[str] = ("setsid", "-w"),
         command_interpreter: Sequence[str] = ("bash", "-lc"),
         request_timeout_s: float = 180.0,
         container_watch_interval_s: float = 15.0,
@@ -166,6 +167,9 @@ class DockerBackend(SandboxBackend):
             security if isinstance(security, DockerSecurityConfig) else DockerSecurityConfig(**dict(security or {}))
         )
         self.keepalive_command = tuple(keepalive_command)
+        # Probed against each image before the first one-shot command, because it needs
+        # util-linux's `setsid -w`. Set it to () to run commands with no session isolation.
+        self.command_prefix = tuple(command_prefix)
         self.command_interpreter = tuple(command_interpreter)
         # Retained so a session can describe its own truncation without reaching into the
         # engine client, which test doubles and other engines do not have to expose.
@@ -888,17 +892,52 @@ class DockerBackend(SandboxBackend):
         """
         mode = (spec.exec_mode if spec is not None else None) or self.default_exec_mode
         if mode is ExecMode.ONE_SHOT:
+            # The persistent shell isolates commands through its own process group, which
+            # `_signal_shell_group` already relies on. A one-shot exec has no such group, so
+            # it is the mode that needs the session prefix.
             return OneShotExec(
                 self.engine,
                 container_id,
                 self.command_interpreter,
                 max_observation_chars=self.max_observation_chars,
+                resolve_command_prefix=lambda: self._resolve_command_prefix(container_id),
             )
         return PersistentShellExec(
             lambda: self._shell_factory(container_id),
             max_observation_chars=self.max_observation_chars,
             kill_group=lambda pid: self._signal_shell_group(container_id, pid),
         )
+
+    async def _resolve_command_prefix(self, container_id: str) -> tuple[str, ...]:
+        """Return the process-isolation prefix this container's image actually supports.
+
+        The prefix needs util-linux's ``setsid -w``. BusyBox ships a ``setsid`` without
+        ``-w``, which would return before the command finished and lose its exit status, so
+        the capability is probed rather than assumed.
+
+        Best effort by design: this is defence in depth, not a correctness requirement. A
+        probe that cannot complete must not fail an otherwise working sandbox, and the first
+        real command would report the underlying fault anyway.
+        """
+        prefix = self.command_prefix
+        if not prefix:
+            return ()
+        try:
+            exit_code, _, stderr, _ = await self.engine.exec(container_id, [*prefix, "true"], timeout_s=30)
+        except Exception as exc:
+            psrl_logger.warning(
+                f"Could not probe the command isolation prefix {list(prefix)!r} for Docker container "
+                f"{container_id}: {exc!r}. Running commands without it."
+            )
+            return ()
+        if exit_code == 0:
+            return prefix
+        psrl_logger.warning(
+            f"The image for Docker container {container_id} does not support the command isolation prefix "
+            f"{' '.join(prefix)!r} (exit {exit_code}): "
+            f"{stderr.decode(errors='replace').strip()[-200:]}. Running commands without it."
+        )
+        return ()
 
     async def _signal_shell_group(self, container_id: str, pid: int) -> bool:
         """Stop a command the persistent shell started, keeping the container alive.

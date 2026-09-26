@@ -359,10 +359,18 @@ class DockerEngineClient:
         return list(json.loads(body))
 
     async def remove_container(self, container_id: str) -> None:
+        """Delete one container, treating "already gone" and "already going" as success.
+
+        A 404 means it is gone and a 409 means another caller is removing it right now.
+        Both end with the container absent, which is what this call asked for. Raising on
+        409 sends the caller down a second force-remove path, so two teardowns race the
+        same cgroup: that is what the node sweep and a lease release do to each other at
+        the end of every episode.
+        """
         try:
             await self._request("DELETE", f"/containers/{container_id}?force=1&v=1", expected=(204,))
         except DockerEngineError as exc:
-            if exc.status != 404:
+            if exc.status not in (404, 409):
                 raise
 
     async def pause_container(self, container_id: str) -> None:

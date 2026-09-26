@@ -24,7 +24,7 @@ import re
 import select
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -248,6 +248,7 @@ class OneShotExec:
         interpreter: Sequence[str],
         *,
         max_observation_chars: int = 0,
+        resolve_command_prefix: Callable[[], Awaitable[Sequence[str]]] | None = None,
     ) -> None:
         if not interpreter:
             raise ValueError("Docker command interpreter cannot be empty.")
@@ -255,7 +256,26 @@ class OneShotExec:
         self.container_id = container_id
         self.interpreter = tuple(interpreter)
         self.max_observation_chars = max_observation_chars
+        # Resolved once, lazily, before the first command. The prefix runs each command in
+        # its own session so a signal the agent or one of its children sends to their
+        # process group cannot reach the container's keepalive init and stop the container
+        # underneath a running command. It has to be probed rather than assumed, because it
+        # needs a `setsid` that supports `-w` and not every image ships one; resolving it
+        # here rather than at construction keeps every creation path covered by one probe.
+        self._resolve_command_prefix = resolve_command_prefix
+        self._command_prefix: tuple[str, ...] | None = None
         self._last_activity_at: float | None = None
+
+    async def _prefix(self) -> tuple[str, ...]:
+        """
+        Return the process-isolation prefix, probing the image at most once.
+        """
+        if self._command_prefix is None:
+            if self._resolve_command_prefix is None:
+                self._command_prefix = ()
+            else:
+                self._command_prefix = tuple(await self._resolve_command_prefix())
+        return self._command_prefix
 
     @property
     def last_activity_at(self) -> float | None:
@@ -271,10 +291,11 @@ class OneShotExec:
     ) -> ExecResult:
         self._last_activity_at = time.monotonic()
         timeout_s = None if budget is None else budget.timeout_s
+        prefix = await self._prefix()
         try:
             exit_code, stdout, stderr, truncated = await self.transport.exec(
                 self.container_id,
-                [*self.interpreter, command],
+                [*prefix, *self.interpreter, command],
                 cwd=cwd,
                 env=env,
                 timeout_s=timeout_s,

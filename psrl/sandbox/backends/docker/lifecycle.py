@@ -41,6 +41,9 @@ class DockerLifecycleConfig:
     # A stopped container is reaped despite a live owner once it stays stopped this long.
     # Must outlast the session's own stop diagnosis, which takes seconds.
     stopped_grace_s: float = 300.0
+    # A containerd shim whose container record is gone is reclaimed once it is at least this
+    # old. The guard is what keeps a container mid-create or mid-delete out of scope.
+    orphan_task_min_age_s: float = 300.0
     docker_command: tuple[str, ...] = ("docker",)
 
     def __post_init__(self) -> None:
@@ -154,6 +157,7 @@ class DockerLifecycle:
             self.config.lease_ttl_s,
             DockerContainerRuntime(self.config.docker_command),
             stopped_grace_s=self.config.stopped_grace_s,
+            orphan_task_min_age_s=self.config.orphan_task_min_age_s,
         )
 
     def _ensure_gc(self) -> None:
@@ -170,6 +174,7 @@ class DockerLifecycle:
                 self.config.gc_interval_s,
                 idle_exit_cycles=self.config.gc_idle_exit_cycles,
                 stopped_grace_s=self.config.stopped_grace_s,
+                orphan_task_min_age_s=self.config.orphan_task_min_age_s,
                 docker_command=self.config.docker_command,
             )
             if gc_process is None:

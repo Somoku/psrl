@@ -5,7 +5,9 @@ from __future__ import annotations
 import atexit
 import concurrent.futures
 import logging
+import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -20,6 +22,16 @@ _PRUNE_LOCK = threading.Lock()
 _LAST_PRUNE_MONOTONIC = 0.0
 # Images removed per `docker rmi` call, to bound the argument list.
 _PRUNE_BATCH_SIZE = 200
+
+# `containerd-shim-runc-v2 -namespace moby -id <container-id> -address <sock>`. The id is
+# the full container id, which is what `docker ps --no-trunc` prints, so the two can be
+# compared directly. Matching on `-id` also skips this sweep's own `ps` and shell, whose
+# argv contains the pattern but no such flag.
+_SHIM_PROCESS_PATTERN = re.compile(r"^\s*(\d+)\s+(\d+)\s+(.*containerd-shim.*)$")
+_SHIM_ID_PATTERN = re.compile(r"-id\s+([0-9a-f]{12,})")
+# Docker's own containerd namespace. A shim in any other namespace belongs to a different
+# runtime on this node, such as Kubernetes, and is never ours to reclaim.
+_DOCKER_SHIM_NAMESPACE = "moby"
 
 # Cleanup runs here rather than on asyncio's default executor, whose small shared
 # pool stalls episode I/O when many `docker rm` calls block on a loaded daemon.
@@ -241,6 +253,91 @@ class DockerContainerRuntime:
             psrl_logger.warning(f"Docker could not reap every stale sandbox: {exc}.")
             return ids
         return [container_id for container_id in ids if _container_exists(container_id, self.docker_command)]
+
+    def reclaim_orphan_tasks(self, *, min_age_s: float) -> Sequence[str]:
+        """Kill containerd shims whose container Docker no longer knows about.
+
+        A task-delete that fails leaves the shim running, and the shim holds the
+        container's cgroup directories open, so the memory and CPU accounted to them stay
+        charged to the node with nothing left to reclaim them. containerd releases the task
+        and the cgroup once the shim exits, so SIGKILL is enough and no cgroup has to be
+        removed by hand.
+
+        Three guards keep this off a healthy container. Only shims in Docker's own
+        containerd namespace are considered, so another runtime's shims on the same node are
+        never touched. Only shims that have run for `min_age_s` are eligible, which is what
+        keeps a container mid-create or mid-delete out of scope. And the container listing
+        is read *after* the shims, so a container created in between is present in it and
+        can only ever spare a shim, never doom one.
+        """
+        shims = self._list_shims(min_age_s=min_age_s)
+        if not shims:
+            return []
+        known = self._known_container_ids()
+        if known is None:
+            # Without the listing every shim looks orphaned, so reclaim nothing.
+            return []
+        reclaimed: list[str] = []
+        for pid, container_id in shims:
+            if container_id in known:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue  # It exited between the listing and here, which is the goal.
+            except OSError as exc:
+                psrl_logger.warning(f"Could not kill orphan containerd shim {pid} for {container_id}: {exc}.")
+                continue
+            reclaimed.append(container_id)
+        return reclaimed
+
+    def _list_shims(self, *, min_age_s: float) -> list[tuple[int, str]]:
+        """
+        Return `(pid, container_id)` for Docker's containerd shims older than `min_age_s`.
+        """
+        try:
+            listed = subprocess.run(
+                ["ps", "-eo", "pid,etimes,args", "--no-headers"],
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            psrl_logger.warning(f"Could not list processes to find orphan containerd shims: {exc}.")
+            return []
+        if listed.returncode != 0:
+            psrl_logger.warning("Could not list processes to find orphan containerd shims.")
+            return []
+        shims: list[tuple[int, str]] = []
+        for line in listed.stdout.decode(errors="replace").splitlines():
+            process = _SHIM_PROCESS_PATTERN.match(line)
+            if not process:
+                continue
+            arguments = process.group(3)
+            if f"-namespace {_DOCKER_SHIM_NAMESPACE}" not in arguments:
+                continue
+            identifier = _SHIM_ID_PATTERN.search(arguments)
+            if identifier is None or int(process.group(2)) < min_age_s:
+                continue
+            shims.append((int(process.group(1)), identifier.group(1)))
+        return shims
+
+    def _known_container_ids(self) -> set[str] | None:
+        """
+        Return every container id Docker still lists, or None when it cannot be asked.
+        """
+        try:
+            listed = subprocess.run(
+                _command(self.docker_command, "ps", "-aq", "--no-trunc"),
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            psrl_logger.warning(f"Could not list containers to find orphan containerd shims: {exc}.")
+            return None
+        if listed.returncode != 0:
+            psrl_logger.warning("Could not list containers to find orphan containerd shims.")
+            return None
+        return set(listed.stdout.decode(errors="replace").split())
 
 
 def sanitize_compose_project_name(name: str) -> str:

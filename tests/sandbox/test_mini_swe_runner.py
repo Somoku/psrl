@@ -15,7 +15,7 @@ from examples.mini_swe.runner import (
     parse_duration_seconds,
     resolve_container_config,
 )
-from psrl.sandbox import ExecResult, SandboxRef, SandboxSource, SandboxSpec
+from psrl.sandbox import ExecMode, ExecResult, SandboxRef, SandboxSource, SandboxSpec
 
 
 def _payload() -> dict[str, Any]:
@@ -94,6 +94,22 @@ def test_mini_swe_runner_defaults_the_capacity_class() -> None:
     payload = _payload()
 
     assert build_sandbox_spec(payload).resource_class == "default"
+
+
+def test_mini_swe_runner_declares_one_shot_exec_for_both_sandboxes() -> None:
+    """This workload owns its exec mode rather than inheriting the node's default.
+
+    Every command it runs is a self-contained script with an explicit `cwd` -- the agent
+    CLI, patch collection, the git sanitizer, the grader -- so no shell has anything to
+    remember between them. A persistent shell would add one, and because that shell reads
+    its commands from stdin, the long-lived agent CLI would inherit the command pipe as
+    its own stdin and consume it. An interactive shell agent has the opposite need, which
+    is exactly why the mode belongs on the spec and not on the backend.
+    """
+    payload = _payload()
+
+    assert build_sandbox_spec(payload).exec_mode is ExecMode.ONE_SHOT
+    assert build_sandbox_spec(payload, grading=True).exec_mode is ExecMode.ONE_SHOT
 
 
 def test_mini_swe_runner_preserves_forward_env_and_docker_memory_units() -> None:

@@ -153,7 +153,10 @@ class DockerBackend(SandboxBackend):
         disk_admission: DockerDiskAdmissionConfig | Mapping[str, Any] | None = None,
         cgroup_parent: str | None = None,
         isolation_runtime: str | None = None,
-        default_exec_mode: ExecMode = ExecMode.PERSISTENT,
+        # Only covers a spec that declares no mode of its own. One-shot is the safe
+        # default: it keeps no state between commands, so landing on it by omission
+        # costs an optimization rather than correctness.
+        default_exec_mode: ExecMode = ExecMode.ONE_SHOT,
         shell_factory: Callable[[str], ShellProcess] | None = None,
         engine: DockerEngine | None = None,
         cli_force_remove: Callable[[Sequence[str]], Sequence[str]] | None = None,
@@ -883,12 +886,20 @@ class DockerBackend(SandboxBackend):
             ) from exc
 
     def _exec_strategy(self, container_id: str, spec: SandboxSpec | None) -> ExecStrategy:
-        """
-        Build the exec strategy a spec asked for.
+        """Build the exec strategy a spec asked for.
 
-        A harness that keeps shell state across turns needs the persistent shell.
-        A grader that runs one command is cheaper without one, and pays no shell
-        process for the life of the sandbox.
+        An interactive shell agent needs the persistent shell, because its actions are
+        single commands whose `cd`, `source`, and exported variables have to survive into
+        the next one. A workload whose commands are self-contained scripts is cheaper
+        without one, and pays no shell process for the life of the sandbox.
+
+        Which of those a workload is, is a property of the workload rather than of the
+        node, so a spec is expected to declare it. `default_exec_mode` only covers a spec
+        that does not, and it defaults to the one-shot mode: it carries no state between
+        commands, so a workload that silently lands on it loses an optimization rather
+        than a correctness guarantee. Defaulting the other way is not symmetric — a
+        persistent shell reads its commands from stdin, so a long-lived child that reads
+        stdin inherits that pipe and eats the command stream.
         """
         mode = (spec.exec_mode if spec is not None else None) or self.default_exec_mode
         if mode is ExecMode.ONE_SHOT:

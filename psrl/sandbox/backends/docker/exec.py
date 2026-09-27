@@ -425,18 +425,31 @@ class PersistentShellExec:
         return True
 
     def _wrap(self, command: str, *, cwd: str | None, env: Mapping[str, str] | None) -> str:
-        """
-        Build the text one command needs, including its sentinel.
+        """Build the text one command needs, including its sentinel.
 
         Per-command overrides are applied as a prefix rather than by restarting the
         shell, which is the whole point of keeping one open.
+
+        The command's stdin is detached from the shell's own. This shell reads its
+        commands from stdin, so anything the command starts would otherwise inherit that
+        same pipe: a child that reads stdin consumes the next queued command, the sentinel
+        never arrives, and the strategy waits out its deadline on a command that already
+        finished. Redirecting here rather than asking every caller to remember it keeps
+        the guarantee a property of the strategy, and matches `OneShotExec`, whose
+        transport never attaches stdin at all.
+
+        A command that genuinely needs to be fed input must pipe or redirect it itself,
+        which is unaffected: an inner redirection binds tighter than this outer one.
         """
         prefix: list[str] = []
         for key, value in (env or {}).items():
             prefix.append(f"export {key}={_quote(value)};")
         if cwd:
             prefix.append(f"cd {_quote(cwd)} || exit 200;")
+        # Braces, not a subshell: a subshell would discard the `cd` and the exports that
+        # later commands in this same shell are expected to still see.
         body = command if command.endswith("\n") else command + "\n"
+        body = f"{{\n{body}}} < /dev/null\n"
         sentinel = (
             f"__psrl_rc=$?; sleep 0.01; printf '{_MARKER_PREFIX}%s?{self._token}{_MARKER_SUFFIX}\\n' \"$__psrl_rc\"\n"
         )

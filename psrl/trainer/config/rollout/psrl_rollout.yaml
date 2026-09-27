@@ -220,9 +220,19 @@ agent:
       docker:
         _target_: psrl.sandbox.backends.DockerBackend
 
-        # One exec interface, two strategies. A multi-turn harness keeps a login shell for
-        # stateful turns, while single-command workloads skip it. A spec may override this.
-        default_exec_mode: persistent
+        # One exec interface, two strategies. An interactive shell agent keeps a login
+        # shell, because its actions are single commands whose `cd`, `source`, and
+        # exported variables must survive into the next one. A workload whose commands are
+        # self-contained scripts skips it.
+        #
+        # Which one a workload needs is a property of the workload, so each recipe declares
+        # it on its own spec (`SandboxSpec.exec_mode`) and that always wins. This setting
+        # only covers a spec that declares nothing, and stays on the one-shot strategy for
+        # that case: it keeps no state between commands, so an undeclared workload loses an
+        # optimization rather than correctness. The reverse is not safe — a persistent
+        # shell reads its commands from stdin, so a long-lived child that also reads stdin
+        # consumes the command stream.
+        default_exec_mode: one_shot
 
         # Longest stretch with no output at all before a command is treated as stuck rather
         # than slow. Null waits for the deadline only.

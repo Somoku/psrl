@@ -13,6 +13,7 @@ from typing import Any
 from examples.mini_swe.grading.schema import GradingPlan
 from examples.mini_swe.harness_adapter import MiniSWEAgentAdapter, MiniSWEAgentConfig, RunnerCancelled
 from psrl.sandbox import (
+    ExecMode,
     MountSpec,
     ResourceSpec,
     SandboxFeature,
@@ -185,6 +186,14 @@ def build_sandbox_spec(
         # Declared per role, never inferred from the requested size: node admission gives
         # each class its own guaranteed slice so the larger grader cannot starve.
         resource_class=str(container_config.get("resource_class") or "default"),
+        # Every command this workload runs is a self-contained script with an explicit
+        # `cwd`: the harness CLI, the patch collection, the git sanitizer, and the grader
+        # all carry their own state, so there is nothing for a shell to remember between
+        # them. A persistent shell would only add one, and the agent CLI is a long-lived
+        # child that would inherit that shell's command pipe as its own stdin. Declared
+        # here rather than inherited from the backend default, because it is a property of
+        # this workload and not of the node it runs on.
+        exec_mode=ExecMode.ONE_SHOT,
         # Both sandboxes of one task belong to the same job, which lets the manager detect a
         # job that asks for its grader before releasing its rollout sandbox.
         workflow_id=sandbox_prefix,

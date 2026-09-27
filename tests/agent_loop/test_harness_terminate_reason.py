@@ -1,10 +1,12 @@
 """Terminate-reason classification for the sandboxed harness loops."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
-from psrl.workers.agent_loop.loops.harness_agent_loop import HarnessAgentLoop
+from psrl.workers.agent_loop.loops.harness_agent_loop import HarnessAgentLoop, _raise_if_cancelled
 from psrl.workers.agent_loop.loops.utils import TerminateReason
+from psrl.workers.agent_loop.worker import _classify_rollout_failure
 
 pytestmark = pytest.mark.cpu_test
 
@@ -105,3 +107,44 @@ def test_a_grader_that_was_never_admitted_reports_the_capacity_reason() -> None:
     assert reason.is_successful
     assert reason.is_coordination_fault
     assert not reason.counts_toward_refill_breaker()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_episode_stops_before_it_collects_artifacts() -> None:
+    """An aborted episode must not spend a sandbox collecting a result nobody reads.
+
+    The manager clears the buffer entry when it aborts a group, so the phase after the
+    harness run -- patch collection, grading, reading the TITO trajectory -- has nowhere
+    to put its output. Worse, it runs against a sandbox whose teardown is already in
+    flight. A cancellation delivered inside a shielded section is only recorded on the
+    task, so the loop has to check for it rather than wait for the next await to raise.
+    """
+    observed: list[str] = []
+
+    async def episode() -> None:
+        try:
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            # Stands in for the cleanup paths that legitimately absorb a cancellation.
+            observed.append("cancel absorbed")
+        _raise_if_cancelled()
+        observed.append("collected artifacts")
+
+    task = asyncio.create_task(episode())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert observed == ["cancel absorbed"], "collection ran after the episode was cancelled"
+
+
+def test_a_cancelled_episode_is_a_coordination_fault_not_a_rollout_error() -> None:
+    # What `_raise_if_cancelled` raises has to land on the reason that keeps an abort out
+    # of the breaker built to catch a broken harness.
+    reason = _classify_rollout_failure(asyncio.CancelledError())
+
+    assert reason is TerminateReason.ROLLOUT_CANCELLED
+    assert reason.is_coordination_fault
+    assert not reason.counts_toward_refill_breaker()
+    assert not reason.needs_worker_retry()

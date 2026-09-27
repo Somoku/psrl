@@ -343,7 +343,19 @@ async def test_closed_engine_cannot_reopen_its_connection_pool() -> None:
         await engine.info()
 
 
-async def test_cancelling_exec_joins_transport_task_before_return(monkeypatch):
+async def test_cancelling_exec_joins_transport_task_and_keeps_the_sandbox(monkeypatch):
+    """A caller that stops waiting must not take the sandbox with it.
+
+    The transport task is still joined, so no request is left in flight. But the
+    cancellation came from the caller, which says nothing about the container, and the
+    lease still owns it: an episode cancelled mid-turn has to be able to collect its
+    artifacts afterwards, and the lease release is the hard stop. Destroying here is what
+    made patch collection fail with "sandbox is terminated" on an abort.
+
+    The other direction is `test_docker_cancelled_exec_terminates_disposable_sandbox`:
+    when the transport itself raises, a process may still be running with nobody reading
+    it, and a one-shot exec cannot be signalled, so the container has to go.
+    """
     engine = FakeDockerEngine()
     backend = DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine)
     session = await backend.create(SandboxSpec(SandboxSource.image("image")))
@@ -362,8 +374,12 @@ async def test_cancelling_exec_joins_transport_task_before_return(monkeypatch):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
     assert stopped.is_set()
-    assert engine.removes == 1
+    assert engine.removes == 0
+    # Still usable, which is the point: the next command is what collects the patch.
+    monkeypatch.setattr(engine, "exec", FakeDockerEngine.exec.__get__(engine))
+    assert (await session.exec("echo ok")).exit_code == 0
     await backend.shutdown()
 
 

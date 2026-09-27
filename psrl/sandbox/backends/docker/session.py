@@ -417,7 +417,11 @@ class DockerSession(SandboxSession):
                 return_when=asyncio.FIRST_COMPLETED,
             )
         except asyncio.CancelledError:
-            await complete_cleanup(self._abort_command(exec_task, watcher))
+            # The caller stopped waiting. That is not evidence about the container, and
+            # the lease still owns it, so the command is dropped and the sandbox kept:
+            # an episode cancelled mid-turn still has to collect its artifacts, and the
+            # lease release is the hard stop.
+            await complete_cleanup(self._abort_command(exec_task, watcher, destroy=False))
             raise
         if watcher in done:
             reason = watcher.result()
@@ -429,7 +433,10 @@ class DockerSession(SandboxSession):
             with self.backend.metrics.measure("exec"):
                 return exec_task.result()
         except asyncio.CancelledError:
-            # The command stream was aborted, which does not stop the process it started.
+            # The exec stream itself was cancelled rather than this caller's wait, so a
+            # process may still be running with nobody reading it. A one-shot exec cannot
+            # be signalled, so the container has to go: anything it writes would land in
+            # the next command's output.
             await complete_cleanup(self._abort_command(exec_task, watcher))
             raise
         except (TimeoutError, asyncio.TimeoutError) as exc:
@@ -506,17 +513,29 @@ class DockerSession(SandboxSession):
         watcher: asyncio.Task,
         *,
         diagnose: bool = False,
+        destroy: bool = True,
     ) -> str | None:
+        """Stop tracking a command, and optionally destroy the sandbox it ran in.
+
+        `destroy` is what separates "this container can no longer be trusted" from "this
+        caller stopped waiting". A one-shot exec cannot be signalled, so a command whose
+        stream is abandoned leaves a process that would write into the next command's
+        output: destroying the container is the only answer that cannot be wrong. A caller
+        that cancelled is different. It says nothing about the container, and the sandbox
+        is still leased, so destroying it here would pull the filesystem out from under
+        work the episode has not finished with.
+        """
         exec_task.cancel()
         watcher.cancel()
         await asyncio.gather(exec_task, watcher, return_exceptions=True)
         try:
             return await self._container_stop_reason() if diagnose else None
         finally:
-            try:
-                await self.terminate()
-            except Exception:
-                psrl_logger.warning("Docker command cleanup remains owned by the sandbox lease.", exc_info=True)
+            if destroy:
+                try:
+                    await self.terminate()
+                except Exception:
+                    psrl_logger.warning("Docker command cleanup remains owned by the sandbox lease.", exc_info=True)
 
     async def _container_stop_reason(self) -> str | None:
         """

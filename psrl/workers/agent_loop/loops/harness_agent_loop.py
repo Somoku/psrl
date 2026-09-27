@@ -33,6 +33,24 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
+def _raise_if_cancelled() -> None:
+    """Stop the episode here when it has already been cancelled.
+
+    A cancellation delivered while the episode was inside a shielded section is recorded
+    on the task and raised at the next await. That is normally fine, but the phase that
+    follows the harness run is a sequence of awaits against the sandbox, so the
+    cancellation would surface from whichever one happened to be first and be reported as
+    whatever that call failed with. Checking explicitly turns it back into a cancellation.
+
+    Raises:
+        asyncio.CancelledError: When this task is already cancelled. The worker's
+            classifier maps it to `ROLLOUT_CANCELLED`.
+    """
+    task = asyncio.current_task()
+    if task is not None and task.cancelling() > 0:
+        raise asyncio.CancelledError
+
+
 class HarnessAgentLoop(SessionAgentLoop):
     """
     Run one task-scoped harness and turn its TITO session into training data.
@@ -315,6 +333,18 @@ class HarnessAgentLoop(SessionAgentLoop):
                     session_id,
                     (harness_result.stderr_tail or "").strip()[-500:] or "<empty>",
                 )
+
+            # Everything from here on exists to turn this episode into training data, and
+            # a cancelled episode has no slot left to put it in: the manager cleared the
+            # buffer entry when it aborted the group. Collecting the patch, grading it,
+            # and reading the TITO trajectory would spend an episode's worth of sandbox
+            # time on a result nothing reads, and the collection itself would run against
+            # a sandbox whose teardown is already in flight.
+            #
+            # Reported as cancelled rather than as a rollout error, because that is what
+            # it is: `is_coordination_fault` keeps a shutdown or an abort out of the
+            # breaker that exists to catch a genuinely broken harness.
+            _raise_if_cancelled()
 
             artifact = await self.collect_harness_artifact(
                 task,

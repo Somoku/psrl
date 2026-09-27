@@ -104,6 +104,9 @@ class DockerSession(SandboxSession):
         # A command must be refused from the first moment, but the lifetime reaper's retry
         # of a failed destroy must still be let through.
         self._closed_to_callers = False
+        # Stack of whoever started that teardown, so a command refused afterwards can name
+        # the cause rather than only the symptom.
+        self._closed_by = ""
         self._exec_lock = asyncio.Lock()
         self._exec_strategy = exec_strategy or OneShotExec(
             backend.engine,
@@ -352,8 +355,19 @@ class DockerSession(SandboxSession):
         # Tested against the start of teardown rather than its completion, so a command
         # that arrives while the sandbox is being destroyed is refused as what it is
         # instead of failing later on the shell teardown already under way.
+        #
+        # The message carries the diagnosed exit reason and the stack that started the
+        # teardown. Without them this reads as "the sandbox is gone" and says nothing
+        # about why, which is exactly the report that cannot be acted on: an idle reap, a
+        # lifetime expiry, an OOM, and a lease released by an aborted group all arrive
+        # here identically.
         if self._closed_to_callers:
-            raise RuntimeError("Docker sandbox is terminated.")
+            raise SandboxSessionLostError(
+                f"Docker sandbox {self.sandbox_id!r} was terminated before this command could run "
+                f"(exit_reason={self._exit_reason.value}). Terminated by:\n{self._closed_by or '<unrecorded>'}",
+                sandbox_id=self.sandbox_id,
+                exit_reason=self._exit_reason,
+            )
         self._command_count += 1
         self._busy = True
         try:
@@ -673,6 +687,11 @@ class DockerSession(SandboxSession):
         return ""
 
     async def terminate(self) -> None:
+        # Captured here rather than inside `_terminate`, because `complete_cleanup` runs
+        # that on a task of its own and a new task's stack no longer holds the frames of
+        # whoever asked. This is the last point that still sees the real caller.
+        if not self._closed_to_callers:
+            self._closed_by = "".join(traceback.format_stack()[:-1])
         await complete_cleanup(self._terminate())
 
     async def _terminate(self) -> None:
@@ -689,6 +708,11 @@ class DockerSession(SandboxSession):
             # lifetime reaper retries `terminate` after a failed destroy, and that retry has
             # to be allowed back in or the container leaks.
             self._closed_to_callers = True
+            if not self._closed_by:
+                # A caller that reached `_terminate` directly rather than through
+                # `terminate` still records something, even though these frames are the
+                # cleanup task's rather than the requester's.
+                self._closed_by = "".join(traceback.format_stack()[:-1])
             await complete_cleanup(self._exec_strategy.close())
             await complete_cleanup(self.backend.release_egress(self.sandbox_id))
             with self.backend.metrics.measure("terminate"):

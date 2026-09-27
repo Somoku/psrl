@@ -33,21 +33,42 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-def _raise_if_cancelled() -> None:
-    """Stop the episode here when it has already been cancelled.
+def _raise_if_episode_is_over(lease: SandboxLease | None) -> None:
+    """Stop the episode before it collects artifacts it can no longer keep or store.
+
+    Two distinct ways an episode can be over by this point, and neither raises on its own:
 
     A cancellation delivered while the episode was inside a shielded section is recorded
-    on the task and raised at the next await. That is normally fine, but the phase that
-    follows the harness run is a sequence of awaits against the sandbox, so the
-    cancellation would surface from whichever one happened to be first and be reported as
-    whatever that call failed with. Checking explicitly turns it back into a cancellation.
+    on the task and raised only at the next await. The phase that follows the harness run
+    is a sequence of awaits against the sandbox, so the cancellation would surface from
+    whichever one happened to be first and be reported as whatever that call failed with.
+
+    The lease can also be released by something other than this task. An aborted group
+    releases the lease of a sibling that was still running, which destroys the sandbox
+    while this episode's own task was never cancelled, so `cancelling()` stays zero and
+    the collection proceeds against a sandbox that is already gone. That is the case that
+    reported itself as a bare "sandbox is terminated" from patch collection.
 
     Raises:
-        asyncio.CancelledError: When this task is already cancelled. The worker's
-            classifier maps it to `ROLLOUT_CANCELLED`.
+        asyncio.CancelledError: In either case. The worker's classifier maps it to
+            `ROLLOUT_CANCELLED`, a coordination fault: the group is replaced without the
+            episode being counted as evidence that the harness is broken.
     """
-    task = asyncio.current_task()
+    # `current_task` raises outside a running loop, which is not a reason to fail: the
+    # lease check below is still meaningful, and a caller with no loop has no task to be
+    # cancelled in the first place.
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
     if task is not None and task.cancelling() > 0:
+        raise asyncio.CancelledError
+    if lease is not None and lease.released:
+        psrl_logger.warning(
+            "Sandbox lease for %s was released by something other than this episode, so its "
+            "artifacts can no longer be collected. Ending the episode as cancelled.",
+            lease.ref,
+        )
         raise asyncio.CancelledError
 
 
@@ -344,7 +365,7 @@ class HarnessAgentLoop(SessionAgentLoop):
             # Reported as cancelled rather than as a rollout error, because that is what
             # it is: `is_coordination_fault` keeps a shutdown or an abort out of the
             # breaker that exists to catch a genuinely broken harness.
-            _raise_if_cancelled()
+            _raise_if_episode_is_over(lease)
 
             artifact = await self.collect_harness_artifact(
                 task,

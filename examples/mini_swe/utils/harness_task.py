@@ -3,7 +3,7 @@
 import logging
 import shlex
 
-from psrl.sandbox import SandboxSession
+from psrl.sandbox import SandboxSession, SandboxSessionLostError
 
 psrl_logger = logging.getLogger(__file__)
 
@@ -90,7 +90,19 @@ async def collect_git_patch(
         "done\n"
         'wc -c < "$out"\n'
     )
-    result = await session.exec(script, cwd=workdir, timeout_s=timeout_s)
+    try:
+        result = await session.exec(script, cwd=workdir, timeout_s=timeout_s)
+    except SandboxSessionLostError:
+        # The sandbox is gone, so there is no patch to collect and never will be. Reported
+        # as itself rather than as a patch-collection failure: the worker classifies it as
+        # an infrastructure fault, which replaces the group without counting the episode
+        # against the harness. Raising a bare RuntimeError here instead is what made a
+        # released lease look like a broken collector.
+        psrl_logger.warning(
+            "Sandbox was lost before the harness patch could be collected, so this episode has no patch.",
+            exc_info=True,
+        )
+        raise
     if result.exit_code != 0:
         raise RuntimeError(f"Could not collect harness patch: {result.stderr.strip()}")
     try:

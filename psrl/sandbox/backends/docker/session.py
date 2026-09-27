@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import traceback
 import uuid
 from collections.abc import Mapping
 from dataclasses import replace
@@ -536,6 +537,18 @@ class DockerSession(SandboxSession):
                     await self.terminate()
                 except Exception:
                     psrl_logger.warning("Docker command cleanup remains owned by the sandbox lease.", exc_info=True)
+            else:
+                # The one path that used to destroy a leased sandbox and leave no trace of
+                # who asked. It is reported at INFO with the stack that cancelled, because
+                # the caller is the only thing that explains it: nothing here distinguishes
+                # an episode budget from a harness abort from a shutdown, and the absence
+                # of any other signal is what made this hard to attribute.
+                psrl_logger.info(
+                    "Docker sandbox %s dropped a command because its caller was cancelled. The sandbox is "
+                    "kept for the lease to release. Cancelled by:\n%s",
+                    self.sandbox_id,
+                    "".join(traceback.format_stack()[:-1]),
+                )
 
     async def _container_stop_reason(self) -> str | None:
         """

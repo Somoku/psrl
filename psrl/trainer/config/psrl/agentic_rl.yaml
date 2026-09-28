@@ -16,10 +16,19 @@ refill_failure_threshold: 32
 # 0 to wait indefinitely.
 capacity_failure_threshold: 4
 
-# Seconds of silence after which a training entry is treated as dead and refilled. This is a
-# liveness check: children heartbeat while they work, so a slow episode keeps its entry alive
-# and is bounded by its own episode budget instead of by this number. Leave it null to derive
-# it from the heartbeat (a few missed beats); set it only to raise it.
+# Attempts each validation prompt gets before the round drops it and reports accuracy over a
+# smaller set. A validation prompt is a fixed member of the evaluation set, so losing one to an
+# infrastructure fault changes what the metric was measured over; retrying the same prompt is
+# what keeps accuracy comparable across steps. Only coordination faults and transient errors are
+# retried. 1 means a single attempt, and raising it holds the round's prompts in memory so a
+# retry re-runs the identical task rather than a substitute.
+val_retry_limit: 1
+
+# Seconds of silence after which an entry is treated as dead and recovered. This is a liveness
+# check: children heartbeat while they work, so a slow episode keeps its entry alive and is
+# bounded by its own episode budget instead of by this number. Applies to training and
+# validation alike. Leave it null to derive it from the heartbeat (a few missed beats); set it
+# only to raise it, or to 0 to disable the watchdog.
 entry_stall_timeout_s: null
 
 # Seconds between progress lines while the driver waits for an incomplete buffer.

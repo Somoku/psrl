@@ -4,6 +4,7 @@ import os
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Iterable
+from dataclasses import dataclass, replace
 
 import ray
 import transfer_queue as tq
@@ -38,6 +39,20 @@ from psrl.workers.ps.staleness_controller import EntryInfo
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+@dataclass(frozen=True)
+class InflightGroup:
+    """One dispatched prompt group the stall watchdog is responsible for.
+
+    `is_validate` travels with the record rather than being inferred from the id, because
+    recovery differs by partition: a train group is replaced by a fresh prompt, a
+    validation group is retried as the same prompt and then dropped from the target.
+    """
+
+    dispatched_at: float
+    last_progress_at: float
+    is_validate: bool
 
 
 class BoundedIdSet:
@@ -216,6 +231,20 @@ class PSRL_AgentLoopManager:
         # Preserve an all-failed validation result for waiters that register late.
         self._val_round_all_failed: bool = False
 
+        # Attempts a validation prompt gets before the round gives up on it and shrinks.
+        # A validation prompt is a fixed member of the evaluation set, so losing one to an
+        # infrastructure fault does not just cost a slot the way a train prompt does: it
+        # silently changes which tasks the reported accuracy was measured over. Retrying is
+        # what keeps the metric comparable across steps. One means a single attempt.
+        self.val_retry_limit = max(1, int(self.config.psrl.agentic_rl.get("val_retry_limit", 1)))
+        # Attempts already spent per validation prompt id, for the round in flight.
+        self._val_attempts: dict[int, int] = {}
+        # The round's own prompt rows, keyed by prompt id. A validation retry has to re-run
+        # the same task to keep the evaluation set fixed, and the dataloader cannot be asked
+        # for it again: `get_val_next` advances, so resampling would substitute a different
+        # task under the same slot. Held only for the round in flight.
+        self._val_round_prompts: dict[int, TensorDict] = {}
+
         # Refill breaker state (train only). Groups that fail before being replaced are counted
         # consecutively and cleared by any occupied group, so sporadic failures never trip it.
         # Only reasons that say something about the rollout itself count: a coordination fault
@@ -239,11 +268,12 @@ class PSRL_AgentLoopManager:
         # exception that ends the run.
         self._refill_breaker_diagnosis: str | None = None
 
-        # Train entries whose children were dispatched, keyed by parent id to
-        # `(dispatched_at, last_report_at)`, where a report is either a child's result or its
-        # liveness heartbeat. The watchdog fails an entry only when nothing reports at all,
-        # so it recovers a wedged worker without abandoning a slow but healthy episode.
-        self._inflight_train_groups: dict[int, tuple[float, float]] = {}
+        # Entries whose children were dispatched, keyed by parent id. A progress report is
+        # either a child's result or its liveness heartbeat. The watchdog fails an entry only
+        # when nothing reports at all, so it recovers a wedged worker without abandoning a
+        # slow but healthy episode. Train and validation share the registry because both
+        # block a buffer the same way when a child goes silent.
+        self._inflight_groups: dict[int, InflightGroup] = {}
         self.timeouts = resolve_from_config(self.config)
         self.entry_stall_timeout_s = self.timeouts.entry_stall_timeout_s
         self.entry_stall_check_interval_s = max(0.05, min(60.0, self.timeouts.heartbeat_interval_s / 2))
@@ -327,6 +357,12 @@ class PSRL_AgentLoopManager:
         # a fresh group as already-failed. The train record is deliberately untouched.
         self._failed_val_group_ids.clear()
         self._val_round_all_failed = False
+        # Retry budgets and retained prompts are per round for the same reason: a prompt that
+        # exhausted its attempts last round must start the next one with a full budget.
+        self._val_attempts.clear()
+        self._val_round_prompts.clear()
+        for parent_id in [parent_id for parent_id, entry in self._inflight_groups.items() if entry.is_validate]:
+            self._unregister_inflight_group(parent_id)
 
     def set_reward_manager(self, reward_manager: ray.actor.ActorHandle):
         """Set the reward manager for awaiting async reward completion."""
@@ -728,28 +764,36 @@ class PSRL_AgentLoopManager:
         return RuntimeError(f"Training aborted, rollout groups cannot be refilled. {self._refill_breaker_diagnosis}")
 
     def _register_inflight_groups(self, uids: Iterable, is_validate: bool) -> None:
-        """Record newly dispatched training entries for the stall watchdog.
+        """Record newly dispatched entries for the stall watchdog.
 
-        Validation entries are excluded: they have no replacement prompt, and their
-        recovery shrinks the evaluation set instead.
+        Validation entries are watched on the same terms as training ones. They used to be
+        excluded on the grounds that they have no replacement prompt, but a round whose
+        recovery only shrinks the target still has to notice that a group went silent: a
+        child that reports nothing at all is never subtracted, so the round waits on a slot
+        that will never arrive. Watching both is what makes the silence recoverable.
         """
-        if is_validate or self.entry_stall_timeout_s <= 0 or self.rollout_n <= 1:
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+        if self.entry_stall_timeout_s <= 0 or rollout_n <= 0:
             return
         now = time.monotonic()
         registered = False
         for uid in uids:
-            parent_id = int(uid) // self.rollout_n
-            if parent_id not in self._inflight_train_groups:
-                self._inflight_train_groups[parent_id] = (now, now)
+            parent_id = int(uid) // rollout_n
+            if parent_id not in self._inflight_groups:
+                self._inflight_groups[parent_id] = InflightGroup(
+                    dispatched_at=now,
+                    last_progress_at=now,
+                    is_validate=is_validate,
+                )
                 registered = True
         if registered:
             self._ensure_stall_watchdog()
 
     def _touch_inflight_group(self, parent_id: int) -> None:
         """Record that one child of a dispatched entry reported."""
-        entry = self._inflight_train_groups.get(parent_id)
+        entry = self._inflight_groups.get(parent_id)
         if entry is not None:
-            self._inflight_train_groups[parent_id] = (entry[0], time.monotonic())
+            self._inflight_groups[parent_id] = replace(entry, last_progress_at=time.monotonic())
 
     async def touch_inflight_group(self, parent_id: int) -> None:
         """Record that a child of this entry is alive, without reporting a result.
@@ -761,23 +805,23 @@ class PSRL_AgentLoopManager:
 
     def _unregister_inflight_group(self, parent_id: int) -> None:
         """Stop watching an entry that completed or was already recovered."""
-        self._inflight_train_groups.pop(parent_id, None)
+        self._inflight_groups.pop(parent_id, None)
 
     def _ensure_stall_watchdog(self) -> None:
         """Start the stall watchdog once there is something for it to watch."""
         if self._stall_watchdog_task is None or self._stall_watchdog_task.done():
             self._stall_watchdog_task = asyncio.create_task(self._stall_watchdog())
 
-    def _stalled_entries(self, now: float) -> list[tuple[int, float, float]]:
+    def _stalled_entries(self, now: float) -> list[tuple[int, InflightGroup]]:
         """Return watched entries that made no progress for the stall timeout."""
         return [
-            (parent_id, dispatched_at, last_progress_at)
-            for parent_id, (dispatched_at, last_progress_at) in self._inflight_train_groups.items()
-            if now - last_progress_at >= self.entry_stall_timeout_s
+            (parent_id, entry)
+            for parent_id, entry in self._inflight_groups.items()
+            if now - entry.last_progress_at >= self.entry_stall_timeout_s
         ]
 
     async def _stall_watchdog(self) -> None:
-        """Recover training entries whose children stopped reporting entirely.
+        """Recover entries whose children stopped reporting entirely.
 
         The threshold is a silence check, not a deadline: children send a liveness heartbeat
         while they work, so an episode that is merely slow keeps its entry alive and is bounded
@@ -790,23 +834,26 @@ class PSRL_AgentLoopManager:
         while True:
             await asyncio.sleep(self.entry_stall_check_interval_s)
             now = time.monotonic()
-            for parent_id, dispatched_at, last_progress_at in self._stalled_entries(now):
-                if parent_id not in self._inflight_train_groups:
+            for parent_id, entry in self._stalled_entries(now):
+                if parent_id not in self._inflight_groups:
                     continue
+                silent_for = now - entry.last_progress_at
+                rollout_n = self.val_rollout_n if entry.is_validate else self.rollout_n
                 psrl_logger.error(
-                    "Stall watchdog: entry parent_id=%s produced no result for %.0fs "
-                    "(dispatched %.0fs ago). Aborting the group and refilling.",
+                    "Stall watchdog: entry parent_id=%s validate=%s produced no result for %.0fs "
+                    "(dispatched %.0fs ago). Aborting the group and recovering.",
                     parent_id,
-                    now - last_progress_at,
-                    now - dispatched_at,
+                    entry.is_validate,
+                    silent_for,
+                    now - entry.dispatched_at,
                 )
                 await self.notify_group_failed(
                     parent_id,
-                    failed_uid=parent_id * self.rollout_n,
-                    is_validate=False,
+                    failed_uid=parent_id * rollout_n,
+                    is_validate=entry.is_validate,
                     terminate_reason=TerminateReason.DOWNSTREAM_TIMEOUT,
                     failure_summary=(
-                        f"Stall watchdog: no child reported for {now - last_progress_at:.0f}s, "
+                        f"Stall watchdog: no child reported for {silent_for:.0f}s, "
                         f"so the entry cannot complete. Check the worker and sandbox for a wedged episode."
                     ),
                 )
@@ -844,6 +891,89 @@ class PSRL_AgentLoopManager:
                 "data and that the agent loop manager is running."
             )
         return dispatched
+
+    def _retain_val_round_prompts(self, test_batch: TensorDict) -> None:
+        """Keep each validation prompt's rows so the round can re-run one of them.
+
+        Sliced per prompt up front rather than on demand, because the retry needs exactly
+        the rows of one group and the batch itself is not kept anywhere else: it is handed to
+        the dispatch queue and released.
+        """
+        if self.val_retry_limit <= 1:
+            # A single attempt never re-dispatches, so retaining the whole evaluation batch
+            # for the length of the round would be memory held for nothing.
+            return
+        rollout_n = self.val_rollout_n
+        parent_ids = tu.get(test_batch, "parent_id") if rollout_n > 1 else tu.get(test_batch, "uid")
+        rows_by_parent: dict[int, list[int]] = {}
+        for row, parent_id in enumerate(parent_ids):
+            rows_by_parent.setdefault(int(parent_id), []).append(row)
+        for parent_id, rows in rows_by_parent.items():
+            self._val_round_prompts[parent_id] = test_batch[rows]
+
+    def _forget_validation_group(self, parent_id: int) -> None:
+        """Release a validation prompt the round has given up on.
+
+        Dropping the retained prompt and its attempt count is what turns a shrink into a
+        real removal. Leaving them behind is how a round ends up waiting on a slot it has
+        already subtracted from its own target.
+        """
+        self._val_round_prompts.pop(parent_id, None)
+        self._val_attempts.pop(parent_id, None)
+        self._unregister_inflight_group(parent_id)
+
+    async def _retry_validation_group(
+        self,
+        parent_id: int,
+        terminate_reason: TerminateReason | None,
+    ) -> bool:
+        """Re-dispatch a failed validation prompt if it has attempts left.
+
+        A validation prompt is a fixed member of the evaluation set, so the shrink path is a
+        measurement change rather than a lost slot: accuracy silently stops being comparable
+        to the step before it. Retrying the same prompt is what keeps the set intact, and it
+        is only worth doing for a fault that says nothing about the task — a coordination
+        fault or a transient error. A prompt that genuinely cannot be evaluated would
+        otherwise consume its whole budget re-failing.
+
+        Returns:
+            bool: Whether a replacement was dispatched. `False` means the caller must shrink.
+        """
+        attempts = self._val_attempts.get(parent_id, 1)
+        prompt = self._val_round_prompts.get(parent_id)
+        retryable = terminate_reason is None or terminate_reason.is_coordination_fault or terminate_reason.is_error
+        if prompt is None or attempts >= self.val_retry_limit or not retryable:
+            psrl_logger.info(
+                "notify_group_failed (val): not retrying parent_id=%s "
+                "(attempts=%d/%d, reason=%s, prompt_retained=%s).",
+                parent_id,
+                attempts,
+                self.val_retry_limit,
+                terminate_reason.value if terminate_reason is not None else TerminateReason.UNKNOWN.value,
+                prompt is not None,
+            )
+            return False
+
+        # The abort above marked every child id of this group, and an aborted id is rejected
+        # on its next status update. Releasing that record is what lets the same ids be
+        # dispatched again, which is what keeps the prompt in its own slot.
+        uids = [int(uid) for uid in tu.get(prompt, "uid")]
+        await self.ps_manager_handle.readmit_requests.remote(uids, is_validate=True)
+        # The group is being retried, not recovered, so its failure record must not survive:
+        # the retry's own results arrive under these same ids and would be dropped as late
+        # arrivals from a failed group.
+        self._failed_val_group_ids.discard(parent_id)
+        self._val_attempts[parent_id] = attempts + 1
+        tu.assign_non_tensor_stack(prompt, "version_tag", [self.curr_ps_version_tag] * len(prompt))
+        await self._inner_dispatch_data(prompt, is_validate=True)
+        psrl_logger.warning(
+            "notify_group_failed (val): retrying parent_id=%s as attempt %d/%d (reason=%s).",
+            parent_id,
+            attempts + 1,
+            self.val_retry_limit,
+            terminate_reason.value if terminate_reason is not None else TerminateReason.UNKNOWN.value,
+        )
+        return True
 
     def _entry_info_tq_keys(self, entry_info: EntryInfo, rollout_n: int) -> list[str]:
         request_idxs = entry_info.request_idx if isinstance(entry_info.request_idx, list) else [entry_info.request_idx]
@@ -1006,6 +1136,8 @@ class PSRL_AgentLoopManager:
             await self._purge_tracker_group(parent_id, rollout_n, is_validate)
 
             if is_validate:
+                if await self._retry_validation_group(parent_id, terminate_reason):
+                    return
                 if self.val_buffer_size is None or self.val_buffer_size <= 0:
                     psrl_logger.warning(
                         "notify_group_failed: val_buffer_size=%s, cannot shrink for parent_id=%s.",
@@ -1014,17 +1146,24 @@ class PSRL_AgentLoopManager:
                     )
                     return
                 self.val_buffer_size -= 1
+                self._forget_validation_group(parent_id)
                 psrl_logger.warning(
-                    "notify_group_failed: val_buffer_size decremented to %d for parent_id=%s.",
+                    "notify_group_failed: val_buffer_size decremented to %d for parent_id=%s after %d attempt(s).",
                     self.val_buffer_size,
                     parent_id,
+                    self.val_retry_limit,
                 )
+                # `>=` rather than `==`: a round can shrink past an already-accumulated count
+                # when several groups give up at once, and an equality test would step over the
+                # one value that fires the buffer and leave the round waiting on a slot that no
+                # longer exists. That off-by-one is what wedged a round at 15/16.
                 for buffer_id, accumulated_size in list(self.val_accumulated_buffer_size.items()):
-                    if accumulated_size == self.val_buffer_size and buffer_id not in self.val_data_buffers:
+                    if accumulated_size >= self.val_buffer_size and buffer_id not in self.val_data_buffers:
                         psrl_logger.info(
-                            "notify_group_failed (val): buffer_id=%d now meets "
+                            "notify_group_failed (val): buffer_id=%d has %d entries for an "
                             "adjusted val_buffer_size=%d, assembling and firing.",
                             buffer_id,
+                            accumulated_size,
                             self.val_buffer_size,
                         )
                         await self._flush_ready_buffer(buffer_id, is_validate=True)
@@ -1173,9 +1312,7 @@ class PSRL_AgentLoopManager:
             )
             n_trajectories = n_trajectory if isinstance(n_trajectory, list) else [n_trajectory] * len(request_ids)
             termination_reasons = (
-                terminate_reason
-                if isinstance(terminate_reason, list)
-                else [terminate_reason] * len(request_ids)
+                terminate_reason if isinstance(terminate_reason, list) else [terminate_reason] * len(request_ids)
             )
         else:
             request_ids, prompt_ids, rollout_instance_ids, version_tags, n_trajectories = (
@@ -2074,23 +2211,28 @@ class PSRL_AgentLoopManager:
         else:
             accumulated = self.train_accumulated_buffer_size.get(buffer_id)
             expected = self.ready_entries_per_buffer
-        if self._inflight_train_groups:
+        # Only the waiting partition's own entries, so a validation wait does not report the
+        # training rollouts running alongside it as the thing it is blocked on.
+        watched = [entry for entry in self._inflight_groups.values() if entry.is_validate == is_validate]
+        if watched:
             now = time.monotonic()
-            oldest = max((now - dispatched for dispatched, _ in self._inflight_train_groups.values()), default=0.0)
-            silent_for = max((now - reported for _, reported in self._inflight_train_groups.values()), default=0.0)
+            oldest = max(now - entry.dispatched_at for entry in watched)
+            silent_for = max(now - entry.last_progress_at for entry in watched)
             inflight = (
-                f"in_flight_entries={len(self._inflight_train_groups)} oldest_dispatch_s={oldest:.0f} "
+                f"in_flight_entries={len(watched)} oldest_dispatch_s={oldest:.0f} "
                 f"silent_for_s={silent_for:.0f} stall_in_s={max(0.0, self.entry_stall_timeout_s - silent_for):.0f}"
             )
         else:
             inflight = "in_flight_entries=0"
+        retries = "" if not is_validate else f" val_attempts={sum(self._val_attempts.values())}"
         return (
             f"Buffer wait: buffer_id={buffer_id} validate={is_validate} "
             f"accumulated={accumulated}/{expected} "
             f"refill_failures={sum(self._group_failure_reasons.values())} "
             f"consecutive_group_failures={self._consecutive_group_failures} "
             f"coordination_failures={sum(self._coordination_failures.values())} "
-            f"capacity_failures={self._capacity_failure_streak}/{self.capacity_failure_threshold} {inflight}."
+            f"capacity_failures={self._capacity_failure_streak}/{self.capacity_failure_threshold} "
+            f"{inflight}{retries}."
         )
 
     async def wait_for_training_chunk(self, buffer_id: int, chunk_index: int) -> tuple["KVBatchMeta", bool]:
@@ -2181,6 +2323,7 @@ class PSRL_AgentLoopManager:
         prompt_num = len(test_batch) // self.val_rollout_n
         self.set_val_buffer_size(prompt_num)
         await self.ps_manager_handle.set_val_staleness_inventory_capacity.remote(prompt_num)
+        self._retain_val_round_prompts(test_batch)
 
         # Batch dispatch: register all request IDs and send the full batch in one
         # call for maximal dispatch throughput and vLLM batching efficiency.

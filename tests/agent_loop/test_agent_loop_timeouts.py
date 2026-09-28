@@ -2,7 +2,9 @@
 
 These numbers used to be configured independently, and a shipped recipe had the harness
 allowed two hours while the manager declared an entry dead after one, so healthy long
-episodes were abandoned. The ladder is now the only place they are decided.
+episodes were abandoned. The ladder is now the only place they are decided, and it holds
+only deadlines the rollout itself enforces: a coordination-side timer that expires before
+the work it watches is the same bug in a new place.
 """
 
 import pytest
@@ -26,7 +28,6 @@ def test_the_episode_budget_is_the_only_required_number() -> None:
     assert ladder.setup_timeout_s > ladder.admission_timeout_s
     assert ladder.harness_exec_timeout_s > ladder.episode_timeout_s
     assert ladder.child_deadline_s > ladder.harness_exec_timeout_s
-    assert ladder.entry_stall_timeout_s > ladder.heartbeat_interval_s
 
 
 def test_a_null_episode_budget_selects_the_default_rather_than_no_limit() -> None:
@@ -34,14 +35,17 @@ def test_a_null_episode_budget_selects_the_default_rather_than_no_limit() -> Non
     assert resolve_agent_loop_timeouts(None, None).episode_timeout_s == DEFAULT_EPISODE_TIMEOUT_S
 
 
-def test_the_stall_threshold_is_a_silence_check_not_a_second_episode_budget() -> None:
-    """A long episode must not look stalled: the threshold tracks the heartbeat, not the budget."""
-    short = resolve_agent_loop_timeouts(600, None)
-    long = resolve_agent_loop_timeouts(7200, None)
+def test_no_deadline_is_shorter_than_the_episode_it_bounds() -> None:
+    """Nothing in the ladder may cut an episode off before its own budget runs out.
 
-    assert short.entry_stall_timeout_s < long.entry_stall_timeout_s
-    assert long.entry_stall_timeout_s < long.episode_timeout_s / 2
-    assert long.heartbeat_interval_s >= 30
+    A coordination-side threshold shorter than the episode is what killed healthy
+    validation rollouts at 360s of silence against a 7200s budget. Every deadline here
+    now sits at or beyond the episode.
+    """
+    for episode in (600, 7200):
+        ladder = resolve_agent_loop_timeouts(episode, None)
+        assert ladder.harness_exec_timeout_s > ladder.episode_timeout_s
+        assert ladder.child_deadline_s > ladder.episode_timeout_s
 
 
 def test_the_harness_exec_budget_is_derived_from_the_episode_budget() -> None:
@@ -57,25 +61,19 @@ def test_the_harness_exec_budget_is_derived_from_the_episode_budget() -> None:
 
 
 @pytest.mark.parametrize(
-    ("episode", "admission", "stall", "expected"),
+    ("episode", "admission", "expected"),
     [
-        (0, None, None, "must be greater than zero"),
-        (-5, None, None, "must be greater than zero"),
-        (7200, None, 1, "shorter than"),
+        (0, None, "must be greater than zero"),
+        (-5, None, "must be greater than zero"),
     ],
 )
 def test_contradictory_configurations_are_refused(
     episode: float,
     admission: float | None,
-    stall: float | None,
     expected: str,
 ) -> None:
     with pytest.raises(ValueError, match=expected):
-        resolve_agent_loop_timeouts(episode, admission, entry_stall_timeout_s=stall)
-
-
-def test_the_watchdog_can_still_be_disabled_explicitly() -> None:
-    assert resolve_agent_loop_timeouts(7200, None, entry_stall_timeout_s=0).entry_stall_timeout_s == 0
+        resolve_agent_loop_timeouts(episode, admission)
 
 
 def test_the_ladder_describes_itself_for_the_startup_log() -> None:
@@ -83,7 +81,7 @@ def test_the_ladder_describes_itself_for_the_startup_log() -> None:
 
     assert "episode=7200s" in described
     assert "admission<=1800s" in described
-    assert "stall=" in described
+    assert "harness_exec<=" in described
 
 
 def test_an_admission_wait_that_outlasts_the_episode_is_refused() -> None:
@@ -109,14 +107,8 @@ def test_an_admission_wait_that_outlasts_the_episode_is_refused() -> None:
 
 
 def test_zero_valued_fields_are_rejected_by_the_value_object() -> None:
-    with pytest.raises(ValueError, match="heartbeat_interval_s"):
-        AgentLoopTimeouts(
-            episode_timeout_s=1,
-            setup_allowance_s=1,
-            admission_timeout_s=0,
-            heartbeat_interval_s=0,
-            entry_stall_timeout_s=1,
-        )
+    with pytest.raises(ValueError, match="setup_allowance_s"):
+        AgentLoopTimeouts(episode_timeout_s=1, setup_allowance_s=0, admission_timeout_s=0)
 
 
 def test_the_shipped_configs_resolve_to_a_consistent_ladder() -> None:
@@ -144,6 +136,4 @@ def test_the_shipped_configs_resolve_to_a_consistent_ladder() -> None:
 
     assert ladder.episode_timeout_s == rollout["agent"]["trajectory_timeout"]
     assert ladder.admission_timeout_s == rollout["agent"]["sandbox"]["capacity"]["acquire_timeout_s"]
-    # The stall threshold is derived, and it no longer has to cover a whole episode.
-    assert ladder.entry_stall_timeout_s < ladder.episode_timeout_s
     assert ladder.harness_exec_timeout_s > ladder.episode_timeout_s

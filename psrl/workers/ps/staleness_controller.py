@@ -327,7 +327,16 @@ class StalenessInventory:
 
     def create_buffer_with_capacity(self, ready_num_entries: int, num_entries: int):
         """
-        Set the size of buffers in the inventory.
+        Open a buffer for the next validation round, retiring the previous one.
+
+        Retiring here rather than when the previous round's batch was consumed is what
+        keeps a still-running request's reservation alive. A validation round publishes as
+        soon as enough prompts have landed, while the rest are still generating, and those
+        stragglers keep calling back to update their instance id and version tag. Dropping
+        their entries at consume time turned every one of those calls into a hard error
+        against a prompt the inventory had just forgotten. By the time the next round is
+        being set up the previous one can no longer be referenced, so this is the first
+        moment the old buffer is safe to delete.
 
         Args:
             ready_num_entries (int): The number of entries in the buffer that are sufficient for one training batch
@@ -337,6 +346,8 @@ class StalenessInventory:
             "Buffer size can only be dynamically set for validation inventory "
             "because only one buffer is used during validation."
         )
+        for retired_buffer_id in sorted(self.buffers):
+            self.delete_buffer(retired_buffer_id)
         self.num_entries = num_entries
         self.ready_num_entries = ready_num_entries
         self.create_buffer(self.buffer_id)

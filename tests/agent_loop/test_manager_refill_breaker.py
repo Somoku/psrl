@@ -36,8 +36,6 @@ _STUB_TIMEOUTS = AgentLoopTimeouts(
     episode_timeout_s=7200.0,
     setup_allowance_s=900.0,
     admission_timeout_s=1800.0,
-    heartbeat_interval_s=120.0,
-    entry_stall_timeout_s=360.0,
 )
 
 
@@ -109,7 +107,6 @@ class FakeManager:
         self.val_retry_limit = 1
         self._val_attempts: dict[int, int] = {}
         self._val_round_prompts: dict = {}
-        self._inflight_groups: dict = {}
 
         self.running_loop = None
         self._request_counter = 0
@@ -137,7 +134,6 @@ class FakeManager:
         self._reset_group_failure_streak = PSRL_AgentLoopManager._reset_group_failure_streak.__get__(self)
         self._trip_refill_breaker = PSRL_AgentLoopManager._trip_refill_breaker.__get__(self)
         self._refill_failed_group = PSRL_AgentLoopManager._refill_failed_group.__get__(self)
-        self._unregister_inflight_group = PSRL_AgentLoopManager._unregister_inflight_group.__get__(self)
         self._retry_validation_group = PSRL_AgentLoopManager._retry_validation_group.__get__(self)
         self._forget_validation_group = PSRL_AgentLoopManager._forget_validation_group.__get__(self)
         self._refill_breaker_error = PSRL_AgentLoopManager._refill_breaker_error.__get__(self)

@@ -204,3 +204,77 @@ class TestUpdateRequestMetadata:
                 request_id=request_id,
                 new_instance_id=("worker", 1),
             )
+
+
+class TestValidationBufferLifetime:
+    """A validation round publishes before its stragglers finish, so its entries must outlive it.
+
+    Validation shrinks its target when a group is lost and fires as soon as the remaining
+    prompts have landed, while the rest are still generating. Those stragglers keep calling
+    back to update their instance id and version tag. Retiring the inventory at publish time
+    dropped their entries, and every one of those calls then failed against a prompt the
+    inventory had just forgotten.
+    """
+
+    @staticmethod
+    def _val_inventory(num_prompts: int) -> StalenessInventory:
+        inv = StalenessInventory(
+            num_entries=num_prompts,
+            ready_num_entries=num_prompts,
+            staleness=None,
+            rollout_n=1,
+            is_validate=True,
+        )
+        inv.create_buffer_with_capacity(num_prompts, num_prompts)
+        return inv
+
+    @staticmethod
+    def _reserve(inv: StalenessInventory, prompt_id: int) -> None:
+        inv.reserve_data(
+            entry_info=EntryInfo(
+                rollout_instance_id=("worker", 0),
+                prompt_id=prompt_id,
+                request_idx=0,
+                model_version=0,
+                n_trajectory=1,
+                is_validate=True,
+            ),
+            max_staleness_buffer_id=None,
+        )
+
+    def test_a_straggler_keeps_its_entry_after_the_round_publishes(self):
+        inv = self._val_inventory(3)
+        for prompt_id in (0, 1, 2):
+            self._reserve(inv, prompt_id)
+
+        # The round publishes here. Prompt 2 is still generating.
+        assert 2 in inv.data_tracker, "Publishing must not drop a running prompt's reservation."
+        inv.update_request_instance_id(request_id=2, new_instance_id=("worker", 1))
+
+        buffer_id, entry_id = inv.data_tracker[2]
+        assert inv.buffers[buffer_id].entries[entry_id].entry_info.rollout_instance_id == ("worker", 1)
+
+    def test_the_next_round_retires_the_previous_one(self):
+        inv = self._val_inventory(3)
+        for prompt_id in (0, 1, 2):
+            self._reserve(inv, prompt_id)
+        first_buffer_id = inv.data_tracker[0][0]
+
+        # The next round can only start once the previous one is finished with.
+        inv.create_buffer_with_capacity(2, 2)
+
+        assert first_buffer_id not in inv.buffers
+        assert inv.data_tracker == {}, "A retired round left entries behind."
+
+    def test_a_retained_buffer_does_not_count_as_pending_capacity(self):
+        """`reserve_data` requires exactly one pending validation buffer, so retaining must not add one."""
+        inv = self._val_inventory(2)
+        for prompt_id in (0, 1):
+            self._reserve(inv, prompt_id)
+
+        inv.create_buffer_with_capacity(2, 2)
+        assert len(inv.get_buffers_with_capacity()) == 1
+
+        # A reservation into the fresh round still resolves.
+        self._reserve(inv, 10)
+        assert 10 in inv.data_tracker

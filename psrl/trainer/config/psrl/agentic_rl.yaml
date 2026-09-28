@@ -24,13 +24,6 @@ capacity_failure_threshold: 4
 # retry re-runs the identical task rather than a substitute.
 val_retry_limit: 1
 
-# Seconds of silence after which an entry is treated as dead and recovered. This is a liveness
-# check: children heartbeat while they work, so a slow episode keeps its entry alive and is
-# bounded by its own episode budget instead of by this number. Applies to training and
-# validation alike. Leave it null to derive it from the heartbeat (a few missed beats); set it
-# only to raise it, or to 0 to disable the watchdog.
-entry_stall_timeout_s: null
-
 # Seconds between progress lines while the driver waits for an incomplete buffer.
 buffer_wait_log_interval_s: 60
 

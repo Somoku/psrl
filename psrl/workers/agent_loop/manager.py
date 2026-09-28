@@ -1,10 +1,7 @@
 import asyncio
 import logging
 import os
-import time
 from collections import Counter, OrderedDict
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
 
 import ray
 import transfer_queue as tq
@@ -39,20 +36,6 @@ from psrl.workers.ps.staleness_controller import EntryInfo
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
-
-
-@dataclass(frozen=True)
-class InflightGroup:
-    """One dispatched prompt group the stall watchdog is responsible for.
-
-    `is_validate` travels with the record rather than being inferred from the id, because
-    recovery differs by partition: a train group is replaced by a fresh prompt, a
-    validation group is retried as the same prompt and then dropped from the target.
-    """
-
-    dispatched_at: float
-    last_progress_at: float
-    is_validate: bool
 
 
 class BoundedIdSet:
@@ -268,16 +251,7 @@ class PSRL_AgentLoopManager:
         # exception that ends the run.
         self._refill_breaker_diagnosis: str | None = None
 
-        # Entries whose children were dispatched, keyed by parent id. A progress report is
-        # either a child's result or its liveness heartbeat. The watchdog fails an entry only
-        # when nothing reports at all, so it recovers a wedged worker without abandoning a
-        # slow but healthy episode. Train and validation share the registry because both
-        # block a buffer the same way when a child goes silent.
-        self._inflight_groups: dict[int, InflightGroup] = {}
         self.timeouts = resolve_from_config(self.config)
-        self.entry_stall_timeout_s = self.timeouts.entry_stall_timeout_s
-        self.entry_stall_check_interval_s = max(0.05, min(60.0, self.timeouts.heartbeat_interval_s / 2))
-        self._stall_watchdog_task: asyncio.Task | None = None
         # The driver logs a progress line this often while a buffer is incomplete.
         self.buffer_wait_log_interval_s = float(self.config.psrl.agentic_rl.get("buffer_wait_log_interval_s", 60))
 
@@ -361,8 +335,6 @@ class PSRL_AgentLoopManager:
         # exhausted its attempts last round must start the next one with a full budget.
         self._val_attempts.clear()
         self._val_round_prompts.clear()
-        for parent_id in [parent_id for parent_id, entry in self._inflight_groups.items() if entry.is_validate]:
-            self._unregister_inflight_group(parent_id)
 
     def set_reward_manager(self, reward_manager: ray.actor.ActorHandle):
         """Set the reward manager for awaiting async reward completion."""
@@ -763,101 +735,6 @@ class PSRL_AgentLoopManager:
         """Build the exception that reports a tripped refill breaker."""
         return RuntimeError(f"Training aborted, rollout groups cannot be refilled. {self._refill_breaker_diagnosis}")
 
-    def _register_inflight_groups(self, uids: Iterable, is_validate: bool) -> None:
-        """Record newly dispatched entries for the stall watchdog.
-
-        Validation entries are watched on the same terms as training ones. They used to be
-        excluded on the grounds that they have no replacement prompt, but a round whose
-        recovery only shrinks the target still has to notice that a group went silent: a
-        child that reports nothing at all is never subtracted, so the round waits on a slot
-        that will never arrive. Watching both is what makes the silence recoverable.
-        """
-        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
-        if self.entry_stall_timeout_s <= 0 or rollout_n <= 0:
-            return
-        now = time.monotonic()
-        registered = False
-        for uid in uids:
-            parent_id = int(uid) // rollout_n
-            if parent_id not in self._inflight_groups:
-                self._inflight_groups[parent_id] = InflightGroup(
-                    dispatched_at=now,
-                    last_progress_at=now,
-                    is_validate=is_validate,
-                )
-                registered = True
-        if registered:
-            self._ensure_stall_watchdog()
-
-    def _touch_inflight_group(self, parent_id: int) -> None:
-        """Record that one child of a dispatched entry reported."""
-        entry = self._inflight_groups.get(parent_id)
-        if entry is not None:
-            self._inflight_groups[parent_id] = replace(entry, last_progress_at=time.monotonic())
-
-    async def touch_inflight_group(self, parent_id: int) -> None:
-        """Record that a child of this entry is alive, without reporting a result.
-
-        Results alone cannot tell a slow episode from a wedged worker, because a healthy
-        episode reports only once it finishes. This is the liveness half of that pair.
-        """
-        self._touch_inflight_group(int(parent_id))
-
-    def _unregister_inflight_group(self, parent_id: int) -> None:
-        """Stop watching an entry that completed or was already recovered."""
-        self._inflight_groups.pop(parent_id, None)
-
-    def _ensure_stall_watchdog(self) -> None:
-        """Start the stall watchdog once there is something for it to watch."""
-        if self._stall_watchdog_task is None or self._stall_watchdog_task.done():
-            self._stall_watchdog_task = asyncio.create_task(self._stall_watchdog())
-
-    def _stalled_entries(self, now: float) -> list[tuple[int, InflightGroup]]:
-        """Return watched entries that made no progress for the stall timeout."""
-        return [
-            (parent_id, entry)
-            for parent_id, entry in self._inflight_groups.items()
-            if now - entry.last_progress_at >= self.entry_stall_timeout_s
-        ]
-
-    async def _stall_watchdog(self) -> None:
-        """Recover entries whose children stopped reporting entirely.
-
-        The threshold is a silence check, not a deadline: children send a liveness heartbeat
-        while they work, so an episode that is merely slow keeps its entry alive and is bounded
-        by its own episode budget instead. Only a worker that has stopped saying anything at all
-        — a dead actor, a wedged event loop — reaches this threshold, which is why it is a few
-        heartbeats rather than a fraction of the episode budget. Recovery still aborts the whole
-        group, so the threshold trades a false positive's wasted group against a false negative's
-        stuck buffer.
-        """
-        while True:
-            await asyncio.sleep(self.entry_stall_check_interval_s)
-            now = time.monotonic()
-            for parent_id, entry in self._stalled_entries(now):
-                if parent_id not in self._inflight_groups:
-                    continue
-                silent_for = now - entry.last_progress_at
-                rollout_n = self.val_rollout_n if entry.is_validate else self.rollout_n
-                psrl_logger.error(
-                    "Stall watchdog: entry parent_id=%s validate=%s produced no result for %.0fs "
-                    "(dispatched %.0fs ago). Aborting the group and recovering.",
-                    parent_id,
-                    entry.is_validate,
-                    silent_for,
-                    now - entry.dispatched_at,
-                )
-                await self.notify_group_failed(
-                    parent_id,
-                    failed_uid=parent_id * rollout_n,
-                    is_validate=entry.is_validate,
-                    terminate_reason=TerminateReason.DOWNSTREAM_TIMEOUT,
-                    failure_summary=(
-                        f"Stall watchdog: no child reported for {silent_for:.0f}s, "
-                        f"so the entry cannot complete. Check the worker and sandbox for a wedged episode."
-                    ),
-                )
-
     def _raise_if_refill_breaker_tripped(self) -> None:
         """Convert a latched refill failure into an exception for the driver.
 
@@ -920,7 +797,6 @@ class PSRL_AgentLoopManager:
         """
         self._val_round_prompts.pop(parent_id, None)
         self._val_attempts.pop(parent_id, None)
-        self._unregister_inflight_group(parent_id)
 
     async def _retry_validation_group(
         self,
@@ -1009,7 +885,6 @@ class PSRL_AgentLoopManager:
     ) -> list[EntryInfo]:
         """Drop partially accumulated tracker entries and their TQ payloads."""
         entries = self.rollout_request_tracker.pop(parent_id, [])
-        self._unregister_inflight_group(parent_id)
         if not entries:
             return []
 
@@ -1156,8 +1031,8 @@ class PSRL_AgentLoopManager:
                 # Equality is sufficient, and says the invariant out loud: the target descends
                 # one group at a time under the same lock the accumulate path holds, so it
                 # cannot step over a waiting count. A round left short is therefore always a
-                # group that was neither accumulated nor subtracted, which is what the stall
-                # watchdog now reclaims — not a comparison that missed its moment.
+                # group that never reported at all, which its own episode budget is what
+                # bounds — not a comparison that missed its moment.
                 for buffer_id, accumulated_size in list(self.val_accumulated_buffer_size.items()):
                     if accumulated_size == self.val_buffer_size and buffer_id not in self.val_data_buffers:
                         psrl_logger.info(
@@ -1248,8 +1123,6 @@ class PSRL_AgentLoopManager:
         )
         if not update_status_success:
             return
-
-        self._register_inflight_groups(uids, is_validate)
 
         dispatch_plan = self.get_dispatch_plan(data, is_validate=is_validate)
         for worker_index, batch in dispatch_plan.items():
@@ -1384,7 +1257,6 @@ class PSRL_AgentLoopManager:
                         is_validate=is_validate,
                     )
                     self.rollout_request_tracker.setdefault(prompt_id, []).append(entry_info)
-                    self._touch_inflight_group(prompt_id)
                     psrl_logger.debug(
                         f"Stored rollout entry: prompt_id={prompt_id}, entry={entry_info!r}, "
                         f"count={len(self.rollout_request_tracker[prompt_id])}."
@@ -1397,7 +1269,6 @@ class PSRL_AgentLoopManager:
                             f"samples for prompt {prompt_id}"
                         )
                         entry_infos = self.rollout_request_tracker.pop(prompt_id)
-                        self._unregister_inflight_group(prompt_id)
                         psrl_logger.debug(
                             f"Popped entry_infos from rollout_request_tracker for prompt_id {prompt_id}, "
                             f"entry count: {len(entry_infos)}"
@@ -1975,9 +1846,6 @@ class PSRL_AgentLoopManager:
                     fut.set_result(batch)
             # Remove the key after waking all waiters
             del _buffer_waiters[min_ready_buffer_id]
-
-            if is_validate:
-                await self.ps_manager_handle.maybe_delete_buffer.remote(min_ready_buffer_id, is_validate)
         else:
             psrl_logger.warning(f"No waiter found: buffer_id={buffer_id}.")
 
@@ -2211,19 +2079,10 @@ class PSRL_AgentLoopManager:
         else:
             accumulated = self.train_accumulated_buffer_size.get(buffer_id)
             expected = self.ready_entries_per_buffer
-        # Only the waiting partition's own entries, so a validation wait does not report the
-        # training rollouts running alongside it as the thing it is blocked on.
-        watched = [entry for entry in self._inflight_groups.values() if entry.is_validate == is_validate]
-        if watched:
-            now = time.monotonic()
-            oldest = max(now - entry.dispatched_at for entry in watched)
-            silent_for = max(now - entry.last_progress_at for entry in watched)
-            inflight = (
-                f"in_flight_entries={len(watched)} oldest_dispatch_s={oldest:.0f} "
-                f"silent_for_s={silent_for:.0f} stall_in_s={max(0.0, self.entry_stall_timeout_s - silent_for):.0f}"
-            )
-        else:
-            inflight = "in_flight_entries=0"
+        # Groups still owed to this buffer. Reported as a count rather than an age: nothing
+        # here bounds how long a rollout may take, so "how long has it been quiet" would
+        # invite reading a deadline into a line that carries none.
+        pending = "" if expected is None or accumulated is None else f" pending_groups={expected - accumulated}"
         retries = "" if not is_validate else f" val_attempts={sum(self._val_attempts.values())}"
         return (
             f"Buffer wait: buffer_id={buffer_id} validate={is_validate} "
@@ -2231,8 +2090,8 @@ class PSRL_AgentLoopManager:
             f"refill_failures={sum(self._group_failure_reasons.values())} "
             f"consecutive_group_failures={self._consecutive_group_failures} "
             f"coordination_failures={sum(self._coordination_failures.values())} "
-            f"capacity_failures={self._capacity_failure_streak}/{self.capacity_failure_threshold} "
-            f"{inflight}{retries}."
+            f"capacity_failures={self._capacity_failure_streak}/{self.capacity_failure_threshold}"
+            f"{pending}{retries}."
         )
 
     async def wait_for_training_chunk(self, buffer_id: int, chunk_index: int) -> tuple["KVBatchMeta", bool]:

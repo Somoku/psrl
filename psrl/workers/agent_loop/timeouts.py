@@ -10,34 +10,26 @@ DEFAULT_EPISODE_TIMEOUT_S = 7200.0
 SETUP_ALLOWANCE_S = 900.0
 # Allow the episode deadline to stop the harness before the exec backstop fires.
 EXEC_BACKSTOP_S = 60.0
-MIN_HEARTBEAT_S = 30.0
-MAX_HEARTBEAT_S = 300.0
-HEARTBEAT_DIVISOR = 60.0
-# Liveness detection counts missed heartbeats independently of episode duration.
-STALL_HEARTBEAT_MULTIPLIER = 3.0
-MIN_STALL_TIMEOUT_S = 300.0
 
 
 @dataclass(frozen=True)
 class AgentLoopTimeouts:
-    """Every deadline that bounds a rollout, derived from the episode budget."""
+    """Every deadline that bounds a rollout, derived from the episode budget.
+
+    The rollout owns every deadline here. Nothing downstream — not the staleness
+    inventory, not the agent loop manager — may decide on its own schedule that a
+    dispatched rollout is finished: a coordination layer guessing at a shorter
+    deadline than the one the work is actually held to just kills healthy episodes.
+    """
 
     episode_timeout_s: float
     setup_allowance_s: float
     admission_timeout_s: float
-    heartbeat_interval_s: float
-    entry_stall_timeout_s: float
 
     def __post_init__(self) -> None:
-        for name in (
-            "episode_timeout_s",
-            "setup_allowance_s",
-            "heartbeat_interval_s",
-        ):
+        for name in ("episode_timeout_s", "setup_allowance_s"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"Agent loop timeout {name} must be greater than zero.")
-        if self.entry_stall_timeout_s < 0:
-            raise ValueError("Agent loop timeout entry_stall_timeout_s cannot be negative.")
 
     @property
     def harness_exec_timeout_s(self) -> float:
@@ -59,23 +51,15 @@ class AgentLoopTimeouts:
         return (
             f"episode={self.episode_timeout_s:.0f}s, setup<={self.setup_timeout_s:.0f}s "
             f"(admission<={self.admission_timeout_s:.0f}s), child<={self.child_deadline_s:.0f}s, "
-            f"harness_exec<={self.harness_exec_timeout_s:.0f}s, heartbeat={self.heartbeat_interval_s:.0f}s, "
-            f"stall={self.entry_stall_timeout_s:.0f}s"
+            f"harness_exec<={self.harness_exec_timeout_s:.0f}s"
         )
-
-
-def derive_heartbeat_interval_s(episode_timeout_s: float) -> float:
-    """Return the liveness period for an episode budget, clamped to a sane range."""
-    return max(MIN_HEARTBEAT_S, min(MAX_HEARTBEAT_S, episode_timeout_s / HEARTBEAT_DIVISOR))
 
 
 def resolve_agent_loop_timeouts(
     trajectory_timeout_s: float | None,
     admission_timeout_s: float | None,
-    *,
-    entry_stall_timeout_s: float | None = None,
 ) -> AgentLoopTimeouts:
-    """Derive the ladder, honouring explicit overrides only where they make sense.
+    """Derive the ladder from the episode budget and the admission deadline.
 
     Args:
         trajectory_timeout_s (float | None): The configured episode budget. ``None``
@@ -83,13 +67,9 @@ def resolve_agent_loop_timeouts(
             no bound at all cannot be distinguished from a wedged one.
         admission_timeout_s (float | None): The capacity admission deadline, or ``None``
             when node capacity admission is not in use.
-        entry_stall_timeout_s (float | None): Optional override of the derived stall
-            threshold. Only raise it. The derived value is what makes a silent entry
-            recoverable in minutes. Set it to zero to disable the watchdog entirely, which
-            accepts that a wedged worker blocks its buffer until the run is stopped.
 
     Raises:
-        ValueError: When an override contradicts the ladder it is part of.
+        ValueError: When the admission deadline contradicts the episode it precedes.
     """
     episode = DEFAULT_EPISODE_TIMEOUT_S if trajectory_timeout_s is None else float(trajectory_timeout_s)
     if episode <= 0:
@@ -99,26 +79,10 @@ def resolve_agent_loop_timeouts(
             "wedged one."
         )
     admission = 0.0 if admission_timeout_s is None else float(admission_timeout_s)
-    heartbeat = derive_heartbeat_interval_s(episode)
-    if entry_stall_timeout_s is not None and entry_stall_timeout_s <= 0:
-        # Explicitly disabling the watchdog accepts that a wedged worker blocks its buffer
-        # until the run is stopped, which is sometimes what an experiment wants.
-        stall = 0.0
-    else:
-        derived_stall = max(MIN_STALL_TIMEOUT_S, STALL_HEARTBEAT_MULTIPLIER * heartbeat)
-        stall = derived_stall if entry_stall_timeout_s is None else float(entry_stall_timeout_s)
-        if stall < heartbeat:
-            raise ValueError(
-                f"psrl.agentic_rl.entry_stall_timeout_s={stall:g} is shorter than the "
-                f"{heartbeat:g}s liveness heartbeat, so every running entry would look stalled. "
-                "Leave it null to derive the threshold."
-            )
     ladder = AgentLoopTimeouts(
         episode_timeout_s=episode,
         setup_allowance_s=SETUP_ALLOWANCE_S,
         admission_timeout_s=admission,
-        heartbeat_interval_s=heartbeat,
-        entry_stall_timeout_s=stall,
     )
     validate_agent_loop_timeouts(ladder)
     return ladder
@@ -155,12 +119,11 @@ def validate_agent_loop_timeouts(ladder: AgentLoopTimeouts) -> None:
 def resolve_from_config(config) -> AgentLoopTimeouts:
     """Read and derive the ladder from a trainer config tree.
 
-    The only place the three configuration paths are read, so a key rename cannot leave the
+    The only place these configuration paths are read, so a key rename cannot leave the
     loops, the worker, and the manager enforcing different ladders.
     """
     agent_config = config.gen_actor_rollout_ref.rollout.agent
     return resolve_agent_loop_timeouts(
         agent_config.get("trajectory_timeout"),
         agent_config.sandbox.capacity.get("acquire_timeout_s"),
-        entry_stall_timeout_s=config.psrl.agentic_rl.get("entry_stall_timeout_s"),
     )

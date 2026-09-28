@@ -484,14 +484,14 @@ class TestValidationRecovery:
 
         asyncio.run(_run())
 
-    def test_a_round_already_at_the_shrunk_target_is_fired(self):
-        """`accumulated >= target` rather than `==`: equality steps over the firing value."""
+    def test_the_shrink_that_meets_the_waiting_count_fires_the_buffer(self):
+        """The last group to give up is what completes the round, so it must publish it."""
 
         async def _run():
             manager = FakeManager(val_retry_limit=1)
             manager.set_val_buffer_size(16)
-            # 15 arrived; the 16th is the group about to give up. Shrinking to 15 has to fire
-            # this buffer, which an equality test against a stale count would miss.
+            # 15 arrived; the 16th is the group about to give up. Shrinking to 15 is the
+            # moment the round becomes complete, and nothing else will arrive to notice.
             manager.val_accumulated_buffer_size[4] = 15
 
             await manager.notify_group_failed(
@@ -502,6 +502,37 @@ class TestValidationRecovery:
             )
 
             assert manager.val_buffer_size == 15
+            assert manager.flushed == [(4, True)]
+            manager.stop_watchdog()
+
+        asyncio.run(_run())
+
+    def test_the_target_never_steps_over_a_waiting_count(self):
+        """Why equality suffices: each shrink moves the target by exactly one group.
+
+        The comparison can only miss if the target can jump past `accumulated` while that
+        count sits still. It cannot: every shrink is a single decrement taken under the same
+        lock the accumulate path holds, so the target descends through every integer. A round
+        left short is a group that was neither accumulated nor subtracted, which is the stall
+        watchdog's job, not the comparison's.
+        """
+
+        async def _run():
+            manager = FakeManager(val_retry_limit=1, val_rollout_n=1)
+            manager.set_val_buffer_size(4)
+            manager.val_accumulated_buffer_size[4] = 2
+
+            for parent_id in (10, 11):
+                await manager.notify_group_failed(
+                    parent_id,
+                    failed_uid=parent_id,
+                    is_validate=True,
+                    terminate_reason=TerminateReason.CONTAINER_LOST,
+                )
+
+            # 4 -> 3 -> 2: the target landed on the waiting count instead of passing it, so
+            # the buffer fired exactly once, on the shrink that met it.
+            assert manager.val_buffer_size == 2
             assert manager.flushed == [(4, True)]
             manager.stop_watchdog()
 

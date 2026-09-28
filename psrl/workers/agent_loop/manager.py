@@ -1153,17 +1153,17 @@ class PSRL_AgentLoopManager:
                     parent_id,
                     self.val_retry_limit,
                 )
-                # `>=` rather than `==`: a round can shrink past an already-accumulated count
-                # when several groups give up at once, and an equality test would step over the
-                # one value that fires the buffer and leave the round waiting on a slot that no
-                # longer exists. That off-by-one is what wedged a round at 15/16.
+                # Equality is sufficient, and says the invariant out loud: the target descends
+                # one group at a time under the same lock the accumulate path holds, so it
+                # cannot step over a waiting count. A round left short is therefore always a
+                # group that was neither accumulated nor subtracted, which is what the stall
+                # watchdog now reclaims — not a comparison that missed its moment.
                 for buffer_id, accumulated_size in list(self.val_accumulated_buffer_size.items()):
-                    if accumulated_size >= self.val_buffer_size and buffer_id not in self.val_data_buffers:
+                    if accumulated_size == self.val_buffer_size and buffer_id not in self.val_data_buffers:
                         psrl_logger.info(
-                            "notify_group_failed (val): buffer_id=%d has %d entries for an "
+                            "notify_group_failed (val): buffer_id=%d now meets "
                             "adjusted val_buffer_size=%d, assembling and firing.",
                             buffer_id,
-                            accumulated_size,
                             self.val_buffer_size,
                         )
                         await self._flush_ready_buffer(buffer_id, is_validate=True)

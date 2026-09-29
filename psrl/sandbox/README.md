@@ -204,11 +204,12 @@ sandbox. `capacity.*` then bounds only the `docker` backend, so a mixed deployme
 sizes the envelope for Docker alone.
 
 **To place sandboxes on other nodes**, turn on
-`psrl.deployment.sandbox_placement.enabled` and name the fleet in
-`gen_actor_rollout_ref.rollout.agent.node_ips`, which is required because defaulting
-to every alive node would put sandboxes on the GPU nodes. The trainer then creates one
-placement service and one node agent per node, and every worker places through them, so
-`capacity.*` is enforced where the containers run. See [OPERATIONS.md](OPERATIONS.md).
+`psrl.deployment.sandbox_placement.enabled`. The fleet is
+`gen_actor_rollout_ref.rollout.agent.node_ips` when it names one, and every alive node
+otherwise — which shares nodes with the trainer, so name the fleet to keep sandboxes off
+the GPU nodes. The trainer then creates one placement service and one node agent per
+node, and every worker places through them, so `capacity.*` is enforced where the
+containers run. See [OPERATIONS.md](OPERATIONS.md).
 
 ## Run end to end
 

@@ -146,8 +146,8 @@ TCP has resources that are not in the caller's node-capacity accounting.
 
 Turning on `psrl.deployment.sandbox_placement.enabled` moves sandboxes off the agent
 loop worker's own node. The trainer creates one placement service for the job and one
-node agent per node in `gen_actor_rollout_ref.rollout.agent.node_ips`, and each worker
-builds one remote backend over those handles. A worker then holds **no local backend
+node agent per node in `gen_actor_rollout_ref.rollout.agent.node_ips` — or per alive node
+when that list is empty — and each worker builds one remote backend over those handles. A worker then holds **no local backend
 and no local capacity accounting**, because a sandbox it places consumes another node's
 envelope, and a leftover local backend would let a task fall back to an unaccounted
 daemon.
@@ -169,8 +169,10 @@ inverted configuration fails at startup rather than by draining the fleet later.
 
 What the plane requires of a deployment:
 
-- **`node_ips` must be set.** It is the sandbox fleet, and defaulting to every alive
-  node would put sandboxes on the nodes the trainer is training on.
+- **`node_ips` names the fleet, and every alive node is the default.** Leaving it empty
+  places sandboxes on the nodes the trainer is training on. Each node admits against its
+  own envelope, so a co-located sandbox is bounded by `capacity.*` rather than free to
+  take the machine, but set `node_ips` to keep them off the GPU nodes entirely.
 - **A cross-node resume needs a shared snapshot store**, because the internal backend
   publishes a snapshot to a registry and re-creates from the digest reference. A node
   that cannot reach the store cannot restore a snapshot taken elsewhere. Without one

@@ -119,8 +119,10 @@ heterogeneous_rollout:
 # is enforced where the containers actually run.
 sandbox_placement:
 
-  # Off uses the local backend each worker already runs. `agent.node_ips` is required when
-  # this is on, because "every alive node" would put sandboxes on the GPU nodes.
+  # Off uses the local backend each worker already runs. On, the fleet is `agent.node_ips`
+  # when it names one and every alive node otherwise, which shares nodes with the trainer:
+  # each node still admits against its own envelope, so name the fleet to keep sandboxes
+  # off the GPU nodes.
   enabled: False
 
   # The backend the fleet runs, which is also the placement filter and the name a task asks

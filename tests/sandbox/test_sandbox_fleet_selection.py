@@ -68,7 +68,7 @@ def test_an_unnamed_fleet_is_every_alive_node(monkeypatch: pytest.MonkeyPatch) -
     """The empty list used to be refused; it now means the whole cluster."""
     trainer, captured = _trainer([], monkeypatch)
 
-    trainer._build_sandbox_plane(_PLACEMENT, _NODES)
+    trainer._build_sandbox_plane(_PLACEMENT, _NODES, concurrency_per_node=258)
 
     assert captured == [["node-a", "node-b"]]
 
@@ -80,7 +80,7 @@ def test_an_unnamed_fleet_says_sandboxes_will_share_the_trainer_nodes(
     trainer, _ = _trainer([], monkeypatch)
 
     with caplog.at_level(logging.WARNING):
-        trainer._build_sandbox_plane(_PLACEMENT, _NODES)
+        trainer._build_sandbox_plane(_PLACEMENT, _NODES, concurrency_per_node=258)
 
     message = "\n".join(record.getMessage() for record in caplog.records)
     assert "every alive node" in message
@@ -91,7 +91,7 @@ def test_a_named_fleet_is_used_as_given(monkeypatch: pytest.MonkeyPatch) -> None
     """`alive_nodes` is already filtered by the allow list, so the plane just uses it."""
     trainer, captured = _trainer(["10.0.0.2"], monkeypatch)
 
-    trainer._build_sandbox_plane(_PLACEMENT, [_NODES[1]])
+    trainer._build_sandbox_plane(_PLACEMENT, [_NODES[1]], concurrency_per_node=258)
 
     assert captured == [["node-b"]]
 
@@ -102,6 +102,6 @@ def test_a_named_fleet_does_not_warn_about_sharing(
     trainer, _ = _trainer(["10.0.0.2"], monkeypatch)
 
     with caplog.at_level(logging.WARNING):
-        trainer._build_sandbox_plane(_PLACEMENT, [_NODES[1]])
+        trainer._build_sandbox_plane(_PLACEMENT, [_NODES[1]], concurrency_per_node=258)
 
     assert "every alive node" not in "\n".join(record.getMessage() for record in caplog.records)

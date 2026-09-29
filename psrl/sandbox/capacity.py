@@ -687,6 +687,11 @@ class SandboxCapacityCoordinator:
                 "capacity": asdict(self._capacity.resources),
                 "physical_capacity": asdict(self._capacity.physical),
                 "available_capacity": asdict(self.available_capacity),
+                # What each declared class could actually be granted right now. The
+                # remainder above is not that number: a borrower may not take another
+                # class's unmet guarantee, so an external scheduler comparing against the
+                # remainder believes the node fits far more than it will admit.
+                "class_headroom": {name: asdict(self.class_headroom(name)) for name in self._headroom_classes()},
                 "free_gpus": len(self._free_gpus),
                 "memory_overcommit_ratio": self._config.memory_overcommit_ratio,
                 "allocations": len(self._allocations),
@@ -789,6 +794,43 @@ class SandboxCapacityCoordinator:
             waiter = min(fitting, key=lambda item: item.queued_at)
             self._count_bypasses(eligible, waiter)
             self._grant(waiter)
+
+    def _headroom_classes(self) -> tuple[str, ...]:
+        """Return the class names headroom is worth reporting for.
+
+        Every declared class, plus `default` for the deployment that declares none: a
+        request carries a class either way, and one whose class is absent from the report
+        would be compared against nothing.
+        """
+        names = set(self._guaranteed) | set(self._ceilings) | {"default"}
+        return tuple(sorted(names))
+
+    def class_headroom(self, resource_class: str) -> ResourceQuantity:
+        """Return what this class could be granted right now, if it asked.
+
+        This is the number a scheduler outside the node has to compare against, and it is
+        not the envelope's remainder. A borrower may not take another class's unmet
+        guarantee, and a class may have a ceiling of its own, so the remainder overstates
+        what this class can actually get — by the whole of every other queued guarantee.
+
+        Reporting the remainder instead is how an external scheduler comes to believe a
+        node fits far more than it will admit: it sends the work, the node queues it
+        correctly, and the mismatch surfaces only as sandboxes that never start.
+
+        Derived from the same two rules `_drain_waiters` admits by, so the answer cannot
+        drift from the decision it predicts.
+        """
+        headroom = (self.available_capacity - self._reserved_others(resource_class)).clamped_non_negative()
+        ceiling = self._ceilings.get(resource_class)
+        if ceiling is None:
+            return headroom
+        under_ceiling = (ceiling - self._usage(resource_class)).clamped_non_negative()
+        return ResourceQuantity(
+            memory_mb=min(headroom.memory_mb, under_ceiling.memory_mb),
+            cpu_millis=min(headroom.cpu_millis, under_ceiling.cpu_millis),
+            gpu_count=min(headroom.gpu_count, under_ceiling.gpu_count),
+            disk_mb=min(headroom.disk_mb, under_ceiling.disk_mb),
+        )
 
     def _borrowable(self, waiter: _Waiter) -> bool:
         """

@@ -52,19 +52,25 @@ _FALLBACK_RESERVATION_TTL_S = 60.0
 _PLACEMENT_RETRY_INTERVAL_S = 5.0
 
 
-def _placement_footprint(spec: SandboxSpec | None) -> dict[str, int]:
-    """Return what a spec will cost the node that takes it, in the envelope's own units.
+def _placement_footprint(spec: SandboxSpec | None) -> dict[str, Any]:
+    """Return what a spec will cost the node that takes it, and which class pays for it.
 
     Zero when the spec declares no resources, which placement reads as "do not filter on
     capacity" rather than as a free sandbox: a request whose size is unknown cannot be
     compared against a remainder, and refusing it would be a guess in the other direction.
+
+    The class travels with the size because headroom is per class: a node's remainder
+    includes room reserved for other classes' guarantees, so comparing a rollout against
+    it overstates what the node will admit by the whole of the grader's share.
     """
     resources = spec.resources if spec is not None else None
+    resource_class = spec.resource_class if spec is not None else "default"
     if resources is None:
-        return {"memory_mb": 0, "cpu_millis": 0}
+        return {"memory_mb": 0, "cpu_millis": 0, "resource_class": resource_class}
     return {
         "memory_mb": int(resources.memory_mb or 0),
         "cpu_millis": int(math.ceil((resources.cpu_count or 0) * 1000)),
+        "resource_class": resource_class,
     }
 
 
@@ -395,9 +401,12 @@ class BoundedTransport:
             "acquire_group",
             "checkpoint",
             "exec",
+            "pause",
             "prefetch",
             "read_bytes",
+            "release",
             "restore",
+            "resume",
             "write_bytes",
         }
     )
@@ -513,10 +522,12 @@ class BoundedTransport:
         return await self._bounded("diagnostics", lambda: self.transport.diagnostics(node_id, backend, sandbox_id))
 
     async def pause(self, node_id: str, backend: str, sandbox_id: str, mode: str) -> None:
-        await self._bounded("pause", lambda: self.transport.pause(node_id, backend, sandbox_id, mode))
+        # Freezing a sandbox stops every process in its cgroup, and a checkpointing pause
+        # writes its memory out, so the duration is the sandbox rather than a round trip.
+        await self._unbounded(lambda: self.transport.pause(node_id, backend, sandbox_id, mode))
 
     async def resume(self, node_id: str, backend: str, sandbox_id: str) -> None:
-        await self._bounded("resume", lambda: self.transport.resume(node_id, backend, sandbox_id))
+        await self._unbounded(lambda: self.transport.resume(node_id, backend, sandbox_id))
 
     async def checkpoint(
         self,
@@ -543,7 +554,12 @@ class BoundedTransport:
         return await self._unbounded(lambda: self.transport.restore(node_id, snapshot, spec, callback=callback))
 
     async def release(self, node_id: str, backend: str, sandbox_id: str) -> None:
-        await self._bounded("release", lambda: self.transport.release(node_id, backend, sandbox_id))
+        # Releasing destroys the container: it stops the processes, unmounts the overlay and
+        # returns the capacity. Bounding that at a round trip's deadline abandoned the call
+        # while the node was still tearing down, so the container survived the release that
+        # had already been reported as done — a leak the next run inherits as a node that
+        # cannot admit anything.
+        await self._unbounded(lambda: self.transport.release(node_id, backend, sandbox_id))
 
 
 class RemoteSandboxSession:

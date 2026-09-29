@@ -548,16 +548,22 @@ class SandboxNodeAgent:
             )
         return {"node_id": self.node_id, "backends": payloads}
 
-    async def capacity_headroom(self) -> dict[str, int | None]:
-        """Return what this node's envelope can still grant, and what it totals.
+    async def capacity_headroom(self) -> dict[str, Any]:
+        """Return what this node could grant each resource class, and what it totals.
 
         This is the one fact placement cannot derive for itself. It ranked nodes by how
         many reservations it had handed each one, which answers "where have I sent work"
         rather than "where does work fit" — and those diverge precisely when the cluster
         is full, which is when the answer matters.
 
-        A node with no envelope reports `None` rather than zero: zero would read as "full"
-        and exclude a provider backend that never had an envelope to begin with.
+        Reported per class rather than as one number, because that is the granularity
+        admission actually works at: a borrower may not take another class's unmet
+        guarantee, so the envelope's remainder overstates what any one class can get. A
+        scheduler given the remainder sends work a node will queue rather than admit, and
+        the mismatch shows up only as sandboxes that never start.
+
+        A node with no envelope reports `None` rather than zero: zero reads as "full" and
+        would exclude a provider backend that never had an envelope to begin with.
         """
         envelope = await self.manager.capacity_snapshot()
         if not envelope:
@@ -566,14 +572,25 @@ class SandboxNodeAgent:
                 "available_cpu_millis": None,
                 "envelope_memory_mb": None,
                 "envelope_cpu_millis": None,
+                "class_headroom": {},
             }
         available = envelope.get("available_capacity") or {}
         capacity = envelope.get("capacity") or {}
+        per_class = envelope.get("class_headroom") or {}
         return {
+            # Kept for a node whose class is not declared, and as the ceiling no class can
+            # exceed. Per-class headroom is what a request is compared against.
             "available_memory_mb": int(available.get("memory_mb", 0) or 0),
             "available_cpu_millis": int(available.get("cpu_millis", 0) or 0),
             "envelope_memory_mb": int(capacity.get("memory_mb", 0) or 0),
             "envelope_cpu_millis": int(capacity.get("cpu_millis", 0) or 0),
+            "class_headroom": {
+                str(name): {
+                    "memory_mb": int((values or {}).get("memory_mb", 0) or 0),
+                    "cpu_millis": int((values or {}).get("cpu_millis", 0) or 0),
+                }
+                for name, values in per_class.items()
+            },
         }
 
     async def _gpu_count(self) -> int:

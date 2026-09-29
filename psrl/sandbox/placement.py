@@ -110,6 +110,12 @@ class NodeCapabilities:
     # by capacity rather than by how loaded they are.
     envelope_memory_mb: int | None = None
     envelope_cpu_millis: int | None = None
+    # What each resource class could be granted right now, which is the granularity
+    # admission actually works at: a class may not borrow another's unmet guarantee, so
+    # the remainder above overstates what any one class can get. A request is compared
+    # against its own class's entry, falling back to the remainder when the node declares
+    # no class by that name.
+    class_headroom: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
 
     @classmethod
     def from_advertisement(cls, payload: Mapping[str, object]) -> NodeCapabilities:
@@ -139,6 +145,13 @@ class NodeCapabilities:
             available_cpu_millis=_optional_int("available_cpu_millis"),
             envelope_memory_mb=_optional_int("envelope_memory_mb"),
             envelope_cpu_millis=_optional_int("envelope_cpu_millis"),
+            class_headroom={
+                str(name): {
+                    "memory_mb": int((values or {}).get("memory_mb", 0) or 0),
+                    "cpu_millis": int((values or {}).get("cpu_millis", 0) or 0),
+                }
+                for name, values in (payload.get("class_headroom") or {}).items()
+            },
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -161,6 +174,7 @@ class NodeCapabilities:
             "available_cpu_millis": self.available_cpu_millis,
             "envelope_memory_mb": self.envelope_memory_mb,
             "envelope_cpu_millis": self.envelope_cpu_millis,
+            "class_headroom": {name: dict(values) for name, values in self.class_headroom.items()},
         }
 
 
@@ -190,6 +204,9 @@ class PlacementRequest:
     # declared no footprint, and such a request is not filtered on capacity.
     memory_mb: int = 0
     cpu_millis: int = 0
+    # Which admission class this request will be charged to. Headroom differs by class, so
+    # comparing against the wrong one is the same error as comparing against the envelope.
+    resource_class: str = "default"
 
     def __post_init__(self) -> None:
         """Normalize a payload into the types this service compares.
@@ -238,17 +255,33 @@ class _NodeRecord:
     pending_memory_mb: int = 0
     pending_cpu_millis: int = 0
 
-    def free_memory_mb(self) -> int | None:
-        """Return reported headroom minus what is already promised, or `None` if unbounded."""
-        if self.capabilities.available_memory_mb is None:
-            return None
-        return self.capabilities.available_memory_mb - self.pending_memory_mb
+    def free_memory_mb(self, resource_class: str = "default") -> int | None:
+        """Return what this class could still get, net of promises, or `None` if unbounded.
 
-    def free_cpu_millis(self) -> int | None:
-        """Return reported headroom minus what is already promised, or `None` if unbounded."""
-        if self.capabilities.available_cpu_millis is None:
-            return None
-        return self.capabilities.available_cpu_millis - self.pending_cpu_millis
+        The class's own headroom when the node reports one, because that is what admission
+        will actually compare against: the envelope's remainder includes room reserved for
+        other classes' unmet guarantees, and treating it as available is how a scheduler
+        comes to send a node several times the work it will admit.
+        """
+        reported = self._reported(resource_class, "memory_mb", self.capabilities.available_memory_mb)
+        return None if reported is None else reported - self.pending_memory_mb
+
+    def free_cpu_millis(self, resource_class: str = "default") -> int | None:
+        """Return what this class could still get, net of promises, or `None` if unbounded."""
+        reported = self._reported(resource_class, "cpu_millis", self.capabilities.available_cpu_millis)
+        return None if reported is None else reported - self.pending_cpu_millis
+
+    def _reported(self, resource_class: str, field_name: str, fallback: int | None) -> int | None:
+        """Read one dimension of a class's headroom, falling back to the envelope remainder.
+
+        A node that declares no class by this name has nothing class-specific to say about
+        it, and the remainder is then the only bound it knows. A node that declares no
+        envelope at all reports `None`, which means unbounded rather than full.
+        """
+        headroom = self.capabilities.class_headroom.get(resource_class)
+        if headroom is None:
+            return fallback
+        return int(headroom.get(field_name, 0) or 0)
 
     def can_hold(self, request: PlacementRequest) -> bool:
         """Return whether this node still has room for one request.
@@ -257,14 +290,14 @@ class _NodeRecord:
         so this service has no basis to refuse it. A request that declares no footprint is
         likewise not filtered, because zero is the absence of a measurement here.
         """
-        memory = self.free_memory_mb()
+        memory = self.free_memory_mb(request.resource_class)
         if memory is not None and request.memory_mb > 0 and request.memory_mb > memory:
             return False
-        cpu = self.free_cpu_millis()
+        cpu = self.free_cpu_millis(request.resource_class)
         return not (cpu is not None and request.cpu_millis > 0 and request.cpu_millis > cpu)
 
-    def utilisation(self) -> float:
-        """Return how full this node is, as the worse of its two dimensions.
+    def utilisation(self, resource_class: str = "default") -> float:
+        """Return how full this node is for one class, as the worse of its two dimensions.
 
         A fraction rather than an absolute, so two nodes of different sizes are ordered by
         how loaded they are rather than by how large they are. A node with no envelope
@@ -272,8 +305,8 @@ class _NodeRecord:
         """
         worst = 0.0
         for free, total in (
-            (self.free_memory_mb(), self.capabilities.envelope_memory_mb),
-            (self.free_cpu_millis(), self.capabilities.envelope_cpu_millis),
+            (self.free_memory_mb(resource_class), self.capabilities.envelope_memory_mb),
+            (self.free_cpu_millis(resource_class), self.capabilities.envelope_cpu_millis),
         ):
             if free is None or not total:
                 continue
@@ -293,6 +326,9 @@ class _Reservation:
     # What this reservation promised the node, so releasing it returns exactly what it took.
     memory_mb: int = 0
     cpu_millis: int = 0
+    # Which admission class this request will be charged to. Headroom differs by class, so
+    # comparing against the wrong one is the same error as comparing against the envelope.
+    resource_class: str = "default"
 
 
 def as_placement_request(request: PlacementRequest | Mapping[str, Any]) -> PlacementRequest:
@@ -495,6 +531,13 @@ class PlacementService:
                 available_cpu_millis=_optional_int(headroom.get("available_cpu_millis")),
                 envelope_memory_mb=_optional_int(headroom.get("envelope_memory_mb")),
                 envelope_cpu_millis=_optional_int(headroom.get("envelope_cpu_millis")),
+                class_headroom={
+                    str(name): {
+                        "memory_mb": int((values or {}).get("memory_mb", 0) or 0),
+                        "cpu_millis": int((values or {}).get("cpu_millis", 0) or 0),
+                    }
+                    for name, values in (headroom.get("class_headroom") or {}).items()
+                },
             )
             record.pending_memory_mb = 0
             record.pending_cpu_millis = 0
@@ -702,7 +745,7 @@ class PlacementService:
         return sorted(
             eligible,
             key=lambda record: (
-                round(record.utilisation() * _BALANCE_BUCKETS),
+                round(record.utilisation(request.resource_class) * _BALANCE_BUCKETS),
                 # More matches first, so the score is negated rather than ascending.
                 -self._locality_score(record.capabilities, request),
                 record.load,
@@ -804,8 +847,9 @@ class PlacementService:
             f"{record.capabilities.node_id}={record.free_memory_mb()}MB/{record.free_cpu_millis()}mcpu free"
             for record in eligible
         )
+        class_phrase = f" for resource_class='{request.resource_class}'" if request.resource_class else ""
         return (
-            f"Every capable sandbox node is full: the request needs {request.memory_mb}MB and "
+            f"Every capable sandbox node is full{class_phrase}: the request needs {request.memory_mb}MB and "
             f"{request.cpu_millis}mcpu, and the candidates have [{rooms}]. This clears as sandboxes "
             "are released; raise the envelope or lower concurrency if it does not."
         )

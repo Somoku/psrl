@@ -593,3 +593,90 @@ async def test_shutdown_wakes_queued_requests_and_refuses_new_admission():
         await waiting
     with pytest.raises(RuntimeError, match="closed"):
         await coordinator.acquire("new", "owner", 1, 1)
+
+
+class TestClassHeadroomPredictsAdmission:
+    """What a class could be granted now, which is not the envelope's remainder.
+
+    An external scheduler has to compare a request against this. Given the remainder it
+    believes a node fits everything the envelope holds, sends the work, and the node then
+    queues most of it — correctly, and invisibly.
+    """
+
+    @staticmethod
+    def _coordinator() -> SandboxCapacityCoordinator:
+        return SandboxCapacityCoordinator(
+            SandboxCapacityConfig(
+                memory_mb=1000,
+                cpu_cores=10,
+                utilization=1,
+                lease_ttl_s=10,
+                heartbeat_interval_s=1,
+                classes={
+                    "rollout": {"guaranteed_share": 0.45},
+                    "grader": {"guaranteed_share": 0.45},
+                },
+            )
+        )
+
+    async def test_an_idle_fleet_lets_a_class_borrow_the_whole_envelope(self) -> None:
+        # Nothing is queued, so nothing is reserved against, and a borrower sees it all.
+        coordinator = self._coordinator()
+
+        headroom = coordinator.class_headroom("rollout")
+
+        assert headroom.memory_mb == 1000
+
+    async def test_a_queued_class_reserves_its_unmet_guarantee_away(self) -> None:
+        """This is the gap that made the envelope's remainder the wrong number.
+
+        _reserved_others fires only when another class is actively WAITING in the queue
+        (not yet granted). To get grader into a waiting state, we first exhaust nearly
+        all the available capacity with rollout grants so grader cannot be admitted.
+        """
+        coordinator = self._coordinator()
+        # Grant 900 MB of rollout — only 100 MB remains, less than grader's guarantee (450).
+        await coordinator.acquire("r1", "owner", 900, 1.0, "rollout", None, 0)
+        # Now queue 200 MB grader. It cannot borrow (only 100 MB free, less than the 200
+        # needed), so it waits. Its unmet guarantee = 450 - 0 used = 450 MB.
+        queued = asyncio.ensure_future(coordinator.acquire("g1", "owner", 200, 1.0, "grader", None, 0))
+        await asyncio.sleep(0.05)
+
+        headroom = coordinator.class_headroom("rollout")
+
+        # available = 100, _reserved_others("rollout") = max(0, 450 - 0) = 450
+        # headroom = (100 - 450).clamped = 0
+        assert headroom.memory_mb == 0, "grader's unmet guarantee fully consumes available capacity"
+        queued.cancel()
+        await asyncio.gather(queued, return_exceptions=True)
+
+    async def test_headroom_shrinks_as_the_class_is_granted(self) -> None:
+        coordinator = self._coordinator()
+        before = coordinator.class_headroom("rollout").memory_mb
+
+        await coordinator.acquire("r1", "owner", 200, 1.0, "rollout", None, 0)
+
+        assert coordinator.class_headroom("rollout").memory_mb == before - 200
+
+    async def test_headroom_is_reported_for_every_declared_class(self) -> None:
+        coordinator = self._coordinator()
+
+        snapshot = await coordinator.snapshot()
+
+        assert set(snapshot["class_headroom"]) >= {"rollout", "grader", "default"}
+        assert snapshot["class_headroom"]["rollout"]["memory_mb"] == 1000
+
+    async def test_headroom_never_goes_negative(self) -> None:
+        # Two waiting classes could otherwise reserve more than the envelope holds.
+        coordinator = self._coordinator()
+        # Fill the envelope first so both queued tasks actually wait.
+        await coordinator.acquire("r0", "owner", 1000, 1.0, "rollout", None, 0)
+        first = asyncio.ensure_future(coordinator.acquire("g1", "owner", 100, 1.0, "grader", None, 0))
+        second = asyncio.ensure_future(coordinator.acquire("d1", "owner", 100, 1.0, "default", None, 0))
+        await asyncio.sleep(0.05)
+
+        assert coordinator.class_headroom("rollout").memory_mb >= 0
+
+        for task in (first, second):
+            task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)

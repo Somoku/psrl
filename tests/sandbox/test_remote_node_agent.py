@@ -605,16 +605,26 @@ def test_the_work_calls_are_the_ones_whose_duration_is_the_work() -> None:
     """Pin the split, because a new method silently inheriting either side is the bug.
 
     Each of these wraps something whose length is set by the work: a command, an admission
-    queue, an image pull, a file transfer. Everything else is one round trip.
+    queue, an image pull, a file transfer, a container teardown, or a cgroup freeze.
+    Everything else is one round trip.
+
+    `release` and `release_group` destroy a container (stop processes, unmount overlay,
+    return cgroup resources) — that work takes as long as Docker takes, so a 60s
+    coordination deadline truncates them and leaks the container when it fires.
+    `pause` and `resume` freeze and thaw a cgroup, which is similarly bounded by the
+    runtime, not by network latency.
     """
     assert BoundedTransport.WORK_CALLS == {
         "acquire",
         "acquire_group",
         "checkpoint",
         "exec",
+        "pause",
         "prefetch",
         "read_bytes",
+        "release",
         "restore",
+        "resume",
         "write_bytes",
     }
 

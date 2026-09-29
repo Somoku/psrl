@@ -142,8 +142,11 @@ sandbox_placement:
   # How often a node reports that it is still there. Keep it well inside `node_ttl_s`.
   heartbeat_interval_s: 30.0
 
-  # Deadline for one call to a node agent or the placement service. Without it a partitioned
-  # node blocks its caller for the rest of the run.
+  # Deadline for one coordination call to a node agent or the placement service: a question
+  # or a reservation move, which answers in milliseconds when healthy. Without it a
+  # partitioned node blocks its caller for the rest of the run. Calls that wrap work keep
+  # the budget they already carry — a command has `timeout_s`, an admission has the capacity
+  # deadline, a file transfer scales with its size — so this is not sized against an episode.
   rpc_timeout_s: 60.0
 
   # A node label every sandbox node carries, so a request can pin itself to a dedicated node.

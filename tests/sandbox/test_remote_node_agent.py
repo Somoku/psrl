@@ -523,9 +523,9 @@ async def test_an_unreadable_placement_ttl_does_not_stop_renewal() -> None:
     assert await remote._reservation_ttl_s() == 60.0
 
 
-async def test_a_call_that_never_answers_raises_a_named_timeout() -> None:
-    # A remote call has no default deadline, so without one a wedged agent blocks its
-    # caller for the rest of the run and the reservation renewer stops with it.
+async def test_a_coordination_call_that_never_answers_raises_a_named_timeout() -> None:
+    # A coordination call has no deadline of its own, so without one a wedged agent blocks
+    # its caller for the rest of the run and the reservation renewer stops with it.
     import asyncio
 
     placement, remote, agents = _cluster(("node-a", FakeBackend(set())))
@@ -535,22 +535,56 @@ async def test_a_call_that_never_answers_raises_a_named_timeout() -> None:
     async def hang(*args, **kwargs):
         await released.wait()
 
-    remote.transport.acquire = hang
+    remote.transport.connect = hang
     remote.transport = BoundedTransport(remote.transport, timeout_s=0.02)
 
-    with pytest.raises(NodeAgentTimeout, match="'acquire'") as raised:
-        await remote.create(_spec())
+    with pytest.raises(NodeAgentTimeout, match="'connect'") as raised:
+        await remote.transport.connect("node-a", "fake", "sandbox-1")
 
     # It is a TimeoutError, which is what a caller already knows how to handle.
     assert isinstance(raised.value, TimeoutError)
-    # The reservation the timed-out create was holding is withdrawn, not left charged.
-    assert placement.snapshot().reservations_open == 0
     released.set()
 
 
-async def test_the_deadline_covers_every_call_the_protocol_declares() -> None:
-    # A policy applied to some calls is a policy with a hole, and a hole is where the
-    # caller that never returns gets through.
+async def test_a_work_call_is_not_cut_off_by_the_coordination_deadline() -> None:
+    """A call that wraps work must outlive a deadline meant for a round trip.
+
+    `exec` carries the command's own `timeout_s` and the node enforces it, so bounding it
+    here again overrode a budget set by the only party that knows the work. At
+    `rpc_timeout_s=60` against a 7260s harness budget that truncated healthy episodes at
+    1/121 of their allowance and reported them as a node fault.
+    """
+    import asyncio
+
+    _, remote, _ = _cluster(("node-a", FakeBackend(set())))
+    started = asyncio.Event()
+
+    async def slower_than_the_rpc_deadline(*args, **kwargs):
+        started.set()
+        await asyncio.sleep(0.1)
+        return {"exit_code": 0, "stdout": "done", "stderr": "", "truncated": False}
+
+    remote.transport.exec = slower_than_the_rpc_deadline
+    bounded = BoundedTransport(remote.transport, timeout_s=0.02)
+
+    result = await bounded.exec(
+        "node-a",
+        "fake",
+        "sandbox-1",
+        "sleep 1",
+        cwd=None,
+        env=None,
+        timeout_s=600.0,
+        silence_timeout_s=None,
+    )
+
+    assert started.is_set()
+    assert result["stdout"] == "done"
+
+
+async def test_every_protocol_call_is_classified_as_work_or_coordination() -> None:
+    # A call that is neither is a call whose deadline nobody decided: it either truncates
+    # real work or lets a partitioned node hang its caller.
     bounded = BoundedTransport(_cluster(("node-a", FakeBackend(set())))[1].transport, timeout_s=1.0)
     declared = sorted(
         name
@@ -560,9 +594,29 @@ async def test_the_deadline_covers_every_call_the_protocol_declares() -> None:
     )
 
     missing = [name for name in declared if not hasattr(bounded, name)]
+    unknown_work = sorted(BoundedTransport.WORK_CALLS - set(declared))
 
     assert declared, "The protocol must declare the calls this wrapper is meant to cover."
-    assert missing == [], f"Every node agent call needs a deadline, and these have none: {missing}"
+    assert missing == [], f"Every node agent call needs a classification, and these have none: {missing}"
+    assert unknown_work == [], f"WORK_CALLS names calls the protocol does not declare: {unknown_work}"
+
+
+def test_the_work_calls_are_the_ones_whose_duration_is_the_work() -> None:
+    """Pin the split, because a new method silently inheriting either side is the bug.
+
+    Each of these wraps something whose length is set by the work: a command, an admission
+    queue, an image pull, a file transfer. Everything else is one round trip.
+    """
+    assert BoundedTransport.WORK_CALLS == {
+        "acquire",
+        "acquire_group",
+        "checkpoint",
+        "exec",
+        "prefetch",
+        "read_bytes",
+        "restore",
+        "write_bytes",
+    }
 
 
 def test_a_bounded_transport_refuses_a_useless_deadline() -> None:

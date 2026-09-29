@@ -160,7 +160,7 @@ daemon.
 | `reservation_ttl_s` | How long a reservation survives without renewal. The caller renews at a third of it |
 | `sweep_interval_s` | The sweep enforces the reservation TTL, so it has to be the shorter of the two |
 | `heartbeat_interval_s` | How often a node reports it is still there. Keep it well inside the node TTL |
-| `rpc_timeout_s` | Deadline for one call to a node agent or the placement service |
+| `rpc_timeout_s` | Deadline for one *coordination* call to a node agent or the placement service. Calls that wrap work — `exec`, `acquire`, `prefetch`, `read_bytes`, `write_bytes`, `checkpoint`, `restore` — keep the budget they already carry, so this must not be sized against an episode |
 | `required_label` | A node label a request pins itself to, or null to accept any node |
 | `callback_target` | A `host:port` a node forwards to so a sandbox reaches this worker's session server, or null to leave callback URLs alone |
 

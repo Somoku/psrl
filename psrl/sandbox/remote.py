@@ -337,16 +337,45 @@ class NodeAgentTimeout(TimeoutError):
 
 
 class BoundedTransport:
-    """Apply a per-call deadline to every call to a node agent or the placement service.
+    """Bound the coordination calls to a node agent, and let the work calls keep their own.
 
-    A remote call has no default deadline, so a wedged agent or a partitioned node blocks
-    its caller for the rest of the run. The failure is worse than it looks: the reservation
-    renewer makes its own calls, so one call that never returns stops every renewal and
-    placement then frees the reservations of a worker that is still running sandboxes.
+    A coordination call is one round trip that asks a question or moves a reservation, so a
+    healthy one answers in milliseconds and one that has not answered in a minute is a
+    fault: a wedged agent or a partitioned node. It needs a deadline here, because it has
+    none of its own and the reservation renewer runs on these calls — one that never returns
+    stops every renewal, and placement then frees the reservations of a worker that is still
+    running sandboxes.
 
-    It wraps the transport rather than living inside one, so the deadline is one policy
-    applied to every transport and a fake can exercise it without a cluster.
+    A work call wraps something whose duration is the work itself: a harness CLI that may run
+    for the whole episode, a node admission that may queue behind other tenants, a file whose
+    transfer scales with its size. Those arrive already bounded by the caller that knows what
+    it asked for — `exec` carries `timeout_s`, `acquire` is held to the manager's admission
+    deadline, and the file calls are bounded against a stalled socket by the backend's own
+    read timeout. Imposing this deadline on them as well would override a budget set by the
+    only party that knows the work with one that knows nothing about it, and at
+    `rpc_timeout_s=60` against a 7260s harness budget that is a 121x truncation of healthy
+    work reported as a node fault.
+
+    So the split is by what the call measures, not by which transport carries it. It wraps
+    the transport rather than living inside one, so the policy has one definition and a fake
+    can exercise it without a cluster.
     """
+
+    # Calls whose duration is the work they wrap, so the caller's own budget is the only
+    # deadline that can be right. Listed explicitly, because a new protocol method must be
+    # classified deliberately rather than silently inherit a coordination deadline.
+    WORK_CALLS = frozenset(
+        {
+            "acquire",
+            "acquire_group",
+            "checkpoint",
+            "exec",
+            "prefetch",
+            "read_bytes",
+            "restore",
+            "write_bytes",
+        }
+    )
 
     def __init__(self, transport: NodeAgentTransport, *, timeout_s: float = 60.0) -> None:
         if timeout_s <= 0:
@@ -359,6 +388,10 @@ class BoundedTransport:
             return await asyncio.wait_for(call(), timeout=self.timeout_s)
         except asyncio.TimeoutError as exc:
             raise NodeAgentTimeout(f"Sandbox node call {name!r} did not answer within {self.timeout_s:g}s.") from exc
+
+    async def _unbounded(self, call) -> Any:
+        """Forward a work call, leaving its deadline to the budget it already carries."""
+        return await call()
 
     async def choose(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         return await self._bounded("choose", lambda: self.transport.choose(request))
@@ -379,9 +412,8 @@ class BoundedTransport:
         return await self._bounded("candidate_nodes", lambda: self.transport.candidate_nodes(request, limit=limit))
 
     async def prefetch(self, node_id: str, references: Sequence[str], *, concurrency: int) -> int:
-        return await self._bounded(
-            "prefetch", lambda: self.transport.prefetch(node_id, references, concurrency=concurrency)
-        )
+        # Warming pulls images, so its duration is the registry and the working set.
+        return await self._unbounded(lambda: self.transport.prefetch(node_id, references, concurrency=concurrency))
 
     async def release_reservation(self, reservation_id: str) -> None:
         await self._bounded("release_reservation", lambda: self.transport.release_reservation(reservation_id))
@@ -393,7 +425,9 @@ class BoundedTransport:
         *,
         callback: str | None = None,
     ) -> Mapping[str, Any]:
-        return await self._bounded("acquire", lambda: self.transport.acquire(node_id, spec, callback=callback))
+        # Bounded by the manager's admission deadline, which may legitimately queue for
+        # far longer than a coordination round trip.
+        return await self._unbounded(lambda: self.transport.acquire(node_id, spec, callback=callback))
 
     async def acquire_group(
         self,
@@ -402,9 +436,7 @@ class BoundedTransport:
         *,
         callback: str | None = None,
     ) -> list[Mapping[str, Any]]:
-        return await self._bounded(
-            "acquire_group", lambda: self.transport.acquire_group(node_id, specs, callback=callback)
-        )
+        return await self._unbounded(lambda: self.transport.acquire_group(node_id, specs, callback=callback))
 
     async def connect(self, node_id: str, backend: str, sandbox_id: str) -> Mapping[str, Any]:
         return await self._bounded("connect", lambda: self.transport.connect(node_id, backend, sandbox_id))
@@ -421,8 +453,9 @@ class BoundedTransport:
         timeout_s: float | None,
         silence_timeout_s: float | None,
     ) -> Mapping[str, Any]:
-        return await self._bounded(
-            "exec",
+        # `timeout_s` is the command's own budget and it is enforced on the node, so the
+        # deadline travels with the call instead of being imposed on top of it.
+        return await self._unbounded(
             lambda: self.transport.exec(
                 node_id,
                 backend,
@@ -436,12 +469,12 @@ class BoundedTransport:
         )
 
     async def read_bytes(self, node_id: str, backend: str, sandbox_id: str, path: str) -> bytes:
-        return await self._bounded("read_bytes", lambda: self.transport.read_bytes(node_id, backend, sandbox_id, path))
+        # Transfer time scales with the file, which a fixed deadline cannot know. The
+        # backend's socket read timeout is what catches a transfer that has actually stalled.
+        return await self._unbounded(lambda: self.transport.read_bytes(node_id, backend, sandbox_id, path))
 
     async def write_bytes(self, node_id: str, backend: str, sandbox_id: str, path: str, data: bytes) -> None:
-        await self._bounded(
-            "write_bytes", lambda: self.transport.write_bytes(node_id, backend, sandbox_id, path, data)
-        )
+        await self._unbounded(lambda: self.transport.write_bytes(node_id, backend, sandbox_id, path, data))
 
     async def status(self, node_id: str, backend: str, sandbox_id: str) -> str:
         return await self._bounded("status", lambda: self.transport.status(node_id, backend, sandbox_id))
@@ -468,9 +501,9 @@ class BoundedTransport:
         kind: str,
         policy: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        return await self._bounded(
-            "checkpoint", lambda: self.transport.checkpoint(node_id, backend, sandbox_id, kind, policy)
-        )
+        # A snapshot commits a filesystem and may publish it to a registry, so its duration
+        # is the image, not a round trip.
+        return await self._unbounded(lambda: self.transport.checkpoint(node_id, backend, sandbox_id, kind, policy))
 
     async def restore(
         self,
@@ -480,9 +513,9 @@ class BoundedTransport:
         *,
         callback: str | None = None,
     ) -> Mapping[str, Any]:
-        return await self._bounded(
-            "restore", lambda: self.transport.restore(node_id, snapshot, spec, callback=callback)
-        )
+        # Restoring pulls a snapshot and provisions from it, so it is admission plus an
+        # image pull rather than a round trip.
+        return await self._unbounded(lambda: self.transport.restore(node_id, snapshot, spec, callback=callback))
 
     async def release(self, node_id: str, backend: str, sandbox_id: str) -> None:
         await self._bounded("release", lambda: self.transport.release(node_id, backend, sandbox_id))

@@ -1,8 +1,14 @@
 """Cluster-wide node selection and the two-sided reservation protocol.
 
-A sandbox node advertises what it can do, and this service picks one. Selection is
-capability match first, then image locality, then load, so a task lands on a node
-that already holds its image rather than on whichever node happens to be idle.
+A sandbox node advertises what it can do and how much room it has left, and this service
+picks one. Selection is capability match, then room, then how loaded the node is, then
+image locality — requirements before optimisations. Ranking locality first let a
+per-instance image draw a whole batch onto the one node holding it, and with no room check
+those requests were reserved onto a node that could admit a fraction of them; the rest
+queued at that node for an episode's length with nothing anywhere reporting a fault.
+
+Room has to be reported rather than inferred. A reservation count says where this service
+has sent work, not where work fits, and the two diverge exactly when the cluster is full.
 
 The reservation protocol exists because a reservation is held in two places at
 once: here and on the node that will enforce it. Without a release path, every
@@ -19,7 +25,7 @@ import logging
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from psrl.sandbox.core import ResumeLevel, SandboxCapabilities, SandboxFeature
@@ -31,6 +37,12 @@ psrl_logger = logging.getLogger(__file__)
 DEFAULT_NODE_TTL_S = 120.0
 
 
+# How finely utilisation is compared before locality is allowed to decide. Ten buckets
+# means nodes within about a tenth of each other count as equally loaded, which leaves
+# locality a real say without letting it override a node that is genuinely fuller.
+_BALANCE_BUCKETS = 10
+
+
 class NoPlacementCandidate(RuntimeError):
     """
     Raised when no registered node satisfies a request.
@@ -38,6 +50,27 @@ class NoPlacementCandidate(RuntimeError):
     This is a capacity planning fault rather than a task failure: the request never
     reached a node, so nothing about the workload was learned.
     """
+
+
+class PlacementCapacityExhausted(RuntimeError):
+    """Raised when every capable node is full right now.
+
+    Deliberately not a `NoPlacementCandidate`. That one says the fleet can never run this
+    request, which is a deployment fault and will not improve by waiting. This says the
+    fleet can run it but has no room at this instant, which resolves as sandboxes are
+    released — so the caller's recourse is to wait rather than to fail the task. Placing
+    it anyway is what the old code did, and the request then waited at a node that could
+    not admit it, with no record anywhere that it was queued.
+    """
+
+
+def _optional_int(value: Any) -> int | None:
+    """Return an int, preserving `None` as the absence of a declared envelope.
+
+    Zero and `None` must not collapse into each other here: zero means a node that is
+    full right now, `None` means a node that never had an envelope to be full of.
+    """
+    return None if value is None else int(value)
 
 
 @dataclass(frozen=True)
@@ -64,12 +97,30 @@ class NodeCapabilities:
     # them under. A caller knows only the reference, so a reference index makes locality usable.
     image_digests: frozenset[str] = frozenset()
     image_references: frozenset[str] = frozenset()
+    # What this node's admission envelope can still grant, as the node last reported it.
+    # Placement cannot decide where a sandbox fits without it: ranking by a reservation
+    # count says which node this service has sent the most work to, not which node can
+    # take more, and the two diverge exactly when the cluster is full. `None` means the
+    # node declared no envelope, which is how a provider backend that schedules its own
+    # capacity opts out of this filter rather than being refused by it.
+    available_memory_mb: int | None = None
+    available_cpu_millis: int | None = None
+    # The envelope's total, kept alongside the remainder so a balance comparison is a
+    # fraction rather than an absolute: two nodes of different sizes are otherwise ordered
+    # by capacity rather than by how loaded they are.
+    envelope_memory_mb: int | None = None
+    envelope_cpu_millis: int | None = None
 
     @classmethod
     def from_advertisement(cls, payload: Mapping[str, object]) -> NodeCapabilities:
         """
         Build a capability record from a node's advertisement.
         """
+
+        def _optional_int(key: str) -> int | None:
+            value = payload.get(key)
+            return None if value is None else int(value)
+
         return cls(
             node_id=str(payload["node_id"]),
             backend=str(payload["backend"]),
@@ -84,6 +135,10 @@ class NodeCapabilities:
             draining=bool(payload.get("draining", False)),
             image_digests=frozenset(str(item) for item in payload.get("image_digests", ())),
             image_references=frozenset(str(item) for item in payload.get("image_references", ())),
+            available_memory_mb=_optional_int("available_memory_mb"),
+            available_cpu_millis=_optional_int("available_cpu_millis"),
+            envelope_memory_mb=_optional_int("envelope_memory_mb"),
+            envelope_cpu_millis=_optional_int("envelope_cpu_millis"),
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -102,6 +157,10 @@ class NodeCapabilities:
             "draining": self.draining,
             "image_digests": sorted(self.image_digests),
             "image_references": sorted(self.image_references),
+            "available_memory_mb": self.available_memory_mb,
+            "available_cpu_millis": self.available_cpu_millis,
+            "envelope_memory_mb": self.envelope_memory_mb,
+            "envelope_cpu_millis": self.envelope_cpu_millis,
         }
 
 
@@ -125,6 +184,12 @@ class PlacementRequest:
     image_references: frozenset[str] = frozenset()
     # Owner of the reservation, so a dead caller's slots can be swept.
     owner_id: str = ""
+    # What the sandbox will cost the node that takes it. Placement needs the size to
+    # decide anything about fit: without it the only question it can answer is which node
+    # it has sent the least work to, which is not the same question. Zero means the caller
+    # declared no footprint, and such a request is not filtered on capacity.
+    memory_mb: int = 0
+    cpu_millis: int = 0
 
     def __post_init__(self) -> None:
         """Normalize a payload into the types this service compares.
@@ -165,6 +230,55 @@ class _NodeRecord:
     # cancelled. Load is what breaks a tie, so it only has to be comparable.
     load: int = 0
     seen_at: float = 0.0
+    # What this service has promised the node since its last report. A reservation is
+    # made here and charged on the node later, so between those two moments the node's
+    # reported headroom still counts the room as free. Without this, a batch of
+    # concurrent requests all read the same stale headroom and all pick the same node,
+    # which is how one node ends up holding more sandboxes than its envelope admits.
+    pending_memory_mb: int = 0
+    pending_cpu_millis: int = 0
+
+    def free_memory_mb(self) -> int | None:
+        """Return reported headroom minus what is already promised, or `None` if unbounded."""
+        if self.capabilities.available_memory_mb is None:
+            return None
+        return self.capabilities.available_memory_mb - self.pending_memory_mb
+
+    def free_cpu_millis(self) -> int | None:
+        """Return reported headroom minus what is already promised, or `None` if unbounded."""
+        if self.capabilities.available_cpu_millis is None:
+            return None
+        return self.capabilities.available_cpu_millis - self.pending_cpu_millis
+
+    def can_hold(self, request: PlacementRequest) -> bool:
+        """Return whether this node still has room for one request.
+
+        A node that declared no envelope is never excluded: it schedules its own capacity,
+        so this service has no basis to refuse it. A request that declares no footprint is
+        likewise not filtered, because zero is the absence of a measurement here.
+        """
+        memory = self.free_memory_mb()
+        if memory is not None and request.memory_mb > 0 and request.memory_mb > memory:
+            return False
+        cpu = self.free_cpu_millis()
+        return not (cpu is not None and request.cpu_millis > 0 and request.cpu_millis > cpu)
+
+    def utilisation(self) -> float:
+        """Return how full this node is, as the worse of its two dimensions.
+
+        A fraction rather than an absolute, so two nodes of different sizes are ordered by
+        how loaded they are rather than by how large they are. A node with no envelope
+        sorts as empty, since nothing here can claim otherwise.
+        """
+        worst = 0.0
+        for free, total in (
+            (self.free_memory_mb(), self.capabilities.envelope_memory_mb),
+            (self.free_cpu_millis(), self.capabilities.envelope_cpu_millis),
+        ):
+            if free is None or not total:
+                continue
+            worst = max(worst, 1.0 - max(0, free) / total)
+        return worst
 
 
 @dataclass
@@ -176,6 +290,9 @@ class _Reservation:
     # When the owner last said it still holds this reservation. The sweeper ages a
     # reservation from here, not from creation, so a live sandbox is only swept when it is not renewed.
     renewed_at: float = 0.0
+    # What this reservation promised the node, so releasing it returns exactly what it took.
+    memory_mb: int = 0
+    cpu_millis: int = 0
 
 
 def as_placement_request(request: PlacementRequest | Mapping[str, Any]) -> PlacementRequest:
@@ -233,6 +350,9 @@ class PlacementSnapshot:
     reservations_swept: int = 0
     rejections: int = 0
     no_candidate: int = 0
+    # Times every capable node was full. Apart from `no_candidate`, because this one
+    # clears itself as sandboxes are released and that one never will.
+    capacity_exhausted: int = 0
     oldest_reservation_age_s: float = 0.0
     mean_decision_s: float = 0.0
     # How often the chosen node already held what the request would have pulled. This
@@ -299,6 +419,10 @@ class PlacementService:
         self._swept = 0
         self._rejections = 0
         self._no_candidate = 0
+        # Counted apart from `_no_candidate`: a fleet with no room is a scheduling state
+        # that clears itself, and a fleet with no capable node is a misconfiguration.
+        # Reporting both as one number would hide which of the two a run is suffering.
+        self._capacity_exhausted = 0
         self._locality_asked = 0
         self._locality_hits = 0
         self._decisions = 0
@@ -315,8 +439,12 @@ class PlacementService:
         return self._reservation_ttl_s
 
     def register(self, capabilities: NodeCapabilities, *, now: float | None = None) -> None:
-        """
-        Admit a node to the registry, or refresh one already known.
+        """Admit a node to the registry, or refresh one already known.
+
+        A re-registration carries a fresh advertisement, which already accounts for every
+        grant the node has made. The promises this service has not yet seen land there are
+        carried over with the open reservations that made them, because dropping them would
+        let the same room be promised twice while those reservations are still alive.
         """
         current = time.monotonic() if now is None else now
         existing = self._nodes.get(capabilities.node_id)
@@ -324,6 +452,8 @@ class PlacementService:
             capabilities=capabilities,
             load=existing.load if existing else 0,
             seen_at=current,
+            pending_memory_mb=existing.pending_memory_mb if existing else 0,
+            pending_cpu_millis=existing.pending_cpu_millis if existing else 0,
         )
 
     def unregister(self, node_id: str) -> None:
@@ -336,9 +466,21 @@ class PlacementService:
         ]:
             self._reservations.pop(reservation_id, None)
 
-    def heartbeat(self, node_id: str, *, load: int | None = None, now: float | None = None) -> None:
-        """
-        Refresh a node's liveness and, when reported, its load.
+    def heartbeat(
+        self,
+        node_id: str,
+        *,
+        load: int | None = None,
+        headroom: Mapping[str, Any] | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Refresh a node's liveness and, when reported, its load and headroom.
+
+        Headroom is refreshed here because it is the one input that goes stale on its own:
+        every grant the node makes shrinks it, and placement has no way to observe that
+        from its own side. A reported snapshot also clears the reservations this service
+        was charging against the node, since the node's own accounting now includes
+        whatever those reservations became.
         """
         record = self._nodes.get(node_id)
         if record is None:
@@ -346,6 +488,16 @@ class PlacementService:
         record.seen_at = time.monotonic() if now is None else now
         if load is not None:
             record.load = max(0, load)
+        if headroom is not None:
+            record.capabilities = replace(
+                record.capabilities,
+                available_memory_mb=_optional_int(headroom.get("available_memory_mb")),
+                available_cpu_millis=_optional_int(headroom.get("available_cpu_millis")),
+                envelope_memory_mb=_optional_int(headroom.get("envelope_memory_mb")),
+                envelope_cpu_millis=_optional_int(headroom.get("envelope_cpu_millis")),
+            )
+            record.pending_memory_mb = 0
+            record.pending_cpu_millis = 0
 
     def has_node(self, node_id: str) -> bool:
         """Return whether this service still knows one node.
@@ -358,14 +510,21 @@ class PlacementService:
         return node_id in self._nodes
 
     def choose(self, request: PlacementRequest | Mapping[str, Any], *, now: float | None = None) -> PlacementDecision:
-        """Pick a node and reserve it.
+        """Pick a node that can actually hold the request, and reserve it there.
 
-        Capability match, then image locality, then load. A node that cannot host the
-        request is not a candidate at all, because a fallback that ignores a
-        requirement is how a full-state resume ends up on a filesystem backend.
+        Capability match, then room, then balance, then image locality. The order is the
+        point: a capability is a requirement, room is a requirement, and locality is an
+        optimisation. Ranking locality first let a per-instance image pin an entire batch
+        onto whichever node happened to hold it, and because nothing then checked room,
+        every one of those requests was reserved onto a node that could admit only a
+        fraction of them. They queued at the node instead, invisibly, until the run's
+        first buffer could never fill.
 
         Raises:
-            NoPlacementCandidate: When no node satisfies the request.
+            NoPlacementCandidate: When no live node could ever satisfy the request.
+            PlacementCapacityExhausted: When a node could satisfy it but none has room
+                right now. Separate because the caller's recourse differs: the first is a
+                deployment fault, the second resolves as sandboxes are released.
         """
         request = as_placement_request(request)
         started_at = time.monotonic()
@@ -378,15 +537,25 @@ class PlacementService:
             # prefetch's targets and a read-only scan is not a rejection.
             self._rejections += len(candidates)
             raise NoPlacementCandidate(self._explain(request, candidates))
-        chosen = self._rank(eligible, request)[0]
+        roomy = [record for record in eligible if record.can_hold(request)]
+        if not roomy:
+            self._capacity_exhausted += 1
+            raise PlacementCapacityExhausted(self._explain_capacity(request, eligible))
+        chosen = self._rank(roomy, request)[0]
         reservation = _Reservation(
             reservation_id=uuid.uuid4().hex,
             node_id=chosen.capabilities.node_id,
             owner_id=request.owner_id,
             created_at=current,
             renewed_at=current,
+            memory_mb=max(0, request.memory_mb),
+            cpu_millis=max(0, request.cpu_millis),
         )
         chosen.load += 1
+        # Charge the promise now, so the next caller in this same batch sees the room go
+        # even though the node cannot report it until the grant lands.
+        chosen.pending_memory_mb += reservation.memory_mb
+        chosen.pending_cpu_millis += reservation.cpu_millis
         self._reservations[reservation.reservation_id] = reservation
         self._decisions += 1
         self._note_locality(chosen.capabilities, request)
@@ -447,14 +616,22 @@ class PlacementService:
         self._retire(reservation_id, "cancelled")
 
     def _retire(self, reservation_id: str, outcome: str) -> None:
-        """
-        Drop one reservation and record how it ended.
+        """Drop one reservation, record how it ended, and give back what it promised.
+
+        Every way a reservation can end funnels through here, which is why the promised
+        resources are returned here too: a charge released on only some of those paths
+        would leak headroom, and a node whose headroom has leaked is one this service
+        stops sending work to while it sits idle.
         """
         reservation = self._reservations.pop(reservation_id, None)
         if reservation is None:
             return
         self._outcomes[outcome] = self._outcomes.get(outcome, 0) + 1
         self._decrement(reservation.node_id)
+        record = self._nodes.get(reservation.node_id)
+        if record is not None:
+            record.pending_memory_mb = max(0, record.pending_memory_mb - reservation.memory_mb)
+            record.pending_cpu_millis = max(0, record.pending_cpu_millis - reservation.cpu_millis)
 
     def sweep(self, *, now: float | None = None) -> list[str]:
         """
@@ -492,6 +669,7 @@ class PlacementService:
             locality_hits=self._locality_hits,
             rejections=self._rejections,
             no_candidate=self._no_candidate,
+            capacity_exhausted=self._capacity_exhausted,
             oldest_reservation_age_s=max(
                 (current - reservation.created_at for reservation in self._reservations.values()),
                 default=0.0,
@@ -507,14 +685,24 @@ class PlacementService:
         return tuple(record.capabilities for record in self._nodes.values())
 
     def _rank(self, eligible: Sequence[_NodeRecord], request: PlacementRequest) -> list[_NodeRecord]:
-        """Order candidates by locality, then load, then node id.
+        """Order candidates by how full they are, then by locality, then by load and id.
 
-        The node id is the last key so two equally good nodes do not alternate,
-        which would make a run's placement impossible to reproduce.
+        Balance leads because capacity is a constraint and locality is an optimisation:
+        saving an image pull is worth nothing if the sandbox then waits behind a full
+        node's queue for an episode's length. With locality first, a per-instance image
+        drew every request in a batch to one node and the rest of the fleet stayed idle.
+
+        Utilisation is bucketed rather than compared exactly, so locality still decides
+        between nodes that are similarly loaded — which is what makes it an optimisation
+        rather than a tie-breaker that never fires.
+
+        The node id is the last key so two equally good nodes do not alternate, which
+        would make a run's placement impossible to reproduce.
         """
         return sorted(
             eligible,
             key=lambda record: (
+                round(record.utilisation() * _BALANCE_BUCKETS),
                 # More matches first, so the score is negated rather than ascending.
                 -self._locality_score(record.capabilities, request),
                 record.load,
@@ -602,6 +790,24 @@ class PlacementService:
             f"resume level: {request.required_resume_level.value if request.required_resume_level else 'none'}, "
             f"gpus: {request.gpu_count}, label: {request.required_label!r}, "
             f"candidate nodes: {[record.capabilities.node_id for record in candidates]})."
+        )
+
+    @staticmethod
+    def _explain_capacity(request: PlacementRequest, eligible: Sequence[_NodeRecord]) -> str:
+        """Say how full each capable node is, which is what decides whether to wait.
+
+        The per-node remainder is the useful part: it separates "the fleet is busy" from
+        "this request is larger than any node's envelope", and only the second is a
+        planning fault.
+        """
+        rooms = ", ".join(
+            f"{record.capabilities.node_id}={record.free_memory_mb()}MB/{record.free_cpu_millis()}mcpu free"
+            for record in eligible
+        )
+        return (
+            f"Every capable sandbox node is full: the request needs {request.memory_mb}MB and "
+            f"{request.cpu_millis}mcpu, and the candidates have [{rooms}]. This clears as sandboxes "
+            "are released; raise the envelope or lower concurrency if it does not."
         )
 
     def _decrement(self, node_id: str) -> None:

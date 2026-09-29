@@ -147,7 +147,10 @@ class SandboxNodeActor:
     async def report_node(self) -> None:
         """Re-announce this node to placement, or refresh it when placement still knows it."""
         if await self.placement.has_node.remote(self.node_id):
-            await self.placement.heartbeat.remote(self.node_id)
+            # The heartbeat carries headroom, because that is the input placement cannot
+            # observe for itself: every grant this node makes shrinks it, and a stale
+            # remainder is what let one node be chosen for a whole batch it could not hold.
+            await self.placement.heartbeat.remote(self.node_id, headroom=await self.agent.capacity_headroom())
             return
         await self.register()
 

@@ -522,6 +522,7 @@ class SandboxNodeAgent:
         placement must not pick it until it can destroy what it already holds.
         """
         self.start_liveness()
+        headroom = await self.capacity_headroom()
         payloads: list[dict[str, Any]] = []
         for name, backend in self.manager._backends.items():
             capabilities = backend.capabilities
@@ -539,9 +540,41 @@ class SandboxNodeAgent:
                     "draining": self.draining,
                     "image_digests": sorted(index["digests"]),
                     "image_references": sorted(index["references"]),
+                    # Only a backend that admits against this node's envelope reports
+                    # headroom. One that schedules its own capacity reports none, which is
+                    # how it opts out of the capacity filter rather than being refused by it.
+                    **(headroom if backend.uses_node_capacity else {}),
                 }
             )
         return {"node_id": self.node_id, "backends": payloads}
+
+    async def capacity_headroom(self) -> dict[str, int | None]:
+        """Return what this node's envelope can still grant, and what it totals.
+
+        This is the one fact placement cannot derive for itself. It ranked nodes by how
+        many reservations it had handed each one, which answers "where have I sent work"
+        rather than "where does work fit" — and those diverge precisely when the cluster
+        is full, which is when the answer matters.
+
+        A node with no envelope reports `None` rather than zero: zero would read as "full"
+        and exclude a provider backend that never had an envelope to begin with.
+        """
+        envelope = await self.manager.capacity_snapshot()
+        if not envelope:
+            return {
+                "available_memory_mb": None,
+                "available_cpu_millis": None,
+                "envelope_memory_mb": None,
+                "envelope_cpu_millis": None,
+            }
+        available = envelope.get("available_capacity") or {}
+        capacity = envelope.get("capacity") or {}
+        return {
+            "available_memory_mb": int(available.get("memory_mb", 0) or 0),
+            "available_cpu_millis": int(available.get("cpu_millis", 0) or 0),
+            "envelope_memory_mb": int(capacity.get("memory_mb", 0) or 0),
+            "envelope_cpu_millis": int(capacity.get("cpu_millis", 0) or 0),
+        }
 
     async def _gpu_count(self) -> int:
         """

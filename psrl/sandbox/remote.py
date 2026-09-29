@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -44,6 +45,27 @@ psrl_logger = logging.getLogger(__file__)
 # Renewal cadence fallback, used only when the placement TTL cannot be read. Placement's own
 # default is a minute, and renewing every third of it is the stated cadence.
 _FALLBACK_RESERVATION_TTL_S = 60.0
+
+# How long to wait before asking placement again once every capable node is full. Short
+# enough that a released sandbox is picked up promptly, long enough not to spin: the thing
+# being waited for is an episode ending, which is minutes, not milliseconds.
+_PLACEMENT_RETRY_INTERVAL_S = 5.0
+
+
+def _placement_footprint(spec: SandboxSpec | None) -> dict[str, int]:
+    """Return what a spec will cost the node that takes it, in the envelope's own units.
+
+    Zero when the spec declares no resources, which placement reads as "do not filter on
+    capacity" rather than as a free sandbox: a request whose size is unknown cannot be
+    compared against a remainder, and refusing it would be a guess in the other direction.
+    """
+    resources = spec.resources if spec is not None else None
+    if resources is None:
+        return {"memory_mb": 0, "cpu_millis": 0}
+    return {
+        "memory_mb": int(resources.memory_mb or 0),
+        "cpu_millis": int(math.ceil((resources.cpu_count or 0) * 1000)),
+    }
 
 
 class RemoteNodeError(RuntimeError):
@@ -232,7 +254,10 @@ class InProcessTransport:
         the agent runs, and each transport installs its own as the agent's liveness reporter.
         """
         if self.placement.has_node(node_id):
-            self.placement.heartbeat(node_id)
+            # The heartbeat carries headroom, because that is the input placement cannot
+            # observe for itself: every grant the node makes shrinks it, and a stale
+            # remainder is what let one node be chosen for a whole batch it could not hold.
+            self.placement.heartbeat(node_id, headroom=await self.agents[node_id].capacity_headroom())
             return
         await self.register_node(node_id)
 
@@ -878,11 +903,38 @@ class RemoteSandboxBackend(SandboxBackend):
         self._settle_reservation(reservation_id)
         await asyncio.gather(self.transport.cancel_reservation(reservation_id), return_exceptions=True)
 
+    async def _choose_when_room(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Ask placement for a node, waiting while the fleet has no room.
+
+        A full fleet is a state that clears itself: every running sandbox ends, and its
+        node reports the room back. So the only correct response to it is to wait, and the
+        caller is already bounded — the episode budget above this decides how long the
+        wait may last and reports it as a capacity fault if it runs out. Failing here
+        instead would turn a busy cluster into a lost rollout.
+
+        A fleet that cannot satisfy the request at all is different and is not retried: no
+        amount of waiting adds a capability a node never advertised.
+        """
+        # Imported here rather than at module scope, matching the other placement types
+        # this module needs: the placement service is optional to a deployment that runs
+        # no plane, and a top-level import would make it mandatory.
+        from psrl.sandbox.placement import PlacementCapacityExhausted
+
+        while True:
+            try:
+                return await self.transport.choose(request)
+            except PlacementCapacityExhausted as exhausted:
+                psrl_logger.info(
+                    "Every capable sandbox node is full, so this request is waiting for one to free up: %s",
+                    exhausted,
+                )
+                await asyncio.sleep(_PLACEMENT_RETRY_INTERVAL_S)
+
     async def create(self, spec: SandboxSpec) -> SandboxSession:
         """
         Pick a node, provision there, and hand back a session that speaks locally.
         """
-        decision = await self.transport.choose(self._placement_request(spec))
+        decision = await self._choose_when_room(self._placement_request(spec))
         reservation_id = str(decision["reservation_id"])
         node_id = str(decision["node_id"])
         self._claim_reservation(reservation_id)
@@ -908,7 +960,7 @@ class RemoteSandboxBackend(SandboxBackend):
         members = list(specs)
         if not members:
             raise ValueError("A remote sandbox group requires at least one member spec.")
-        decision = await self.transport.choose(self._placement_request(members[0]))
+        decision = await self._choose_when_room(self._placement_request(members[0]))
         reservation_id = str(decision["reservation_id"])
         node_id = str(decision["node_id"])
         self._claim_reservation(reservation_id)
@@ -948,7 +1000,7 @@ class RemoteSandboxBackend(SandboxBackend):
         Restore a snapshot on whichever node placement picks.
         """
         request = self._placement_request(spec, snapshot=snapshot)
-        decision = await self.transport.choose(request)
+        decision = await self._choose_when_room(request)
         reservation_id = str(decision["reservation_id"])
         node_id = str(decision["node_id"])
         self._claim_reservation(reservation_id)
@@ -1018,6 +1070,11 @@ class RemoteSandboxBackend(SandboxBackend):
             "image_references": sorted(references),
             "image_digests": sorted(digests),
             "owner_id": self.owner_id,
+            # The footprint travels with the request, because placement cannot decide
+            # whether a sandbox fits without knowing how big it is. Sent as the same two
+            # numbers the node's envelope is denominated in, so no conversion is needed at
+            # the far end to compare them.
+            **_placement_footprint(spec),
         }
 
     def snapshot(self) -> dict[str, float]:

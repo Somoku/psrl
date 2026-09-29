@@ -104,7 +104,9 @@ async def collect_git_patch(
         )
         raise
     if result.exit_code != 0:
-        raise RuntimeError(f"Could not collect harness patch: {result.stderr.strip()}")
+        raise RuntimeError(
+            f"Could not collect harness patch (exit {result.exit_code}): {result.stderr.strip()}"
+        )
     try:
         payload = await session.read_bytes(_HARNESS_PATCH_PATH)
     except Exception as exc:

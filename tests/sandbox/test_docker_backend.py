@@ -532,3 +532,83 @@ async def test_docker_without_owner_skips_lease_and_node_gc(monkeypatch, tmp_pat
     assert spawned == []  # an owner-less backend never starts a collector
     assert list(tmp_path.iterdir()) == []  # and never writes a lease file
     await session.terminate()
+
+
+def test_a_backend_takes_the_owner_id_it_is_given(monkeypatch) -> None:
+    """A process that is not an agent loop worker has to be able to claim its containers.
+
+    The owner id is what attributes a container to its creator, and everything keyed on it
+    follows: the `psrl.actor_id` label, the lease the backend heartbeats, and the filter
+    both teardown and the node reclaimer select by. A sandbox node actor places containers
+    for other workers and shares no environment with any of them, so an environment
+    variable cannot reach it.
+    """
+    monkeypatch.delenv("PSRL_ACTOR_ID", raising=False)
+
+    backend = DockerBackend(engine=FakeDockerEngine(), owner_id="node-abc123")
+
+    assert backend.owner_id == "node-abc123"
+    assert backend.lifecycle.owner_id == "node-abc123"
+
+
+def test_an_explicit_owner_id_beats_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("PSRL_ACTOR_ID", "w0-host-1-deadbeef")
+
+    backend = DockerBackend(engine=FakeDockerEngine(), owner_id="node-abc123")
+
+    assert backend.owner_id == "node-abc123"
+
+
+def test_a_backend_built_without_an_owner_can_adopt_one(monkeypatch) -> None:
+    """Hydra builds a backend from YAML before anyone knows who will own it."""
+    monkeypatch.delenv("PSRL_ACTOR_ID", raising=False)
+    backend = DockerBackend(engine=FakeDockerEngine())
+    assert backend.owner_id == ""
+
+    backend.adopt_owner_id("node-abc123")
+
+    # Both halves of one identity: the label says who a container belongs to, and the
+    # lease says that owner is still alive. Setting only the label would have the
+    # reclaimer destroy a container that is still in use.
+    assert backend.owner_id == "node-abc123"
+    assert backend.lifecycle.owner_id == "node-abc123"
+
+
+def test_adopting_never_overrides_an_owner_already_known(monkeypatch) -> None:
+    monkeypatch.setenv("PSRL_ACTOR_ID", "w0-host-1-deadbeef")
+    backend = DockerBackend(engine=FakeDockerEngine())
+
+    backend.adopt_owner_id("node-abc123")
+
+    assert backend.owner_id == "w0-host-1-deadbeef"
+    assert backend.lifecycle.owner_id == "w0-host-1-deadbeef"
+
+
+def test_an_owned_backend_labels_its_containers_with_its_owner(monkeypatch) -> None:
+    """The label is the only thing that connects a container to the run that made it."""
+    monkeypatch.delenv("PSRL_ACTOR_ID", raising=False)
+    backend = DockerBackend(engine=FakeDockerEngine(), owner_id="node-abc123")
+
+    spec = SandboxSpec(SandboxSource.image("image"))
+    config = backend._build_container_config(spec, backend._resolve_policy(spec))
+
+    assert config["Labels"]["psrl.actor_id"] == "node-abc123"
+
+
+def test_an_unowned_backend_labels_nothing_to_attribute_it_by(monkeypatch) -> None:
+    """Pin the failure mode, because its symptom is silence rather than an error.
+
+    With no owner there is no label, and every mechanism that selects by it — the startup
+    sweep, the reclaimer, teardown at exit — quietly matches nothing. That is how 122
+    containers survived a run and starved the next one with no error logged anywhere.
+    """
+    monkeypatch.delenv("PSRL_ACTOR_ID", raising=False)
+    backend = DockerBackend(engine=FakeDockerEngine())
+
+    spec = SandboxSpec(SandboxSource.image("image"))
+    config = backend._build_container_config(spec, backend._resolve_policy(spec))
+
+    assert "psrl.actor_id" not in config["Labels"]
+    # The lease store label still identifies the deployment, which is what lets
+    # `list_owned` find such a container and report it as unowned rather than miss it.
+    assert config["Labels"]["psrl.lease_store"]

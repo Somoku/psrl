@@ -230,6 +230,16 @@ def build_sandbox_manager(
     if capacity_coordinator is not None and not owner_id:
         raise ValueError("Sandbox capacity coordinator requires a non-empty owner_id.")
     for backend in backends.values():
+        # A backend declared in YAML is built by Hydra, which knows nothing about who will
+        # own it, and a backend that reads its owner from the environment only finds one
+        # inside an agent loop worker. This is the single place that knows both the owner
+        # and the backend set, so it is where the two are joined: without it a placed
+        # sandbox carries no owner label, and every mechanism keyed on that label — the
+        # startup sweep, the node reclaimer, teardown at exit — silently does nothing.
+        # A backend that already knows its owner keeps it.
+        adopt_owner = getattr(backend, "adopt_owner_id", None)
+        if owner_id and callable(adopt_owner):
+            adopt_owner(owner_id)
         lifecycle_lease_ttl_s, lifecycle_gc_interval_s = _lifecycle_timings(backend)
         assert_timing_orderings(
             capacity,

@@ -13,7 +13,7 @@ import threading
 import time
 from collections.abc import Sequence
 
-from psrl.sandbox.reclaimer import OwnedContainer
+from psrl.sandbox.reclaimer import UNOWNED_OWNER_ID, OwnedContainer
 
 psrl_logger = logging.getLogger(__file__)
 
@@ -229,11 +229,28 @@ class DockerContainerRuntime:
             psrl_logger.warning(f"Could not list PSRL sandbox containers: {stderr}.")
             return None
         containers: list[OwnedContainer] = []
+        unowned = 0
         for line in result.stdout.decode(errors="replace").splitlines():
             container_id, _, remainder = line.partition("\t")
             owner_id, _, state = remainder.partition("\t")
-            if container_id.strip() and owner_id.strip():
-                containers.append(OwnedContainer(container_id.strip(), owner_id.strip(), state.strip().lower()))
+            if not container_id.strip():
+                continue
+            # A container in this lease store with no owner label is still this node's
+            # container, and still holds the memory its envelope was sized against.
+            # Dropping it here is what let a previous run's containers accumulate
+            # invisibly until the node could admit nothing: the reclaimer read an empty
+            # list and concluded the node was clean. Reported under a name no lease is
+            # ever written for, so the existing staleness check reclaims it.
+            owner = owner_id.strip()
+            if not owner:
+                owner = UNOWNED_OWNER_ID
+                unowned += 1
+            containers.append(OwnedContainer(container_id.strip(), owner, state.strip().lower()))
+        if unowned:
+            psrl_logger.warning(
+                f"{unowned} PSRL sandbox container(s) carry no owner label, so no lease can vouch for them. "
+                "Reclaiming them as abandoned."
+            )
         return containers
 
     def remove_containers(self, container_ids: Sequence[str]) -> Sequence[str]:

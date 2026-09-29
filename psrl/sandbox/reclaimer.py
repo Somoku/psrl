@@ -45,6 +45,14 @@ def lease_store_id(heartbeat_dir: str) -> str:
     return hashlib.sha256(os.path.abspath(heartbeat_dir).encode()).hexdigest()[:16]
 
 
+# The owner reported for a container that carries no owner label. Nothing writes a
+# heartbeat under this name, so `_stale_owners` finds no lease for it and the ordinary
+# sweep reclaims it. A container nobody claims is exactly a container that should be
+# reclaimed, and reporting it under a real-looking owner would instead make the reclaimer
+# wait for a lease that will never appear.
+UNOWNED_OWNER_ID = "<unowned>"
+
+
 def owner_heartbeat_path(heartbeat_dir: str, owner_id: str) -> str:
     """
     Return the heartbeat file path for one sandbox owner.

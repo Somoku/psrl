@@ -147,6 +147,25 @@ class DockerLifecycle:
             return
         if outcome.removed:
             psrl_logger.info(f"Reclaimed {len(outcome.removed)} abandoned Docker sandbox(es) left by an earlier run.")
+        # A container this node could not destroy still holds its memory, and the envelope
+        # this run is about to be admitted against does not account for it. Saying so is
+        # the difference between starting short and starting short without knowing it,
+        # which is the state that turned a leak into a silent hang.
+        if outcome.unremovable:
+            psrl_logger.error(
+                f"{len(outcome.unremovable)} Docker sandbox(es) left by an earlier run could not be removed, "
+                f"so their memory is still spoken for while this run is admitted against a full envelope: "
+                f"{list(outcome.unremovable)}."
+            )
+        if outcome.remaining is None:
+            psrl_logger.warning(
+                "Could not count the Docker sandboxes this node still holds, so the startup sweep cannot "
+                "confirm the node is clean."
+            )
+        elif outcome.remaining:
+            psrl_logger.warning(
+                f"This node still holds {outcome.remaining} Docker sandbox(es) after the startup sweep."
+            )
 
     def _reclaimer(self) -> NodeReclaimer:
         """

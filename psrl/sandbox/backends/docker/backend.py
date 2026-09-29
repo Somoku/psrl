@@ -148,6 +148,7 @@ class DockerBackend(SandboxBackend):
         snapshot_store: SnapshotStoreConfig | Mapping[str, Any] | None = None,
         snapshot_local_cache_fraction: float = 0.3,
         warm_pool: WarmPoolConfig | Mapping[str, Any] | None = None,
+        owner_id: str | None = None,
         owner_id_env: str = "PSRL_ACTOR_ID",
         lifecycle: DockerLifecycleConfig | Mapping[str, Any] | None = None,
         disk_admission: DockerDiskAdmissionConfig | Mapping[str, Any] | None = None,
@@ -194,7 +195,14 @@ class DockerBackend(SandboxBackend):
         self.container_watch_interval_s = container_watch_interval_s
         if not self.keepalive_command or not self.command_interpreter:
             raise ValueError("Docker keepalive_command and command_interpreter cannot be empty.")
-        self.owner_id = os.getenv(owner_id_env, "")
+        # An owner id is what attributes a container to whoever created it: it becomes the
+        # `psrl.actor_id` label, the lease this backend heartbeats, and the filter its
+        # teardown and the node reclaimer both select by. The environment variable carries
+        # it for an agent loop worker, which sets it before building its own backend. A
+        # process that is not one — a sandbox node actor placing containers for others —
+        # has to be given it, because it shares no environment with a worker, and a backend
+        # with no owner labels nothing, sweeps nothing, and removes nothing at exit.
+        self.owner_id = owner_id or os.getenv(owner_id_env, "")
         self.lifecycle = DockerLifecycle(
             self.owner_id,
             DockerLifecycleConfig.from_value(lifecycle, docker_host=docker_host),
@@ -250,6 +258,24 @@ class DockerBackend(SandboxBackend):
         self._close_event: asyncio.Event | None = None
         self._sessions: dict[str, DockerSession] = {}
         self._creates: set[asyncio.Task] = set()
+
+    def adopt_owner_id(self, owner_id: str) -> None:
+        """Claim this backend's containers for `owner_id`, unless it already has an owner.
+
+        A backend declared in YAML is constructed before anyone knows who will own it, so
+        the owner arrives afterwards. It has to reach the lifecycle as well as the label,
+        because those are the two halves of one identity: the label says who a container
+        belongs to and the lifecycle holds the lease that says that owner is still alive.
+        Setting only one of them is worse than setting neither — a labelled container whose
+        owner never heartbeats is reclaimed while it is in use.
+
+        Ignoring a backend that already has an owner keeps the explicit argument and the
+        environment variable authoritative over this late assignment.
+        """
+        if not owner_id or self.owner_id:
+            return
+        self.owner_id = owner_id
+        self.lifecycle.owner_id = owner_id
 
     async def prepare(self, spec: SandboxSpec) -> None:
         """Warm an image, and a pooled container when the deployment keeps a pool.

@@ -20,6 +20,10 @@ mode: psrl_async
 # logprobs mode for rollout logprobs
 logprobs_mode: raw_logprobs
 
+# Capture a topk head or a complete support with a bounded per-token budget.
+sampler_distribution: disabled
+sampler_max_tokens: 128
+
 # Select the rollout weight loader. Large safetensors models should set `use_shm=True`.
 load_format: dummy
 

@@ -119,6 +119,9 @@ class RolloutConfig(_VeRLRolloutConfig):
     # The SMG router uses this template to render TITO session prompts.
     chat_template: str | None = None
 
+    sampler_distribution: str = "disabled"
+    sampler_max_tokens: int = 128
+
 
 __all__ = [
     "SamplingConfig",

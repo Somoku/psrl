@@ -121,6 +121,26 @@ def validate_config(
     # Router replay lives on the training engine config, which Hydra mounts under a strategy-specific
     # key. Only the Megatron and VeOmni engine templates expose it, so a missing key means disabled.
     actor_config = config.train_actor_rollout_ref.actor
+    rollout_config = config.gen_actor_rollout_ref.rollout
+    capture_mode = rollout_config.get("sampler_distribution", "disabled")
+    if capture_mode != "disabled":
+        from psrl.utils.sampler_distribution import configure_capture
+
+        configure_capture(
+            {
+                "temperature": rollout_config.temperature,
+                "top_p": rollout_config.top_p,
+                "top_k": rollout_config.top_k,
+            },
+            capture_mode,
+            rollout_config.get("sampler_max_tokens", 128),
+        )
+        if rollout_config.logprobs_mode != "processed_logprobs":
+            raise ValueError("Sampler capture requires rollout.logprobs_mode=processed_logprobs.")
+        if OmegaConf.select(rollout_config, "mtp.enable", default=False) or OmegaConf.select(
+            rollout_config, "engine_kwargs.vllm.speculative_config", default=None
+        ):
+            raise ValueError("Sampler capture requires a non-speculative rollout sampler.")
     engine_mount = "megatron" if actor_config.strategy == "megatron" else "fsdp_config"
     actor_router_replay = OmegaConf.select(actor_config, f"{engine_mount}.router_replay.mode", default="disabled")
     rollout_routing_replay = config.gen_actor_rollout_ref.rollout.enable_rollout_routing_replay

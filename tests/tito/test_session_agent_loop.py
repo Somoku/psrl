@@ -22,6 +22,8 @@ def _bare_loop(trajectory_id_strategy: str = "manual") -> SessionAgentLoop:
     )
     loop.timer = SimpleNamespace(generation=nullcontext)
     loop.model_config = SimpleNamespace(path="model")
+    loop.rollout_config = {}
+    loop._capture_sessions = set()
 
     return loop
 

@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from psrl.utils.routed_experts import canonicalize_routed_experts, validate_routed_experts_array
+from psrl.utils.sampler_distribution import SamplerDistribution
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -106,12 +107,27 @@ def build_training_data(
     all_response_ids: list[int] = []
     all_response_mask: list[int] = []
     all_logprobs: list[float] = []
+    capture_distribution = any(
+        record.get("sampler_distribution") is not None or record.get("sampler_capture_width", 0) > 0
+        for record in records
+    )
+    distribution_segments: list[SamplerDistribution] = []
 
     cursor = 0
     total_acc_len = len(accumulated_token_ids)
     for i, record in enumerate(records):
         prompt_len = record["prompt_token_count"]
         raw_lps = record.get("output_logprobs") or []
+        distribution = None
+        if capture_distribution:
+            payload = record.get("sampler_distribution")
+            if payload is None and raw_lps:
+                raise ValueError(f"Missing sampler distribution at TITO turn {i}.")
+            distribution = (
+                SamplerDistribution.from_wire(payload, raw_lps)
+                if payload is not None
+                else SamplerDistribution.empty(0)
+            )
 
         # Environment/user tokens between previous cursor and this turn's prompt end
         if cursor > 0 and prompt_len > cursor:
@@ -119,6 +135,8 @@ def build_training_data(
             all_response_ids.extend(env_ids)
             all_response_mask.extend([0] * len(env_ids))
             all_logprobs.extend([0.0] * len(env_ids))
+            if capture_distribution:
+                distribution_segments.append(SamplerDistribution.empty(len(env_ids)))
 
             psrl_logger.debug(
                 "[TITO turn %d] env_ids: cursor=%d, prompt_len=%d, env_count=%d, env_ids[:5]=%s",
@@ -169,6 +187,8 @@ def build_training_data(
         all_response_ids.extend(output_ids)
         all_response_mask.extend([1] * len(output_ids))
         all_logprobs.extend(output_logprobs)
+        if distribution is not None:
+            distribution_segments.append(distribution.prefix(len(output_ids)))
 
         cursor = prompt_len + len(output_ids)
 
@@ -230,5 +250,8 @@ def build_training_data(
         "response_mask": all_response_mask,
         "logprobs": all_logprobs,
         "routed_experts": routed_experts,
+        "sampler_distribution": (
+            SamplerDistribution.concatenate(distribution_segments) if capture_distribution else None
+        ),
         "num_turns": len(records),
     }

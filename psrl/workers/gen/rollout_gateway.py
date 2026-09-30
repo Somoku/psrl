@@ -156,6 +156,8 @@ class RolloutGateway:
             trajectory_id_strategy,
             logging_path,
             turn_output_kwargs,
+            sampler_distribution,
+            sampler_max_tokens,
         ):
             import uvicorn
 
@@ -180,6 +182,8 @@ class RolloutGateway:
                 client_concurrency=client_concurrency,
                 trajectory_id_strategy=trajectory_id_strategy,
                 turn_output_writer=turn_output_writer,
+                sampler_distribution=sampler_distribution,
+                sampler_max_tokens=sampler_max_tokens,
             )
             uvicorn.run(router.app, host=host, port=port, log_level="warning")
 
@@ -198,6 +202,8 @@ class RolloutGateway:
                     "output_dir": turn_output_writer_template.output_dir,
                     "include_response": turn_output_writer_template.include_response,
                 },
+                self.config.gen_actor_rollout_ref.rollout.get("sampler_distribution", "disabled"),
+                self.config.gen_actor_rollout_ref.rollout.get("sampler_max_tokens", 128),
             ),
         )
         self.session_router_process.daemon = True

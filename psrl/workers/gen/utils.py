@@ -4,6 +4,7 @@ from typing import Any
 import torch
 
 from psrl.utils.routed_experts import canonicalize_routed_experts
+from psrl.utils.sampler_distribution import SamplerDistribution
 
 # (worker_id, data_parallel_rank)
 RolloutInstanceId = tuple[str, int]
@@ -72,6 +73,10 @@ class TokenOutput:
     """logprobs of response token ids"""
     routed_experts: Any | None = None
     """routed experts of response token ids"""
+    sampler_distribution: SamplerDistribution | None = None
+    """
+    Compact sampler rows aligned with the response, including empty environment rows.
+    """
     # NOTE(linsh): Pooling models return embedding or classification tensors in
     # `pooling_output`, which remains `None` for generative models.
     pooling_output: Any | None = None
@@ -156,6 +161,10 @@ class TokenOutput:
         )
         if routed_experts is not None:
             output["routed_experts"] = routed_experts
+
+        if self.sampler_distribution is not None:
+            self.sampler_distribution.validate_capture("topk", 0, self.response_mask)
+            output.update(self.sampler_distribution.as_tensor_fields(len(self.prompt_ids)))
 
         reward_score = output.get("reward_score", None)
         if reward_score is not None:

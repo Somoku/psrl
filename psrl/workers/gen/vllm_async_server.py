@@ -351,6 +351,17 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         self.kv_cache_manager = self._build_kv_cache_manager()
         args.update(self.kv_cache_manager.get_engine_kwargs())
+        capture_mode = self.config.get("sampler_distribution", "disabled")
+        if capture_mode != "disabled":
+            from psrl.utils.sampler_distribution import capture_width
+
+            width = capture_width(capture_mode, self.config.get("sampler_max_tokens", 128))
+            if args["logprobs_mode"] != "processed_logprobs":
+                raise ValueError("Sampler distribution capture requires logprobs_mode=processed_logprobs.")
+            configured_max = args.get("max_logprobs", width)
+            if configured_max != -1 and configured_max < width:
+                raise ValueError(f"vLLM max_logprobs must be at least {width} for sampler capture.")
+            args["max_logprobs"] = configured_max
 
         # SMG consumes the merged GPU and LMCache event stream through localhost.
         kv_events_args = self._build_kv_events_args()

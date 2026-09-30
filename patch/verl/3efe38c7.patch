@@ -280,7 +280,7 @@ index 3de61d36..d8693de8 100644
                  has_pred = (
                      pred_vals is not None
 diff --git a/verl/trainer/ppo/padding_utils.py b/verl/trainer/ppo/padding_utils.py
-index 284b7f54..63b5c913 100644
+index 284b7f54..29c56cc3 100644
 --- a/verl/trainer/ppo/padding_utils.py
 +++ b/verl/trainer/ppo/padding_utils.py
 @@ -23,7 +23,6 @@ from __future__ import annotations
@@ -310,8 +310,12 @@ index 284b7f54..63b5c913 100644
  
      Returns:
          A tuple of (template_sample, template_tag) ready for padding.
-@@ -90,6 +94,14 @@ def construct_minimal_padding_template(
+@@ -88,8 +92,18 @@ def construct_minimal_padding_template(
+     template_sample = {}
+     for key in source_td.keys():
          value = source_td[key]
++        if key.startswith("sampler_"):
++            continue
          template_sample[key] = value.clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value)
  
 +    # A response-token field copied from the source is longer than the one-token response built
@@ -325,7 +329,20 @@ index 284b7f54..63b5c913 100644
      # Deep copy the template tag from an existing sample.
      template_tag = copy.deepcopy(source_tag)
  
-@@ -113,6 +125,7 @@ def construct_minimal_padding_template(
+@@ -102,6 +116,12 @@ def construct_minimal_padding_template(
+     position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
+     routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
+ 
++    if "sampler_offsets" in source_td:
++        template_sample["sampler_offsets"] = source_td["sampler_offsets"].new_zeros(input_ids.size(0) + 1)
++        template_sample["sampler_complete"] = source_td["sampler_complete"].new_zeros(input_ids.size(0))
++        template_sample["sampler_token_ids"] = source_td["sampler_token_ids"].new_empty(0)
++        template_sample["sampler_log_probs"] = source_td["sampler_log_probs"].new_empty(0)
++
+     sequence_length = input_ids.size(0)
+     teacher_ids = template_sample.get("teacher_ids")
+     if teacher_ids is not None:
+@@ -113,6 +133,7 @@ def construct_minimal_padding_template(
  
      # Update the fields and remove redundant parts
      template_sample.update(
@@ -333,7 +350,7 @@ index 284b7f54..63b5c913 100644
          prompts=prompts,
          responses=responses,
          input_ids=input_ids,
-@@ -124,6 +137,9 @@ def construct_minimal_padding_template(
+@@ -124,6 +145,9 @@ def construct_minimal_padding_template(
          rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
          rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
      )
@@ -343,7 +360,7 @@ index 284b7f54..63b5c913 100644
      if "multi_modal_inputs" in template_sample:
          template_sample["multi_modal_inputs"] = {}
      if routed_experts is not None:
-@@ -137,6 +153,7 @@ def construct_minimal_padding_template(
+@@ -137,6 +161,7 @@ def construct_minimal_padding_template(
          prompt_len=SYNTHETIC_PADDING_SEQ_LEN - 1,
          response_len=1,
          seq_len=SYNTHETIC_PADDING_SEQ_LEN,
@@ -351,7 +368,7 @@ index 284b7f54..63b5c913 100644
      )
      return template_sample, template_tag
  
-@@ -171,26 +188,18 @@ def upsample_batch_to_divisible_size(
+@@ -171,26 +196,18 @@ def upsample_batch_to_divisible_size(
      source_key = batch.keys[source_idx]
      source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
  
@@ -876,7 +893,7 @@ index 63783752..bcb90b5c 100644
      dist_checkpointing_prefix: str = ""
      dist_ckpt_optim_fully_reshardable: bool = False
 diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
-index c5cbc35d..f3c62b18 100644
+index c5cbc35d..7b49e24a 100644
 --- a/verl/workers/engine/fsdp/transformer_impl.py
 +++ b/verl/workers/engine/fsdp/transformer_impl.py
 @@ -29,6 +29,7 @@ from tensordict import TensorDict
@@ -1046,8 +1063,88 @@ index c5cbc35d..f3c62b18 100644
              sync_ctx = (
                  nullcontext()
                  if forward_only
+@@ -1339,6 +1380,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
+         )
+         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+         distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
++        extra_processor = getattr(logits_processor_func, "logits_processor", None)
++        if extra_processor is not None and use_fused_kernels:
++            raise ValueError("An auxiliary logits processor requires materialized logits.")
++        if extra_processor is not None and distillation_use_topk:
++            raise ValueError("Compose auxiliary logits processing explicitly with distillation.")
+ 
+         if calculate_sum_pi_squared and use_fused_kernels:
+             raise NotImplementedError(
+@@ -1409,8 +1455,24 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                         )
+ 
+                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
+-                if distillation_use_topk:
+-                    outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
++                if distillation_use_topk or extra_processor is not None:
++                    if extra_processor is None:
++                        outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
++                    else:
++                        row_ids = torch.arange(input_ids.values().shape[0], device=logits_rmpad.device).unsqueeze(0) + 1
++                        static_pad = self._get_packed_pad_size(row_ids.shape[-1])
++                        if static_pad:
++                            row_ids, _ = pad_packed_inputs(row_ids, None, static_pad)
++                        if self.use_ulysses_sp:
++                            row_ids, _, _ = ulysses_pad_and_slice_inputs(
++                                row_ids, None, sp_size=self.ulysses_sequence_parallel_size
++                            )
++                        outputs = extra_processor(
++                            logits=logits_rmpad.unsqueeze(0),
++                            data=micro_batch,
++                            row_ids=row_ids - 1,
++                            process_group=None,
++                        )
+                     cu_seqlens = input_ids.offsets()
+                     for k, v in outputs.items():
+                         v = v.squeeze(0)
+@@ -1423,7 +1485,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                 if not distillation_only:
+                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                     inplace_backward = True
+-                    if calculate_entropy:
++                    if calculate_entropy or extra_processor is not None:
+                         inplace_backward = False
+                     log_probs = logprobs_from_logits(
+                         logits=logits_rmpad,
+@@ -1508,8 +1570,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                     # (log_probs is also not gathered) and pad_size is only
+                     # populated in output_args along the use_remove_padding=True
+                     # path of prepare_model_inputs.
+-                    if distillation_use_topk:
+-                        outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
++                    if distillation_use_topk or extra_processor is not None:
++                        if extra_processor is None:
++                            outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
++                        else:
++                            outputs = extra_processor(
++                                logits=logits_rmpad.unsqueeze(0),
++                                data=micro_batch,
++                                row_ids=torch.arange(logits_rmpad.shape[0], device=logits_rmpad.device).unsqueeze(0),
++                                process_group=None,
++                            )
+                         for k, v in outputs.items():
+                             v = v.squeeze(0)
+                             assert v.shape == (logits_rmpad.shape[0],), (
+@@ -1519,7 +1589,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
+ 
+                     log_probs = None
+                     if not distillation_only:
+-                        log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
++                        log_probs = logprobs_from_logits(
++                            logits=logits_rmpad,
++                            labels=input_ids_rmpad_rolled,
++                            inplace_backward=extra_processor is None and not calculate_entropy,
++                        )
+ 
+                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
+                     if not distillation_only:
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index 01499e86..d1d06f14 100644
+index 01499e86..73d472fe 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
 @@ -15,6 +15,7 @@
@@ -1136,7 +1233,8 @@ index 01499e86..d1d06f14 100644
 +                self.module = apply_qat_to_modules(self.module, self._qat_config)
  
 -        self._maybe_enable_fused_kernels()
--
++            self._maybe_enable_fused_kernels()
+ 
 -        if self.model_config.mtp.enable:
 -            patch_engine_mtp(self.module, self.model_config)
 -        elif (
@@ -1144,10 +1242,6 @@ index 01499e86..d1d06f14 100644
 -            and self.engine_config.override_transformer_config.get("mtp_num_layers") == 0
 -        ):
 -            from verl.models.mcore.mtp_patch import patch_postprocess
-+            self._maybe_enable_fused_kernels()
- 
--            for model in self.module:
--                patch_postprocess(model)
 +            if self.model_config.mtp.enable:
 +                patch_engine_mtp(self.module, self.model_config)
 +            elif (
@@ -1156,6 +1250,11 @@ index 01499e86..d1d06f14 100644
 +            ):
 +                from verl.models.mcore.mtp_patch import patch_postprocess
  
+-            for model in self.module:
+-                patch_postprocess(model)
++                for model in self.module:
++                    patch_postprocess(model)
+ 
 -        # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
 -        if self.engine_config.forward_only:
 -            self.optimizer = None
@@ -1163,11 +1262,6 @@ index 01499e86..d1d06f14 100644
 -            self.to(device="cpu", model=self._is_offload_param, optimizer=False, grad=False)
 -            log_gpu_memory_usage("After offload model during init (forward_only)", logger=logger)
 -            return
-+                for model in self.module:
-+                    patch_postprocess(model)
- 
--        self.optimizer = self._build_optimizer()
--        self.lr_scheduler = self._build_lr_scheduler()
 +            # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
 +            if self.engine_config.forward_only:
 +                self.optimizer = None
@@ -1176,12 +1270,17 @@ index 01499e86..d1d06f14 100644
 +                log_gpu_memory_usage("After offload model during init (forward_only)", logger=logger)
 +                return
  
--        full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
--        mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
+-        self.optimizer = self._build_optimizer()
+-        self.lr_scheduler = self._build_lr_scheduler()
 +        tms_optim_ctx = torch_memory_saver.region(enable_cpu_backup=True) if USE_TMS else nullcontext()
 +        with tms_optim_ctx:
 +            self.optimizer = self._build_optimizer()
 +            self.lr_scheduler = self._build_lr_scheduler()
+ 
+-        full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
+-        mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
++            full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
++            mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
  
 -        tmp_config = OmegaConf.create(
 -            {
@@ -1192,9 +1291,7 @@ index 01499e86..d1d06f14 100644
 -                },
 -            }
 -        )
-+            full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
-+            mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
- 
+-
 -        role = "actor" if not self.is_value_model else "critic"
 +            tmp_config = OmegaConf.create(
 +                {
@@ -1325,6 +1422,65 @@ index 01499e86..d1d06f14 100644
  
          if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
              # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
+@@ -1201,6 +1242,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         logits_processor_func: Callable,
+         batch: TensorDict,
+         data_format: str,
++        auxiliary_row_ids=None,
+     ):
+         assert logits.shape[:2] == label.shape[:2]
+         # avoid non-positive temperature such as padding
+@@ -1235,8 +1277,20 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
+         if distillation_use_topk:
+             ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
++        extra_processor = getattr(logits_processor_func, "logits_processor", None)
++        if extra_processor is not None:
++            ret.update(
++                extra_processor(
++                    logits=logits_bak,
++                    data=batch,
++                    row_ids=auxiliary_row_ids - 1,
++                    process_group=mpu.get_tensor_model_parallel_group(),
++                )
++            )
+         if not distillation_only:
+-            ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
++            # Cross entropy mutates its saved logits during backward.
++            label_logits = logits_bak.clone() if extra_processor is not None else logits_bak
++            ret["log_probs"] = vocab_parallel_log_probs_from_logits(label_logits, label)
+ 
+         return ret
+ 
+@@ -1258,6 +1312,14 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
+         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
++        extra_processor = getattr(logits_processor_func, "logits_processor", None)
++        if extra_processor is not None and use_fused_kernels:
++            raise ValueError("An auxiliary logits processor requires materialized logits.")
++        if extra_processor is not None and distillation_use_topk:
++            raise ValueError("Compose auxiliary logits processing explicitly with distillation.")
++        if extra_processor is not None and self.model_config.mtp.enable and self.model_config.mtp.enable_train:
++            raise ValueError("Auxiliary logits processors require an explicit MTP target alignment.")
++
+         pad_to_length_bucket = (
+             self.engine_config.pad_to_length_bucket
+             if self.engine_config.pad_to_length and self.engine_config.use_remove_padding
+@@ -1384,6 +1446,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 "response_attention_mask": response_attention_mask,
+             }
+ 
++            if extra_processor is not None:
++                # The model forward applies the same CP, FP8 and bucket padding as the labels.
++                markers = torch.arange(input_ids.values().shape[0], device=input_ids.device) + 1
++                logits_processor_args["auxiliary_row_ids"] = torch.nested.nested_tensor_from_jagged(
++                    markers, input_ids.offsets()
++                )
++
+             mtp_loss_normalization_factor = None
+             if (
+                 self.model_config.mtp.enable
 diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
 index b55d4ce6..aa1efea6 100644
 --- a/verl/workers/engine_workers.py

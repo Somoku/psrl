@@ -311,6 +311,8 @@ class AgentLoopBase(ABC):
         is_sticky_session: bool,
     ) -> "TokenOutput":
         """Call SMG /generate and consume its token-native response."""
+        if not request_input.is_validate and self.rollout_config.get("sampler_distribution", "disabled") != "disabled":
+            raise ValueError("Sampler distribution capture requires a session agent using chat completions.")
         request_url = f"{self.rollout_gateway_url}/generate"
 
         payload_sampling_params = dict(sampling_params)

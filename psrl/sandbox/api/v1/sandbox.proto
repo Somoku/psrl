@@ -427,6 +427,12 @@ message NodeView {
   // A node that cannot destroy what it holds still holds its memory, so admitting
   // against it would over-commit the host.
   bool draining = 12;
+  // Placement filters on these, so they have to cross: a spec that names a host
+  // path is not portable to a node without one, and a resume requirement must be
+  // refused rather than served at a weaker level.
+  bool host_mounts = 13;
+  repeated Feature features = 14;
+  ResumeLevel resume_level = 15;
 }
 
 message Headroom {

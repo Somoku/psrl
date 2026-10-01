@@ -179,10 +179,6 @@ agent:
       # waiting agent's pages are reclaimable. Raise this only against the OOM counter.
       memory_overcommit_ratio: 1.0
 
-      # Member requests wait this fraction of the deadline above, so a capacity shortage
-      # costs an episode retry instead of holding a whole phase.
-      acquire_deadline_fraction: 1.0
-
       # Guarantees must sum to below one; what is left over is the elastic pool, and it is
       # the only capacity a class may borrow. A class can never take another class's unused
       # guarantee, so an undersized share starves that class even while the node looks busy
@@ -205,15 +201,22 @@ agent:
       # Maximum admission wait in seconds. The agent loop refuses a deadline at or above
       # `trajectory_timeout`, because a request that queues longer than it would work is a
       # capacity fault rather than a wait. Null waits indefinitely.
-      acquire_timeout_s: 1800
+      acquire_timeout_s: 3600
 
     # Idle windows derive from the one number an operator can estimate: episode length.
     # The pause, reap, and lifetime windows follow in order, or are asserted if named directly.
+    # One number an operator can estimate. Every window the module enforces -- the idle
+    # pause, the idle reap, the absolute lifetime, the admission deadline, the capacity
+    # lease and its heartbeat, the reservation TTL and its renewal, and the reclamation
+    # sweep -- is derived from these and asserted in one place, so an ordering cannot be
+    # configured wrongly. Leave `episode_deadline_s` unset to run without idle windows.
+    #
+    # A deployment that needs a specific window sets it under `overrides`, and the
+    # orderings are still asserted against it.
     timing:
       episode_deadline_s: null
-      pause_after_episodes: 2.0
-      reap_after_pause_windows: 3.0
-      lifetime_after_reap_windows: 4.0
+      node_ttl_s: 120.0
+      rpc_timeout_s: 60.0
 
     backends:
 

@@ -207,9 +207,6 @@ class SandboxCapacityConfig:
     heartbeat_interval_s: float = 30
     classes: dict[str, ResourceClassShare] = field(default_factory=dict)
     acquire_timeout_s: float | None = 1800.0
-    # Member queue deadline as a fraction of the configured default. A capacity
-    # shortage costs an episode retry, and the fraction follows the episode length.
-    acquire_deadline_fraction: float = 1.0
 
     def __post_init__(self) -> None:
         if self.memory_mb is not None and self.memory_mb <= 0:
@@ -227,8 +224,6 @@ class SandboxCapacityConfig:
                 "Sandbox capacity memory_overcommit_ratio must be at least 1. A value below one would "
                 "under-admit the node rather than overcommit it."
             )
-        if not 0 < self.acquire_deadline_fraction <= 1:
-            raise ValueError("Sandbox capacity acquire_deadline_fraction must be in (0, 1].")
         if self.lease_ttl_s <= 0 or not 0 < self.heartbeat_interval_s < self.lease_ttl_s:
             raise ValueError("Sandbox capacity heartbeat must be positive and shorter than lease_ttl_s.")
         object.__setattr__(self, "classes", resolve_class_shares(self.classes))
@@ -514,14 +509,11 @@ class SandboxCapacityCoordinator:
         """
         Return how long one request waits before it is a capacity fault.
 
-        Derived from the configured deadline rather than set separately, so an
-        operator states how long a phase may take and the queue inherits a
-        fraction of it. A member that cannot be admitted costs a retry instead of
-        holding the whole phase.
+        This is the admission deadline the timing contract derived from the episode
+        deadline, so a member that cannot be admitted costs an episode retry rather
+        than holding the whole phase.
         """
-        if self._config.acquire_timeout_s is None:
-            return None
-        return self._config.acquire_timeout_s * self._config.acquire_deadline_fraction
+        return self._config.acquire_timeout_s
 
     def _ensure_sweeper(self) -> None:
         if self._sweeper is None:

@@ -94,6 +94,14 @@ The ordered work breakdown for the refactor, with an exit criterion, a rollback
 note, and a decision trace for every step.
 :::
 
+:::{grid-item-card} {octicon}`server;1.5em` Sandbox Service
+:link: sandbox_service
+:link-type: doc
+
+The standalone service shape: a cluster control plane with a fleet monitor, one agent
+per node owning lifecycle and reclamation, and a Python SDK as the only caller surface.
+:::
+
 ::::
 
 ---
@@ -119,4 +127,5 @@ sandbox_backend_integration
 sandbox_agentenv
 sandbox_opensandbox
 sandbox_snapshot_store
+sandbox_service
 ```

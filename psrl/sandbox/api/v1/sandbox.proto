@@ -1,0 +1,476 @@
+// The sandbox service contract.
+//
+// This file is the single source for both implementations. The transitional
+// Python control plane and the Go service that replaces it generate from it, so
+// the two cannot drift while they coexist, and the SDK speaks one wire format
+// throughout.
+//
+// Two rules shape it.
+//
+//   - Command and file traffic are absent on purpose. A create returns the
+//     resolved agent endpoint and the SDK talks to the sandbox directly, because
+//     an episode issues dozens of commands and a control plane in that path adds
+//     a hop and a serialization without making a decision.
+//   - A failure is typed by attribution rather than by where it happened. An
+//     infrastructure fault that arrives as a task result would be recorded as a
+//     model or harness failure and would corrupt a reward.
+
+syntax = "proto3";
+
+package psrl.sandbox.v1;
+
+option go_package = "github.com/psrl/sandbox/api/v1;sandboxv1";
+
+// ---------------------------------------------------------------------------
+// Control plane
+// ---------------------------------------------------------------------------
+
+// What a caller asks a fleet for. One create, one release, and the state
+// operations; everything else happens against the sandbox itself.
+service SandboxControl {
+  rpc Create(CreateRequest) returns (CreateResponse);
+  // A group is a completion unit rather than a scheduling unit, so members are
+  // admitted independently and no member holds capacity while a sibling queues.
+  rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse);
+  rpc Restore(RestoreRequest) returns (CreateResponse);
+
+  rpc Status(SandboxHandle) returns (StatusResponse);
+  rpc Diagnostics(SandboxHandle) returns (DiagnosticsResponse);
+  rpc Pause(PauseRequest) returns (Empty);
+  rpc Resume(SandboxHandle) returns (Empty);
+  rpc Snapshot(SnapshotRequest) returns (SnapshotRef);
+  rpc DeleteSnapshot(SnapshotRef) returns (Empty);
+  rpc Release(SandboxHandle) returns (Empty);
+
+  // Reports for the caller's metric hook. The planes report and never log.
+  rpc Fleet(Empty) returns (FleetReport);
+  rpc Quota(Empty) returns (QuotaReport);
+}
+
+// What one node offers the control plane. A node keeps final admission
+// authority, so a Placement decision is a proposal and this is where it is
+// accepted or refused against live local pressure.
+service SandboxNode {
+  rpc Admit(AdmitRequest) returns (AdmitResponse);
+  rpc CreateOn(CreateOnRequest) returns (CreateResponse);
+  rpc ReleaseOn(SandboxHandle) returns (Empty);
+  rpc Report(Empty) returns (NodeView);
+  rpc Sweep(Empty) returns (SweepReport);
+}
+
+// ---------------------------------------------------------------------------
+// The portable request
+// ---------------------------------------------------------------------------
+
+message SandboxSpec {
+  Source source = 1;
+  Resources resources = 2;
+
+  // Which quota share pays for this sandbox.
+  string resource_class = 3;
+  // One sandbox phase per workflow, so a workflow's phases cannot starve each other.
+  string workflow_id = 4;
+  // A retried create adopts the existing sandbox rather than building a second one.
+  string idempotency_key = 5;
+
+  map<string, string> env = 6;
+  map<string, string> metadata = 7;
+  string workdir = 8;
+  ExecMode exec_mode = 9;
+
+  // Requirements. Admission refuses a backend that cannot meet them rather than
+  // serving a weaker guarantee: a workspace restore must not be readable as proof
+  // that a live process survived a move.
+  repeated Feature required_features = 10;
+  ResumeLevel required_resume_level = 11;
+  // A pin. Empty selects by capability.
+  string backend = 12;
+
+  EgressPolicy egress = 13;
+  repeated CredentialRef credentials = 14;
+  repeated CredentialBinding credential_bindings = 15;
+  repeated Mount mounts = 16;
+  repeated Volume volumes = 17;
+  StatePolicy state_policy = 18;
+
+  // Tuning only one backend understands, keyed by backend name. It never takes
+  // part in routing and is not part of the spec's identity, so a provider's own
+  // knobs stay reachable without making the portable spec unportable. A key
+  // naming a backend this deployment does not run is an error, not a no-op.
+  map<string, BackendOptions> backend_options = 19;
+}
+
+message BackendOptions {
+  map<string, string> values = 1;
+}
+
+message Source {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    IMAGE = 1;
+    TEMPLATE = 2;
+  }
+  Kind kind = 1;
+  string reference = 2;
+}
+
+message Resources {
+  // Absent means the caller stated no requirement, which placement reads as "do
+  // not filter on this dimension" rather than as zero.
+  optional double cpu_count = 1;
+  optional int64 memory_mb = 2;
+  optional int64 disk_mb = 3;
+  optional int32 gpu_count = 4;
+}
+
+enum ExecMode {
+  EXEC_MODE_UNSPECIFIED = 0;
+  // A shell that outlives one command, so a working directory and an exported
+  // variable survive from one turn to the next.
+  PERSISTENT = 1;
+  // One process per command, which is cheaper for a grader that runs exactly one.
+  ONE_SHOT = 2;
+}
+
+enum Feature {
+  FEATURE_UNSPECIFIED = 0;
+  FREEZE = 1;
+  HIBERNATE = 2;
+  FILESYSTEM_SNAPSHOT = 3;
+  FULL_STATE_SNAPSHOT = 4;
+  RESTORE = 5;
+  NATIVE_FORK = 6;
+  HOST_MOUNT = 7;
+  RESUME_ANYWHERE = 8;
+  WARM_POOL = 9;
+  IMAGE_ON_DEMAND = 10;
+  IMAGE_BLOCK_DELIVERY = 11;
+  TEMPLATE_BUILD = 12;
+  VOLUME = 13;
+  EGRESS_POLICY = 14;
+  CREDENTIAL_INJECTION = 15;
+  ISOLATION_RUNTIME = 16;
+}
+
+// What survives a resume elsewhere. Ordered, so a requirement is one comparison:
+// a filesystem resume restores the workspace and starts every process fresh,
+// while a full-state resume lets a harness continue instead of restart.
+enum ResumeLevel {
+  RESUME_LEVEL_UNSPECIFIED = 0;
+  FILESYSTEM = 1;
+  FULL_STATE = 2;
+}
+
+message Mount {
+  string source = 1;
+  string target = 2;
+  bool read_only = 3;
+}
+
+message Volume {
+  string name = 1;
+  string target = 2;
+  bool read_only = 3;
+}
+
+message EgressPolicy {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    ALLOW = 1;
+    DENY = 2;
+  }
+  // Deny, because a policy that has to deny explicitly is one a caller forgets,
+  // and the omission is invisible until a reward looks wrong.
+  Action default_action = 1;
+  repeated Rule rules = 2;
+
+  message Rule {
+    Action action = 1;
+    // A hostname, a wildcard domain, or a CIDR block.
+    string target = 2;
+    repeated int32 ports = 3;
+  }
+}
+
+// A secret named rather than carried, so a spec can be logged, hashed, and
+// compared without leaking one.
+message CredentialRef {
+  string source_env = 1;
+  string target_env = 2;
+  string name = 3;
+}
+
+message CredentialBinding {
+  string name = 1;
+  // Required: a binding that matched every host would offer the credential to
+  // whatever destination the workload chose.
+  repeated string hosts = 2;
+  string credential = 3;
+  repeated string schemes = 4;
+  repeated string methods = 5;
+  repeated string paths = 6;
+  CredentialAuth auth = 7;
+}
+
+message CredentialAuth {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    BEARER = 1;
+    BASIC = 2;
+    API_KEY = 3;
+    CUSTOM_HEADERS = 4;
+    PASSTHROUGH = 5;
+  }
+  Type type = 1;
+  string header_name = 2;
+  map<string, string> headers = 3;
+  repeated Substitution substitutions = 4;
+
+  message Substitution {
+    string credential = 1;
+    string placeholder = 2;
+    repeated string surfaces = 3;
+  }
+}
+
+message StatePolicy {
+  bool enabled = 1;
+  bool allow_secret_capture = 2;
+  bool allow_external_side_effects = 3;
+  bool reseed_after_restore = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Handles and results
+// ---------------------------------------------------------------------------
+
+message SandboxHandle {
+  string backend = 1;
+  string sandbox_id = 2;
+  string node_id = 3;
+}
+
+message CreateRequest {
+  SandboxSpec spec = 1;
+  // The caller's session server, as a host:port a node can reach, when a sandbox
+  // has to call back. The node opens a forwarder and reports the port, so one URL
+  // resolves from whichever node the sandbox landed on.
+  string callback_target = 2;
+}
+
+message CreateGroupRequest {
+  repeated SandboxSpec specs = 1;
+  string callback_target = 2;
+}
+
+message CreateResponse {
+  SandboxHandle handle = 1;
+  // What the hosting backend actually granted, which is not always what the
+  // deployment declared.
+  Capabilities capabilities = 2;
+  // Where the SDK talks to this sandbox. Returned with the handle so command
+  // traffic needs no further round trip through the control plane.
+  AgentEndpoint agent = 3;
+  // Set when this sandbox came from a warm pool rather than a cold create.
+  bool warm_start = 4;
+}
+
+message CreateGroupResponse {
+  repeated CreateResponse members = 1;
+}
+
+message AgentEndpoint {
+  // Base address of the in-sandbox agent, with a scheme.
+  string address = 1;
+  // Headers the agent requires, carried rather than reconstructed: a resumed
+  // sandbox can move and can require different ones.
+  map<string, string> headers = 2;
+  // The alias and port this sandbox reaches the caller's own server by, when the
+  // hosting node rewrites loopback URLs at all.
+  string callback_host_alias = 3;
+  int32 callback_port = 4;
+}
+
+message Capabilities {
+  repeated Feature features = 1;
+  // Reported only with RESUME_ANYWHERE, so the two cannot contradict each other.
+  ResumeLevel resume_level = 2;
+  // Which pause semantics this sandbox offers. A freeze keeps it resident; a
+  // hibernation releases compute.
+  repeated PauseMode pause_modes = 3;
+}
+
+enum PauseMode {
+  PAUSE_MODE_UNSPECIFIED = 0;
+  PAUSE_FREEZE = 1;
+  PAUSE_HIBERNATE = 2;
+}
+
+message PauseRequest {
+  SandboxHandle handle = 1;
+  PauseMode mode = 2;
+}
+
+message SnapshotRequest {
+  SandboxHandle handle = 1;
+  SnapshotKind kind = 2;
+}
+
+enum SnapshotKind {
+  SNAPSHOT_KIND_UNSPECIFIED = 0;
+  SNAPSHOT_FILESYSTEM = 1;
+  SNAPSHOT_FULL_STATE = 2;
+}
+
+message SnapshotRef {
+  string backend = 1;
+  string snapshot_id = 2;
+  SnapshotKind kind = 3;
+  map<string, string> metadata = 4;
+  ResumeLevel resume_level = 5;
+}
+
+message RestoreRequest {
+  SnapshotRef snapshot = 1;
+  SandboxSpec spec = 2;
+  string callback_target = 3;
+}
+
+enum SandboxStatus {
+  SANDBOX_STATUS_UNSPECIFIED = 0;
+  RUNNING = 1;
+  PAUSED = 2;
+  EXITED = 3;
+  TERMINATED = 4;
+}
+
+message StatusResponse {
+  SandboxStatus status = 1;
+}
+
+// Why a sandbox stopped existing. A post mortem starts here, so an operator can
+// act differently on one killed for memory, one its caller released, and one
+// reclaimed because its owner died.
+enum ExitReason {
+  EXIT_REASON_UNSPECIFIED = 0;
+  RELEASED = 1;
+  REAPED_IDLE = 2;
+  REAPED_LIFETIME = 3;
+  OOM = 4;
+  RECLAIMED_ORPHAN = 5;
+  FAILED = 6;
+}
+
+message DiagnosticsResponse {
+  SandboxHandle handle = 1;
+  SandboxStatus status = 2;
+  ExitReason exit_reason = 3;
+  // Bounded, so a diagnosis cannot pull a whole log through a control channel.
+  string log_tail = 4;
+  map<string, string> inspect = 5;
+  ResourceUsage usage = 6;
+}
+
+message ResourceUsage {
+  // Absent means the backend does not report that quantity, which is not the
+  // same as a measured zero.
+  optional int64 memory_bytes = 1;
+  optional int64 peak_memory_bytes = 2;
+  optional int64 cpu_total_ns = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Node level
+// ---------------------------------------------------------------------------
+
+message AdmitRequest {
+  SandboxSpec spec = 1;
+}
+
+message AdmitResponse {
+  bool admitted = 1;
+  string lease_id = 2;
+  // Device indices, not a count: two sandboxes must never be granted the same one.
+  repeated int32 gpu_indices = 3;
+  // Why this node refused, so the gateway can ask placement for another one
+  // rather than failing the episode.
+  string refusal = 4;
+}
+
+message CreateOnRequest {
+  string lease_id = 1;
+  SandboxSpec spec = 2;
+  string callback_target = 3;
+}
+
+// One node's view, collected by Monitor and read by Placement.
+message NodeView {
+  string node_id = 1;
+  string backend = 2;
+
+  // What each class could be granted now. A request is compared against its own
+  // class, never against the envelope remainder: a borrower may not take another
+  // class's unmet guarantee, so the remainder overstates what a class can get.
+  map<string, Headroom> class_headroom = 3;
+  Headroom envelope = 4;
+
+  // Measured rather than inferred, so ranking is by how loaded a node is rather
+  // than by how much work this service has sent it.
+  int32 live_sandboxes = 5;
+  double cpu_used_pct = 6;
+  double mem_used_pct = 7;
+
+  repeated string image_digests = 8;
+  repeated string image_references = 9;
+  int32 gpu_free = 10;
+  repeated string labels = 11;
+  // A node that cannot destroy what it holds still holds its memory, so admitting
+  // against it would over-commit the host.
+  bool draining = 12;
+}
+
+message Headroom {
+  int64 memory_mb = 1;
+  int64 cpu_millis = 2;
+  int32 gpu_count = 3;
+  int64 disk_mb = 4;
+}
+
+message SweepReport {
+  repeated string paused = 1;
+  repeated string reaped_idle = 2;
+  repeated string reaped_lifetime = 3;
+  repeated string reclaimed_orphan = 4;
+  int32 skipped_busy = 5;
+  int32 failures = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------------------
+
+message FleetReport {
+  repeated NodeView nodes = 1;
+  int32 drained_nodes = 2;
+  int32 reservations_open = 3;
+  // Counted apart: a fleet with no room clears itself as sandboxes are released,
+  // and a fleet with no capable node never will.
+  int64 capacity_exhausted = 4;
+  int64 no_candidate = 5;
+  double locality_hit_ratio = 6;
+}
+
+message QuotaReport {
+  map<string, ClassQuota> classes = 1;
+}
+
+message ClassQuota {
+  double guaranteed_share = 1;
+  double max_share = 2;
+  Headroom granted = 3;
+  Headroom headroom = 4;
+  int32 queued = 5;
+  double wait_s_mean = 6;
+}
+
+message Empty {}

@@ -1,5 +1,5 @@
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import hydra
@@ -8,65 +8,7 @@ from omegaconf import DictConfig, OmegaConf
 from psrl.sandbox.capacity import SandboxCapacityConfig
 from psrl.sandbox.core import SandboxBackend
 from psrl.sandbox.manager import SandboxManager
-
-
-@dataclass(frozen=True)
-class SandboxTimingConfig:
-    """Idle windows, derived from the one number an operator can estimate.
-
-    An operator knows roughly how long one episode takes. The pause window, the
-    reap window, and the absolute lifetime all follow from it, in that order, so
-    the ordering cannot be configured wrongly. A deployment that needs a
-    different shape can still set the windows directly, and then the orderings
-    are asserted rather than derived.
-    """
-
-    # How long one episode may take, including its grading phase.
-    episode_deadline_s: float | None = None
-    # How many episodes of silence before an idle sandbox releases its compute.
-    pause_after_episodes: float = 2.0
-    # How many pause windows before an idle sandbox is destroyed instead.
-    reap_after_pause_windows: float = 3.0
-    # How many reap windows before the absolute lifetime backstop fires.
-    lifetime_after_reap_windows: float | None = 4.0
-    # Explicit overrides. None derives from the deadline above.
-    pause_window_s: float | None = None
-    reap_window_s: float | None = None
-    lifetime_s: float | None = None
-
-    def __post_init__(self) -> None:
-        for name in ("pause_after_episodes", "reap_after_pause_windows", "lifetime_after_reap_windows"):
-            value = getattr(self, name)
-            if value is not None and value < 1:
-                raise ValueError(f"Sandbox timing {name} must be at least one window.")
-        if self.episode_deadline_s is not None and self.episode_deadline_s <= 0:
-            raise ValueError("Sandbox timing episode_deadline_s must be greater than zero when set.")
-
-    def resolve_pause_window_s(self) -> float | None:
-        """Return the idle window after which a sandbox releases its compute."""
-        if self.pause_window_s is not None:
-            return self.pause_window_s
-        if self.episode_deadline_s is None:
-            return None
-        return self.episode_deadline_s * self.pause_after_episodes
-
-    def resolve_reap_window_s(self) -> float | None:
-        """Return the idle window after which a sandbox is destroyed."""
-        if self.reap_window_s is not None:
-            return self.reap_window_s
-        pause = self.resolve_pause_window_s()
-        if pause is None:
-            return None
-        return pause * self.reap_after_pause_windows
-
-    def resolve_lifetime_s(self) -> float | None:
-        """Return the absolute lifetime backstop, whether or not the sandbox is idle."""
-        if self.lifetime_s is not None:
-            return self.lifetime_s
-        reap = self.resolve_reap_window_s()
-        if reap is None or self.lifetime_after_reap_windows is None:
-            return None
-        return reap * self.lifetime_after_reap_windows
+from psrl.sandbox.timing import TimingContract
 
 
 @dataclass
@@ -76,49 +18,7 @@ class SandboxManagerConfig:
     default_backend: str = "docker"
     backends: dict[str, Any] = field(default_factory=dict)
     capacity: SandboxCapacityConfig = field(default_factory=SandboxCapacityConfig)
-    timing: SandboxTimingConfig = field(default_factory=SandboxTimingConfig)
-
-
-def assert_timing_orderings(
-    capacity: SandboxCapacityConfig,
-    timing: SandboxTimingConfig,
-    lifecycle_lease_ttl_s: float | None = None,
-    lifecycle_gc_interval_s: float | None = None,
-) -> None:
-    """Refuse a configuration whose timeouts are in an order the module cannot honor.
-
-    Each of these is a rule the code relies on. A violation produces a slow leak or
-    a sandbox reclaimed while in use, and neither failure points at the
-    configuration, so this is asserted where the configuration is built rather
-    than documented and hoped for.
-
-    Raises:
-        ValueError: When an ordering is inverted.
-    """
-    pause = timing.resolve_pause_window_s()
-    reap = timing.resolve_reap_window_s()
-    lifetime = timing.resolve_lifetime_s()
-    if pause is not None and reap is not None and pause >= reap:
-        raise ValueError(
-            f"Sandbox idle pause window ({pause:g}s) must be shorter than the reap window ({reap:g}s), or a "
-            "sandbox is destroyed before it is ever paused."
-        )
-    if reap is not None and lifetime is not None and reap >= lifetime:
-        raise ValueError(
-            f"Sandbox idle reap window ({reap:g}s) must be shorter than the absolute lifetime ({lifetime:g}s), "
-            "or the lifetime backstop fires first and the reaper never runs."
-        )
-    if capacity.lease_ttl_s <= 0:
-        raise ValueError("Sandbox capacity lease_ttl_s must be greater than zero.")
-    if lifecycle_lease_ttl_s is not None and lifecycle_gc_interval_s is not None:
-        # Crash recovery has to be strictly faster than the capacity lease, or a dead worker's
-        # containers outlive the reservation and new work is admitted against spoken-for memory.
-        if lifecycle_lease_ttl_s + lifecycle_gc_interval_s >= capacity.lease_ttl_s:
-            raise ValueError(
-                f"Sandbox crash recovery (lease {lifecycle_lease_ttl_s:g}s + sweep {lifecycle_gc_interval_s:g}s) "
-                f"must complete inside the capacity lease TTL ({capacity.lease_ttl_s:g}s), or a dead worker's "
-                "containers outlive the reservation that protected the node."
-            )
+    timing: TimingContract | None = None
 
 
 def _config_section(config: DictConfig | SandboxManagerConfig, name: str):
@@ -145,12 +45,60 @@ def resolve_capacity(config: DictConfig | SandboxManagerConfig) -> SandboxCapaci
     return capacity if isinstance(capacity, SandboxCapacityConfig) else SandboxCapacityConfig(**dict(capacity or {}))
 
 
-def _resolve_timing(config: DictConfig | SandboxManagerConfig) -> SandboxTimingConfig:
-    """Normalize the derived idle windows from a Hydra config or a typed value."""
-    timing = _config_section(config, "timing") or SandboxTimingConfig()
+def resolve_timing(config: DictConfig | SandboxManagerConfig) -> TimingContract | None:
+    """Normalize the timing contract from a Hydra config or a typed value.
+
+    None means a deployment declared no episode deadline, which leaves the idle
+    windows off: a sandbox then lives until its caller releases it. That is a valid
+    shape for a test or a single-shot run, so it is an absence rather than an error.
+    """
+    timing = _config_section(config, "timing")
+    if timing is None:
+        return None
     if isinstance(timing, DictConfig):
         timing = OmegaConf.to_container(timing, resolve=True)
-    return timing if isinstance(timing, SandboxTimingConfig) else SandboxTimingConfig(**dict(timing))
+    if isinstance(timing, TimingContract):
+        return timing.validate()
+    values = {name: value for name, value in dict(timing).items() if value is not None}
+    overridden = {name for name in values if name not in ("episode_deadline_s", "node_ttl_s", "rpc_timeout_s")}
+    if not values.get("episode_deadline_s"):
+        if not overridden:
+            return None
+        # A deployment that names windows without a deadline still gets a contract, so
+        # its orderings are asserted. The deadline only has to be large enough not to
+        # be the binding constraint on the windows it was not used to derive.
+        values["episode_deadline_s"] = _implied_deadline_s(values)
+    return TimingContract.from_value(values).validate()
+
+
+def _implied_deadline_s(values: dict[str, Any]) -> float:
+    """Return a deadline consistent with the windows a deployment stated directly.
+
+    The pause window is two episodes by construction, so a stated pause window implies
+    the deadline that produced it. Without one, the largest stated span is the floor:
+    anything smaller would make the derived windows contradict the stated ones.
+    """
+    pause = values.get("pause_window_s")
+    if pause:
+        return float(pause) / 2
+    return max(float(value) for value in values.values())
+
+
+def bind_capacity_timing(capacity: SandboxCapacityConfig, timing: TimingContract | None) -> SandboxCapacityConfig:
+    """Return the envelope with its deadlines taken from the timing contract.
+
+    The capacity lease, its heartbeat, and the admission deadline are spans like any
+    other, so they belong to the one contract rather than to a second set of knobs
+    that has to be kept in step with it by hand.
+    """
+    if timing is None:
+        return capacity
+    return replace(
+        capacity,
+        lease_ttl_s=timing.capacity_lease_ttl_s,
+        heartbeat_interval_s=timing.owner_heartbeat_interval_s,
+        acquire_timeout_s=timing.acquire_timeout_s,
+    )
 
 
 def _lifecycle_timings(backend: SandboxBackend) -> tuple[float | None, float | None]:
@@ -163,6 +111,30 @@ def _lifecycle_timings(backend: SandboxBackend) -> tuple[float | None, float | N
         getattr(settings, "lease_ttl_s", None),
         getattr(settings, "gc_interval_s", None),
     )
+
+
+def assert_lifecycle_fits_capacity(
+    capacity: SandboxCapacityConfig,
+    lifecycle_lease_ttl_s: float | None,
+    lifecycle_gc_interval_s: float | None,
+) -> None:
+    """Refuse a backend whose crash recovery outlives the reservation protecting the node.
+
+    Every other ordering is asserted by `TimingContract.validate()`. This one cannot
+    be, because a backend's own lease is built by Hydra and is not known until the
+    backend exists.
+
+    Raises:
+        ValueError: When recovery cannot complete inside the capacity lease.
+    """
+    if lifecycle_lease_ttl_s is None or lifecycle_gc_interval_s is None:
+        return
+    if lifecycle_lease_ttl_s + lifecycle_gc_interval_s >= capacity.lease_ttl_s:
+        raise ValueError(
+            f"Sandbox crash recovery (lease {lifecycle_lease_ttl_s:g}s + sweep {lifecycle_gc_interval_s:g}s) "
+            f"must complete inside the capacity lease TTL ({capacity.lease_ttl_s:g}s), or a dead worker's "
+            "containers outlive the reservation that protected the node."
+        )
 
 
 def placement_manager_config(
@@ -181,7 +153,7 @@ def placement_manager_config(
         default_backend=backend_name,
         backends={},
         capacity=resolve_capacity(config),
-        timing=_resolve_timing(config),
+        timing=resolve_timing(config),
     )
 
 
@@ -193,9 +165,9 @@ def build_sandbox_manager(
 ) -> SandboxManager:
     """Instantiate the configured backends and bind the worker's node capacity.
 
-    Every timeout ordering the module relies on is asserted here rather than
-    documented and hoped for. A violation produces a slow leak or a sandbox
-    reclaimed while it is in use, and neither failure points at the configuration.
+    The timing contract resolves and validates every span before a backend is built,
+    so a configuration whose deadlines are in an impossible order fails here rather
+    than leaking a node slot per episode.
 
     `extra_backends` carries backends a deployment built in code rather than declared,
     which is the case for any backend whose constructor takes a live object: a remote
@@ -225,8 +197,8 @@ def build_sandbox_manager(
         backends[name] = backend
     if config.default_backend not in backends:
         raise ValueError(f"Default sandbox backend {config.default_backend!r} is not configured.")
-    capacity = resolve_capacity(config)
-    timing = _resolve_timing(config)
+    timing = resolve_timing(config)
+    capacity = bind_capacity_timing(resolve_capacity(config), timing)
     if capacity_coordinator is not None and not owner_id:
         raise ValueError("Sandbox capacity coordinator requires a non-empty owner_id.")
     for backend in backends.values():
@@ -240,13 +212,7 @@ def build_sandbox_manager(
         adopt_owner = getattr(backend, "adopt_owner_id", None)
         if owner_id and callable(adopt_owner):
             adopt_owner(owner_id)
-        lifecycle_lease_ttl_s, lifecycle_gc_interval_s = _lifecycle_timings(backend)
-        assert_timing_orderings(
-            capacity,
-            timing,
-            lifecycle_lease_ttl_s=lifecycle_lease_ttl_s,
-            lifecycle_gc_interval_s=lifecycle_gc_interval_s,
-        )
+        assert_lifecycle_fits_capacity(capacity, *_lifecycle_timings(backend))
     manager = SandboxManager(
         backends,
         config.default_backend,
@@ -254,6 +220,7 @@ def build_sandbox_manager(
         capacity_owner_id=owner_id,
         capacity_heartbeat_interval_s=capacity.heartbeat_interval_s if capacity_coordinator is not None else None,
     )
-    manager.configure_idle_policy(timing.resolve_pause_window_s(), timing.resolve_reap_window_s())
-    manager.configure_lifetime(timing.resolve_lifetime_s())
+    if timing is not None:
+        manager.configure_idle_policy(timing.pause_window_s, timing.reap_window_s)
+        manager.configure_lifetime(timing.lifetime_s)
     return manager

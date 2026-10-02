@@ -514,5 +514,6 @@ func TestTheAdapterSatisfiesEveryContractItClaims(t *testing.T) {
 		_ backend.Backend       = b
 		_ backend.NodeScheduled = b
 		_ backend.Stateful      = b
+		_ backend.Preflighter   = b
 	)
 }

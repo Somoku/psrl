@@ -466,6 +466,13 @@ func (b *Backend) Sweep(ctx context.Context) ([]backend.Handle, error) {
 }
 
 // Preflight refuses a node whose daemon this service cannot drive.
+//
+// Every check here is something that would otherwise fail inside an episode,
+// where it costs a sample and reads as a flaky rollout rather than as the
+// configuration error it is. The pinned API version is compared against what
+// the daemon will actually serve, and a configured runtime has to exist: both
+// are declared as capabilities, and a capability the node cannot honour is
+// worse than one it never claimed.
 func (b *Backend) Preflight(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
@@ -474,13 +481,107 @@ func (b *Backend) Preflight(ctx context.Context) error {
 		MinAPIVersion string `json:"MinAPIVersion"`
 		Version       string `json:"Version"`
 	}
-	if err := b.call(ctx, http.MethodGet, "/version", nil, &version); err != nil {
+	// Unversioned, because the pinned version is what is being checked: asking
+	// through the prefix makes a too-new pin look like a dead daemon.
+	if err := b.callUnversioned(ctx, http.MethodGet, "/version", &version); err != nil {
 		return fmt.Errorf("docker daemon at %s is not answering: %w", b.cfg.Socket, err)
 	}
 	if version.APIVersion == "" {
 		return fmt.Errorf("docker daemon at %s reported no API version", b.cfg.Socket)
 	}
+	// The service pins an API version, so a daemon that will not serve it has to
+	// fail here. Discovering it on the first create means finding out from an
+	// endpoint that silently did not exist.
+	if version.MinAPIVersion != "" && olderAPI(b.cfg.APIVersion, version.MinAPIVersion) {
+		return fmt.Errorf(
+			"docker daemon at %s serves API %s and newer, but this service is pinned to %s; "+
+				"set backends[].api_version to %s or newer",
+			b.cfg.Socket, version.MinAPIVersion, b.cfg.APIVersion, version.MinAPIVersion)
+	}
+	if olderAPI(version.APIVersion, b.cfg.APIVersion) {
+		return fmt.Errorf(
+			"docker daemon at %s serves API up to %s, but this service is pinned to %s; "+
+				"upgrade the daemon or set backends[].api_version to %s",
+			b.cfg.Socket, version.APIVersion, b.cfg.APIVersion, version.APIVersion)
+	}
+	return b.preflightRuntime(ctx)
+}
+
+// preflightRuntime refuses a configured runtime the daemon does not have.
+//
+// This backend declares isolation_runtime whenever a runtime is configured, and
+// placement routes a spec that requires it here. If the runtime is absent, the
+// daemon rejects the create -- so without this check the service advertises an
+// isolation boundary it cannot provide and the refusal arrives per episode.
+func (b *Backend) preflightRuntime(ctx context.Context) error {
+	if b.cfg.Runtime == "" {
+		return nil
+	}
+	var info struct {
+		Runtimes map[string]struct {
+			Path string `json:"path"`
+		} `json:"Runtimes"`
+	}
+	if err := b.call(ctx, http.MethodGet, "/info", nil, &info); err != nil {
+		return fmt.Errorf("docker daemon at %s did not report its runtimes: %w", b.cfg.Socket, err)
+	}
+	if _, has := info.Runtimes[b.cfg.Runtime]; !has {
+		available := make([]string, 0, len(info.Runtimes))
+		for name := range info.Runtimes {
+			available = append(available, name)
+		}
+		sort.Strings(available)
+		return fmt.Errorf(
+			"docker runtime %q is not installed on this node (available: %v), but this backend "+
+				"declares isolation_runtime with it, so a spec requiring stronger isolation would be "+
+				"admitted and then run without it",
+			b.cfg.Runtime, available)
+	}
 	return nil
+}
+
+// olderAPI reports whether a Docker API version precedes another.
+//
+// Compared field by field as integers rather than as strings, because the
+// versions pass 1.9: "v1.10" sorts before "v1.9" lexically and after it
+// numerically, and the wrong answer here refuses a daemon that would have worked.
+func olderAPI(version, floor string) bool {
+	left := apiParts(version)
+	right := apiParts(floor)
+	if left == nil || right == nil {
+		// Not comparable. The only safe answer is "not older", so an unrecognised
+		// version string never refuses a daemon that would have worked.
+		return false
+	}
+	for i := 0; i < len(left) && i < len(right); i++ {
+		if left[i] != right[i] {
+			return left[i] < right[i]
+		}
+	}
+	return len(left) < len(right)
+}
+
+func apiParts(version string) []int {
+	fields := strings.Split(strings.TrimPrefix(version, "v"), ".")
+	out := make([]int, 0, len(fields))
+	for _, field := range fields {
+		if field == "" {
+			// An empty field is not a zero: "" would otherwise parse as version 0 and
+			// compare older than everything.
+			return nil
+		}
+		value := 0
+		for i := 0; i < len(field); i++ {
+			if field[i] < '0' || field[i] > '9' {
+				// A version with a non-numeric field is not comparable, so the caller
+				// gets the only safe answer: not older, and therefore not refused.
+				return nil
+			}
+			value = value*10 + int(field[i]-'0')
+		}
+		out = append(out, value)
+	}
+	return out
 }
 
 func (b *Backend) call(ctx context.Context, method, path string, body any, out any) error {
@@ -492,6 +593,35 @@ func (b *Backend) call(ctx context.Context, method, path string, body any, out a
 		return nil
 	}
 	return json.Unmarshal(raw, out)
+}
+
+// callUnversioned reaches an endpoint without the pinned API prefix.
+//
+// Only /version uses this, and it has to: a daemon rejects a URL carrying an
+// API version it does not serve, so asking it through the prefix returns a 400
+// that reads as "the daemon is not answering". The point of preflight is to say
+// which setting is wrong, and that answer is in the reply this fetches.
+func (b *Backend) callUnversioned(ctx context.Context, method, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, method, "http://docker"+path, bytes.NewReader(nil))
+	if err != nil {
+		return err
+	}
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw := new(bytes.Buffer)
+	if _, err := raw.ReadFrom(resp.Body); err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("docker API returned %d: %s", resp.StatusCode, strings.TrimSpace(raw.String()))
+	}
+	if out == nil || raw.Len() == 0 {
+		return nil
+	}
+	return json.Unmarshal(raw.Bytes(), out)
 }
 
 func (b *Backend) callRaw(ctx context.Context, method, path string, body any) ([]byte, error) {

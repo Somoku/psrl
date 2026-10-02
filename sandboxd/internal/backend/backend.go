@@ -193,17 +193,20 @@ type Stateful interface {
 	DeleteSnapshot(ctx context.Context, snapshotID string) error
 }
 
-// Deployer is implemented by a backend this service can install on a node, so a
-// named backend deploys with no per-node manual step.
-type Deployer interface {
-	// Preflight refuses a node that cannot run this backend, at deploy time
-	// rather than at the first rollout. A kernel too old or a missing device
-	// surfaces here, where it is a configuration error, instead of inside an
-	// episode where it is a lost sample.
-	Preflight(ctx context.Context, nodeID string) error
-	Deploy(ctx context.Context, nodeID string) error
-	HealthCheck(ctx context.Context, nodeID string) error
-	Teardown(ctx context.Context, nodeID string) error
+// Preflighter is implemented by a backend that can refuse a deployment it
+// cannot drive, before the deployment serves rather than during it.
+//
+// A runtime too old, a missing device, an isolation runtime that was configured
+// but never installed: each is a configuration error, and each is invisible
+// until a create fails. Checked at startup it names the wrong setting; checked
+// on the first rollout it costs a sample and reads as a flaky run.
+//
+// Installing a runtime is deliberately not here. That is a deployment's own job
+// -- a package manager, an image, a daemonset -- and a service that shelled out
+// to do it would own a second, worse provisioning tool. What the service owns is
+// the refusal.
+type Preflighter interface {
+	Preflight(ctx context.Context) error
 }
 
 // Registry resolves a spec to the backend that will serve it.

@@ -22,7 +22,9 @@ import (
 
 	"psrl.dev/sandboxd/internal/backend"
 	"psrl.dev/sandboxd/internal/backend/agentenv"
+	"psrl.dev/sandboxd/internal/backend/cubesandbox"
 	"psrl.dev/sandboxd/internal/backend/dockerbackend"
+	"psrl.dev/sandboxd/internal/backend/opensandbox"
 	"psrl.dev/sandboxd/internal/monitor"
 	"psrl.dev/sandboxd/internal/node"
 	"psrl.dev/sandboxd/internal/placement"
@@ -104,13 +106,100 @@ type BackendConfig struct {
 
 func main() {
 	configPath := flag.String("config", "", "path to the service configuration")
+	check := flag.Bool("preflight", false,
+		"validate the configuration and every backend it declares, then exit without serving")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// Preflight is its own mode rather than a flag the service honours while
+	// starting, so a deployment can be validated from a pipeline before anything
+	// is listening: the exit code is the whole answer.
+	if *check {
+		if err := preflight(*configPath, log); err != nil {
+			log.Error("sandboxd preflight failed", "error", err)
+			os.Exit(1)
+		}
+		log.Info("sandboxd preflight passed")
+		return
+	}
 	if err := run(*configPath, log); err != nil {
 		log.Error("sandboxd stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+// preflight validates a deployment without serving it.
+//
+// It builds exactly what run would build, in the same order, so a pass here
+// means the same configuration starts. Building is most of the check: the timing
+// contract asserts its own orderings, the quota shares have to sum below one,
+// and every backend is reached and refused if it cannot be driven.
+func preflight(configPath string, log *slog.Logger) error {
+	cfg, err := load(configPath)
+	if err != nil {
+		return err
+	}
+	spans, err := timing.New(
+		seconds(cfg.Timing.EpisodeDeadlineS),
+		seconds(cfg.Timing.NodeTTLS),
+		seconds(cfg.Timing.RPCTimeoutS),
+		overrides(cfg.Timing.Overrides),
+	)
+	if err != nil {
+		return err
+	}
+	log.Info("timing contract resolved", "spans", spans.Spans())
+
+	// buildBackends preflights each one as it is built, which is the expensive
+	// part of the check and the part that reaches the node.
+	backends, err := buildBackends(cfg, log)
+	if err != nil {
+		return err
+	}
+	if _, err := backend.NewRegistry(backends, cfg.DefaultBackend); err != nil {
+		return err
+	}
+	if _, err := quota.New(quota.Config{
+		Total: quota.Amount{
+			MemoryMB: cfg.Fleet.MemoryMB, CPUMillis: cfg.Fleet.CPUMillis, DiskMB: cfg.Fleet.DiskMB,
+			Sandboxes: 1 << 20,
+		},
+		Classes:  quotaClasses(cfg),
+		LeaseTTL: spans.CapacityLeaseTTL(),
+	}); err != nil {
+		return err
+	}
+	// The node envelope and its windows are only meaningful where a runtime is
+	// installed here, which is the same condition run uses to build the agent.
+	local := localBackends(backends)
+	if len(local) == 0 {
+		log.Info("no local runtime is declared, so this process would serve control only")
+		return nil
+	}
+	gate, err := node.NewAdmission(node.Config{
+		Envelope: node.Resources{
+			MemoryMB: cfg.Node.MemoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB,
+		},
+		Classes:         nodeClasses(cfg),
+		GPUIndices:      cfg.Node.GPUIndices,
+		LocalCPUCeiling: cfg.Node.LocalCPUCeiling,
+		LocalMemCeiling: cfg.Node.LocalMemCeiling,
+		LeaseTTL:        spans.CapacityLeaseTTL(),
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := node.NewLifecycle(cfg.NodeID, gate, node.Windows{
+		PauseWindow:   spans.PauseWindow(),
+		ReapWindow:    spans.ReapWindow(),
+		Lifetime:      spans.Lifetime(),
+		SweepInterval: spans.SweepInterval(),
+	}); err != nil {
+		return err
+	}
+	log.Info("deployment is servable",
+		"node", cfg.NodeID, "local_backends", backendNames(local), "all_backends", backendNames(backends))
+	return nil
 }
 
 func run(configPath string, log *slog.Logger) error {
@@ -277,48 +366,57 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 		if declared.Mode == "" {
 			mode = backend.SchedulingPSRL
 		}
+		var (
+			b   backend.Backend
+			err error
+		)
 		switch declared.Type {
 		case "agentenv":
 			nodes := make([]agentenv.NodeAddress, 0, len(declared.Nodes))
 			for _, node := range declared.Nodes {
 				nodes = append(nodes, agentenv.NodeAddress{NodeID: node.NodeID, Address: node.Address})
 			}
-			b, err := agentenv.New(agentenv.Config{
+			b, err = agentenv.New(agentenv.Config{
 				Gateway:   declared.Gateway,
 				Nodes:     nodes,
 				Scheduler: declared.Scheduler,
 				APIKey:    declared.APIKey,
 			}, mode)
-			if err != nil {
-				return nil, err
-			}
-			if err := b.Preflight(context.Background()); err != nil {
-				return nil, fmt.Errorf("backend %q preflight: %w", declared.Type, err)
-			}
-			log.Info("sandbox backend ready", "type", declared.Type, "mode", mode)
-			built = append(built, b)
+		case "cubesandbox":
+			b, err = cubesandbox.New(cubesandbox.Config{
+				Gateway: declared.Gateway,
+				APIKey:  declared.APIKey,
+			})
+		case "opensandbox":
+			b, err = opensandbox.New(opensandbox.Config{
+				Gateway: declared.Gateway,
+				APIKey:  declared.APIKey,
+			})
 		case "docker":
-			b, err := dockerbackend.New(dockerbackend.Config{
+			b, err = dockerbackend.New(dockerbackend.Config{
 				Socket:     declared.Socket,
 				APIVersion: declared.APIVersion,
 				NodeID:     cfg.NodeID,
 				OwnerID:    owner,
 				Runtime:    declared.Runtime,
 			}, mode)
-			if err != nil {
-				return nil, err
-			}
-			// Preflight at startup rather than at the first rollout: a daemon that
-			// is not answering is a configuration error, and discovering it inside
-			// an episode costs a sample.
-			if err := b.Preflight(context.Background()); err != nil {
-				return nil, fmt.Errorf("backend %q preflight: %w", declared.Type, err)
-			}
-			log.Info("sandbox backend ready", "type", declared.Type, "mode", mode)
-			built = append(built, b)
 		default:
 			return nil, fmt.Errorf("sandbox backend type %q is not built into this binary", declared.Type)
 		}
+		if err != nil {
+			return nil, err
+		}
+		// Preflighted through the interface rather than per type, so a backend
+		// added later cannot be wired in without its refusal. At startup rather
+		// than at the first rollout: a daemon that is not answering is a
+		// configuration error, and discovering it inside an episode costs a sample.
+		if checker, can := b.(backend.Preflighter); can {
+			if err := checker.Preflight(context.Background()); err != nil {
+				return nil, fmt.Errorf("backend %q preflight: %w", declared.Type, err)
+			}
+		}
+		log.Info("sandbox backend ready", "type", declared.Type, "mode", mode)
+		built = append(built, b)
 	}
 	return built, nil
 }

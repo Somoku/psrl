@@ -96,7 +96,12 @@ class DockerSession(SandboxSession):
         self.backend = backend
         self.sandbox_id = sandbox_id
         self._spec = spec
-        self._policy = policy or DockerPolicyProfile()
+        if policy is not None:
+            self._policy = policy
+        elif spec is not None and spec.policy_profile:
+            self._policy = backend.policy_profiles.get(spec.policy_profile, DockerPolicyProfile())
+        else:
+            self._policy = DockerPolicyProfile()
         self._command_count = 0
         self._terminate_lock = asyncio.Lock()
         self._terminated = False

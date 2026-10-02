@@ -33,10 +33,10 @@ func (l *LocalNodeClient) Admit(ctx context.Context, nodeID string, spec backend
 
 // CreateOn provisions against an admission the node already granted.
 func (l *LocalNodeClient) CreateOn(
-	ctx context.Context, nodeID, leaseID string, spec backend.Spec, callback string,
+	ctx context.Context, nodeID, leaseID, backendName string, spec backend.Spec, callback string,
 ) (backend.Created, error) {
 	resp, err := l.node.CreateOn(ctx, &v1.CreateOnRequest{
-		LeaseId: leaseID, Spec: specToProto(spec), CallbackTarget: callback,
+		LeaseId: leaseID, Spec: specToProto(spec), CallbackTarget: callback, Backend: backendName,
 	})
 	if err != nil {
 		return backend.Created{}, err

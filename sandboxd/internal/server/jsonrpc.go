@@ -532,9 +532,13 @@ func (j *JSONListener) fleet(ctx context.Context) (any, error) {
 	}
 	nodes := make([]any, 0, len(report.GetNodes()))
 	for _, node := range report.GetNodes() {
+		hosted := make([]string, 0, len(node.GetBackends()))
+		for _, b := range node.GetBackends() {
+			hosted = append(hosted, b.GetName())
+		}
 		nodes = append(nodes, map[string]any{
 			"node_id":        node.GetNodeId(),
-			"backend":        node.GetBackend(),
+			"backends":       hosted,
 			"live_sandboxes": node.GetLiveSandboxes(),
 			"cpu_used_pct":   node.GetCpuUsedPct(),
 			"mem_used_pct":   node.GetMemUsedPct(),

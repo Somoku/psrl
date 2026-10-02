@@ -22,7 +22,11 @@ import (
 // with the same code path either way.
 type NodeClient interface {
 	Admit(ctx context.Context, nodeID string, spec backend.Spec) (leaseID string, gpus []int32, refusal string, err error)
-	CreateOn(ctx context.Context, nodeID, leaseID string, spec backend.Spec, callback string) (backend.Created, error)
+	// CreateOn names the runtime to provision on, because one node can host
+	// several and routing already matched the spec against one of them.
+	CreateOn(
+		ctx context.Context, nodeID, leaseID, backendName string, spec backend.Spec, callback string,
+	) (backend.Created, error)
 	ReleaseOn(ctx context.Context, handle backend.Handle) error
 	StatusOn(ctx context.Context, handle backend.Handle) (string, error)
 }
@@ -181,7 +185,10 @@ func (c *Control) place(ctx context.Context, selected backend.Backend, spec back
 		}
 		withDevices := spec
 		withDevices.AssignedGPUs = gpus
-		created, err := c.nodes.CreateOn(ctx, decision.NodeID, leaseID, withDevices, callback)
+		// The runtime placement matched on, not the one routing picked: on a node
+		// hosting several they agree, and where they could not, placement's is the
+		// one whose capabilities were checked against this node.
+		created, err := c.nodes.CreateOn(ctx, decision.NodeID, leaseID, decision.Backend, withDevices, callback)
 		if err != nil {
 			c.placement.Cancel(decision.ReservationID)
 			return placed{}, status.Errorf(codes.Unavailable, "node %s could not create: %v", decision.NodeID, err)
@@ -347,15 +354,18 @@ func (c *Control) Fleet(context.Context, *v1.Empty) (*v1.FleetReport, error) {
 		LocalityHitRatio:  report.LocalityHitRatio,
 	}
 	for _, view := range c.monitor.Fleet() {
-		out.Nodes = append(out.Nodes, &v1.NodeView{
+		reported := &v1.NodeView{
 			NodeId:        view.NodeID,
-			Backend:       view.Backend,
 			LiveSandboxes: int32(view.LiveSandboxes),
 			CpuUsedPct:    view.CPUUsedPct,
 			MemUsedPct:    view.MemUsedPct,
 			GpuFree:       view.GPUFree,
 			Draining:      view.Draining,
-		})
+		}
+		for _, hosted := range view.Backends {
+			reported.Backends = append(reported.Backends, &v1.BackendView{Name: hosted.Name})
+		}
+		out.Nodes = append(out.Nodes, reported)
 	}
 	return out, nil
 }

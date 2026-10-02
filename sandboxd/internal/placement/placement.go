@@ -55,14 +55,42 @@ func (h Headroom) Add(o Headroom) Headroom {
 	return Headroom{h.MemoryMB + o.MemoryMB, h.CPUMillis + o.CPUMillis, h.GPUCount + o.GPUCount, h.DiskMB + o.DiskMB}
 }
 
+// BackendCapability is one runtime a node hosts, with what it can actually
+// grant.
+//
+// Capability is per runtime rather than per node: one machine can run a
+// container daemon and a microVM node side by side, and only one of them can
+// carry a live process to another host. A node-level set would let a request
+// needing a full-state resume land on a node that hosts such a runtime and then
+// be served by its container daemon.
+type BackendCapability struct {
+	Name        string
+	Features    map[string]struct{}
+	ResumeLevel string
+	HostMounts  bool
+}
+
+// Supports reports whether this runtime offers a feature.
+func (b BackendCapability) Supports(feature string) bool {
+	_, has := b.Features[feature]
+	return has
+}
+
 // NodeView is one node's state, as the monitor last collected it.
 type NodeView struct {
-	NodeID  string
-	Backend string
-	SeenAt  time.Time
+	NodeID string
+	SeenAt time.Time
+
+	// Backends are the runtimes this node hosts. A node hosting none can serve
+	// nothing, so it is filtered out rather than read as unconstrained.
+	Backends []BackendCapability
 
 	// What each class could be granted now. A request is compared against its own
 	// class, never against the envelope remainder.
+	//
+	// Node level rather than per runtime, because the runtimes share one machine:
+	// a microVM and a container on the same host draw on the same memory, and
+	// accounting them apart would admit twice what the node has.
 	ClassHeadroom map[string]Headroom
 	Envelope      Headroom
 
@@ -74,9 +102,6 @@ type NodeView struct {
 	ImageReferences map[string]struct{}
 	GPUFree         int32
 	Labels          map[string]struct{}
-	Features        map[string]struct{}
-	ResumeLevel     string
-	HostMounts      bool
 	// A node that cannot destroy what it holds still holds its memory, so
 	// admitting against it would over-commit the host.
 	Draining bool
@@ -180,6 +205,9 @@ type Service struct {
 	// a NodeView is large, and sorting them by value spent a third of the service's
 	// time copying structs.
 	capable, roomy []int
+	// matched is the runtime each candidate node was matched on, for this decision
+	// only. Reused rather than allocated per create, which is on the hot path.
+	matched map[string]string
 	// Per-candidate utilisation, computed once per decision rather than on every
 	// comparison the sort makes.
 	scores []candidateScore
@@ -202,6 +230,7 @@ func New(cfg Config, monitor Monitor) (*Service, error) {
 		pending:  map[string]Headroom{},
 		viewedAt: map[string]time.Time{},
 		reserved: map[string]*reservation{},
+		matched:  map[string]string{},
 		now:      time.Now,
 	}, nil
 }
@@ -223,6 +252,7 @@ func (s *Service) Choose(req Request) (Decision, error) {
 	fleet := s.fleetLocked()
 	live := 0
 	capable, roomy := s.capable[:0], s.roomy[:0]
+	matched := s.matched
 	for i := range fleet {
 		view := &fleet[i]
 		if now.Sub(view.SeenAt) > s.cfg.NodeTTL {
@@ -230,9 +260,13 @@ func (s *Service) Choose(req Request) (Decision, error) {
 		}
 		s.refreshPendingLocked(view)
 		live++
-		if !s.satisfies(view, req) {
+		runtime, ok := s.satisfies(view, req)
+		if !ok {
 			continue
 		}
+		// The matched runtime is remembered per node, so the winner provisions on
+		// the one its capabilities were actually checked against.
+		matched[view.NodeID] = runtime
 		capable = append(capable, i)
 		if s.canHold(view, req) {
 			roomy = append(roomy, i)
@@ -263,7 +297,7 @@ func (s *Service) Choose(req Request) (Decision, error) {
 	s.pending[chosen.NodeID] = s.pending[chosen.NodeID].Add(req.Footprint)
 	s.decisions++
 	s.noteLocality(chosen, req)
-	return Decision{NodeID: chosen.NodeID, Backend: chosen.Backend, ReservationID: id}, nil
+	return Decision{NodeID: chosen.NodeID, Backend: matched[chosen.NodeID], ReservationID: id}, nil
 }
 
 // fleetLocked returns the cached fleet view, pulling only when it has changed.
@@ -284,35 +318,51 @@ func (s *Service) refreshPendingLocked(view *NodeView) {
 	}
 }
 
-// satisfies reports whether one node can host a request at all.
+// satisfies returns the runtime on this node that can host a request, and
+// whether one exists.
 //
-// Deliberately strict. A node that cannot bind a host path, or resumes at a
-// weaker level, is not a slower candidate; it is a wrong one.
-func (s *Service) satisfies(view *NodeView, req Request) bool {
+// Deliberately strict. A runtime that cannot bind a host path, or resumes at a
+// weaker level, is not a slower candidate; it is a wrong one. The match is per
+// runtime because that is where capability lives: a node hosting both a microVM
+// and a container daemon satisfies a full-state resume only through the former,
+// and the chosen name travels in the decision so the node provisions on the
+// runtime that was actually matched.
+func (s *Service) satisfies(view *NodeView, req Request) (string, bool) {
 	if view.Draining {
-		return false
-	}
-	if req.Backend != "" && view.Backend != req.Backend {
-		return false
-	}
-	for _, feature := range req.RequiredFeatures {
-		if _, has := view.Features[feature]; !has {
-			return false
-		}
-	}
-	if req.RequiredResume != "" && !resumeSatisfies(view.ResumeLevel, req.RequiredResume) {
-		return false
-	}
-	if req.RequiresHostMount && !view.HostMounts {
-		return false
+		return "", false
 	}
 	if req.GPUCount > view.GPUFree {
-		return false
+		return "", false
 	}
 	if req.RequiredLabel != "" {
 		if _, has := view.Labels[req.RequiredLabel]; !has {
+			return "", false
+		}
+	}
+	for _, hosted := range view.Backends {
+		if req.Backend != "" && hosted.Name != req.Backend {
+			continue
+		}
+		if !capable(hosted, req) {
+			continue
+		}
+		return hosted.Name, true
+	}
+	return "", false
+}
+
+// capable reports whether one runtime meets a request's stated requirements.
+func capable(hosted BackendCapability, req Request) bool {
+	for _, feature := range req.RequiredFeatures {
+		if !hosted.Supports(feature) {
 			return false
 		}
+	}
+	if req.RequiredResume != "" && !resumeSatisfies(hosted.ResumeLevel, req.RequiredResume) {
+		return false
+	}
+	if req.RequiresHostMount && !hosted.HostMounts {
+		return false
 	}
 	return true
 }

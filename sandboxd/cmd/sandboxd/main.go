@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"psrl.dev/sandboxd/internal/backend"
+	"psrl.dev/sandboxd/internal/backend/agentenv"
 	"psrl.dev/sandboxd/internal/backend/dockerbackend"
 	"psrl.dev/sandboxd/internal/monitor"
 	"psrl.dev/sandboxd/internal/node"
@@ -67,19 +68,38 @@ type Config struct {
 		Max        float64 `json:"max_share"`
 	} `json:"classes"`
 
-	Backends []struct {
-		Type string `json:"type"`
-		// Mode is "psrl" or "provider": who chooses the node. It is a deployment
-		// property rather than a backend capability, so the same backend can run
-		// both ways in one fleet and a scheduler ablation holds everything else fixed.
-		Mode       string `json:"mode"`
-		Socket     string `json:"socket"`
-		APIVersion string `json:"api_version"`
-		Runtime    string `json:"runtime"`
-	} `json:"backends"`
+	Backends []BackendConfig `json:"backends"`
 
 	DefaultBackend string `json:"default_backend"`
 	OwnerID        string `json:"owner_id"`
+}
+
+// BackendConfig declares one backend. The fields a backend does not use are
+// absent from its own configuration rather than ignored, so a deployment that
+// sets a Docker socket on a microVM backend sees it do nothing and can tell.
+type BackendConfig struct {
+	Type string `json:"type"`
+	// Mode is "psrl" or "provider": who chooses the node. It is a deployment
+	// property rather than a backend capability, so the same backend can run
+	// both ways in one fleet and a scheduler ablation holds everything else fixed.
+	Mode string `json:"mode"`
+
+	// Docker.
+	Socket     string `json:"socket"`
+	APIVersion string `json:"api_version"`
+	Runtime    string `json:"runtime"`
+
+	// AgentEnv. Nodes are required in psrl mode, where this service chooses
+	// which one to call; a gateway is required in provider mode, where AgentEnv
+	// chooses. Scheduler is where a binding is registered so the provider's own
+	// routing keeps working while this service places.
+	Gateway   string `json:"gateway"`
+	Scheduler string `json:"scheduler"`
+	APIKey    string `json:"api_key"`
+	Nodes     []struct {
+		NodeID  string `json:"node_id"`
+		Address string `json:"address"`
+	} `json:"nodes"`
 }
 
 func main() {
@@ -121,37 +141,53 @@ func run(configPath string, log *slog.Logger) error {
 		return err
 	}
 
-	gate, err := node.NewAdmission(node.Config{
-		Envelope: node.Resources{
-			MemoryMB: cfg.Node.MemoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB,
-		},
-		Classes:         nodeClasses(cfg),
-		GPUIndices:      cfg.Node.GPUIndices,
-		LocalCPUCeiling: cfg.Node.LocalCPUCeiling,
-		LocalMemCeiling: cfg.Node.LocalMemCeiling,
-		LeaseTTL:        spans.CapacityLeaseTTL(),
-	})
-	if err != nil {
-		return err
-	}
-	life, err := node.NewLifecycle(cfg.NodeID, gate, node.Windows{
-		PauseWindow:   spans.PauseWindow(),
-		ReapWindow:    spans.ReapWindow(),
-		Lifetime:      spans.Lifetime(),
-		SweepInterval: spans.SweepInterval(),
-	})
-	if err != nil {
-		return err
-	}
-	agent, err := server.NewNode(server.NodeConfig{
-		NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backend: backends[0],
-	})
-	if err != nil {
-		return err
-	}
+	// Only the runtimes installed on this machine get a node agent. A provider
+	// backend runs on the provider's own hosts, so admitting it against this
+	// node's envelope would charge this machine for memory it never spends.
+	local := localBackends(backends)
 
 	fleet := monitor.New(spans.NodeTTL)
-	fleet.Report(agent.View())
+
+	var (
+		agent *server.Node
+		life  *node.Lifecycle
+		nodes server.NodeClient
+	)
+	if len(local) > 0 {
+		gate, err := node.NewAdmission(node.Config{
+			Envelope: node.Resources{
+				MemoryMB: cfg.Node.MemoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB,
+			},
+			Classes:         nodeClasses(cfg),
+			GPUIndices:      cfg.Node.GPUIndices,
+			LocalCPUCeiling: cfg.Node.LocalCPUCeiling,
+			LocalMemCeiling: cfg.Node.LocalMemCeiling,
+			LeaseTTL:        spans.CapacityLeaseTTL(),
+		})
+		if err != nil {
+			return err
+		}
+		life, err = node.NewLifecycle(cfg.NodeID, gate, node.Windows{
+			PauseWindow:   spans.PauseWindow(),
+			ReapWindow:    spans.ReapWindow(),
+			Lifetime:      spans.Lifetime(),
+			SweepInterval: spans.SweepInterval(),
+		})
+		if err != nil {
+			return err
+		}
+		agent, err = server.NewNode(server.NodeConfig{
+			// Every runtime installed here shares one admission ledger: a microVM and
+			// a container on this host draw on the same memory, so accounting them
+			// apart would admit twice what the machine has.
+			NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backends: local,
+		})
+		if err != nil {
+			return err
+		}
+		fleet.Report(agent.View())
+		nodes = server.NewLocalNodeClient(agent)
+	}
 
 	ledger, err := quota.New(quota.Config{
 		Total: quota.Amount{
@@ -174,7 +210,7 @@ func run(configPath string, log *slog.Logger) error {
 	}
 	control, err := server.NewControl(server.ControlConfig{
 		Registry: registry, Ledger: ledger, Placement: place, Monitor: fleet,
-		Nodes:          server.NewLocalNodeClient(agent),
+		Nodes:          nodes,
 		AcquireTimeout: spans.AcquireTimeout(),
 	})
 	if err != nil {
@@ -184,12 +220,13 @@ func run(configPath string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	life.Start(ctx)
-	defer life.Stop()
-
-	// The node republishes itself on the contract's cadence, so placement reads a
-	// view that is never more than a report old.
-	go republish(ctx, agent, fleet, spans.LoadReportInterval())
+	if agent != nil {
+		life.Start(ctx)
+		defer life.Stop()
+		// The node republishes itself on the contract's cadence, so placement reads
+		// a view that is never more than a report old.
+		go republish(ctx, agent, fleet, spans.LoadReportInterval())
+	}
 	go sweepReservations(ctx, place, spans.SweepInterval())
 
 	listener, err := listen(cfg.Listen)
@@ -241,6 +278,25 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 			mode = backend.SchedulingPSRL
 		}
 		switch declared.Type {
+		case "agentenv":
+			nodes := make([]agentenv.NodeAddress, 0, len(declared.Nodes))
+			for _, node := range declared.Nodes {
+				nodes = append(nodes, agentenv.NodeAddress{NodeID: node.NodeID, Address: node.Address})
+			}
+			b, err := agentenv.New(agentenv.Config{
+				Gateway:   declared.Gateway,
+				Nodes:     nodes,
+				Scheduler: declared.Scheduler,
+				APIKey:    declared.APIKey,
+			}, mode)
+			if err != nil {
+				return nil, err
+			}
+			if err := b.Preflight(context.Background()); err != nil {
+				return nil, fmt.Errorf("backend %q preflight: %w", declared.Type, err)
+			}
+			log.Info("sandbox backend ready", "type", declared.Type, "mode", mode)
+			built = append(built, b)
 		case "docker":
 			b, err := dockerbackend.New(dockerbackend.Config{
 				Socket:     declared.Socket,
@@ -265,6 +321,19 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 		}
 	}
 	return built, nil
+}
+
+// localBackends are the runtimes installed on this machine, which are the ones
+// this node's admission can speak for. A provider backend places on the
+// provider's own hosts, so this node has no envelope to charge it against.
+func localBackends(backends []backend.Backend) []backend.Backend {
+	local := make([]backend.Backend, 0, len(backends))
+	for _, b := range backends {
+		if b.Mode() == backend.SchedulingPSRL {
+			local = append(local, b)
+		}
+	}
+	return local
 }
 
 func backendNames(backends []backend.Backend) []string {

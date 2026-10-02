@@ -33,7 +33,8 @@ type stack struct {
 	backend *dockerbackend.Backend
 }
 
-func newStack(t *testing.T, fleetMemoryMB int64) *stack {
+// dockerSocket returns the daemon to test against, skipping where none is.
+func dockerSocket(t *testing.T) string {
 	t.Helper()
 	socket := os.Getenv("DOCKER_SOCKET")
 	if socket == "" {
@@ -42,6 +43,12 @@ func newStack(t *testing.T, fleetMemoryMB int64) *stack {
 	if _, err := os.Stat(socket); err != nil {
 		t.Skipf("no docker socket at %s", socket)
 	}
+	return socket
+}
+
+func newStack(t *testing.T, fleetMemoryMB int64) *stack {
+	t.Helper()
+	socket := dockerSocket(t)
 
 	// Short spans, so a reclamation test does not wait an episode.
 	spans, err := timing.New(2*time.Second, 8*time.Second, 5*time.Second, nil)
@@ -81,7 +88,9 @@ func newStack(t *testing.T, fleetMemoryMB int64) *stack {
 	if err != nil {
 		t.Fatalf("lifecycle: %v", err)
 	}
-	agent, err := NewNode(NodeConfig{NodeID: "node-a", Admission: gate, Lifecycle: life, Backend: docker})
+	agent, err := NewNode(NodeConfig{
+		NodeID: "node-a", Admission: gate, Lifecycle: life, Backends: []backend.Backend{docker},
+	})
 	if err != nil {
 		t.Fatalf("node: %v", err)
 	}

@@ -10,7 +10,11 @@ import (
 )
 
 func view(id string) placement.NodeView {
-	return placement.NodeView{NodeID: id, Backend: "docker", SeenAt: time.Now()}
+	return placement.NodeView{
+		NodeID:   id,
+		SeenAt:   time.Now(),
+		Backends: []placement.BackendCapability{{Name: "docker"}},
+	}
 }
 
 func TestAReportBecomesVisibleInTheFleet(t *testing.T) {

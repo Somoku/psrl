@@ -38,14 +38,13 @@ func (m *fakeMonitor) set(nodes []NodeView) {
 func node(id string, memMB int64, opts ...func(*NodeView)) NodeView {
 	view := NodeView{
 		NodeID:          id,
-		Backend:         "docker",
 		SeenAt:          time.Now(),
+		Backends:        []BackendCapability{{Name: "docker", Features: map[string]struct{}{}}},
 		ClassHeadroom:   map[string]Headroom{"rollout": {MemoryMB: memMB, CPUMillis: memMB}},
 		Envelope:        Headroom{MemoryMB: 1000, CPUMillis: 1000},
 		ImageDigests:    map[string]struct{}{},
 		ImageReferences: map[string]struct{}{},
 		Labels:          map[string]struct{}{},
-		Features:        map[string]struct{}{},
 	}
 	for _, opt := range opts {
 		opt(&view)
@@ -56,8 +55,22 @@ func node(id string, memMB int64, opts ...func(*NodeView)) NodeView {
 func withFeatures(names ...string) func(*NodeView) {
 	return func(v *NodeView) {
 		for _, name := range names {
-			v.Features[name] = struct{}{}
+			v.Backends[0].Features[name] = struct{}{}
 		}
+	}
+}
+
+// hosting adds a second runtime to a node, which is the shape of a machine
+// running a container daemon and a microVM side by side.
+func hosting(name, resumeLevel string, features ...string) func(*NodeView) {
+	return func(v *NodeView) {
+		hosted := BackendCapability{
+			Name: name, ResumeLevel: resumeLevel, Features: map[string]struct{}{},
+		}
+		for _, feature := range features {
+			hosted.Features[feature] = struct{}{}
+		}
+		v.Backends = append(v.Backends, hosted)
 	}
 }
 
@@ -325,7 +338,7 @@ func TestPlacementIsReproducibleForEquallyGoodNodes(t *testing.T) {
 func TestAResumeRequirementIsRefusedRatherThanDowngraded(t *testing.T) {
 	// A workspace restore must not be readable as proof a live process survived.
 	weak := node("a", 500, withFeatures("resume_anywhere"))
-	weak.ResumeLevel = "filesystem"
+	weak.Backends[0].ResumeLevel = "filesystem"
 	service := mustService(t, &fakeMonitor{nodes: []NodeView{weak}})
 
 	req := request(10)
@@ -335,6 +348,72 @@ func TestAResumeRequirementIsRefusedRatherThanDowngraded(t *testing.T) {
 
 	if !errors.Is(err, ErrNoCandidate) {
 		t.Fatalf("a weaker resume must be refused, got %v", err)
+	}
+}
+
+func TestARequestIsMatchedToTheRuntimeThatHasTheCapability(t *testing.T) {
+	// A node hosting both docker and agentenv satisfies a full-state resume
+	// through the agentenv runtime only. The decision backend must name agentenv,
+	// not docker, so the node creates on the right runtime.
+	mixed := node("a", 500, hosting("agentenv", "full_state", "resume_anywhere", "native_fork"))
+	service := mustService(t, &fakeMonitor{nodes: []NodeView{mixed}})
+
+	req := Request{ResourceClass: "rollout", Footprint: Headroom{MemoryMB: 10}}
+	req.RequiredFeatures = []string{"resume_anywhere"}
+	req.RequiredResume = "full_state"
+	decision, err := service.Choose(req)
+	if err != nil {
+		t.Fatalf("choose: %v", err)
+	}
+	if decision.Backend != "agentenv" {
+		t.Fatalf("landed on %q, want the runtime that actually has full_state resume", decision.Backend)
+	}
+}
+
+func TestARequestWithNoRequirementsPicksTheFirstRuntime(t *testing.T) {
+	// A spec that states no requirements gets the default runtime, which is the
+	// first one declared on the node.
+	service := mustService(t, &fakeMonitor{nodes: []NodeView{node("a", 500)}})
+
+	decision, err := service.Choose(request(10))
+	if err != nil {
+		t.Fatalf("choose: %v", err)
+	}
+	if decision.Backend != "docker" {
+		t.Fatalf("got %q, want the first declared runtime", decision.Backend)
+	}
+}
+
+func TestAPinNameASpecificRuntimeOnAMixedNode(t *testing.T) {
+	// A caller can pin the backend name to hold it fixed across an ablation
+	// while everything else in the spec stays the same.
+	mixed := node("a", 500, hosting("agentenv", "full_state", "resume_anywhere"))
+	service := mustService(t, &fakeMonitor{nodes: []NodeView{mixed}})
+
+	req := request(10)
+	req.Backend = "agentenv"
+	decision, err := service.Choose(req)
+	if err != nil {
+		t.Fatalf("choose: %v", err)
+	}
+	if decision.Backend != "agentenv" {
+		t.Fatalf("pin was not honoured: got %q", decision.Backend)
+	}
+}
+
+func TestANodeWithNoRuntimeThatMatchesIsTreatedAsIncapable(t *testing.T) {
+	// A node that only hosts docker cannot satisfy a request that needs a
+	// feature only agentenv has. The error must be ErrNoCandidate, not
+	// ErrExhausted, because adding more capacity would not fix it.
+	dockerOnly := node("a", 500)
+	service := mustService(t, &fakeMonitor{nodes: []NodeView{dockerOnly}})
+
+	req := request(10)
+	req.RequiredFeatures = []string{"resume_anywhere"}
+	req.RequiredResume = "full_state"
+	_, err := service.Choose(req)
+	if !errors.Is(err, ErrNoCandidate) {
+		t.Fatalf("a docker-only node must refuse a full-state resume with ErrNoCandidate, got %v", err)
 	}
 }
 

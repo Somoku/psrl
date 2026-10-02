@@ -19,7 +19,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.5.1
 // - protoc             v4.25.3
-// source: sandbox.proto
+// source: api/v1/sandbox.proto
 
 package sandboxv1
 
@@ -564,7 +564,7 @@ var SandboxControl_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "sandbox.proto",
+	Metadata: "api/v1/sandbox.proto",
 }
 
 const (
@@ -826,5 +826,5 @@ var SandboxNode_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "sandbox.proto",
+	Metadata: "api/v1/sandbox.proto",
 }

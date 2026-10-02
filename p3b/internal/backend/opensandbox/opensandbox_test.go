@@ -1,293 +1,378 @@
-package opensandbox
+package opensandbox_test
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
-	"sync"
 	"testing"
-	"time"
 
-	sbbackend "psrl.dev/sandboxd/internal/backend"
+	"psrl.dev/sandboxd/internal/backend"
+	"psrl.dev/sandboxd/internal/backend/opensandbox"
 )
 
-// A fake OpenSandbox HTTP server matching the SDK's documented wire shapes.
-type fakeOpen struct {
-	mu        sync.Mutex
-	server    *httptest.Server
-	sandboxes map[string]string // id -> state
-	seq       int
+// -- construction -------------------------------------------------------------
+
+func TestNewPSRLModeRequiresNodes(t *testing.T) {
+	_, err := opensandbox.New(opensandbox.Config{}, backend.SchedulingPSRL)
+	if err == nil {
+		t.Fatal("expected error for psrl mode with no nodes")
+	}
 }
 
-func newFakeOpen(t *testing.T) *fakeOpen {
-	t.Helper()
-	fake := &fakeOpen{sandboxes: map[string]string{}}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/sandboxes", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			// List: minimal response for preflight check.
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"items":      []any{},
-				"pagination": map[string]any{"page": 1},
-			})
-			return
-		}
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		fake.mu.Lock()
-		defer fake.mu.Unlock()
-		fake.seq++
-		id := fmt.Sprintf("osb-%d", fake.seq)
-		fake.sandboxes[id] = "Running"
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(sandboxInfo{
-			ID:     id,
-			Status: struct{ State string `json:"state"` }{State: "Running"},
-		})
-	})
-	mux.HandleFunc("/sandboxes/", func(w http.ResponseWriter, r *http.Request) {
-		fake.mu.Lock()
-		defer fake.mu.Unlock()
-		path := strings.TrimPrefix(r.URL.Path, "/sandboxes/")
-		id, action, _ := strings.Cut(path, "/")
-		state, known := fake.sandboxes[id]
-		if !known {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		switch {
-		case r.Method == http.MethodDelete && action == "":
-			delete(fake.sandboxes, id)
-			w.WriteHeader(http.StatusNoContent)
-		case r.Method == http.MethodGet && action == "":
-			_ = json.NewEncoder(w).Encode(sandboxInfo{
-				ID:     id,
-				Status: struct{ State string `json:"state"` }{State: state},
-			})
-		case action == "pause":
-			fake.sandboxes[id] = "Paused"
-			w.WriteHeader(http.StatusNoContent)
-		case action == "resume":
-			fake.sandboxes[id] = "Running"
-			w.WriteHeader(http.StatusOK)
-		case action == "snapshots":
-			_ = json.NewEncoder(w).Encode(snapshotInfo{ID: "snap-" + id})
-		case strings.HasPrefix(action, "endpoints/"):
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"endpoint": "https://osb.example.com/" + id,
-				"headers":  map[string]string{"Authorization": "Bearer tok-" + id},
-			})
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	})
-	mux.HandleFunc("/snapshots/", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})
-	fake.server = httptest.NewServer(mux)
-	t.Cleanup(fake.server.Close)
-	return fake
+func TestNewProviderModeRequiresGateway(t *testing.T) {
+	_, err := opensandbox.New(opensandbox.Config{}, backend.SchedulingProvider)
+	if err == nil {
+		t.Fatal("expected error for provider mode with no gateway")
+	}
 }
 
-func newOpenBackend(t *testing.T, fake *fakeOpen) *Backend {
-	t.Helper()
-	b, err := New(Config{Gateway: fake.server.URL})
+func TestNewInvalidModeIsRefused(t *testing.T) {
+	_, err := opensandbox.New(opensandbox.Config{Gateway: "http://x"}, backend.SchedulingMode("sideways"))
+	if err == nil {
+		t.Fatal("expected error for invalid scheduling mode")
+	}
+}
+
+func TestNewNodeRequiresBothIDAndAddress(t *testing.T) {
+	_, err := opensandbox.New(opensandbox.Config{
+		Nodes: []opensandbox.NodeAddress{{NodeID: "n1", Address: ""}},
+	}, backend.SchedulingPSRL)
+	if err == nil {
+		t.Fatal("expected error for node with empty address")
+	}
+}
+
+func TestNewPSRLModeSucceeds(t *testing.T) {
+	b, err := opensandbox.New(opensandbox.Config{
+		Nodes: []opensandbox.NodeAddress{{NodeID: "n1", Address: "http://node1:8080"}},
+	}, backend.SchedulingPSRL)
 	if err != nil {
-		t.Fatalf("new backend: %v", err)
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if b.Mode() != backend.SchedulingPSRL {
+		t.Fatalf("expected psrl mode, got %q", b.Mode())
+	}
+}
+
+func TestNewProviderModeSucceeds(t *testing.T) {
+	b, err := opensandbox.New(opensandbox.Config{
+		Gateway: "https://gateway.example.com/v1",
+	}, backend.SchedulingProvider)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if b.Mode() != backend.SchedulingProvider {
+		t.Fatalf("expected provider mode, got %q", b.Mode())
+	}
+}
+
+// -- capabilities differ by mode ----------------------------------------------
+
+func TestCapabilitiesPSRLModeExcludesProviderOnlyFeatures(t *testing.T) {
+	b := mustNew(t, backend.SchedulingPSRL, "http://n1:8080")
+	caps := b.Capabilities()
+	providerOnly := []string{"warm_pool", "image_block_delivery", "template_build", "resume_anywhere", "volume"}
+	featureSet := make(map[string]bool, len(caps.Features))
+	for _, f := range caps.Features {
+		featureSet[f] = true
+	}
+	for _, f := range providerOnly {
+		if featureSet[f] {
+			t.Errorf("psrl mode declared provider-only feature %q", f)
+		}
+	}
+}
+
+func TestCapabilitiesPSRLModeIncludesDockerModeFeatures(t *testing.T) {
+	b := mustNew(t, backend.SchedulingPSRL, "http://n1:8080")
+	caps := b.Capabilities()
+	required := []string{"freeze", "filesystem_snapshot", "restore", "egress_policy", "credential_injection"}
+	featureSet := make(map[string]bool, len(caps.Features))
+	for _, f := range caps.Features {
+		featureSet[f] = true
+	}
+	for _, f := range required {
+		if !featureSet[f] {
+			t.Errorf("psrl mode missing docker-mode feature %q", f)
+		}
+	}
+}
+
+func TestCapabilitiesProviderModeIncludesFullSet(t *testing.T) {
+	b := mustNew(t, backend.SchedulingProvider, "")
+	caps := b.Capabilities()
+	full := []string{"warm_pool", "image_block_delivery", "template_build", "resume_anywhere"}
+	featureSet := make(map[string]bool, len(caps.Features))
+	for _, f := range caps.Features {
+		featureSet[f] = true
+	}
+	for _, f := range full {
+		if !featureSet[f] {
+			t.Errorf("provider mode missing full-cluster feature %q", f)
+		}
+	}
+}
+
+func TestCapabilitiesPSRLModeHasNoResumeAnywhere(t *testing.T) {
+	// Snapshots in docker mode are node-local; cross-node resume is not possible.
+	b := mustNew(t, backend.SchedulingPSRL, "http://n1:8080")
+	for _, f := range b.Capabilities().Features {
+		if f == "resume_anywhere" {
+			t.Fatal("psrl mode must not declare resume_anywhere: docker snapshots are node-local")
+		}
+	}
+}
+
+// -- per-node routing ---------------------------------------------------------
+
+func TestCreatePSRLModeRoutesToChosenNode(t *testing.T) {
+	// The adapter makes two calls: POST /sandboxes (create) then
+	// GET /sandboxes/{id}/endpoints/{port} (endpoint resolution). Capture
+	// only the first path to verify that the create went to /sandboxes.
+	var firstPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if firstPath == "" {
+			firstPath = r.URL.Path
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": "sb-1", "status": map[string]string{"state": "Running"}})
+	}))
+	defer srv.Close()
+
+	b, err := opensandbox.New(opensandbox.Config{
+		Nodes: []opensandbox.NodeAddress{{NodeID: "n1", Address: srv.URL}},
+	}, backend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	spec := backend.Spec{
+		Source:    backend.Source{Kind: "image", Reference: "alpine:latest"},
+		Resources: backend.Resources{CPUCount: 1, MemoryMB: 256},
+	}
+	created, err := b.Create(context.Background(), "n1", spec, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if created.Handle.NodeID != "n1" {
+		t.Errorf("NodeID on handle: got %q, want n1", created.Handle.NodeID)
+	}
+	if firstPath != "/sandboxes" {
+		t.Errorf("first request path: got %q, want /sandboxes", firstPath)
+	}
+}
+
+func TestCreatePSRLModeUnknownNodeIsRefused(t *testing.T) {
+	b := mustNew(t, backend.SchedulingPSRL, "http://n1:8080")
+	spec := backend.Spec{Source: backend.Source{Kind: "image", Reference: "alpine:latest"}}
+	_, err := b.Create(context.Background(), "unknown-node", spec, "")
+	if err == nil {
+		t.Fatal("expected error for unknown node id")
+	}
+}
+
+// -- operation guards ---------------------------------------------------------
+
+func TestSnapshotRefusesFullState(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	b := mustNewWithServer(t, backend.SchedulingPSRL, srv.URL)
+	handle := backend.Handle{Backend: "opensandbox", SandboxID: "sb-1", NodeID: "n1"}
+	_, err := b.Snapshot(context.Background(), handle, "full_state")
+	if err == nil {
+		t.Fatal("expected error when requesting full_state snapshot")
+	}
+}
+
+func TestSnapshotRefusesFullStateInProviderMode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	b, err := opensandbox.New(opensandbox.Config{Gateway: srv.URL}, backend.SchedulingProvider)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	handle := backend.Handle{Backend: "opensandbox", SandboxID: "sb-1"}
+	_, err = b.Snapshot(context.Background(), handle, "full_state")
+	if err == nil {
+		t.Fatal("expected error when requesting full_state snapshot in provider mode")
+	}
+}
+
+func TestPauseRefusesHibernate(t *testing.T) {
+	b := mustNew(t, backend.SchedulingPSRL, "http://n1:8080")
+	handle := backend.Handle{Backend: "opensandbox", SandboxID: "sb-1", NodeID: "n1"}
+	err := b.Pause(context.Background(), handle, "hibernate")
+	if err == nil {
+		t.Fatal("expected error when requesting hibernate pause")
+	}
+}
+
+func TestPauseAcceptsFreeze(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	b := mustNewWithServer(t, backend.SchedulingPSRL, srv.URL)
+	handle := backend.Handle{Backend: "opensandbox", SandboxID: "sb-1", NodeID: "n1"}
+	if err := b.Pause(context.Background(), handle, "freeze"); err != nil {
+		t.Fatalf("pause with freeze: %v", err)
+	}
+}
+
+func TestPauseAcceptsEmptyMode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	b := mustNewWithServer(t, backend.SchedulingPSRL, srv.URL)
+	handle := backend.Handle{Backend: "opensandbox", SandboxID: "sb-1", NodeID: "n1"}
+	if err := b.Pause(context.Background(), handle, ""); err != nil {
+		t.Fatalf("pause with empty mode: %v", err)
+	}
+}
+
+// -- nodes listing ------------------------------------------------------------
+
+func TestNodesPSRLModeReturnsConfiguredIDs(t *testing.T) {
+	b, err := opensandbox.New(opensandbox.Config{
+		Nodes: []opensandbox.NodeAddress{
+			{NodeID: "n2", Address: "http://n2:8080"},
+			{NodeID: "n1", Address: "http://n1:8080"},
+		},
+	}, backend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ids, err := b.Nodes(context.Background())
+	if err != nil {
+		t.Fatalf("nodes: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 node ids, got %d", len(ids))
+	}
+	// Nodes() returns sorted IDs.
+	if ids[0] != "n1" || ids[1] != "n2" {
+		t.Errorf("unexpected ordering: %v", ids)
+	}
+}
+
+func TestNodesProviderModeReturnsEmpty(t *testing.T) {
+	b := mustNew(t, backend.SchedulingProvider, "")
+	ids, err := b.Nodes(context.Background())
+	if err != nil {
+		t.Fatalf("nodes: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("provider mode should return no node ids, got %v", ids)
+	}
+}
+
+// -- preflight ----------------------------------------------------------------
+
+func TestPreflightPSRLModeProbesEachNode(t *testing.T) {
+	probed := make(map[string]int)
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probed["n1"]++
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer srv1.Close()
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probed["n2"]++
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer srv2.Close()
+
+	b, err := opensandbox.New(opensandbox.Config{
+		Nodes: []opensandbox.NodeAddress{
+			{NodeID: "n1", Address: srv1.URL},
+			{NodeID: "n2", Address: srv2.URL},
+		},
+	}, backend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := b.Preflight(context.Background()); err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if probed["n1"] == 0 || probed["n2"] == 0 {
+		t.Errorf("preflight did not probe both nodes: %v", probed)
+	}
+}
+
+func TestPreflightPSRLModeFailsIfANodeIsDown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer srv.Close()
+
+	b, err := opensandbox.New(opensandbox.Config{
+		Nodes: []opensandbox.NodeAddress{
+			{NodeID: "up",   Address: srv.URL},
+			{NodeID: "down", Address: "http://127.0.0.1:1"}, // nothing listening
+		},
+	}, backend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := b.Preflight(context.Background()); err == nil {
+		t.Fatal("expected preflight to fail when a node is unreachable")
+	}
+}
+
+// -- resource limits ----------------------------------------------------------
+
+func TestCreateSendsResourceLimitsAsKubernetesQuantities(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&body)
+		json.NewEncoder(w).Encode(map[string]any{"id": "sb-1"})
+	}))
+	defer srv.Close()
+	b := mustNewWithServer(t, backend.SchedulingPSRL, srv.URL)
+	spec := backend.Spec{
+		Source:    backend.Source{Kind: "image", Reference: "alpine:latest"},
+		Resources: backend.Resources{CPUCount: 2, MemoryMB: 512},
+	}
+	if _, err := b.Create(context.Background(), "n1", spec, ""); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	limits, _ := body["resourceLimits"].(map[string]any)
+	if limits["cpu"] != "2000m" {
+		t.Errorf("cpu: got %q, want 2000m", limits["cpu"])
+	}
+	if limits["memory"] != "512Mi" {
+		t.Errorf("memory: got %q, want 512Mi", limits["memory"])
+	}
+}
+
+// -- helpers ------------------------------------------------------------------
+
+func mustNew(t *testing.T, mode backend.SchedulingMode, nodeAddr string) *opensandbox.Backend {
+	t.Helper()
+	var cfg opensandbox.Config
+	if mode == backend.SchedulingPSRL {
+		cfg.Nodes = []opensandbox.NodeAddress{{NodeID: "n1", Address: nodeAddr}}
+	} else {
+		cfg.Gateway = "https://gateway.example.com/v1"
+	}
+	b, err := opensandbox.New(cfg, mode)
+	if err != nil {
+		t.Fatalf("opensandbox.New: %v", err)
 	}
 	return b
 }
 
-func openSpec() sbbackend.Spec {
-	return sbbackend.Spec{
-		Source:        sbbackend.Source{Kind: "image", Reference: "python:3.11-slim"},
-		Resources:     sbbackend.Resources{CPUCount: 2, MemoryMB: 2048},
-		ResourceClass: "rollout",
-		Env:           map[string]string{"TASK": "swe"},
+func mustNewWithServer(t *testing.T, mode backend.SchedulingMode, serverURL string) *opensandbox.Backend {
+	t.Helper()
+	var cfg opensandbox.Config
+	if mode == backend.SchedulingPSRL {
+		cfg.Nodes = []opensandbox.NodeAddress{{NodeID: "n1", Address: serverURL}}
+	} else {
+		cfg.Gateway = serverURL
 	}
-}
-
-func TestItNeedsAGateway(t *testing.T) {
-	if _, err := New(Config{}); err == nil {
-		t.Fatal("opensandbox must refuse an empty gateway")
-	}
-}
-
-func TestItDeclaresAFreeze(t *testing.T) {
-	fake := newFakeOpen(t)
-	caps := newOpenBackend(t, fake).Capabilities()
-
-	if !caps.Supports("freeze") {
-		t.Fatal("opensandbox must declare freeze")
-	}
-	for _, mode := range caps.PauseModes {
-		if mode == "hibernate" {
-			t.Fatal("opensandbox keeps the sandbox resident on pause, so it must not claim hibernate")
-		}
-	}
-}
-
-func TestItDeclaresImageBlockDelivery(t *testing.T) {
-	// OpenSandbox's block-level image delivery is a real differentiator from
-	// plain layer pulling; callers that need it must be able to require it.
-	fake := newFakeOpen(t)
-	caps := newOpenBackend(t, fake).Capabilities()
-
-	if !caps.Supports("image_block_delivery") {
-		t.Fatal("opensandbox must declare image_block_delivery")
-	}
-}
-
-func TestItDeclaresNoResumeLevel(t *testing.T) {
-	// Filesystem snapshots do not carry live process state.
-	fake := newFakeOpen(t)
-	if newOpenBackend(t, fake).Capabilities().ResumeLevel != "" {
-		t.Fatal("opensandbox captures filesystem only, not live process state")
-	}
-}
-
-func TestResourcesAreConvertedToKubernetesQuantities(t *testing.T) {
-	// 2 CPUs → "2000m", 2048 MB → "2048Mi"; 0 GPU → absent.
-	limits := resourceLimits(sbbackend.Spec{
-		Resources: sbbackend.Resources{CPUCount: 2, MemoryMB: 2048},
-	})
-	if limits["cpu"] != "2000m" {
-		t.Fatalf("cpu limit is %q, want \"2000m\"", limits["cpu"])
-	}
-	if limits["memory"] != "2048Mi" {
-		t.Fatalf("memory limit is %q, want \"2048Mi\"", limits["memory"])
-	}
-	if _, has := limits["gpu"]; has {
-		t.Fatal("a spec with no GPU must not send a gpu limit")
-	}
-}
-
-func TestACreateReturnsASandboxAndAnAgentEndpoint(t *testing.T) {
-	fake := newFakeOpen(t)
-	b := newOpenBackend(t, fake)
-
-	created, err := b.Create(context.Background(), "", openSpec(), "")
+	b, err := opensandbox.New(cfg, mode)
 	if err != nil {
-		t.Fatalf("create: %v", err)
+		t.Fatalf("opensandbox.New: %v", err)
 	}
-	if created.Handle.SandboxID == "" {
-		t.Fatal("create must return a sandbox id")
-	}
-	if created.Agent.Address == "" {
-		t.Fatal("create must return an agent endpoint")
-	}
-}
-
-func TestLifecycleRunsThroughPauseResumeAndRelease(t *testing.T) {
-	fake := newFakeOpen(t)
-	b := newOpenBackend(t, fake)
-	ctx := context.Background()
-
-	created, err := b.Create(ctx, "", openSpec(), "")
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if err := b.Pause(ctx, created.Handle, "freeze"); err != nil {
-		t.Fatalf("pause: %v", err)
-	}
-	state, _ := b.Status(ctx, created.Handle)
-	if state != "paused" {
-		t.Fatalf("state is %q after pause, want paused", state)
-	}
-	if err := b.Resume(ctx, created.Handle); err != nil {
-		t.Fatalf("resume: %v", err)
-	}
-	state, _ = b.Status(ctx, created.Handle)
-	if state != "running" {
-		t.Fatalf("state is %q after resume, want running", state)
-	}
-	if err := b.Release(ctx, created.Handle); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-}
-
-func TestHibernateIsRefused(t *testing.T) {
-	fake := newFakeOpen(t)
-	b := newOpenBackend(t, fake)
-	created, _ := b.Create(context.Background(), "", openSpec(), "")
-
-	if err := b.Pause(context.Background(), created.Handle, "hibernate"); err == nil {
-		t.Fatal("opensandbox must refuse hibernate")
-	}
-}
-
-func TestFullStateSnapshotIsRefused(t *testing.T) {
-	fake := newFakeOpen(t)
-	b := newOpenBackend(t, fake)
-	created, _ := b.Create(context.Background(), "", openSpec(), "")
-
-	if _, err := b.Snapshot(context.Background(), created.Handle, "full_state"); err == nil {
-		t.Fatal("opensandbox captures filesystem only, so full_state must be refused")
-	}
-}
-
-func TestSnapshotReturnsAnId(t *testing.T) {
-	fake := newFakeOpen(t)
-	b := newOpenBackend(t, fake)
-	created, _ := b.Create(context.Background(), "", openSpec(), "")
-
-	id, err := b.Snapshot(context.Background(), created.Handle, "filesystem")
-	if err != nil {
-		t.Fatalf("snapshot: %v", err)
-	}
-	if id == "" {
-		t.Fatal("snapshot must return an id")
-	}
-	if err := b.DeleteSnapshot(context.Background(), id); err != nil {
-		t.Fatalf("delete snapshot: %v", err)
-	}
-}
-
-func TestReleasingAGoneSandboxIsIdempotent(t *testing.T) {
-	fake := newFakeOpen(t)
-	b := newOpenBackend(t, fake)
-	created, _ := b.Create(context.Background(), "", openSpec(), "")
-	_ = b.Release(context.Background(), created.Handle)
-
-	if err := b.Release(context.Background(), created.Handle); err != nil {
-		t.Fatalf("retried release must be safe: %v", err)
-	}
-}
-
-func TestAGoneSandboxReportsTerminated(t *testing.T) {
-	fake := newFakeOpen(t)
-	b := newOpenBackend(t, fake)
-	created, _ := b.Create(context.Background(), "", openSpec(), "")
-	_ = b.Release(context.Background(), created.Handle)
-
-	state, err := b.Status(context.Background(), created.Handle)
-	if err != nil {
-		t.Fatalf("gone sandbox is a state, not an error: %v", err)
-	}
-	if state != "terminated" {
-		t.Fatalf("state is %q, want terminated", state)
-	}
-}
-
-func TestPreflightPassesWhenGatewayAnswers(t *testing.T) {
-	fake := newFakeOpen(t)
-	if err := newOpenBackend(t, fake).Preflight(context.Background()); err != nil {
-		t.Fatalf("preflight must pass against a live gateway: %v", err)
-	}
-}
-
-func TestPreflightFailsWhenGatewayIsAbsent(t *testing.T) {
-	b, _ := New(Config{
-		Gateway:        "http://127.0.0.1:1",
-		RequestTimeout: time.Second,
-	})
-	if err := b.Preflight(context.Background()); err == nil {
-		t.Fatal("preflight must refuse an unreachable gateway")
-	}
+	return b
 }

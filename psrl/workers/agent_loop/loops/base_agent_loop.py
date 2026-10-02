@@ -16,7 +16,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
 from verl.utils.tokenizer.chat_template import apply_chat_template, initialize_system_prompt
 
-from psrl.sandbox import SandboxCapacityTimeout
+from psrl.sandbox import SandboxCapacityTimeout, SandboxSessionLostError
 from psrl.utils.common.http_io_thread import get_http_io_thread
 from psrl.utils.common.http_utils import (
     RequestAbortedByGatewayError,
@@ -808,6 +808,21 @@ class AgentLoopBase(ABC):
                 self.last_error_traceback,
             )
             return None, TerminateReason.SANDBOX_CAPACITY_TIMEOUT
+        except SandboxSessionLostError as exc:
+            # The container stopped under a running command, so its work is gone. Reported
+            # separately from a rollout error because the group must be replaced but the run
+            # must not read a container or host lifecycle fault as a broken harness.
+            self._record_error(exc)
+            psrl_logger.error(
+                "Sandbox was lost mid-episode for request %s (reason=%s, exit_code=%s, finished_at=%s).\n"
+                "Underlying failure:\n%s",
+                request_ids,
+                exc.exit_reason.value,
+                exc.exit_code,
+                exc.finished_at or "<unknown>",
+                self.last_error_traceback,
+            )
+            return None, TerminateReason.CONTAINER_LOST
         except asyncio.TimeoutError as exc:
             # A call inside the episode timed out, which is an infrastructure fault
             # rather than the configured episode budget. Record its traceback first.

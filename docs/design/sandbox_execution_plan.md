@@ -141,8 +141,9 @@ mode a target owner.
 ### Status
 
 Steps 2.1 to 2.3 and 2.5 are wired: the trainer creates the placement service and one
-node agent per node in `gen_actor_rollout_ref.rollout.agent.node_ips`, each worker builds
-its backend over those handles, and the plane is exercised on a real cluster by
+node agent per node in `gen_actor_rollout_ref.rollout.agent.node_ips` (every alive node
+when that list is empty), each worker builds its backend over those handles, and the plane
+is exercised on a real cluster by
 `python -m tests.sandbox.smoke_ray_plane`.
 
 Two exit criteria are not met yet, so the steps that carry them stay open:

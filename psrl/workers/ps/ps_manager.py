@@ -328,19 +328,19 @@ class PSManager(RequestStatusTracker):
         else:
             return min(pending_buffers)
 
-    def maybe_delete_buffer(self, buffer_id: int, is_validate: bool = False):
-        """Maybe delete a buffer from the staleness inventory.
+    def maybe_delete_buffer(self, buffer_id: int):
+        """Maybe delete a training buffer from the staleness inventory.
 
         When RESERVE entries are cleared from a buffer, we can not delete it immediately
         because we rely on the READY buffer status to awake training workers.
 
         This method checks if the buffer can be deleted based on the current PS model version
         because the PS model version indicates which buffers have been consumed by training workers.
-        """
-        if is_validate:
-            self.val_staleness_inventory.delete_buffer(buffer_id)
-            return
 
+        Validation is not handled here. Its inventory is retired when the next round opens
+        (`create_buffer_with_capacity`), because a published validation batch leaves
+        stragglers still generating and still calling back about their own entries.
+        """
         ready_for_delete_buffer_ids = self.staleness_inventory.get_ready_for_delete_buffer_ids()
         if buffer_id in ready_for_delete_buffer_ids:
             for bid in sorted(list(ready_for_delete_buffer_ids)):

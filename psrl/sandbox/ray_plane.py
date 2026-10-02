@@ -147,7 +147,10 @@ class SandboxNodeActor:
     async def report_node(self) -> None:
         """Re-announce this node to placement, or refresh it when placement still knows it."""
         if await self.placement.has_node.remote(self.node_id):
-            await self.placement.heartbeat.remote(self.node_id)
+            # The heartbeat carries headroom, because that is the input placement cannot
+            # observe for itself: every grant this node makes shrinks it, and a stale
+            # remainder is what let one node be chosen for a whole batch it could not hold.
+            await self.placement.heartbeat.remote(self.node_id, headroom=await self.agent.capacity_headroom())
             return
         await self.register()
 
@@ -521,7 +524,7 @@ def build_sandbox_plane(
     reservation_ttl_s: float = 60.0,
     sweep_interval_s: float = 10.0,
     heartbeat_interval_s: float = 30.0,
-    max_concurrency_per_node: int = 8,
+    max_concurrency_per_node: int,
     owner_id: str | None = None,
     labels: Sequence[str] = (),
 ) -> SandboxPlane:
@@ -530,7 +533,15 @@ def build_sandbox_plane(
     A node agent is pinned with hard affinity, because a manager admitted against one node's
     envelope must run on that node. It takes no CPU, because it must not perturb GPU
     scheduling and it is idle except while a request is in flight.
+
+    `max_concurrency_per_node` is required rather than defaulted, because the agent is the
+    only way into a node once a plane is on and no constant here can know how much work a
+    deployment will aim at one node. A default was worse than an omission: at eight, a run
+    that sent a hundred-odd sandboxes to a node served them eight at a time, and because an
+    actor's own queue is not a timeout, the run neither failed nor progressed.
     """
+    if max_concurrency_per_node < 1:
+        raise ValueError("A sandbox plane needs max_concurrency_per_node of at least one.")
     if not node_ids:
         raise ValueError("A sandbox plane needs at least one node.")
     # The placement service holds a cache and rebuilds from the nodes, so losing it is

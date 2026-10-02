@@ -11,6 +11,7 @@ from psrl.sandbox.core import ResumeLevel, SandboxFeature
 from psrl.sandbox.placement import (
     NodeCapabilities,
     NoPlacementCandidate,
+    PlacementCapacityExhausted,
     PlacementRequest,
     PlacementService,
     fleet_capabilities,
@@ -493,3 +494,289 @@ def test_a_fleet_with_no_nodes_declares_nothing() -> None:
 
     assert capabilities.features == frozenset()
     assert capabilities.resume_level is None
+
+
+def _sized(node_id: str, *, free_mb: int, total_mb: int = 1408 * 1024, **overrides) -> NodeCapabilities:
+    """A node that reports an envelope, which is what makes it filterable on capacity."""
+    return _node(
+        node_id,
+        available_memory_mb=free_mb,
+        available_cpu_millis=free_mb // 8,
+        envelope_memory_mb=total_mb,
+        envelope_cpu_millis=total_mb // 8,
+        **overrides,
+    )
+
+
+class TestCapacityIsAConstraintNotAPreference:
+    """Placement must not send a sandbox where it cannot fit.
+
+    Selection used to be capability, then image locality, then reservation count, and
+    nothing in it asked whether the chosen node had room. A batch of same-image requests
+    therefore all went to the one node holding that image, were all reserved there, and
+    then queued at the node's own admission for an episode's length — with no error, since
+    every layer believed it had done its job.
+    """
+
+    def test_a_node_without_room_is_not_a_candidate(self) -> None:
+        service = _service()
+        service.register(_sized("full", free_mb=8 * 1024), now=1000.0)
+        service.register(_sized("roomy", free_mb=512 * 1024), now=1000.0)
+
+        decision = service.choose(
+            PlacementRequest(backend="docker", memory_mb=16 * 1024, cpu_millis=2000),
+            now=1000.0,
+        )
+
+        assert decision.node_id == "roomy"
+
+    def test_a_full_fleet_is_a_wait_not_a_dead_end(self) -> None:
+        """The two failures need different recourse, so they are different exceptions."""
+        service = _service()
+        service.register(_sized("full", free_mb=1024), now=1000.0)
+
+        with pytest.raises(PlacementCapacityExhausted, match="full"):
+            service.choose(
+                PlacementRequest(backend="docker", memory_mb=16 * 1024, cpu_millis=2000),
+                now=1000.0,
+            )
+        # Not the other one: that says the fleet can never run this, which is untrue here
+        # and would have the caller fail a rollout that only needed to wait.
+        assert service.snapshot(now=1000.0).capacity_exhausted == 1
+        assert service.snapshot(now=1000.0).no_candidate == 0
+
+    def test_an_impossible_request_is_still_a_dead_end(self) -> None:
+        service = _service()
+        service.register(_sized("roomy", free_mb=512 * 1024), now=1000.0)
+
+        with pytest.raises(NoPlacementCandidate):
+            service.choose(
+                PlacementRequest(backend="docker", gpu_count=8, memory_mb=1024, cpu_millis=1000),
+                now=1000.0,
+            )
+
+    def test_a_node_that_declares_no_envelope_is_never_filtered_out(self) -> None:
+        """A provider backend schedules its own capacity, so this service cannot judge it."""
+        service = _service()
+        service.register(_node("provider"), now=1000.0)
+
+        decision = service.choose(
+            PlacementRequest(backend="docker", memory_mb=1024 * 1024, cpu_millis=99000),
+            now=1000.0,
+        )
+
+        assert decision.node_id == "provider"
+
+    def test_a_request_with_no_declared_size_is_not_filtered(self) -> None:
+        # Zero is the absence of a measurement, not a free sandbox.
+        service = _service()
+        service.register(_sized("full", free_mb=0), now=1000.0)
+
+        assert service.choose(PlacementRequest(backend="docker"), now=1000.0).node_id == "full"
+
+
+class TestBalanceOutranksLocality:
+    """An image pull is an optimisation; a full node is a constraint."""
+
+    def test_a_loaded_local_node_loses_to_an_idle_remote_one(self) -> None:
+        service = _service()
+        service.register(
+            _sized("warm-but-loaded", free_mb=64 * 1024, image_digests=["sha256:task"]),
+            now=1000.0,
+        )
+        service.register(_sized("cold-but-idle", free_mb=1408 * 1024), now=1000.0)
+
+        decision = service.choose(
+            PlacementRequest(
+                backend="docker",
+                image_digests=frozenset({"sha256:task"}),
+                memory_mb=16 * 1024,
+                cpu_millis=2000,
+            ),
+            now=1000.0,
+        )
+
+        assert decision.node_id == "cold-but-idle"
+
+    def test_locality_still_decides_between_similarly_loaded_nodes(self) -> None:
+        """Otherwise balance would have demoted locality to something that never fires."""
+        service = _service()
+        service.register(_sized("cold", free_mb=1408 * 1024), now=1000.0)
+        service.register(
+            _sized("warm", free_mb=1400 * 1024, image_digests=["sha256:task"]),
+            now=1000.0,
+        )
+
+        decision = service.choose(
+            PlacementRequest(
+                backend="docker",
+                image_digests=frozenset({"sha256:task"}),
+                memory_mb=16 * 1024,
+                cpu_millis=2000,
+            ),
+            now=1000.0,
+        )
+
+        assert decision.node_id == "warm"
+
+
+class TestReservationsAreChargedBeforeTheGrantLands:
+    """A promise has to cost something the moment it is made.
+
+    A node cannot report a grant until it has made one, so between `choose` and the
+    node's next report its headroom still counts that room as free. A batch of concurrent
+    callers all read that same stale figure, all pick the same node, and the node ends up
+    holding more sandboxes than its envelope admits.
+    """
+
+    def test_a_batch_spreads_across_the_fleet_without_any_report(self) -> None:
+        service = _service()
+        # Two identical nodes, each with room for exactly two of these sandboxes.
+        service.register(_sized("node-a", free_mb=32 * 1024, total_mb=32 * 1024), now=1000.0)
+        service.register(_sized("node-b", free_mb=32 * 1024, total_mb=32 * 1024), now=1000.0)
+        request = PlacementRequest(backend="docker", memory_mb=16 * 1024, cpu_millis=2000)
+
+        chosen = [service.choose(request, now=1000.0).node_id for _ in range(4)]
+
+        assert sorted(chosen) == ["node-a", "node-a", "node-b", "node-b"]
+        # And the fifth has nowhere to go, rather than being stacked onto a full node.
+        with pytest.raises(PlacementCapacityExhausted):
+            service.choose(request, now=1000.0)
+
+    def test_a_retired_reservation_gives_its_room_back(self) -> None:
+        service = _service()
+        service.register(_sized("only", free_mb=16 * 1024, total_mb=16 * 1024), now=1000.0)
+        request = PlacementRequest(backend="docker", memory_mb=16 * 1024, cpu_millis=2000)
+        decision = service.choose(request, now=1000.0)
+
+        service.cancel(decision.reservation_id)
+
+        # Released on every path a reservation can end, or headroom leaks and the node is
+        # avoided while it sits idle.
+        assert service.choose(request, now=1000.0).node_id == "only"
+
+    def test_a_fresh_report_supersedes_the_promises_it_already_includes(self) -> None:
+        service = _service()
+        service.register(_sized("only", free_mb=32 * 1024, total_mb=32 * 1024), now=1000.0)
+        request = PlacementRequest(backend="docker", memory_mb=16 * 1024, cpu_millis=2000)
+        service.choose(request, now=1000.0)
+
+        # The node now reports the grant itself, so the promise must not be counted twice.
+        service.heartbeat(
+            "only",
+            headroom={
+                "available_memory_mb": 16 * 1024,
+                "available_cpu_millis": 2000,
+                "envelope_memory_mb": 32 * 1024,
+                "envelope_cpu_millis": 4000,
+            },
+            now=1000.0,
+        )
+
+        assert service.choose(request, now=1000.0).node_id == "only"
+
+    def test_a_reregistration_keeps_promises_its_advertisement_cannot_see(self) -> None:
+        service = _service()
+        service.register(_sized("only", free_mb=32 * 1024, total_mb=32 * 1024), now=1000.0)
+        request = PlacementRequest(backend="docker", memory_mb=16 * 1024, cpu_millis=2000)
+        service.choose(request, now=1000.0)
+
+        # Re-advertised with the same headroom, because the grant has not landed yet.
+        service.register(_sized("only", free_mb=32 * 1024, total_mb=32 * 1024), now=1000.0)
+
+        # One slot left, not two: the open reservation still holds the other.
+        assert service.choose(request, now=1000.0).node_id == "only"
+        with pytest.raises(PlacementCapacityExhausted):
+            service.choose(request, now=1000.0)
+
+
+class TestHeadroomIsComparedPerClass:
+    """A class cannot borrow another's unmet guarantee, so the remainder overstates it.
+
+    The node reported `available_capacity` — the envelope's remainder — and placement
+    compared every request against it. On a 1760 GiB node that read as room for 110
+    sandboxes, while the coordinator would admit 88 at best and 39 once the grader class
+    queued. Placement sent the work, the node queued it correctly, and the difference
+    surfaced only as sandboxes that never started.
+    """
+
+    @staticmethod
+    def _classed(node_id: str, *, rollout_mb: int, envelope_mb: int) -> NodeCapabilities:
+        return _node(
+            node_id,
+            available_memory_mb=envelope_mb,
+            available_cpu_millis=envelope_mb // 8,
+            envelope_memory_mb=envelope_mb,
+            envelope_cpu_millis=envelope_mb // 8,
+            class_headroom={
+                "rollout": {"memory_mb": rollout_mb, "cpu_millis": rollout_mb // 8},
+                "grader": {"memory_mb": 0, "cpu_millis": 0},
+            },
+        )
+
+    def test_a_request_is_held_to_its_own_class_not_the_envelope(self) -> None:
+        service = _service()
+        # The envelope has room for four of these, but rollout's own share has room for one.
+        service.register(self._classed("only", rollout_mb=16 * 1024, envelope_mb=64 * 1024), now=1000.0)
+        request = PlacementRequest(backend="docker", memory_mb=16 * 1024, cpu_millis=2000, resource_class="rollout")
+
+        assert service.choose(request, now=1000.0).node_id == "only"
+        # The second would fit the envelope and not the class, which is what admission
+        # would have decided, so placement must decide the same way.
+        with pytest.raises(PlacementCapacityExhausted, match="rollout"):
+            service.choose(request, now=1000.0)
+
+    def test_a_class_with_no_headroom_reported_falls_back_to_the_envelope(self) -> None:
+        """A node that says nothing class-specific is bounded only by its remainder."""
+        service = _service()
+        service.register(self._classed("only", rollout_mb=16 * 1024, envelope_mb=64 * 1024), now=1000.0)
+
+        # `default` is absent from this node's class_headroom, so the remainder applies.
+        request = PlacementRequest(backend="docker", memory_mb=48 * 1024, cpu_millis=2000)
+
+        assert service.choose(request, now=1000.0).node_id == "only"
+
+    def test_a_starved_class_is_refused_even_on_an_empty_node(self) -> None:
+        """Grader's share is fully reserved here, so no grader sandbox fits."""
+        service = _service()
+        service.register(self._classed("idle", rollout_mb=64 * 1024, envelope_mb=64 * 1024), now=1000.0)
+
+        with pytest.raises(PlacementCapacityExhausted, match="grader"):
+            service.choose(
+                PlacementRequest(backend="docker", memory_mb=1024, cpu_millis=1000, resource_class="grader"),
+                now=1000.0,
+            )
+
+    def test_balance_is_measured_within_the_requesting_class(self) -> None:
+        service = _service()
+        # Same envelope, but node-b's rollout share is nearly spent.
+        service.register(self._classed("node-a", rollout_mb=64 * 1024, envelope_mb=64 * 1024), now=1000.0)
+        service.register(self._classed("node-b", rollout_mb=16 * 1024, envelope_mb=64 * 1024), now=1000.0)
+
+        decision = service.choose(
+            PlacementRequest(backend="docker", memory_mb=16 * 1024, cpu_millis=2000, resource_class="rollout"),
+            now=1000.0,
+        )
+
+        assert decision.node_id == "node-a"
+
+    def test_a_heartbeat_refreshes_the_per_class_view(self) -> None:
+        service = _service()
+        service.register(self._classed("only", rollout_mb=16 * 1024, envelope_mb=64 * 1024), now=1000.0)
+        request = PlacementRequest(backend="docker", memory_mb=16 * 1024, cpu_millis=2000, resource_class="rollout")
+        service.choose(request, now=1000.0)
+
+        # The grader drained, so rollout may now borrow more than its guarantee.
+        service.heartbeat(
+            "only",
+            headroom={
+                "available_memory_mb": 64 * 1024,
+                "available_cpu_millis": 8000,
+                "envelope_memory_mb": 64 * 1024,
+                "envelope_cpu_millis": 8000,
+                "class_headroom": {"rollout": {"memory_mb": 48 * 1024, "cpu_millis": 6000}},
+            },
+            now=1000.0,
+        )
+
+        assert service.choose(request, now=1000.0).node_id == "only"

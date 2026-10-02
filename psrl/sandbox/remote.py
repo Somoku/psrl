@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -44,6 +45,33 @@ psrl_logger = logging.getLogger(__file__)
 # Renewal cadence fallback, used only when the placement TTL cannot be read. Placement's own
 # default is a minute, and renewing every third of it is the stated cadence.
 _FALLBACK_RESERVATION_TTL_S = 60.0
+
+# How long to wait before asking placement again once every capable node is full. Short
+# enough that a released sandbox is picked up promptly, long enough not to spin: the thing
+# being waited for is an episode ending, which is minutes, not milliseconds.
+_PLACEMENT_RETRY_INTERVAL_S = 5.0
+
+
+def _placement_footprint(spec: SandboxSpec | None) -> dict[str, Any]:
+    """Return what a spec will cost the node that takes it, and which class pays for it.
+
+    Zero when the spec declares no resources, which placement reads as "do not filter on
+    capacity" rather than as a free sandbox: a request whose size is unknown cannot be
+    compared against a remainder, and refusing it would be a guess in the other direction.
+
+    The class travels with the size because headroom is per class: a node's remainder
+    includes room reserved for other classes' guarantees, so comparing a rollout against
+    it overstates what the node will admit by the whole of the grader's share.
+    """
+    resources = spec.resources if spec is not None else None
+    resource_class = spec.resource_class if spec is not None else "default"
+    if resources is None:
+        return {"memory_mb": 0, "cpu_millis": 0, "resource_class": resource_class}
+    return {
+        "memory_mb": int(resources.memory_mb or 0),
+        "cpu_millis": int(math.ceil((resources.cpu_count or 0) * 1000)),
+        "resource_class": resource_class,
+    }
 
 
 class RemoteNodeError(RuntimeError):
@@ -232,7 +260,10 @@ class InProcessTransport:
         the agent runs, and each transport installs its own as the agent's liveness reporter.
         """
         if self.placement.has_node(node_id):
-            self.placement.heartbeat(node_id)
+            # The heartbeat carries headroom, because that is the input placement cannot
+            # observe for itself: every grant the node makes shrinks it, and a stale
+            # remainder is what let one node be chosen for a whole batch it could not hold.
+            self.placement.heartbeat(node_id, headroom=await self.agents[node_id].capacity_headroom())
             return
         await self.register_node(node_id)
 
@@ -337,16 +368,48 @@ class NodeAgentTimeout(TimeoutError):
 
 
 class BoundedTransport:
-    """Apply a per-call deadline to every call to a node agent or the placement service.
+    """Bound the coordination calls to a node agent, and let the work calls keep their own.
 
-    A remote call has no default deadline, so a wedged agent or a partitioned node blocks
-    its caller for the rest of the run. The failure is worse than it looks: the reservation
-    renewer makes its own calls, so one call that never returns stops every renewal and
-    placement then frees the reservations of a worker that is still running sandboxes.
+    A coordination call is one round trip that asks a question or moves a reservation, so a
+    healthy one answers in milliseconds and one that has not answered in a minute is a
+    fault: a wedged agent or a partitioned node. It needs a deadline here, because it has
+    none of its own and the reservation renewer runs on these calls — one that never returns
+    stops every renewal, and placement then frees the reservations of a worker that is still
+    running sandboxes.
 
-    It wraps the transport rather than living inside one, so the deadline is one policy
-    applied to every transport and a fake can exercise it without a cluster.
+    A work call wraps something whose duration is the work itself: a harness CLI that may run
+    for the whole episode, a node admission that may queue behind other tenants, a file whose
+    transfer scales with its size. Those arrive already bounded by the caller that knows what
+    it asked for — `exec` carries `timeout_s`, `acquire` is held to the manager's admission
+    deadline, and the file calls are bounded against a stalled socket by the backend's own
+    read timeout. Imposing this deadline on them as well would override a budget set by the
+    only party that knows the work with one that knows nothing about it, and at
+    `rpc_timeout_s=60` against a 7260s harness budget that is a 121x truncation of healthy
+    work reported as a node fault.
+
+    So the split is by what the call measures, not by which transport carries it. It wraps
+    the transport rather than living inside one, so the policy has one definition and a fake
+    can exercise it without a cluster.
     """
+
+    # Calls whose duration is the work they wrap, so the caller's own budget is the only
+    # deadline that can be right. Listed explicitly, because a new protocol method must be
+    # classified deliberately rather than silently inherit a coordination deadline.
+    WORK_CALLS = frozenset(
+        {
+            "acquire",
+            "acquire_group",
+            "checkpoint",
+            "exec",
+            "pause",
+            "prefetch",
+            "read_bytes",
+            "release",
+            "restore",
+            "resume",
+            "write_bytes",
+        }
+    )
 
     def __init__(self, transport: NodeAgentTransport, *, timeout_s: float = 60.0) -> None:
         if timeout_s <= 0:
@@ -359,6 +422,10 @@ class BoundedTransport:
             return await asyncio.wait_for(call(), timeout=self.timeout_s)
         except asyncio.TimeoutError as exc:
             raise NodeAgentTimeout(f"Sandbox node call {name!r} did not answer within {self.timeout_s:g}s.") from exc
+
+    async def _unbounded(self, call) -> Any:
+        """Forward a work call, leaving its deadline to the budget it already carries."""
+        return await call()
 
     async def choose(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         return await self._bounded("choose", lambda: self.transport.choose(request))
@@ -379,9 +446,8 @@ class BoundedTransport:
         return await self._bounded("candidate_nodes", lambda: self.transport.candidate_nodes(request, limit=limit))
 
     async def prefetch(self, node_id: str, references: Sequence[str], *, concurrency: int) -> int:
-        return await self._bounded(
-            "prefetch", lambda: self.transport.prefetch(node_id, references, concurrency=concurrency)
-        )
+        # Warming pulls images, so its duration is the registry and the working set.
+        return await self._unbounded(lambda: self.transport.prefetch(node_id, references, concurrency=concurrency))
 
     async def release_reservation(self, reservation_id: str) -> None:
         await self._bounded("release_reservation", lambda: self.transport.release_reservation(reservation_id))
@@ -393,7 +459,9 @@ class BoundedTransport:
         *,
         callback: str | None = None,
     ) -> Mapping[str, Any]:
-        return await self._bounded("acquire", lambda: self.transport.acquire(node_id, spec, callback=callback))
+        # Bounded by the manager's admission deadline, which may legitimately queue for
+        # far longer than a coordination round trip.
+        return await self._unbounded(lambda: self.transport.acquire(node_id, spec, callback=callback))
 
     async def acquire_group(
         self,
@@ -402,9 +470,7 @@ class BoundedTransport:
         *,
         callback: str | None = None,
     ) -> list[Mapping[str, Any]]:
-        return await self._bounded(
-            "acquire_group", lambda: self.transport.acquire_group(node_id, specs, callback=callback)
-        )
+        return await self._unbounded(lambda: self.transport.acquire_group(node_id, specs, callback=callback))
 
     async def connect(self, node_id: str, backend: str, sandbox_id: str) -> Mapping[str, Any]:
         return await self._bounded("connect", lambda: self.transport.connect(node_id, backend, sandbox_id))
@@ -421,8 +487,9 @@ class BoundedTransport:
         timeout_s: float | None,
         silence_timeout_s: float | None,
     ) -> Mapping[str, Any]:
-        return await self._bounded(
-            "exec",
+        # `timeout_s` is the command's own budget and it is enforced on the node, so the
+        # deadline travels with the call instead of being imposed on top of it.
+        return await self._unbounded(
             lambda: self.transport.exec(
                 node_id,
                 backend,
@@ -436,12 +503,12 @@ class BoundedTransport:
         )
 
     async def read_bytes(self, node_id: str, backend: str, sandbox_id: str, path: str) -> bytes:
-        return await self._bounded("read_bytes", lambda: self.transport.read_bytes(node_id, backend, sandbox_id, path))
+        # Transfer time scales with the file, which a fixed deadline cannot know. The
+        # backend's socket read timeout is what catches a transfer that has actually stalled.
+        return await self._unbounded(lambda: self.transport.read_bytes(node_id, backend, sandbox_id, path))
 
     async def write_bytes(self, node_id: str, backend: str, sandbox_id: str, path: str, data: bytes) -> None:
-        await self._bounded(
-            "write_bytes", lambda: self.transport.write_bytes(node_id, backend, sandbox_id, path, data)
-        )
+        await self._unbounded(lambda: self.transport.write_bytes(node_id, backend, sandbox_id, path, data))
 
     async def status(self, node_id: str, backend: str, sandbox_id: str) -> str:
         return await self._bounded("status", lambda: self.transport.status(node_id, backend, sandbox_id))
@@ -455,10 +522,12 @@ class BoundedTransport:
         return await self._bounded("diagnostics", lambda: self.transport.diagnostics(node_id, backend, sandbox_id))
 
     async def pause(self, node_id: str, backend: str, sandbox_id: str, mode: str) -> None:
-        await self._bounded("pause", lambda: self.transport.pause(node_id, backend, sandbox_id, mode))
+        # Freezing a sandbox stops every process in its cgroup, and a checkpointing pause
+        # writes its memory out, so the duration is the sandbox rather than a round trip.
+        await self._unbounded(lambda: self.transport.pause(node_id, backend, sandbox_id, mode))
 
     async def resume(self, node_id: str, backend: str, sandbox_id: str) -> None:
-        await self._bounded("resume", lambda: self.transport.resume(node_id, backend, sandbox_id))
+        await self._unbounded(lambda: self.transport.resume(node_id, backend, sandbox_id))
 
     async def checkpoint(
         self,
@@ -468,9 +537,9 @@ class BoundedTransport:
         kind: str,
         policy: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        return await self._bounded(
-            "checkpoint", lambda: self.transport.checkpoint(node_id, backend, sandbox_id, kind, policy)
-        )
+        # A snapshot commits a filesystem and may publish it to a registry, so its duration
+        # is the image, not a round trip.
+        return await self._unbounded(lambda: self.transport.checkpoint(node_id, backend, sandbox_id, kind, policy))
 
     async def restore(
         self,
@@ -480,12 +549,17 @@ class BoundedTransport:
         *,
         callback: str | None = None,
     ) -> Mapping[str, Any]:
-        return await self._bounded(
-            "restore", lambda: self.transport.restore(node_id, snapshot, spec, callback=callback)
-        )
+        # Restoring pulls a snapshot and provisions from it, so it is admission plus an
+        # image pull rather than a round trip.
+        return await self._unbounded(lambda: self.transport.restore(node_id, snapshot, spec, callback=callback))
 
     async def release(self, node_id: str, backend: str, sandbox_id: str) -> None:
-        await self._bounded("release", lambda: self.transport.release(node_id, backend, sandbox_id))
+        # Releasing destroys the container: it stops the processes, unmounts the overlay and
+        # returns the capacity. Bounding that at a round trip's deadline abandoned the call
+        # while the node was still tearing down, so the container survived the release that
+        # had already been reported as done — a leak the next run inherits as a node that
+        # cannot admit anything.
+        await self._unbounded(lambda: self.transport.release(node_id, backend, sandbox_id))
 
 
 class RemoteSandboxSession:
@@ -845,11 +919,38 @@ class RemoteSandboxBackend(SandboxBackend):
         self._settle_reservation(reservation_id)
         await asyncio.gather(self.transport.cancel_reservation(reservation_id), return_exceptions=True)
 
+    async def _choose_when_room(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Ask placement for a node, waiting while the fleet has no room.
+
+        A full fleet is a state that clears itself: every running sandbox ends, and its
+        node reports the room back. So the only correct response to it is to wait, and the
+        caller is already bounded — the episode budget above this decides how long the
+        wait may last and reports it as a capacity fault if it runs out. Failing here
+        instead would turn a busy cluster into a lost rollout.
+
+        A fleet that cannot satisfy the request at all is different and is not retried: no
+        amount of waiting adds a capability a node never advertised.
+        """
+        # Imported here rather than at module scope, matching the other placement types
+        # this module needs: the placement service is optional to a deployment that runs
+        # no plane, and a top-level import would make it mandatory.
+        from psrl.sandbox.placement import PlacementCapacityExhausted
+
+        while True:
+            try:
+                return await self.transport.choose(request)
+            except PlacementCapacityExhausted as exhausted:
+                psrl_logger.info(
+                    "Every capable sandbox node is full, so this request is waiting for one to free up: %s",
+                    exhausted,
+                )
+                await asyncio.sleep(_PLACEMENT_RETRY_INTERVAL_S)
+
     async def create(self, spec: SandboxSpec) -> SandboxSession:
         """
         Pick a node, provision there, and hand back a session that speaks locally.
         """
-        decision = await self.transport.choose(self._placement_request(spec))
+        decision = await self._choose_when_room(self._placement_request(spec))
         reservation_id = str(decision["reservation_id"])
         node_id = str(decision["node_id"])
         self._claim_reservation(reservation_id)
@@ -875,7 +976,7 @@ class RemoteSandboxBackend(SandboxBackend):
         members = list(specs)
         if not members:
             raise ValueError("A remote sandbox group requires at least one member spec.")
-        decision = await self.transport.choose(self._placement_request(members[0]))
+        decision = await self._choose_when_room(self._placement_request(members[0]))
         reservation_id = str(decision["reservation_id"])
         node_id = str(decision["node_id"])
         self._claim_reservation(reservation_id)
@@ -915,7 +1016,7 @@ class RemoteSandboxBackend(SandboxBackend):
         Restore a snapshot on whichever node placement picks.
         """
         request = self._placement_request(spec, snapshot=snapshot)
-        decision = await self.transport.choose(request)
+        decision = await self._choose_when_room(request)
         reservation_id = str(decision["reservation_id"])
         node_id = str(decision["node_id"])
         self._claim_reservation(reservation_id)
@@ -985,6 +1086,11 @@ class RemoteSandboxBackend(SandboxBackend):
             "image_references": sorted(references),
             "image_digests": sorted(digests),
             "owner_id": self.owner_id,
+            # The footprint travels with the request, because placement cannot decide
+            # whether a sandbox fits without knowing how big it is. Sent as the same two
+            # numbers the node's envelope is denominated in, so no conversion is needed at
+            # the far end to compare them.
+            **_placement_footprint(spec),
         }
 
     def snapshot(self) -> dict[str, float]:

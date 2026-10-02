@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import shlex
 from abc import ABC, abstractmethod
@@ -17,6 +18,14 @@ from omegaconf import DictConfig, OmegaConf
 
 from psrl.sandbox import ExecResult, SandboxSession
 from psrl.workers.agent_loop.harness.runtime import executable_path
+
+psrl_logger = logging.getLogger(__file__)
+
+# Deadline for reading a diagnostic log tail out of the sandbox. Bounded well below the
+# episode budget because it runs after the harness has already exited: a container that
+# cannot answer within this window is not going to, and the caller absorbs the failure
+# rather than spending the rest of the episode's wall clock waiting for it.
+_DIAGNOSTIC_READ_TIMEOUT_S = 60.0
 
 # Trajectory output formats the post-rollout integrity scanner can dispatch on.
 # `auto` resolves to the kind default below, but the scan dispatch key is always a concrete format.
@@ -144,6 +153,17 @@ class HarnessConfig:
             else HarnessCompactionConfig(**dict(compaction or {}))
         )
         return cls(**normalized)
+
+
+class HarnessExecBudgetExpired(TimeoutError):
+    """The harness CLI itself overran ``HarnessConfig.time_budget_s``.
+
+    Raised only for the exec that runs the harness command, so a caller can tell the
+    episode's own backstop firing apart from an infrastructure timeout on some other call
+    inside the episode. Both surface as `TimeoutError`, and treating the second as the
+    first reports a completed episode as budget exhaustion, suppresses the retry an
+    infrastructure fault needs, and counts it against the run's failure streak.
+    """
 
 
 @dataclass(frozen=True)
@@ -289,6 +309,13 @@ class Harness(ABC):
         self._active_exec = task
         try:
             result = await task
+        except TimeoutError as expired:
+            # Mark the one timeout that really is the harness exec budget, so the caller
+            # does not have to infer it from an undistinguished TimeoutError raised by any
+            # other awaited call in this method.
+            raise HarnessExecBudgetExpired(
+                f"Harness {self.config.kind!r} exec exceeded its {self.config.time_budget_s:.0f}s budget."
+            ) from expired
         finally:
             if self._active_exec is task:
                 self._active_exec = None
@@ -330,8 +357,21 @@ class Harness(ABC):
             await task
 
     async def _read_tail(self, path: str) -> str:
-        result = await self.sandbox.exec(
-            f"tail -c {self.config.output_tail_chars} {shlex.quote(path)}",
-            timeout_s=30,
-        )
+        """Return a bounded tail of one log file, or an empty string if it cannot be read.
+
+        This is diagnostics, so every failure is absorbed. A sandbox whose container has
+        stopped or whose runtime has stalled raises here, and both `SandboxCommandTimeout`
+        and `SandboxSessionLostError` would otherwise propagate out of a harness run that
+        had already finished its work — turning a complete episode into a reported budget
+        expiry or a lost container. Losing the tail costs a post mortem; losing the
+        trajectory costs the episode.
+        """
+        try:
+            result = await self.sandbox.exec(
+                f"tail -c {self.config.output_tail_chars} {shlex.quote(path)}",
+                timeout_s=_DIAGNOSTIC_READ_TIMEOUT_S,
+            )
+        except Exception:
+            psrl_logger.warning(f"Could not read harness log tail {path!r}.", exc_info=True)
+            return ""
         return result.stdout if result.exit_code == 0 else ""

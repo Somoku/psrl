@@ -132,6 +132,7 @@ class DockerBackend(SandboxBackend):
         policy_profiles: Mapping[str, DockerPolicyProfile | Mapping[str, Any]] | None = None,
         security: DockerSecurityConfig | Mapping[str, Any] | None = None,
         keepalive_command: Sequence[str] = ("tail", "-f", "/dev/null"),
+        command_prefix: Sequence[str] = ("setsid", "-w"),
         command_interpreter: Sequence[str] = ("bash", "-lc"),
         request_timeout_s: float = 180.0,
         container_watch_interval_s: float = 15.0,
@@ -147,12 +148,16 @@ class DockerBackend(SandboxBackend):
         snapshot_store: SnapshotStoreConfig | Mapping[str, Any] | None = None,
         snapshot_local_cache_fraction: float = 0.3,
         warm_pool: WarmPoolConfig | Mapping[str, Any] | None = None,
+        owner_id: str | None = None,
         owner_id_env: str = "PSRL_ACTOR_ID",
         lifecycle: DockerLifecycleConfig | Mapping[str, Any] | None = None,
         disk_admission: DockerDiskAdmissionConfig | Mapping[str, Any] | None = None,
         cgroup_parent: str | None = None,
         isolation_runtime: str | None = None,
-        default_exec_mode: ExecMode = ExecMode.PERSISTENT,
+        # Only covers a spec that declares no mode of its own. One-shot is the safe
+        # default: it keeps no state between commands, so landing on it by omission
+        # costs an optimization rather than correctness.
+        default_exec_mode: ExecMode = ExecMode.ONE_SHOT,
         shell_factory: Callable[[str], ShellProcess] | None = None,
         engine: DockerEngine | None = None,
         cli_force_remove: Callable[[Sequence[str]], Sequence[str]] | None = None,
@@ -166,6 +171,9 @@ class DockerBackend(SandboxBackend):
             security if isinstance(security, DockerSecurityConfig) else DockerSecurityConfig(**dict(security or {}))
         )
         self.keepalive_command = tuple(keepalive_command)
+        # Probed against each image before the first one-shot command, because it needs
+        # util-linux's `setsid -w`. Set it to () to run commands with no session isolation.
+        self.command_prefix = tuple(command_prefix)
         self.command_interpreter = tuple(command_interpreter)
         # Retained so a session can describe its own truncation without reaching into the
         # engine client, which test doubles and other engines do not have to expose.
@@ -187,7 +195,14 @@ class DockerBackend(SandboxBackend):
         self.container_watch_interval_s = container_watch_interval_s
         if not self.keepalive_command or not self.command_interpreter:
             raise ValueError("Docker keepalive_command and command_interpreter cannot be empty.")
-        self.owner_id = os.getenv(owner_id_env, "")
+        # An owner id is what attributes a container to whoever created it: it becomes the
+        # `psrl.actor_id` label, the lease this backend heartbeats, and the filter its
+        # teardown and the node reclaimer both select by. The environment variable carries
+        # it for an agent loop worker, which sets it before building its own backend. A
+        # process that is not one — a sandbox node actor placing containers for others —
+        # has to be given it, because it shares no environment with a worker, and a backend
+        # with no owner labels nothing, sweeps nothing, and removes nothing at exit.
+        self.owner_id = owner_id or os.getenv(owner_id_env, "")
         self.lifecycle = DockerLifecycle(
             self.owner_id,
             DockerLifecycleConfig.from_value(lifecycle, docker_host=docker_host),
@@ -243,6 +258,24 @@ class DockerBackend(SandboxBackend):
         self._close_event: asyncio.Event | None = None
         self._sessions: dict[str, DockerSession] = {}
         self._creates: set[asyncio.Task] = set()
+
+    def adopt_owner_id(self, owner_id: str) -> None:
+        """Claim this backend's containers for `owner_id`, unless it already has an owner.
+
+        A backend declared in YAML is constructed before anyone knows who will own it, so
+        the owner arrives afterwards. It has to reach the lifecycle as well as the label,
+        because those are the two halves of one identity: the label says who a container
+        belongs to and the lifecycle holds the lease that says that owner is still alive.
+        Setting only one of them is worse than setting neither — a labelled container whose
+        owner never heartbeats is reclaimed while it is in use.
+
+        Ignoring a backend that already has an owner keeps the explicit argument and the
+        environment variable authoritative over this late assignment.
+        """
+        if not owner_id or self.owner_id:
+            return
+        self.owner_id = owner_id
+        self.lifecycle.owner_id = owner_id
 
     async def prepare(self, spec: SandboxSpec) -> None:
         """Warm an image, and a pooled container when the deployment keeps a pool.
@@ -879,26 +912,70 @@ class DockerBackend(SandboxBackend):
             ) from exc
 
     def _exec_strategy(self, container_id: str, spec: SandboxSpec | None) -> ExecStrategy:
-        """
-        Build the exec strategy a spec asked for.
+        """Build the exec strategy a spec asked for.
 
-        A harness that keeps shell state across turns needs the persistent shell.
-        A grader that runs one command is cheaper without one, and pays no shell
-        process for the life of the sandbox.
+        An interactive shell agent needs the persistent shell, because its actions are
+        single commands whose `cd`, `source`, and exported variables have to survive into
+        the next one. A workload whose commands are self-contained scripts is cheaper
+        without one, and pays no shell process for the life of the sandbox.
+
+        Which of those a workload is, is a property of the workload rather than of the
+        node, so a spec is expected to declare it. `default_exec_mode` only covers a spec
+        that does not, and it defaults to the one-shot mode: it carries no state between
+        commands, so a workload that silently lands on it loses an optimization rather
+        than a correctness guarantee. Defaulting the other way is not symmetric — a
+        persistent shell reads its commands from stdin, so a long-lived child that reads
+        stdin inherits that pipe and eats the command stream.
         """
         mode = (spec.exec_mode if spec is not None else None) or self.default_exec_mode
         if mode is ExecMode.ONE_SHOT:
+            # The persistent shell isolates commands through its own process group, which
+            # `_signal_shell_group` already relies on. A one-shot exec has no such group, so
+            # it is the mode that needs the session prefix.
             return OneShotExec(
                 self.engine,
                 container_id,
                 self.command_interpreter,
                 max_observation_chars=self.max_observation_chars,
+                resolve_command_prefix=lambda: self._resolve_command_prefix(container_id),
             )
         return PersistentShellExec(
             lambda: self._shell_factory(container_id),
             max_observation_chars=self.max_observation_chars,
             kill_group=lambda pid: self._signal_shell_group(container_id, pid),
+            startup_timeout_s=self.startup_timeout_s,
         )
+
+    async def _resolve_command_prefix(self, container_id: str) -> tuple[str, ...]:
+        """Return the process-isolation prefix this container's image actually supports.
+
+        The prefix needs util-linux's ``setsid -w``. BusyBox ships a ``setsid`` without
+        ``-w``, which would return before the command finished and lose its exit status, so
+        the capability is probed rather than assumed.
+
+        Best effort by design: this is defence in depth, not a correctness requirement. A
+        probe that cannot complete must not fail an otherwise working sandbox, and the first
+        real command would report the underlying fault anyway.
+        """
+        prefix = self.command_prefix
+        if not prefix:
+            return ()
+        try:
+            exit_code, _, stderr, _ = await self.engine.exec(container_id, [*prefix, "true"], timeout_s=30)
+        except Exception as exc:
+            psrl_logger.warning(
+                f"Could not probe the command isolation prefix {list(prefix)!r} for Docker container "
+                f"{container_id}: {exc!r}. Running commands without it."
+            )
+            return ()
+        if exit_code == 0:
+            return prefix
+        psrl_logger.warning(
+            f"The image for Docker container {container_id} does not support the command isolation prefix "
+            f"{' '.join(prefix)!r} (exit {exit_code}): "
+            f"{stderr.decode(errors='replace').strip()[-200:]}. Running commands without it."
+        )
+        return ()
 
     async def _signal_shell_group(self, container_id: str, pid: int) -> bool:
         """Stop a command the persistent shell started, keeping the container alive.
@@ -942,7 +1019,7 @@ class DockerBackend(SandboxBackend):
             session = self._track_session(adopted, spec, policy)
             try:
                 await self._enforce_egress(adopted, egress)
-                await self._await_ready(session, spec)
+                await self._await_ready(session)
             except BaseException as error:
                 # An unusable claimed entry must not be handed out, and one that cannot be
                 # destroyed must still report cleanup: a bare raise would leak the slot.
@@ -957,7 +1034,7 @@ class DockerBackend(SandboxBackend):
         session = self._track_session(container_id, spec, policy)
         try:
             await self._enforce_egress(container_id, egress)
-            await self._await_ready(session, spec)
+            await self._await_ready(session)
         except BaseException as error:
             # An unusable or uncontained sandbox must not be handed out, since the caller
             # cannot tell it from a working one. The cleanup failure rides in the error.
@@ -968,7 +1045,7 @@ class DockerBackend(SandboxBackend):
             raise
         return session
 
-    async def _await_ready(self, session: DockerSession, spec: SandboxSpec) -> None:
+    async def _await_ready(self, session: DockerSession) -> None:
         """
         Confirm the sandbox answers before it is handed to a caller.
 
@@ -1184,6 +1261,12 @@ class DockerBackend(SandboxBackend):
             return await self._create_and_start(name, config)
 
     async def connect(self, sandbox_id: str) -> SandboxSession:
+        """Adopt a container this backend did not create, and prove it answers.
+
+        A reconnected session is handed to a caller that cannot tell it from a created
+        one, so it owes the same readiness guarantee: running is not the same as able to
+        run a command, and a persistent shell adopted here has never been started.
+        """
         if self._closed:
             raise RuntimeError("Docker backend is closed.")
         session = self._track_session(sandbox_id)
@@ -1192,6 +1275,7 @@ class DockerBackend(SandboxBackend):
             await session.resume()
         elif status != SandboxStatus.RUNNING:
             raise RuntimeError(f"Docker sandbox {sandbox_id!r} is not running (status={status.value}).")
+        await self._await_ready(session)
         return session
 
     async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> SandboxSession:

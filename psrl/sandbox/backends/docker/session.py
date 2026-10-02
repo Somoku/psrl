@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import traceback
 import uuid
 from collections.abc import Mapping
 from dataclasses import replace
@@ -28,6 +29,7 @@ from psrl.sandbox.core import (
     SandboxOomError,
     SandboxRef,
     SandboxSession,
+    SandboxSessionLostError,
     SandboxSpec,
     SandboxStatus,
     SandboxTransportError,
@@ -98,6 +100,13 @@ class DockerSession(SandboxSession):
         self._command_count = 0
         self._terminate_lock = asyncio.Lock()
         self._terminated = False
+        # Set at the start of teardown, while `_terminated` is set only once it finished.
+        # A command must be refused from the first moment, but the lifetime reaper's retry
+        # of a failed destroy must still be let through.
+        self._closed_to_callers = False
+        # Stack of whoever started that teardown, so a command refused afterwards can name
+        # the cause rather than only the symptom.
+        self._closed_by = ""
         self._exec_lock = asyncio.Lock()
         self._exec_strategy = exec_strategy or OneShotExec(
             backend.engine,
@@ -343,8 +352,22 @@ class DockerSession(SandboxSession):
         """
         Run one command under the exec lock its caller already holds.
         """
-        if self._terminated:
-            raise RuntimeError("Docker sandbox is terminated.")
+        # Tested against the start of teardown rather than its completion, so a command
+        # that arrives while the sandbox is being destroyed is refused as what it is
+        # instead of failing later on the shell teardown already under way.
+        #
+        # The message carries the diagnosed exit reason and the stack that started the
+        # teardown. Without them this reads as "the sandbox is gone" and says nothing
+        # about why, which is exactly the report that cannot be acted on: an idle reap, a
+        # lifetime expiry, an OOM, and a lease released by an aborted group all arrive
+        # here identically.
+        if self._closed_to_callers:
+            raise SandboxSessionLostError(
+                f"Docker sandbox {self.sandbox_id!r} was terminated before this command could run "
+                f"(exit_reason={self._exit_reason.value}). Terminated by:\n{self._closed_by or '<unrecorded>'}",
+                sandbox_id=self.sandbox_id,
+                exit_reason=self._exit_reason,
+            )
         self._command_count += 1
         self._busy = True
         try:
@@ -409,19 +432,26 @@ class DockerSession(SandboxSession):
                 return_when=asyncio.FIRST_COMPLETED,
             )
         except asyncio.CancelledError:
-            await complete_cleanup(self._abort_command(exec_task, watcher))
+            # The caller stopped waiting. That is not evidence about the container, and
+            # the lease still owns it, so the command is dropped and the sandbox kept:
+            # an episode cancelled mid-turn still has to collect its artifacts, and the
+            # lease release is the hard stop.
+            await complete_cleanup(self._abort_command(exec_task, watcher, destroy=False))
             raise
         if watcher in done:
             reason = watcher.result()
             await complete_cleanup(self._abort_command(exec_task, watcher))
-            raise self._stopped_error(reason)
+            raise await self._stopped_error(reason)
         if exec_task not in done:
             return await complete_cleanup(self._command_overran(exec_task, watcher, timeout_s))
         try:
             with self.backend.metrics.measure("exec"):
                 return exec_task.result()
         except asyncio.CancelledError:
-            # The command stream was aborted, which does not stop the process it started.
+            # The exec stream itself was cancelled rather than this caller's wait, so a
+            # process may still be running with nobody reading it. A one-shot exec cannot
+            # be signalled, so the container has to go: anything it writes would land in
+            # the next command's output.
             await complete_cleanup(self._abort_command(exec_task, watcher))
             raise
         except (TimeoutError, asyncio.TimeoutError) as exc:
@@ -429,7 +459,7 @@ class DockerSession(SandboxSession):
         except (aiohttp.ClientError, SandboxTransportError) as exc:
             reason = await complete_cleanup(self._abort_command(exec_task, watcher, diagnose=True))
             if reason is not None:
-                raise self._stopped_error(reason) from exc
+                raise await self._stopped_error(reason) from exc
             raise
 
     async def _command_overran(
@@ -455,7 +485,7 @@ class DockerSession(SandboxSession):
         if not preserved:
             reason = await complete_cleanup(self._abort_command(exec_task, watcher, diagnose=True))
             if reason is not None:
-                raise self._stopped_error(reason)
+                raise await self._stopped_error(reason)
         else:
             exec_task.cancel()
             watcher.cancel()
@@ -498,17 +528,41 @@ class DockerSession(SandboxSession):
         watcher: asyncio.Task,
         *,
         diagnose: bool = False,
+        destroy: bool = True,
     ) -> str | None:
+        """Stop tracking a command, and optionally destroy the sandbox it ran in.
+
+        `destroy` is what separates "this container can no longer be trusted" from "this
+        caller stopped waiting". A one-shot exec cannot be signalled, so a command whose
+        stream is abandoned leaves a process that would write into the next command's
+        output: destroying the container is the only answer that cannot be wrong. A caller
+        that cancelled is different. It says nothing about the container, and the sandbox
+        is still leased, so destroying it here would pull the filesystem out from under
+        work the episode has not finished with.
+        """
         exec_task.cancel()
         watcher.cancel()
         await asyncio.gather(exec_task, watcher, return_exceptions=True)
         try:
             return await self._container_stop_reason() if diagnose else None
         finally:
-            try:
-                await self.terminate()
-            except Exception:
-                psrl_logger.warning("Docker command cleanup remains owned by the sandbox lease.", exc_info=True)
+            if destroy:
+                try:
+                    await self.terminate()
+                except Exception:
+                    psrl_logger.warning("Docker command cleanup remains owned by the sandbox lease.", exc_info=True)
+            else:
+                # The one path that used to destroy a leased sandbox and leave no trace of
+                # who asked. It is reported at INFO with the stack that cancelled, because
+                # the caller is the only thing that explains it: nothing here distinguishes
+                # an episode budget from a harness abort from a shutdown, and the absence
+                # of any other signal is what made this hard to attribute.
+                psrl_logger.info(
+                    "Docker sandbox %s dropped a command because its caller was cancelled. The sandbox is "
+                    "kept for the lease to release. Cancelled by:\n%s",
+                    self.sandbox_id,
+                    "".join(traceback.format_stack()[:-1]),
+                )
 
     async def _container_stop_reason(self) -> str | None:
         """
@@ -527,14 +581,46 @@ class DockerSession(SandboxSession):
             return None
         return "oom_killed" if state.get("OOMKilled") else "exited"
 
-    def _stopped_error(self, reason: str) -> RuntimeError:
+    async def _stopped_error(self, reason: str) -> RuntimeError:
+        """Build the error for a container that stopped under a running command.
+
+        The diagnostics are read here, once, rather than at each detection site: a stop can
+        be noticed either by the daemon's event stream or by the inspect poll, and only the
+        exit status tells a signal apart from a clean exit or a daemon-side removal. This
+        runs only when a container has already died, so the extra inspect is not on any hot
+        path, and it is best-effort because a daemon that cannot answer must not replace the
+        stop with a transport error.
+        """
         self._exit_reason = _STOP_REASONS.get(reason, SandboxExitReason.UNKNOWN)
         if reason == "oom_killed":
             memory_mb = self._spec.resources.memory_mb if self._spec is not None else None
             return SandboxOomError(
                 f"Docker sandbox {self.sandbox_id!r} was OOM-killed during a command. memory_limit_mb={memory_mb}."
             )
-        return RuntimeError(f"Docker sandbox {self.sandbox_id!r} stopped ({reason}) while a command was running.")
+        state: Mapping[str, Any] = {}
+        try:
+            inspection = await self.backend.engine.inspect_container(self.sandbox_id)
+            state = (inspection or {}).get("State") or {}
+        except (aiohttp.ClientError, SandboxTransportError, TimeoutError, asyncio.TimeoutError):
+            state = {}
+        exit_code = state.get("ExitCode")
+        exit_code = int(exit_code) if isinstance(exit_code, int) else None
+        state_error = str(state.get("Error") or "")
+        finished_at = str(state.get("FinishedAt") or "")
+        diagnostics = f"exit_code={exit_code}"
+        if finished_at:
+            diagnostics += f", finished_at={finished_at}"
+        if state_error:
+            diagnostics += f", state_error={state_error!r}"
+        return SandboxSessionLostError(
+            f"Docker sandbox {self.sandbox_id!r} stopped ({reason}) while a command was running, so the "
+            f"command never completed ({diagnostics}).",
+            sandbox_id=self.sandbox_id,
+            exit_reason=self._exit_reason,
+            exit_code=exit_code,
+            state_error=state_error,
+            finished_at=finished_at,
+        )
 
     async def read_bytes(self, path: str) -> bytes:
         with self.backend.metrics.measure("read_bytes"):
@@ -601,15 +687,39 @@ class DockerSession(SandboxSession):
         return ""
 
     async def terminate(self) -> None:
+        # Captured here rather than inside `_terminate`, because `complete_cleanup` runs
+        # that on a task of its own and a new task's stack no longer holds the frames of
+        # whoever asked. This is the last point that still sees the real caller.
+        if not self._closed_to_callers:
+            self._closed_by = "".join(traceback.format_stack()[:-1])
         await complete_cleanup(self._terminate())
 
     async def _terminate(self) -> None:
         async with self._terminate_lock:
             if self._terminated:
                 return
+            # Close the session to callers before any teardown starts. Otherwise the window
+            # between closing the shell and the end of this method leaves a session that
+            # `_track_session` still hands out and whose guard has not tripped: the next
+            # command finds no shell and fails, instead of being refused as a use of a
+            # terminated sandbox.
+            #
+            # Tracked separately from `_terminated`, which means teardown *finished*: the
+            # lifetime reaper retries `terminate` after a failed destroy, and that retry has
+            # to be allowed back in or the container leaks.
+            self._closed_to_callers = True
+            if not self._closed_by:
+                # A caller that reached `_terminate` directly rather than through
+                # `terminate` still records something, even though these frames are the
+                # cleanup task's rather than the requester's.
+                self._closed_by = "".join(traceback.format_stack()[:-1])
             await complete_cleanup(self._exec_strategy.close())
             await complete_cleanup(self.backend.release_egress(self.sandbox_id))
             with self.backend.metrics.measure("terminate"):
+                # Raises when the container survives, which leaves this session registered
+                # on purpose: a container that is still alive must keep an owner that can
+                # destroy it, and dropping it here would free its capacity slot while it
+                # still holds the node's memory.
                 await self._destroy_container()
             if self._exit_reason is SandboxExitReason.UNKNOWN:
                 self._exit_reason = SandboxExitReason.RELEASED

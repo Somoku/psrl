@@ -82,6 +82,8 @@ async def _run_checks() -> list[str]:
         reservation_ttl_s=_RESERVATION_TTL_S,
         sweep_interval_s=_SWEEP_INTERVAL_S,
         heartbeat_interval_s=_LIVENESS_INTERVAL_S,
+        # The smoke test drives one sandbox at a time, so it needs no width.
+        max_concurrency_per_node=8,
     )
     try:
         advertisements = plane.register_nodes()

@@ -1878,7 +1878,19 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             use_node_capacity = False
             capacity_config = None
             hard_affinity = bool(allowed_ips)
-        sandbox_plane = self._build_sandbox_plane(placement_config, alive_nodes) if placement_enabled else None
+        sandbox_plane = (
+            self._build_sandbox_plane(
+                placement_config,
+                alive_nodes,
+                # Every sandbox call a worker makes now crosses this node's agent, so the
+                # agent has to be as wide as the work the whole fleet can aim at one node.
+                # The node-local coordinator is sized the same way, and a plane that is
+                # narrower than the path it replaced serialises the run without failing it.
+                concurrency_per_node=num_agent_workers * (max_concurrency_per_worker + 1) + 1,
+            )
+            if placement_enabled
+            else None
+        )
         worker_plane = (
             sandbox_plane.handle(
                 backend_name=str(placement_config.backend_name),
@@ -2256,20 +2268,36 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         metrics["meta/collect_s"] = time.monotonic() - started_at
         return metrics
 
-    def _build_sandbox_plane(self, placement_config, alive_nodes):
+    def _build_sandbox_plane(self, placement_config, alive_nodes, *, concurrency_per_node: int):
         """Create the placement service and one node agent per sandbox node.
 
-        The fleet is `agent.node_ips`, which is already the allow list the workers are placed
-        by. It is required rather than defaulted to every alive node, because a sandbox on a
-        GPU node competes with the trainer for the machine it is training on.
+        `concurrency_per_node` is how many sandbox calls one node agent may serve at once.
+        It has to come from the workload rather than from a constant: the agent is the only
+        way into a node once a plane is on, so a value below what the fleet can aim at one
+        node turns every call beyond it into a silent queue — containers appear in slow
+        batches, their harnesses never start, and nothing times out because every caller is
+        waiting legitimately in an actor's own queue.
+
+        The fleet is `agent.node_ips` when it names one, and every alive node otherwise.
+        `alive_nodes` arrives already filtered by that allow list, so the fleet and the
+        worker placement are the same set by construction.
+
+        Defaulting to every alive node puts a sandbox on whatever the trainer is training
+        on, which is a real cost but a bounded one: each node admits against its own
+        envelope, so a co-located sandbox is throttled by `capacity.*` rather than free to
+        take the machine. Naming the fleet is how a deployment keeps sandboxes off its GPU
+        nodes, and the log below says which of the two is in force.
         """
         allowed_ips = list(self.config.gen_actor_rollout_ref.rollout.agent.get("node_ips") or [])
-        if not allowed_ips:
-            raise ValueError(
-                "sandbox_placement.enabled requires agent.node_ips. Every alive node would put sandboxes "
-                "on the GPU nodes, so name the sandbox fleet explicitly."
-            )
         node_ids = [node["NodeID"] for node in alive_nodes]
+        if not allowed_ips:
+            psrl_logger.warning(
+                "sandbox_placement is on without agent.node_ips, so the sandbox fleet is every alive "
+                "node (%d): %s. Sandboxes will share nodes with the trainer, bounded by each node's "
+                "own capacity envelope. Set agent.node_ips to name a dedicated fleet.",
+                len(node_ids),
+                sorted(node["NodeManagerAddress"] for node in alive_nodes),
+            )
         required_label = placement_config.get("required_label", None)
         labels = [str(required_label)] if required_label else []
         self.sandbox_plane = build_sandbox_plane(
@@ -2279,6 +2307,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             reservation_ttl_s=float(placement_config.reservation_ttl_s),
             sweep_interval_s=float(placement_config.sweep_interval_s),
             heartbeat_interval_s=float(placement_config.heartbeat_interval_s),
+            max_concurrency_per_node=concurrency_per_node,
             labels=labels,
         )
         advertisements = self.sandbox_plane.register_nodes()

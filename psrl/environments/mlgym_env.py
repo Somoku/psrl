@@ -24,6 +24,7 @@ from omegaconf import DictConfig
 
 from psrl.environments.base import Environment, EnvStepOutput
 from psrl.sandbox import (
+    ExecMode,
     MountSpec,
     ResourceSpec,
     SandboxSource,
@@ -109,6 +110,12 @@ def build_sandbox_spec(
         env=proxy_env,
         metadata=labels,
         policy_profile="airs_bench",
+        # MLGym is an interactive shell agent: `communicate`, `step`, workspace setup,
+        # and grading all issue single commands into one shell, so `cd`, `source`, and
+        # exported variables have to survive from one action to the next. Declared here
+        # rather than inherited from the backend default, because it is a property of
+        # this workload and not of the node it runs on.
+        exec_mode=ExecMode.PERSISTENT,
         # One sandbox per episode, so the episode is the workflow phase that the
         # reservation protects.
         workflow_id=episode_id,

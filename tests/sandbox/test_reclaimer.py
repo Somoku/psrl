@@ -31,11 +31,20 @@ class FakeRuntime:
         self.removed: list[str] = []
         self.unremovable: set[str] = set()
         self.list_error: Exception | None = None
+        self.orphan_tasks: list[str] = []
+        self.orphan_task_error: Exception | None = None
+        self.orphan_task_min_age_s: float | None = None
 
     def list_owned(self, lease_store: str):
         if self.list_error is not None:
             raise self.list_error
         return None if self.containers is None else list(self.containers)
+
+    def reclaim_orphan_tasks(self, *, min_age_s: float):
+        self.orphan_task_min_age_s = min_age_s
+        if self.orphan_task_error is not None:
+            raise self.orphan_task_error
+        return list(self.orphan_tasks)
 
     def remove_containers(self, container_ids):
         ids = list(container_ids)
@@ -324,3 +333,44 @@ def test_an_unreachable_runtime_reports_every_target_as_unremoved(tmp_path) -> N
 
     assert outcome.removed == ()
     assert outcome.unremovable == ("wedged",)
+
+
+def test_a_container_with_no_owner_is_reclaimed(tmp_path) -> None:
+    """Nobody claims it, so nobody can vouch for it.
+
+    A container labelled with no owner used to be dropped from the listing entirely, and a
+    reclaimer reading an empty list concludes the node is clean. That is how a previous
+    run's containers accumulated until the node could admit nothing, with no error
+    anywhere: the memory was spoken for and the envelope did not know it.
+    """
+    heartbeat_dir = str(tmp_path / "hb")
+    runtime = FakeRuntime([OwnedContainer("unclaimed", reclaimer_module.UNOWNED_OWNER_ID, "running")])
+    instance = NodeReclaimer(heartbeat_dir, 900.0, runtime)
+
+    outcome = instance.sweep()
+
+    assert outcome.removed == ("unclaimed",)
+    assert outcome.remaining == 0
+
+
+def test_an_unowned_container_cannot_be_rescued_by_a_live_lease(tmp_path) -> None:
+    """The sentinel owner must never match a lease, however one is written.
+
+    If it could, a live worker's heartbeat would vouch for containers that are not its
+    own, and the leak would become invisible again while looking accounted for.
+    """
+    heartbeat_dir = str(tmp_path / "hb")
+    os.makedirs(heartbeat_dir, exist_ok=True)
+    write_owner_heartbeat(heartbeat_dir, "a-real-owner")
+    runtime = FakeRuntime(
+        [
+            OwnedContainer("owned", "a-real-owner", "running"),
+            OwnedContainer("unclaimed", reclaimer_module.UNOWNED_OWNER_ID, "running"),
+        ]
+    )
+    instance = NodeReclaimer(heartbeat_dir, 900.0, runtime)
+
+    outcome = instance.sweep()
+
+    assert outcome.removed == ("unclaimed",), "A live lease must not vouch for an unowned container."
+    assert outcome.remaining == 1

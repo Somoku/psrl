@@ -6,7 +6,7 @@ import subprocess
 from types import SimpleNamespace
 
 from psrl.sandbox.backends.docker import cli
-from psrl.sandbox.reclaimer import OwnedContainer
+from psrl.sandbox.reclaimer import UNOWNED_OWNER_ID, OwnedContainer
 
 
 def test_force_remove_batches_all_matching_containers(monkeypatch) -> None:
@@ -119,3 +119,32 @@ def test_the_dangling_image_prune_is_bounded_to_untagged_images(monkeypatch) -> 
 
     assert ["docker", "images", "-f", "dangling=true", "-q"] in calls
     assert ["docker", "rmi", "-f", "dead-image"] in calls
+
+
+def test_the_runtime_reports_a_container_with_no_owner_label(monkeypatch) -> None:
+    """An unowned container is this node's container, and it holds this node's memory.
+
+    Dropping it from the listing is what let a previous run's containers accumulate
+    invisibly: the reclaimer read an empty list and concluded the node was clean, while
+    the envelope it admitted against was already spoken for.
+    """
+    _install_docker(
+        monkeypatch,
+        [("sandbox-a", "owner-a", "Running"), ("orphaned", "", "Running")],
+    )
+
+    containers = cli.DockerContainerRuntime().list_owned("store-1")
+
+    assert containers == [
+        OwnedContainer("sandbox-a", "owner-a", "running"),
+        OwnedContainer("orphaned", UNOWNED_OWNER_ID, "running"),
+    ]
+
+
+def test_the_runtime_still_skips_a_row_with_no_container_id(monkeypatch) -> None:
+    # A row with no id names nothing that could be reclaimed.
+    _install_docker(monkeypatch, [("", "owner-a", "Running"), ("sandbox-a", "owner-a", "Running")])
+
+    containers = cli.DockerContainerRuntime().list_owned("store-1")
+
+    assert containers == [OwnedContainer("sandbox-a", "owner-a", "running")]

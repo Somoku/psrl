@@ -121,6 +121,40 @@ class SandboxProvisionError(RuntimeError):
         self.session = session
 
 
+class SandboxSessionLostError(RuntimeError):
+    """Raised when a sandbox stopped for a reason PSRL did not ask for.
+
+    The container is gone, so the command that was running never completed and the work
+    in it is unrecoverable. It carries its own type, and the exit diagnostics the runtime
+    still knows, because it is an infrastructure fault rather than a model or harness
+    failure: the rollout must be replaced, but it must not be counted as evidence that the
+    harness is broken.
+
+    Distinct from `SandboxOomError`, which is the sandbox hitting its own configured
+    memory limit, and from `SandboxCommandTimeout`, which is a command that merely ran
+    out of time inside a container that is still healthy.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_id: str = "",
+        exit_reason: SandboxExitReason | None = None,
+        exit_code: int | None = None,
+        state_error: str = "",
+        finished_at: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.sandbox_id = sandbox_id
+        # Reuses the backend-neutral vocabulary a post mortem already reads, so a caller
+        # never has to parse a second set of reason strings.
+        self.exit_reason = exit_reason or SandboxExitReason.UNKNOWN
+        self.exit_code = exit_code
+        self.state_error = state_error
+        self.finished_at = finished_at
+
+
 class SandboxFeature(str, Enum):
     """
     Optional semantic features exposed by a sandbox backend.

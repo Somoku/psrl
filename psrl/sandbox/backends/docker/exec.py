@@ -24,7 +24,7 @@ import re
 import select
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -248,6 +248,7 @@ class OneShotExec:
         interpreter: Sequence[str],
         *,
         max_observation_chars: int = 0,
+        resolve_command_prefix: Callable[[], Awaitable[Sequence[str]]] | None = None,
     ) -> None:
         if not interpreter:
             raise ValueError("Docker command interpreter cannot be empty.")
@@ -255,7 +256,26 @@ class OneShotExec:
         self.container_id = container_id
         self.interpreter = tuple(interpreter)
         self.max_observation_chars = max_observation_chars
+        # Resolved once, lazily, before the first command. The prefix runs each command in
+        # its own session so a signal the agent or one of its children sends to their
+        # process group cannot reach the container's keepalive init and stop the container
+        # underneath a running command. It has to be probed rather than assumed, because it
+        # needs a `setsid` that supports `-w` and not every image ships one; resolving it
+        # here rather than at construction keeps every creation path covered by one probe.
+        self._resolve_command_prefix = resolve_command_prefix
+        self._command_prefix: tuple[str, ...] | None = None
         self._last_activity_at: float | None = None
+
+    async def _prefix(self) -> tuple[str, ...]:
+        """
+        Return the process-isolation prefix, probing the image at most once.
+        """
+        if self._command_prefix is None:
+            if self._resolve_command_prefix is None:
+                self._command_prefix = ()
+            else:
+                self._command_prefix = tuple(await self._resolve_command_prefix())
+        return self._command_prefix
 
     @property
     def last_activity_at(self) -> float | None:
@@ -271,10 +291,11 @@ class OneShotExec:
     ) -> ExecResult:
         self._last_activity_at = time.monotonic()
         timeout_s = None if budget is None else budget.timeout_s
+        prefix = await self._prefix()
         try:
             exit_code, stdout, stderr, truncated = await self.transport.exec(
                 self.container_id,
-                [*self.interpreter, command],
+                [*prefix, *self.interpreter, command],
                 cwd=cwd,
                 env=env,
                 timeout_s=timeout_s,
@@ -323,6 +344,7 @@ class PersistentShellExec:
         *,
         max_observation_chars: int = 0,
         kill_group: Any = None,
+        startup_timeout_s: float = 300.0,
     ) -> None:
         self._spawn = spawn
         self.max_observation_chars = max_observation_chars
@@ -332,6 +354,8 @@ class PersistentShellExec:
         self._last_activity_at: float | None = None
         self._token = os.urandom(6).hex()
         self._remote_pid: int | None = None
+        # Deadline for the implicit start a command performs when it finds no shell.
+        self._startup_timeout_s = startup_timeout_s
 
     @property
     def remote_pid(self) -> int | None:
@@ -401,18 +425,31 @@ class PersistentShellExec:
         return True
 
     def _wrap(self, command: str, *, cwd: str | None, env: Mapping[str, str] | None) -> str:
-        """
-        Build the text one command needs, including its sentinel.
+        """Build the text one command needs, including its sentinel.
 
         Per-command overrides are applied as a prefix rather than by restarting the
         shell, which is the whole point of keeping one open.
+
+        The command's stdin is detached from the shell's own. This shell reads its
+        commands from stdin, so anything the command starts would otherwise inherit that
+        same pipe: a child that reads stdin consumes the next queued command, the sentinel
+        never arrives, and the strategy waits out its deadline on a command that already
+        finished. Redirecting here rather than asking every caller to remember it keeps
+        the guarantee a property of the strategy, and matches `OneShotExec`, whose
+        transport never attaches stdin at all.
+
+        A command that genuinely needs to be fed input must pipe or redirect it itself,
+        which is unaffected: an inner redirection binds tighter than this outer one.
         """
         prefix: list[str] = []
         for key, value in (env or {}).items():
             prefix.append(f"export {key}={_quote(value)};")
         if cwd:
             prefix.append(f"cd {_quote(cwd)} || exit 200;")
+        # Braces, not a subshell: a subshell would discard the `cd` and the exports that
+        # later commands in this same shell are expected to still see.
         body = command if command.endswith("\n") else command + "\n"
+        body = f"{{\n{body}}} < /dev/null\n"
         sentinel = (
             f"__psrl_rc=$?; sleep 0.01; printf '{_MARKER_PREFIX}%s?{self._token}{_MARKER_SUFFIX}\\n' \"$__psrl_rc\"\n"
         )
@@ -426,10 +463,21 @@ class PersistentShellExec:
         env: Mapping[str, str] | None = None,
         budget: ExecBudget | None = None,
     ) -> ExecResult:
-        # Starting implicitly would consume the shell's probe reply as this command's output,
-        # so the session starts it first. An exited shell still buffers, so check attached, not live.
+        # Hold a shell, starting one if this strategy has none. Being started is a property
+        # of running a command, not of the one creation path that used to do it: a session
+        # reached through `connect`, or reused from the backend registry after a timeout or
+        # an abort closed its shell, would otherwise refuse every command it was handed.
+        #
+        # `start` takes `_start_lock` and returns early when a live shell is already held,
+        # so this is idempotent and safe under concurrent commands. It also drains its own
+        # probe reply before returning, which is what keeps that reply out of this command's
+        # output — the hazard that a start inlined into the read loop below would create.
+        #
+        # The test is "attached", not "live", deliberately. A shell that exited still holds
+        # buffered output belonging to this command, and the read loop reports it against
+        # the shell's exit code; replacing it here would throw that evidence away.
         if self._process is None:
-            raise RuntimeError("Docker sandbox shell is not started.")
+            await self.start(timeout_s=self._startup_timeout_s)
         self._last_activity_at = time.monotonic()
         try:
             return await self._run_inner(command, cwd=cwd, env=env, budget=budget)

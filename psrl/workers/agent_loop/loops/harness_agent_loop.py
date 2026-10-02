@@ -17,6 +17,7 @@ from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.harness import (
     Harness,
     HarnessConfig,
+    HarnessExecBudgetExpired,
     HarnessResult,
     HarnessRuntime,
     HarnessTaskContext,
@@ -30,6 +31,45 @@ from psrl.workers.gen.utils import TokenOutput, rollout_token_budget
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+def _raise_if_episode_is_over(lease: SandboxLease | None) -> None:
+    """Stop the episode before it collects artifacts it can no longer keep or store.
+
+    Two distinct ways an episode can be over by this point, and neither raises on its own:
+
+    A cancellation delivered while the episode was inside a shielded section is recorded
+    on the task and raised only at the next await. The phase that follows the harness run
+    is a sequence of awaits against the sandbox, so the cancellation would surface from
+    whichever one happened to be first and be reported as whatever that call failed with.
+
+    The lease can also be released by something other than this task. An aborted group
+    releases the lease of a sibling that was still running, which destroys the sandbox
+    while this episode's own task was never cancelled, so `cancelling()` stays zero and
+    the collection proceeds against a sandbox that is already gone. That is the case that
+    reported itself as a bare "sandbox is terminated" from patch collection.
+
+    Raises:
+        asyncio.CancelledError: In either case. The worker's classifier maps it to
+            `ROLLOUT_CANCELLED`, a coordination fault: the group is replaced without the
+            episode being counted as evidence that the harness is broken.
+    """
+    # `current_task` raises outside a running loop, which is not a reason to fail: the
+    # lease check below is still meaningful, and a caller with no loop has no task to be
+    # cancelled in the first place.
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    if task is not None and task.cancelling() > 0:
+        raise asyncio.CancelledError
+    if lease is not None and lease.released:
+        psrl_logger.warning(
+            "Sandbox lease for %s was released by something other than this episode, so its "
+            "artifacts can no longer be collected. Ending the episode as cancelled.",
+            lease.ref,
+        )
+        raise asyncio.CancelledError
 
 
 class HarnessAgentLoop(SessionAgentLoop):
@@ -67,6 +107,10 @@ class HarnessAgentLoop(SessionAgentLoop):
         # Set by a task hook when grading never ran, so the completed trajectory is kept
         # and reported as ungraded instead of being discarded or scored as a measured zero.
         self.grader_unavailable = False
+        # Narrower than `grader_unavailable`: set only when the grader sandbox was never
+        # admitted, so the manager's capacity breaker can count the fault instead of reading
+        # it as a generic grader failure.
+        self.grader_capacity_timeout = False
         multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
         if not getattr(multi_turn, "enable", False):
             raise ValueError("Harness training requires rollout.multi_turn.enable=True.")
@@ -267,7 +311,7 @@ class HarnessAgentLoop(SessionAgentLoop):
             harness_started = time.perf_counter()
             try:
                 harness_result = await harness.run(task.prompt, harness_runtime)
-            except TimeoutError as expired:
+            except HarnessExecBudgetExpired as expired:
                 # The harness exec backstop fired, which means the episode budget did not.
                 # Record the cause: without it the manager can only report that some
                 # exception happened, with no exception to show.
@@ -282,6 +326,21 @@ class HarnessAgentLoop(SessionAgentLoop):
                     self.timeouts.episode_timeout_s,
                 )
                 return None, TerminateReason.TRAJECTORY_TIMEOUT
+            except TimeoutError as downstream:
+                # Some call inside the episode timed out without the exec budget expiring, so
+                # the sandbox or the daemon behind it is the fault and the episode budget is
+                # not. Reporting TRAJECTORY_TIMEOUT here would misattribute the cause and let
+                # `is_timeout` suppress the retry an infrastructure fault needs.
+                self._record_error(downstream)
+                psrl_logger.error(
+                    "Harness %s hit an infrastructure timeout for session %s that was not its "
+                    "%.0fs exec budget: %r.",
+                    self.harness_config.kind,
+                    session_id,
+                    self.harness_config.time_budget_s,
+                    downstream,
+                )
+                return None, TerminateReason.DOWNSTREAM_TIMEOUT
             timing["assistant_s"] = time.perf_counter() - harness_started
             if harness_result.exit_code != 0:
                 # The CLI can die without stopping the container, for example when the kernel
@@ -295,6 +354,18 @@ class HarnessAgentLoop(SessionAgentLoop):
                     session_id,
                     (harness_result.stderr_tail or "").strip()[-500:] or "<empty>",
                 )
+
+            # Everything from here on exists to turn this episode into training data, and
+            # a cancelled episode has no slot left to put it in: the manager cleared the
+            # buffer entry when it aborted the group. Collecting the patch, grading it,
+            # and reading the TITO trajectory would spend an episode's worth of sandbox
+            # time on a result nothing reads, and the collection itself would run against
+            # a sandbox whose teardown is already in flight.
+            #
+            # Reported as cancelled rather than as a rollout error, because that is what
+            # it is: `is_coordination_fault` keeps a shutdown or an abort out of the
+            # breaker that exists to catch a genuinely broken harness.
+            _raise_if_episode_is_over(lease)
 
             artifact = await self.collect_harness_artifact(
                 task,
@@ -570,8 +641,12 @@ class HarnessAgentLoop(SessionAgentLoop):
 
         An ungraded trajectory reports `VERIFIER_ERROR` even when it finished early,
         because that flag is what stops a reward nobody measured from being trained as
-        a measured zero.
+        a measured zero. When the grader sandbox was never admitted it reports
+        `GRADER_CAPACITY_TIMEOUT` instead, which is ungraded for the same reason but also
+        tells the manager's capacity breaker that grading is starved rather than broken.
         """
+        if self.grader_capacity_timeout:
+            return TerminateReason.GRADER_CAPACITY_TIMEOUT
         if self.grader_unavailable:
             return TerminateReason.VERIFIER_ERROR
         if any(len(item["prompt_ids"]) + len(item["response_ids"]) > self.rollout_budget for item in training_data):

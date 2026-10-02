@@ -217,6 +217,93 @@ async def test_the_persistent_shell_starts_once_and_probes_readiness() -> None:
     assert len(spawned) == 1
 
 
+async def test_a_command_cannot_read_the_shells_own_command_stream() -> None:
+    """The shell reads its commands from stdin, so a command must not share that pipe.
+
+    A long-lived child that reads stdin would otherwise consume the next queued command:
+    the sentinel never arrives and the strategy waits out its deadline on a command that
+    already finished. That is how the agent CLI, whose stdout and stderr are redirected
+    but whose stdin was not, hung every episode.
+    """
+    shell = FakeShell()
+    strategy = PersistentShellExec(lambda: shell, startup_timeout_s=1)
+    await strategy.start(timeout_s=1)
+
+    await strategy.run("cat")
+
+    # The command body, not the exports or the sentinel, is what gets detached.
+    written = shell.written[-1]
+    assert "} < /dev/null" in written
+    # A brace group, never a subshell: a subshell would discard the `cd` and exports that
+    # later commands in this same shell are expected to still observe.
+    assert "(" not in written.split("cat")[0]
+
+
+async def test_stdin_isolation_keeps_per_command_state_visible() -> None:
+    # The detachment must not cost the persistent shell its reason to exist, so the
+    # prefix that carries `cd` and the exports stays outside the redirected group.
+    shell = FakeShell()
+    strategy = PersistentShellExec(lambda: shell, startup_timeout_s=1)
+    await strategy.start(timeout_s=1)
+
+    await strategy.run("echo hi", cwd="/work", env={"MODE": "test"})
+
+    written = shell.written[-1]
+    assert written.startswith("export MODE='test';cd '/work' || exit 200;")
+    assert "} < /dev/null" in written
+
+
+async def test_a_command_starts_the_shell_when_nothing_started_it() -> None:
+    """Holding a shell is a property of running a command, not of one creation path.
+
+    A session reached through `connect`, or taken from the backend registry after a
+    timeout or an abort closed its shell, has a strategy nobody called `start` on. It
+    still has to run commands: refusing them stranded episodes whose work was already
+    finished, and the only symptom was "shell is not started".
+    """
+    shell = FakeShell(body="patch")
+    spawned: list[FakeShell] = []
+
+    def spawn() -> FakeShell:
+        spawned.append(shell)
+        return shell
+
+    strategy = PersistentShellExec(spawn, startup_timeout_s=1)
+    assert not strategy.started
+
+    result = await strategy.run("git diff")
+
+    assert result.exit_code == 0
+    # The readiness probe's own reply must not be served as this command's output.
+    assert result.stdout == "patch\n"
+    assert len(spawned) == 1
+    assert strategy.started
+
+
+async def test_a_command_after_a_close_starts_a_fresh_shell() -> None:
+    # `close` is what an aborted or timed-out command leaves behind, and the strategy is
+    # reused rather than rebuilt, so the next command has to be able to start over.
+    spawned: list[FakeShell] = []
+
+    def spawn() -> FakeShell:
+        shell = FakeShell(body="back")
+        spawned.append(shell)
+        return shell
+
+    strategy = PersistentShellExec(spawn, startup_timeout_s=1)
+    await strategy.start(timeout_s=1)
+    await strategy.close()
+    assert not strategy.started
+
+    result = await strategy.run("echo back")
+
+    assert result.exit_code == 0
+    assert result.stdout == "back\n"
+    # A second shell, because the first one was closed rather than reused.
+    assert len(spawned) == 2
+    assert spawned[0].closed
+
+
 async def test_a_shell_that_never_answers_readiness_is_refused() -> None:
     shell = FakeShell(body="not up yet", first_body="not up yet")
     strategy = PersistentShellExec(lambda: shell)

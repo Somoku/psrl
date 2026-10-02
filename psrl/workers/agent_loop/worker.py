@@ -23,7 +23,7 @@ from verl.utils.tokenizer import (
 )
 from verl.workers.config.model import HFModelConfig
 
-from psrl.sandbox import SandboxCapacityTimeout
+from psrl.sandbox import SandboxCapacityTimeout, SandboxSessionLostError
 from psrl.sandbox.config import build_sandbox_manager, placement_manager_config
 from psrl.sandbox.ray_plane import SandboxPlaneHandle
 from psrl.utils.common.chat_template import resolve_chat_template_value
@@ -71,14 +71,31 @@ def _classify_rollout_failure(exc: BaseException) -> TerminateReason:
     A blanket `ROLLOUT_ERROR` mislabels the cases that matter most for scheduling: Ray
     reports a cancelled actor call as a `TaskCancelledError` inside a `RayTaskError`,
     which is an ordinary `Exception`, so every teardown cancellation looked like a
-    failing harness and filled the refill breaker during cleanup.
+    failing harness and filled the refill breaker during cleanup. A sandbox that stopped
+    on its own is the same kind of signal: the group does need replacing, but a host or
+    container lifecycle fault is not evidence that the harness is broken.
     """
     for current in _exception_chain(exc):
         if isinstance(current, SandboxCapacityTimeout):
             return TerminateReason.SANDBOX_CAPACITY_TIMEOUT
+        if isinstance(current, SandboxSessionLostError):
+            return TerminateReason.CONTAINER_LOST
         if type(current).__name__ in _CANCELLATION_ERROR_NAMES:
             return TerminateReason.ROLLOUT_CANCELLED
     return TerminateReason.ROLLOUT_ERROR
+
+
+def loss_mask_is_zero(terminate_reason: TerminateReason, *, overlong_filtering: bool) -> bool:
+    """Return whether this trajectory's tokens must not contribute to the loss.
+
+    The two cases are gated separately on purpose. Dropping a budget-truncated trajectory
+    is the DAPO overlong-filtering feature, so it stays opt-in behind its flag. A
+    trajectory with no measurement at all must never steer the policy regardless of that
+    flag: a grader that was starved of capacity, or that failed, produced no reward, and
+    training the absence of a measurement as a measured zero splits a GRPO group on pure
+    infrastructure noise pointing in a direction the policy cannot influence.
+    """
+    return terminate_reason.is_ungraded or (overlong_filtering and terminate_reason.is_budget_truncated)
 
 
 @ray.remote
@@ -142,7 +159,7 @@ class PSRL_AgentLoopWorker:
         self.reward_manager = None
         sandbox_config = config.gen_actor_rollout_ref.rollout.agent.sandbox
         self.sandbox_manager = self._build_sandbox_manager(sandbox_config, capacity_coordinator, sandbox_plane)
-        # Worker heartbeats and manager stall detection share the same deadline ladder.
+        # Every deadline a rollout is held to comes from this one ladder.
         self.timeouts = resolve_from_config(config)
 
         n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
@@ -412,7 +429,7 @@ class PSRL_AgentLoopWorker:
             request_index = tu.get(batch, "uid")[0]
 
         try:
-            await self._run_child_with_liveness(agent_name, batch, prompt_index, request_index)
+            await self._run_agent_loop_inner(agent_name, batch, prompt_index, request_index)
         except Exception as e:
             tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             psrl_logger.error(
@@ -421,46 +438,6 @@ class PSRL_AgentLoopWorker:
                 f"Full traceback:\n{tb_str}"
             )
             raise
-
-    async def _run_child_with_liveness(
-        self,
-        agent_name: str,
-        batch: TensorDict,
-        prompt_index,
-        request_index,
-    ) -> None:
-        """Run one child while reporting liveness to the manager.
-
-        A healthy episode reports only when it finishes, so an entry whose children are all
-        still working is indistinguishable from a wedged one by results alone. The heartbeat
-        is what separates the two, and it is why the manager's stall threshold can be a
-        silence check instead of a guess about how long a rollout should take.
-        """
-        heartbeat = asyncio.ensure_future(self._report_liveness(prompt_index))
-        try:
-            await self._run_agent_loop_inner(agent_name, batch, prompt_index, request_index)
-        finally:
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
-
-    async def _report_liveness(self, prompt_index) -> None:
-        """Touch the manager's in-flight record until the child reports for real."""
-        while True:
-            await asyncio.sleep(self.timeouts.heartbeat_interval_s)
-            if self.agent_loop_manager is None:
-                continue
-            try:
-                await self.agent_loop_manager.touch_inflight_group.remote(int(prompt_index))
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # A missed heartbeat is not a rollout failure: the manager's own threshold
-                # decides when silence means the entry is gone.
-                psrl_logger.debug(
-                    "Sandbox liveness heartbeat failed for prompt_id=%s.",
-                    prompt_index,
-                    exc_info=True,
-                )
 
     async def _run_agent_loop_inner(
         self,
@@ -679,6 +656,9 @@ class PSRL_AgentLoopWorker:
                 "version_tag": version_tag,
                 "n_trajectory": len(outputs),
                 "is_validate": is_validate,
+                # Lets the manager account for a group that occupied its slot but was never
+                # graded, which is otherwise invisible because it is not a group failure.
+                "terminate_reason": terminate_reason,
             }
         )
 
@@ -722,10 +702,10 @@ class PSRL_AgentLoopWorker:
             # do not store raw image/video
             field.pop("multi_modal_data", None)
             field = {k: v for k, v in field.items() if v is not None}
-            # NOTE(lhy): DAPO overlong filtering. A truncated reward reports the cutoff
-            # and an ungraded one was never measured, so neither may steer the policy.
-            # Zero only the VALUES: the mask carries the nested per-row length contract.
-            if self.overlong_filtering and (terminate_reason.is_budget_truncated or terminate_reason.is_ungraded):
+            # A truncated reward reports the cutoff and an ungraded one was never measured,
+            # so neither may steer the policy. Zero only the VALUES: the mask carries the
+            # nested per-row length contract.
+            if loss_mask_is_zero(terminate_reason, overlong_filtering=self.overlong_filtering):
                 field["response_mask"] = torch.zeros_like(field["response_mask"])
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids

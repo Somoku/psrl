@@ -36,8 +36,6 @@ _STUB_TIMEOUTS = AgentLoopTimeouts(
     episode_timeout_s=7200.0,
     setup_allowance_s=900.0,
     admission_timeout_s=1800.0,
-    heartbeat_interval_s=120.0,
-    entry_stall_timeout_s=360.0,
 )
 
 
@@ -87,6 +85,7 @@ class FakeManager:
         self._capacity_failure_streak = 0
         self._group_failure_reasons: Counter = Counter()
         self._coordination_failures: Counter = Counter()
+        self._grading_capacity_faults: set[int] = set()
         self._shutting_down = False
         self._refill_breaker_diagnosis: str | None = None
 
@@ -105,6 +104,9 @@ class FakeManager:
         self.val_accumulated_buffer_size: dict = {}
         self._val_buffer_waiters: dict = {}
         self._val_round_all_failed = False
+        self.val_retry_limit = 1
+        self._val_attempts: dict[int, int] = {}
+        self._val_round_prompts: dict = {}
 
         self.running_loop = None
         self._request_counter = 0
@@ -132,6 +134,8 @@ class FakeManager:
         self._reset_group_failure_streak = PSRL_AgentLoopManager._reset_group_failure_streak.__get__(self)
         self._trip_refill_breaker = PSRL_AgentLoopManager._trip_refill_breaker.__get__(self)
         self._refill_failed_group = PSRL_AgentLoopManager._refill_failed_group.__get__(self)
+        self._retry_validation_group = PSRL_AgentLoopManager._retry_validation_group.__get__(self)
+        self._forget_validation_group = PSRL_AgentLoopManager._forget_validation_group.__get__(self)
         self._refill_breaker_error = PSRL_AgentLoopManager._refill_breaker_error.__get__(self)
         self._raise_if_refill_breaker_tripped = PSRL_AgentLoopManager._raise_if_refill_breaker_tripped.__get__(self)
         self._await_buffer_future = PSRL_AgentLoopManager._await_buffer_future.__get__(self)
@@ -658,9 +662,7 @@ class TestCapacityFailuresHaveTheirOwnBound:
                     terminate_reason=TerminateReason.SANDBOX_CAPACITY_TIMEOUT,
                 )
 
-            assert manager._consecutive_group_failures == 0, (
-                "A capacity fault was counted as an environment fault."
-            )
+            assert manager._consecutive_group_failures == 0, "A capacity fault was counted as an environment fault."
             assert manager._coordination_failures[TerminateReason.SANDBOX_CAPACITY_TIMEOUT.value] == 6
             assert manager._refill_breaker_diagnosis is None
 
@@ -690,17 +692,14 @@ class TestCapacityFailuresHaveTheirOwnBound:
 
             diagnosis = manager._refill_breaker_diagnosis
             assert diagnosis is not None, (
-                "Three consecutive capacity timeouts left the trainer waiting on a buffer "
-                "that could never fill."
+                "Three consecutive capacity timeouts left the trainer waiting on a buffer that could never fill."
             )
             assert TerminateReason.SANDBOX_CAPACITY_TIMEOUT.value in diagnosis
             assert "capacity" in diagnosis
             assert f"{_STUB_TIMEOUTS.admission_timeout_s:.0f}s" in diagnosis, (
                 "The diagnosis must name the admission deadline every attempt burned."
             )
-            assert manager._consecutive_group_failures == 0, (
-                "A capacity fault was reported as a broken harness."
-            )
+            assert manager._consecutive_group_failures == 0, "A capacity fault was reported as a broken harness."
 
         asyncio.run(_run())
 

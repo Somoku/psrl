@@ -316,6 +316,39 @@ class RequestStatusTracker:
             self._request_id_to_status[req_id] = status[i]
             self._status_to_request_ids[status[i]].add(req_id)
 
+    @_state_locked
+    def readmit_requests(self, request_ids: list[int] | int, is_validate: bool = False) -> None:
+        """Clear an abort record so the same request ids may be dispatched again.
+
+        Aborting a group marks every child id, and a marked id is rejected on its next
+        status update. Re-running the same prompt therefore needs its ids released first,
+        which only the validation retry path wants: it re-runs the identical task to keep
+        the evaluation set fixed, where a training refill takes a fresh prompt and fresh ids.
+
+        Done in one locked step rather than as a remove followed by an add, because in
+        between the two the ids exist in neither map and a concurrent status update would
+        raise `KeyError` from `update_request_status`.
+        """
+        if not isinstance(request_ids, list):
+            request_ids = [request_ids]
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+        for req_id in request_ids:
+            self._abort_request_ids.discard(req_id)
+            status = self._request_id_to_status.pop(req_id, None)
+            if status is not None:
+                self._status_to_request_ids[status].discard(req_id)
+            self._request_infos[req_id] = EntryInfo(
+                prompt_id=req_id // rollout_n,
+                request_idx=req_id % rollout_n,
+                rollout_instance_id=INVALID_ROLLOUT_INSTANCE_ID,
+                model_version=-1,
+                n_trajectory=1,
+                is_validate=is_validate,
+            )
+            self._request_id_to_status[req_id] = PSRL_RequestStatus.PENDING
+            self._status_to_request_ids[PSRL_RequestStatus.PENDING].add(req_id)
+        psrl_logger.info(f"Readmitted requests for a fresh attempt: {request_ids}.")
+
     def _check_aborted_request(self, request_id: int, remove: bool = True) -> bool:
         """Check if the request is aborted and remove it from the status tracker if needed.
 

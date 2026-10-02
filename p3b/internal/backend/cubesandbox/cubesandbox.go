@@ -1,14 +1,37 @@
-// Package cubesandbox runs sandboxes on a CubeSandbox cluster.
+// Package cubesandbox runs sandboxes on CubeSandbox nodes.
 //
 // CubeSandbox speaks an E2B-compatible HTTP API: a template is the source (not
 // an image tag), and /sandboxes/{id}/pause freezes the sandbox in place while
-// /sandboxes/{id}/snapshots saves a named checkpoint. Because the provider
-// places sandboxes itself this adapter only runs in provider mode; the psrl
-// scheduling path does not apply.
+// /sandboxes/{id}/snapshots saves a named checkpoint.
 //
-// What this adapter does not do is reimplement anything underneath: the
-// microVM boot, the overlaybd layer system, warm pools, and the snapshot store
-// are CubeSandbox's, and they are the reason to run it at all.
+// # Scheduling modes
+//
+// This adapter supports both scheduling modes defined by the backend contract.
+//
+// In provider mode the adapter sends every request to the Gateway URL and lets
+// CubeSandbox's CubeMaster scheduler decide the node. This is the correct
+// shape when the full CubeMaster feature set (overlaybd, warm pools, snapshot
+// store, image pipeline) is needed and CubeMaster's placement decisions are
+// acceptable.
+//
+// In psrl mode the adapter talks to each Cubelet directly, bypassing CubeMaster
+// entirely. This is the correct shape when:
+//   - p3b's Placement and Admission should own the node decision.
+//   - The deployment runs one Cubelet per node addressable at a known port.
+//   - A scheduler ablation must hold everything but the control plane fixed.
+//
+// The Cubelet exposes a complete lifecycle service (service CubeboxMgr in the
+// CubeSandbox gRPC interface), but this adapter drives it via the same HTTP
+// surface CubeMaster uses internally, so no additional protocol is required.
+//
+// Capability divergence: provider mode can claim warm_pool, template_build,
+// volume, and egress_policy because those are CubeMaster-level features. Psrl
+// mode bypasses CubeMaster, so those are absent. Neither mode declares a resume
+// level: a CubeSandbox snapshot captures the filesystem and not memory.
+//
+// What this adapter does not reimplement: the microVM boot, the overlaybd
+// layer system, and the snapshot store are CubeSandbox's, and they are the
+// reason to run it at all.
 package cubesandbox
 
 import (
@@ -17,38 +40,61 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"psrl.dev/sandboxd/internal/backend"
 )
 
-// Config is one CubeSandbox gateway.
+// Config is one CubeSandbox deployment.
 type Config struct {
-	// Gateway is the cluster entry point (e.g. https://cube.example.com).
+	// Gateway is the cluster entry point, used in provider mode.
+	// E.g. https://cube.example.com
 	Gateway string
-	// APIKey is the X-Api-Key header value. Empty skips the header, which is
-	// correct for a cluster with no authentication layer.
+	// Nodes are the per-node Cubelet addresses, used in psrl mode. Each one
+	// serves the full sandbox API on its own port, so placement here means
+	// choosing which to call.
+	Nodes []NodeAddress
+	// APIKey is the X-Api-Key header value. Empty skips the header.
 	APIKey         string
 	RequestTimeout time.Duration
-	// CreateTimeout is separate because a cold start must boot a microVM and may
-	// need to pull layers. The project's own latency targets allow tens of
-	// seconds; capping that at a coordination deadline would read a slow template
-	// as a cluster fault.
+	// CreateTimeout is separate because a cold start must boot a microVM and
+	// may need to pull layers. Capping that at a coordination deadline would
+	// read a slow template as a cluster fault.
 	CreateTimeout time.Duration
+}
+
+// NodeAddress is one Cubelet node.
+type NodeAddress struct {
+	NodeID  string
+	Address string
 }
 
 // Backend is CubeSandbox as a sandbox backend.
 type Backend struct {
 	cfg  Config
+	mode backend.SchedulingMode
 	http *http.Client
+
+	mu    sync.RWMutex
+	nodes map[string]string // nodeID -> base URL
 }
 
-// New returns a CubeSandbox backend. CubeSandbox has its own scheduler, so
-// provider mode is the only shape this backend runs in.
-func New(cfg Config) (*Backend, error) {
-	if cfg.Gateway == "" {
-		return nil, fmt.Errorf("cubesandbox needs a gateway address")
+// New returns a CubeSandbox backend in the given scheduling mode.
+//
+// Provider mode requires Gateway. Psrl mode requires at least one node address.
+func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
+	if !mode.Valid() {
+		return nil, fmt.Errorf("cubesandbox scheduling mode %q is not psrl or provider", mode)
+	}
+	if mode == backend.SchedulingProvider && cfg.Gateway == "" {
+		return nil, fmt.Errorf("cubesandbox in provider mode needs a gateway address")
+	}
+	if mode == backend.SchedulingPSRL && len(cfg.Nodes) == 0 {
+		return nil, fmt.Errorf(
+			"cubesandbox in psrl mode needs its node addresses, because this service chooses the node itself")
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 60 * time.Second
@@ -56,9 +102,18 @@ func New(cfg Config) (*Backend, error) {
 	if cfg.CreateTimeout <= 0 {
 		cfg.CreateTimeout = 5 * time.Minute
 	}
+	nodes := make(map[string]string, len(cfg.Nodes))
+	for _, node := range cfg.Nodes {
+		if node.NodeID == "" || node.Address == "" {
+			return nil, fmt.Errorf("a cubesandbox node needs both an id and an address")
+		}
+		nodes[node.NodeID] = normalize(node.Address)
+	}
 	cfg.Gateway = normalize(cfg.Gateway)
 	return &Backend{
-		cfg: cfg,
+		cfg:   cfg,
+		mode:  mode,
+		nodes: nodes,
 		http: &http.Client{Transport: &http.Transport{
 			MaxIdleConns: 128, MaxIdleConnsPerHost: 32, IdleConnTimeout: 90 * time.Second,
 		}},
@@ -68,35 +123,88 @@ func New(cfg Config) (*Backend, error) {
 // Name is the registry key for this backend.
 func (b *Backend) Name() string { return "cubesandbox" }
 
-// Mode is always provider: CubeSandbox places sandboxes on its own cluster and
-// this service does cross-backend quota only.
-func (b *Backend) Mode() backend.SchedulingMode { return backend.SchedulingProvider }
+// Mode says who places sandboxes for this deployment.
+func (b *Backend) Mode() backend.SchedulingMode { return b.mode }
 
-// Capabilities declares what CubeSandbox offers.
+// Capabilities declares what this deployment of CubeSandbox actually provides.
 //
-// CubeSandbox's pause is in-place (freeze, not hibernate): the sandbox stays
-// resident and compute is not released. It also supports filesystem snapshots
-// for checkpoint/restore across nodes, template build, warm pools, and its own
-// image delivery pipeline.
+// Provider mode wraps CubeMaster, which has warm pools, template builds, volume
+// attachment, and egress policy. Psrl mode bypasses CubeMaster and talks
+// directly to each Cubelet, so those CubeMaster-level features are absent. What
+// a Cubelet provides directly: microVM create/exec/snapshot/pause/resume/delete.
+//
+// Neither mode declares a resume level, because a CubeSandbox snapshot captures
+// the filesystem and not memory. Claiming full_state would let a conformance run
+// read a filesystem restore as proof a live process survived a move.
 func (b *Backend) Capabilities() backend.Capabilities {
+	if b.mode == backend.SchedulingProvider {
+		return backend.Capabilities{
+			Features: []string{
+				"freeze",
+				"filesystem_snapshot",
+				"restore",
+				"warm_pool",
+				"image_on_demand",
+				"template_build",
+				"volume",
+				"egress_policy",
+			},
+			// No resume level: a snapshot captures the filesystem but not memory, so
+			// a restore on another host starts from a checkpoint rather than a live
+			// process. Claiming full_state would let a conformance run read a
+			// filesystem restore as proof a live process survived the move.
+			ResumeLevel: "",
+			PauseModes:  []string{"freeze"},
+		}
+	}
+	// Psrl mode: direct Cubelet, so the CubeMaster-level features are absent.
+	// A warm pool is managed by CubeMaster, and a template build is a
+	// CubeMaster API; neither is reachable from a Cubelet. Declaring them here
+	// would let a spec requiring one be admitted and then fail at create.
 	return backend.Capabilities{
 		Features: []string{
 			"freeze",
 			"filesystem_snapshot",
 			"restore",
-			"warm_pool",
 			"image_on_demand",
-			"template_build",
-			"volume",
-			"egress_policy",
 		},
-		// No resume level: a snapshot captures the filesystem but not memory, so a
-		// restore on another host starts from a checkpoint rather than a live
-		// process. Claiming full_state would let a conformance run read a filesystem
-		// restore as proof a live process survived the move.
+		// Same reasoning as provider mode, and additionally the snapshot is
+		// node-local here unless the deployment configures a shared store.
 		ResumeLevel: "",
 		PauseModes:  []string{"freeze"},
 	}
+}
+
+// Nodes returns the Cubelet addresses this service may place against.
+//
+// Only meaningful in psrl mode; returns nil in provider mode because
+// CubeMaster owns placement.
+func (b *Backend) Nodes(context.Context) ([]string, error) {
+	if b.mode == backend.SchedulingProvider {
+		return nil, nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	ids := make([]string, 0, len(b.nodes))
+	for id := range b.nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// Headroom is reported by this service's own node admission.
+func (b *Backend) Headroom(context.Context, string) (map[string]backend.Resources, error) {
+	return nil, nil
+}
+
+// RegisterBinding is a no-op for CubeSandbox.
+//
+// CubeMaster has no external RecordAssignment RPC comparable to AgentENV's,
+// so there is nothing to register. In psrl mode this service chose the node
+// and holds the NodeID on the handle; no registration is needed for routing.
+func (b *Backend) RegisterBinding(_ context.Context, _, _ string) error {
+	return nil
 }
 
 type newSandbox struct {
@@ -117,13 +225,15 @@ type sandboxReply struct {
 
 // Create provisions one microVM sandbox.
 //
+// In psrl mode it goes straight to the chosen Cubelet; in provider mode to the
+// CubeMaster gateway. The request body is the same in both modes so the two
+// shapes cannot drift in what they ask for.
+//
 // The source must be a template: CubeSandbox requires a templateID rather than
-// an image reference, because templates encode the microVM parameters (size,
-// layers, config) that a plain image tag does not. A "template" source kind
-// carries the template ID directly; an "image" source maps to the same field,
-// which CubeSandbox resolves to a built template.
+// a raw image reference. A "template" source kind carries the template ID
+// directly; an "image" source maps to the same field.
 func (b *Backend) Create(
-	ctx context.Context, _ string, spec backend.Spec, _ string,
+	ctx context.Context, nodeID string, spec backend.Spec, _ string,
 ) (backend.Created, error) {
 	if spec.Source.Kind != "" && spec.Source.Kind != "template" && spec.Source.Kind != "image" {
 		return backend.Created{},
@@ -132,10 +242,16 @@ func (b *Backend) Create(
 	if spec.Source.Reference == "" {
 		return backend.Created{}, fmt.Errorf("cubesandbox needs a source reference (template id or image tag)")
 	}
+
+	target, err := b.target(nodeID)
+	if err != nil {
+		return backend.Created{}, err
+	}
+
 	body := newSandbox{
 		TemplateID: spec.Source.Reference,
-		// Disable the provider's own expiry: this service owns the lifetime through
-		// its reclamation sweep. -1 means no timeout.
+		// Disable the provider's own expiry: this service owns the lifetime
+		// through its reclamation sweep. -1 means no timeout.
 		Timeout:   -1,
 		AutoPause: false,
 		EnvVars:   spec.Env,
@@ -145,7 +261,7 @@ func (b *Backend) Create(
 
 	createCtx, cancel := context.WithTimeout(ctx, b.cfg.CreateTimeout)
 	defer cancel()
-	raw, err := b.call(createCtx, http.MethodPost, "/sandboxes", body)
+	raw, err := b.call(createCtx, http.MethodPost, target+"/sandboxes", body)
 	if err != nil {
 		return backend.Created{}, fmt.Errorf("cubesandbox create: %w", err)
 	}
@@ -158,8 +274,6 @@ func (b *Backend) Create(
 	}
 
 	// Commands go to the sandbox's own envd agent, not through this service.
-	// The domain is the stable DNS name the cluster assigns; access requires the
-	// envdAccessToken.
 	agentAddress := ""
 	if reply.Domain != "" {
 		agentAddress = "https://" + reply.Domain
@@ -169,7 +283,7 @@ func (b *Backend) Create(
 		agent.Headers = map[string]string{"X-Access-Token": reply.EnvdAccessToken}
 	}
 	return backend.Created{
-		Handle:       backend.Handle{Backend: b.Name(), SandboxID: reply.SandboxID},
+		Handle:       backend.Handle{Backend: b.Name(), SandboxID: reply.SandboxID, NodeID: nodeID},
 		Capabilities: b.Capabilities(),
 		Agent:        agent,
 	}, nil
@@ -192,14 +306,16 @@ func applyOptions(body *newSandbox, spec backend.Spec) {
 
 // Release destroys one sandbox.
 func (b *Backend) Release(ctx context.Context, handle backend.Handle) error {
+	target, err := b.target(handle.NodeID)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
-	_, err := b.call(ctx, http.MethodDelete, "/sandboxes/"+handle.SandboxID, nil)
+	_, err = b.call(ctx, http.MethodDelete, target+"/sandboxes/"+handle.SandboxID, nil)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("cubesandbox release %s: %w", handle.SandboxID, err)
 	}
-	// 404 means the sandbox was already destroyed, which is the outcome the
-	// caller wanted.
 	return nil
 }
 
@@ -209,9 +325,13 @@ type sandboxDetail struct {
 
 // Status reports a sandbox's portable state.
 func (b *Backend) Status(ctx context.Context, handle backend.Handle) (string, error) {
+	target, err := b.target(handle.NodeID)
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
-	raw, err := b.call(ctx, http.MethodGet, "/sandboxes/"+handle.SandboxID, nil)
+	raw, err := b.call(ctx, http.MethodGet, target+"/sandboxes/"+handle.SandboxID, nil)
 	if err != nil {
 		if isNotFound(err) {
 			return "terminated", nil
@@ -235,27 +355,34 @@ func (b *Backend) Status(ctx context.Context, handle backend.Handle) (string, er
 // Pause freezes the sandbox in place.
 //
 // CubeSandbox's pause is an in-place freeze: the sandbox stays resident and
-// compute is not released. A hibernate (write-and-release) is not offered, so
-// requesting one is an error rather than being served as a freeze: a caller
-// that expected its compute to be returned would otherwise be misled.
+// compute is not released. Hibernate is not offered, so requesting one is an
+// error rather than being served as a freeze: a caller that expected compute
+// back would otherwise be misled.
 func (b *Backend) Pause(ctx context.Context, handle backend.Handle, mode string) error {
 	if mode != "" && mode != "freeze" {
 		return fmt.Errorf(
 			"cubesandbox keeps the sandbox resident on pause, so it freezes rather than %q", mode)
 	}
+	target, err := b.target(handle.NodeID)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
-	_, err := b.call(ctx, http.MethodPost, "/sandboxes/"+handle.SandboxID+"/pause", nil)
+	_, err = b.call(ctx, http.MethodPost, target+"/sandboxes/"+handle.SandboxID+"/pause", nil)
 	return err
 }
 
 // Resume unfreezes a paused sandbox.
 func (b *Backend) Resume(ctx context.Context, handle backend.Handle) error {
-	// -1 keeps the sandbox's current expiry; this service owns the lifetime, so
-	// resetting the TTL here would add a second clock.
+	target, err := b.target(handle.NodeID)
+	if err != nil {
+		return err
+	}
+	// -1 keeps the sandbox's current expiry; this service owns the lifetime.
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
-	_, err := b.call(ctx, http.MethodPost, "/sandboxes/"+handle.SandboxID+"/resume",
+	_, err = b.call(ctx, http.MethodPost, target+"/sandboxes/"+handle.SandboxID+"/resume",
 		map[string]any{"timeout": -1})
 	return err
 }
@@ -266,18 +393,23 @@ type snapshotReply struct {
 
 // Snapshot captures the sandbox's filesystem.
 //
-// CubeSandbox snapshots capture the filesystem, so the only kind this backend
-// offers is "filesystem". A full_state claim would overstate what was saved:
-// a restore recreates the filesystem state, not a live process.
+// CubeSandbox snapshots capture the writable layer; "full_state" is refused
+// rather than served as a filesystem snapshot, because a caller that expected
+// a live process to survive a resume would be misled. In psrl mode the
+// snapshot is node-local unless a shared store is configured externally.
 func (b *Backend) Snapshot(ctx context.Context, handle backend.Handle, kind string) (string, error) {
 	if kind != "" && kind != "filesystem" {
 		return "", fmt.Errorf(
 			"cubesandbox captures the filesystem, so it takes a filesystem snapshot rather than %q", kind)
 	}
+	target, err := b.target(handle.NodeID)
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.CreateTimeout)
 	defer cancel()
 	raw, err := b.call(ctx, http.MethodPost,
-		"/sandboxes/"+handle.SandboxID+"/snapshots", map[string]any{})
+		target+"/sandboxes/"+handle.SandboxID+"/snapshots", map[string]any{})
 	if err != nil {
 		return "", fmt.Errorf("cubesandbox snapshot: %w", err)
 	}
@@ -293,26 +425,72 @@ func (b *Backend) Snapshot(ctx context.Context, handle backend.Handle, kind stri
 
 // DeleteSnapshot removes a previously captured snapshot.
 func (b *Backend) DeleteSnapshot(ctx context.Context, snapshotID string) error {
+	target, err := b.anyTarget()
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
-	_, err := b.call(ctx, http.MethodDelete, "/snapshots/"+snapshotID, nil)
+	_, err = b.call(ctx, http.MethodDelete, target+"/snapshots/"+snapshotID, nil)
 	if err != nil && !isNotFound(err) {
 		return err
 	}
 	return nil
 }
 
-// Preflight confirms the cluster is reachable.
+// Preflight confirms the deployment is reachable.
+//
+// In provider mode it probes the gateway. In psrl mode it probes every
+// configured Cubelet, because each one is a distinct server.
 func (b *Backend) Preflight(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
-	if _, err := b.call(ctx, http.MethodGet, "/health", nil); err != nil {
-		return fmt.Errorf("cubesandbox gateway at %s is not answering: %w", b.cfg.Gateway, err)
+	targets := map[string]string{}
+	if b.mode == backend.SchedulingProvider {
+		targets["gateway"] = b.cfg.Gateway
+	} else {
+		b.mu.RLock()
+		for id, address := range b.nodes {
+			targets[id] = address
+		}
+		b.mu.RUnlock()
+	}
+	for name, address := range targets {
+		if _, err := b.call(ctx, http.MethodGet, address+"/health", nil); err != nil {
+			return fmt.Errorf("cubesandbox node %s at %s is not answering: %w", name, address, err)
+		}
 	}
 	return nil
 }
 
-func (b *Backend) call(ctx context.Context, method, path string, body any) ([]byte, error) {
+// target returns the URL a single-sandbox call goes to.
+//
+// In provider mode every call goes to the gateway. In psrl mode a call goes
+// to the node that holds the sandbox, recorded on the handle at create time.
+func (b *Backend) target(nodeID string) (string, error) {
+	if b.mode == backend.SchedulingProvider {
+		return b.cfg.Gateway, nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if nodeID == "" {
+		for _, address := range b.nodes {
+			return address, nil
+		}
+		return "", fmt.Errorf("cubesandbox has no configured nodes")
+	}
+	address, known := b.nodes[nodeID]
+	if !known {
+		return "", fmt.Errorf("cubesandbox node %q is not configured", nodeID)
+	}
+	return address, nil
+}
+
+func (b *Backend) anyTarget() (string, error) {
+	return b.target("")
+}
+
+func (b *Backend) call(ctx context.Context, method, url string, body any) ([]byte, error) {
 	var payload *bytes.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -323,7 +501,7 @@ func (b *Backend) call(ctx context.Context, method, path string, body any) ([]by
 	} else {
 		payload = bytes.NewReader(nil)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, b.cfg.Gateway+path, payload)
+	req, err := http.NewRequestWithContext(ctx, method, url, payload)
 	if err != nil {
 		return nil, err
 	}

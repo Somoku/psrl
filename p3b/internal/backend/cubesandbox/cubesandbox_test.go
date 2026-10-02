@@ -88,7 +88,7 @@ func newFakeCube(t *testing.T) *fakeCube {
 
 func newBackend(t *testing.T, fake *fakeCube) *Backend {
 	t.Helper()
-	b, err := New(Config{Gateway: fake.server.URL})
+	b, err := New(Config{Gateway: fake.server.URL}, sbbackend.SchedulingProvider)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -96,7 +96,7 @@ func newBackend(t *testing.T, fake *fakeCube) *Backend {
 }
 
 func TestItNeedsAGatewayAddress(t *testing.T) {
-	if _, err := New(Config{}); err == nil {
+	if _, err := New(Config{}, sbbackend.SchedulingProvider); err == nil {
 		t.Fatal("cubesandbox must refuse an empty gateway")
 	}
 }
@@ -277,7 +277,7 @@ func TestPreflightFailsWhenGatewayIsAbsent(t *testing.T) {
 	b, _ := New(Config{
 		Gateway:        "http://127.0.0.1:1",
 		RequestTimeout: time.Second,
-	})
+	}, sbbackend.SchedulingProvider)
 	if err := b.Preflight(context.Background()); err == nil {
 		t.Fatal("preflight must refuse an unreachable gateway")
 	}
@@ -289,5 +289,204 @@ func testSpec() sbbackend.Spec {
 		Resources:     sbbackend.Resources{CPUCount: 2, MemoryMB: 2048},
 		ResourceClass: "rollout",
 		Env:           map[string]string{"TASK": "swe"},
+	}
+}
+
+// -- psrl mode ---------------------------------------------------------------
+
+func TestPSRLModeNeedsNodeAddresses(t *testing.T) {
+	if _, err := New(Config{}, sbbackend.SchedulingPSRL); err == nil {
+		t.Fatal("cubesandbox in psrl mode must refuse an empty node list")
+	}
+}
+
+func TestPSRLModeRejectsNodeWithoutAddress(t *testing.T) {
+	_, err := New(Config{
+		Nodes: []NodeAddress{{NodeID: "n1", Address: ""}},
+	}, sbbackend.SchedulingPSRL)
+	if err == nil {
+		t.Fatal("a node needs both an id and an address")
+	}
+}
+
+func TestAnInvalidModeIsRefused(t *testing.T) {
+	if _, err := New(Config{Gateway: "http://x"}, sbbackend.SchedulingMode("sideways")); err == nil {
+		t.Fatal("an unknown scheduling mode must be refused")
+	}
+}
+
+func TestPSRLModeReportsItsMode(t *testing.T) {
+	b, err := New(Config{
+		Nodes: []NodeAddress{{NodeID: "n1", Address: "http://n1:8089"}},
+	}, sbbackend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if b.Mode() != sbbackend.SchedulingPSRL {
+		t.Fatalf("mode: got %q, want psrl", b.Mode())
+	}
+}
+
+func TestPSRLModeDropsCubeMasterFeatures(t *testing.T) {
+	// A warm pool and a template build live on CubeMaster, which the direct
+	// Cubelet path bypasses. Declaring them would admit a spec the create
+	// would then refuse.
+	b, err := New(Config{
+		Nodes: []NodeAddress{{NodeID: "n1", Address: "http://n1:8089"}},
+	}, sbbackend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	for _, absent := range []string{"warm_pool", "template_build", "volume", "egress_policy"} {
+		for _, declared := range b.Capabilities().Features {
+			if declared == absent {
+				t.Errorf("psrl mode must not declare CubeMaster feature %q", absent)
+			}
+		}
+	}
+}
+
+func TestProviderModeKeepsCubeMasterFeatures(t *testing.T) {
+	fake := newFakeCube(t)
+	declared := map[string]bool{}
+	for _, feature := range newBackend(t, fake).Capabilities().Features {
+		declared[feature] = true
+	}
+	for _, wanted := range []string{"warm_pool", "template_build", "volume", "egress_policy"} {
+		if !declared[wanted] {
+			t.Errorf("provider mode should declare %q", wanted)
+		}
+	}
+}
+
+func TestPSRLModeListsItsNodes(t *testing.T) {
+	b, err := New(Config{
+		Nodes: []NodeAddress{
+			{NodeID: "n2", Address: "http://n2:8089"},
+			{NodeID: "n1", Address: "http://n1:8089"},
+		},
+	}, sbbackend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ids, err := b.Nodes(context.Background())
+	if err != nil {
+		t.Fatalf("nodes: %v", err)
+	}
+	// Sorted, so placement reads a stable order.
+	if len(ids) != 2 || ids[0] != "n1" || ids[1] != "n2" {
+		t.Fatalf("nodes: got %v, want [n1 n2]", ids)
+	}
+}
+
+func TestProviderModeListsNoNodes(t *testing.T) {
+	fake := newFakeCube(t)
+	ids, err := newBackend(t, fake).Nodes(context.Background())
+	if err != nil {
+		t.Fatalf("nodes: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("provider mode places on its own cluster, so it reports no nodes: got %v", ids)
+	}
+}
+
+func TestPSRLModeCreateGoesToTheChosenNode(t *testing.T) {
+	// Two Cubelets; a create naming n2 must reach n2 and not n1.
+	var reached string
+	n1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = "n1"
+		json.NewEncoder(w).Encode(map[string]any{"sandboxID": "sb-1"})
+	}))
+	defer n1.Close()
+	n2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = "n2"
+		json.NewEncoder(w).Encode(map[string]any{"sandboxID": "sb-2"})
+	}))
+	defer n2.Close()
+
+	b, err := New(Config{
+		Nodes: []NodeAddress{
+			{NodeID: "n1", Address: n1.URL},
+			{NodeID: "n2", Address: n2.URL},
+		},
+	}, sbbackend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	created, err := b.Create(context.Background(), "n2", testSpec(), "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if reached != "n2" {
+		t.Errorf("create reached %q, want n2", reached)
+	}
+	// The node is recorded so every later call routes back to it.
+	if created.Handle.NodeID != "n2" {
+		t.Errorf("handle node: got %q, want n2", created.Handle.NodeID)
+	}
+}
+
+func TestPSRLModeRefusesAnUnknownNode(t *testing.T) {
+	b, err := New(Config{
+		Nodes: []NodeAddress{{NodeID: "n1", Address: "http://n1:8089"}},
+	}, sbbackend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if _, err := b.Create(context.Background(), "nowhere", testSpec(), ""); err == nil {
+		t.Fatal("a create naming an unconfigured node must be refused")
+	}
+}
+
+func TestPSRLModePreflightProbesEveryNode(t *testing.T) {
+	probed := map[string]bool{}
+	n1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probed["n1"] = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer n1.Close()
+	n2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probed["n2"] = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer n2.Close()
+
+	b, err := New(Config{
+		Nodes: []NodeAddress{
+			{NodeID: "n1", Address: n1.URL},
+			{NodeID: "n2", Address: n2.URL},
+		},
+	}, sbbackend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := b.Preflight(context.Background()); err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if !probed["n1"] || !probed["n2"] {
+		t.Errorf("preflight must probe every node, reached %v", probed)
+	}
+}
+
+func TestPSRLModePreflightFailsWhenOneNodeIsAbsent(t *testing.T) {
+	// One live node is not enough: a fleet missing a node silently loses that
+	// node's whole capacity, so preflight refuses rather than degrading.
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer live.Close()
+
+	b, err := New(Config{
+		Nodes: []NodeAddress{
+			{NodeID: "up", Address: live.URL},
+			{NodeID: "down", Address: "http://127.0.0.1:1"},
+		},
+		RequestTimeout: time.Second,
+	}, sbbackend.SchedulingPSRL)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := b.Preflight(context.Background()); err == nil {
+		t.Fatal("preflight must refuse a fleet with an unreachable node")
 	}
 }

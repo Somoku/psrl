@@ -247,7 +247,9 @@ class DockerBackend(SandboxBackend):
             registry_auth=self.registry_auth,
         )
         self.metrics = SandboxMetrics()
-        self.container_events = ContainerEventWatcher(self.engine, self.engine.inspect_container)
+        self.container_events = ContainerEventWatcher(
+            self.engine, lambda cid: self.engine.inspect_container(cid)
+        )
         self._rootless_checked = False
         self._rootless_lock = asyncio.Lock()
         if image_pull_concurrency < 1:

@@ -232,6 +232,19 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
         sh -s -- -y --profile minimal --default-toolchain stable && \
     rustup component add rustfmt clippy
 
+# Go is needed to compile the p3b sandbox service (p3b/cmd/sandboxd).
+ARG GO_VERSION=1.23.4
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+        -o /tmp/go.tar.gz && \
+    tar -C /usr/local -xzf /tmp/go.tar.gz && \
+    rm /tmp/go.tar.gz && \
+    /usr/local/go/bin/go version
+
+ENV GOROOT=/usr/local/go \
+    GOPATH=/root/go \
+    GOMODCACHE=/root/go/pkg/mod \
+    PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
+
 # Copy only immutable patch inputs before cloning large repositories. This is
 # the same source-first patch pattern used by vime and fails during build when
 # a revision drifts away from its PSRL patch.
@@ -487,10 +500,10 @@ RUN mkdir -p ${PSRL_WORKSPACE}/env
 COPY docker/env.sh ${PSRL_WORKSPACE}/env/psrl.sh
 
 ENV VIRTUAL_ENV=/root/venv \
-    PATH="/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    PATH="/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/go/bin:/root/go/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 RUN echo 'export VIRTUAL_ENV=/root/venv' >> ~/.bashrc && \
-    echo 'export PATH=/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' >> ~/.bashrc
+    echo 'export PATH=/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/go/bin:/root/go/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' >> ~/.bashrc
 
 LABEL org.opencontainers.image.title="PSRL CUDA" \
       org.opencontainers.image.description="PSRL post-training environment with CUDA, vLLM, veRL, SMG, NIXL, LMCache, Megatron, Mooncake, and DeepEP" \

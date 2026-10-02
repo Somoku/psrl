@@ -1,26 +1,31 @@
 """The p3b sandbox service as a PSRL backend.
 
-PSRL has two ways to run a sandbox, and this is the one that does not run it
-in-process. The in-process backends (`docker`, `agentenv`, `opensandbox`) each
-drive a provider from the worker; this one hands the whole decision to the p3b
-service and asks it for a sandbox.
+PSRL has two sandbox paths. The in-process path (`docker`, `agentenv`,
+`opensandbox`) runs sandbox logic inside the worker and charges the worker's
+node envelope. This path does neither: it delegates every placement and
+lifetime decision to the p3b service, and PSRL becomes a pure client.
 
-What moves, and why it is worth a hop: placement, the cross-backend quota
-ledger, and reclamation all become the service's, so every worker in a fleet
-draws on one ledger rather than on its own node envelope. A worker that places
-locally cannot know what the other workers are holding.
+The separation is explicit by design: p3b is an independently deployable
+service that PSRL calls rather than a library it hosts. Nothing in this file
+may import from other `psrl.sandbox` modules — it imports only from the
+standalone `sandboxd` SDK and from `psrl.sandbox.core`, which holds the
+abstract interfaces. The rest of `psrl.sandbox` is the in-process path and
+must not bleed through here.
 
-What does not move: commands. `create` returns the sandbox's own agent
-endpoint, and `exec` goes straight there. An episode issues one create and
-dozens of commands, so routing commands through the service would add a hop per
-command without adding a decision.
+What this backend is responsible for:
+- Translating between PSRL's SandboxSpec and the service's, refusing anything
+  the service cannot represent rather than silently dropping it
+- Wrapping the service's sandbox handle in a SandboxSession so the rest of
+  PSRL never knows which path it is on
+- Reporting fleet and quota state through the service's own reports, so PSRL's
+  metric hooks see a consistent view of a fleet the service manages
 
-The two type systems are deliberately isomorphic — both were generated against
-`psrl/sandbox/api/v1/sandbox.proto` — so the conversions here are field renames
-rather than semantic translation. Where a PSRL spec carries something the
-service has no field for, this backend refuses rather than dropping it: a
-sandbox that silently lost its mount or its egress policy would be a worse
-failure than one that was never created.
+What this backend is not responsible for:
+- Placement, admission, or capacity — the service owns its ledger
+- Reclamation — the service's sweep handles it; a worker exiting does not
+  strand sandboxes
+- Node capacity charging — uses_node_capacity is False; the service's ledger
+  is the only admission that applies
 """
 
 from __future__ import annotations
@@ -28,16 +33,22 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from typing import Any
 
-from psrl.pysandbox import Sandbox as ServiceSandbox
-from psrl.pysandbox import SandboxClient
-from psrl.pysandbox import SandboxSpec as ServiceSpec
-from psrl.pysandbox import (
+from sandboxd import SandboxClient
+from sandboxd import SandboxSpec as ServiceSpec
+from sandboxd import (
     Resources as ServiceResources,
-)
-from psrl.pysandbox import (
+    SnapshotRef as ServiceSnapshotRef,
     Source as ServiceSource,
 )
+from sandboxd import Sandbox as ServiceSandbox
+from sandboxd.errors import (
+    SandboxCapabilityError,
+    SandboxCapacityTimeout,
+    SandboxError,
+)
+
 from psrl.sandbox.core import (
     ExecResult,
     PauseMode,
@@ -45,6 +56,7 @@ from psrl.sandbox.core import (
     ResumeLevel,
     SandboxBackend,
     SandboxCapabilities,
+    SandboxExitReason,
     SandboxFeature,
     SandboxRef,
     SandboxSession,
@@ -55,21 +67,27 @@ from psrl.sandbox.core import (
     SnapshotRef,
 )
 
-psrl_logger = logging.getLogger(__file__)
+psrl_logger = logging.getLogger(__name__)
 
-# The service's default socket. A deployment that runs one service per node uses
-# this; a shared control plane is reached by host:port instead.
+# The service's default socket. A service per node uses this; a shared control
+# plane is reached by host:port.
 DEFAULT_ENDPOINT = "unix:///run/sandboxd.sock"
 
 
 class P3bSession(SandboxSession):
-    """One sandbox held by the service.
+    """One sandbox held by the p3b service.
 
     Commands go to the sandbox's agent endpoint, which `create` already
-    resolved. Lifecycle goes back to the service.
+    resolved. Lifecycle goes back to the service. This class holds no
+    admission state of its own — the service is the source of truth.
     """
 
-    def __init__(self, backend: P3bBackend, sandbox: ServiceSandbox, spec: SandboxSpec | None) -> None:
+    def __init__(
+        self,
+        backend: P3bBackend,
+        sandbox: ServiceSandbox,
+        spec: SandboxSpec | None,
+    ) -> None:
         self._backend = backend
         self._sandbox = sandbox
         self._spec = spec
@@ -77,7 +95,9 @@ class P3bSession(SandboxSession):
         self._busy = False
         self._last_activity_at: float | None = None
         self._terminated = False
-        self._exit_reason = SandboxStatus.UNKNOWN
+        self._exit_reason = SandboxExitReason.UNKNOWN
+
+    # -- SandboxSession identity -----------------------------------------------
 
     @property
     def ref(self) -> SandboxRef:
@@ -85,11 +105,15 @@ class P3bSession(SandboxSession):
 
     @property
     def capabilities(self) -> SandboxCapabilities:
-        return _capabilities_from(self._sandbox.capabilities)
+        # The backend declares the fleet-level capabilities; per-sandbox
+        # capabilities are not reported by the service yet.
+        return self._backend.capabilities
 
     @property
     def spec(self) -> SandboxSpec | None:
         return self._spec
+
+    # -- SandboxSession activity -----------------------------------------------
 
     @property
     def command_count(self) -> int:
@@ -104,17 +128,17 @@ class P3bSession(SandboxSession):
         return self._last_activity_at
 
     @property
-    def exit_reason(self) -> SandboxStatus:
+    def exit_reason(self) -> SandboxExitReason:
         return self._exit_reason
+
+    # -- Node identity (not part of the SandboxSession contract) ---------------
 
     @property
     def node_id(self) -> str:
-        """Return the node the service placed this sandbox on.
-
-        Not part of the session contract, but a rollout that reports where its
-        sandboxes landed needs it, and only the service knows.
-        """
+        """Return the node the service placed this sandbox on."""
         return self._sandbox.node_id
+
+    # -- Data plane: straight to the sandbox -----------------------------------
 
     async def exec(
         self,
@@ -125,11 +149,10 @@ class P3bSession(SandboxSession):
         timeout_s: float | None = None,
         silence_timeout_s: float | None = None,
     ) -> ExecResult:
-        """Run one command in the sandbox.
+        """Run one command straight to the sandbox agent endpoint.
 
-        The SDK's exceptions are already PSRL's: both modules raise the same
-        `SandboxCommandTimeout`, `SandboxOomError`, and `SandboxSessionLost`
-        types, so a caller's attribution logic does not change with the backend.
+        The SDK raises the same SandboxCommandTimeout, SandboxOomError, and
+        SandboxSessionLost types that PSRL already handles — no translation.
         """
         self._busy = True
         try:
@@ -157,40 +180,42 @@ class P3bSession(SandboxSession):
     async def write_bytes(self, path: str, data: bytes) -> None:
         await self._sandbox.write_bytes(path, data)
 
+    # -- Control plane: back to the service ------------------------------------
+
     async def status(self) -> SandboxStatus:
         if self._terminated:
             return SandboxStatus.TERMINATED
-        return SandboxStatus(await self._sandbox.status())
+        raw = await self._sandbox.status()
+        return SandboxStatus(str(raw))
 
     async def terminate(self) -> None:
         """Release the sandbox back to the service.
 
-        Idempotent, because a lease's teardown and a reaper's sweep can both
-        reach a session, and the second one must not raise.
+        Idempotent: a lease teardown and the service's reclamation sweep can
+        both reach a session, and the second must not raise.
         """
         if self._terminated:
             return
         self._terminated = True
-        self._exit_reason = SandboxStatus.RELEASED
+        self._exit_reason = SandboxExitReason.RELEASED
         await self._sandbox.release()
 
     async def stats(self) -> ResourceUsage:
-        """Report resource use.
+        """Return unknown usage.
 
-        The service's reports describe a node and a class rather than one
-        sandbox, so per-sandbox use is unknown here. Reported as unknown rather
-        than zero: a metric that reads zero would be taken as a measurement.
+        The service's fleet reports describe a node and a class, not one
+        sandbox. Returning None fields rather than zeros: a metric that reads
+        zero is indistinguishable from a sandbox that used nothing.
         """
         return ResourceUsage()
 
     async def snapshot(self, kind: SnapshotKind = SnapshotKind.FILESYSTEM) -> SnapshotRef:
-        """Capture the sandbox, through whichever backend the service placed it on."""
         ref = await self._sandbox.snapshot(kind)
         return SnapshotRef(
             backend=self._backend.name,
             snapshot_id=ref.snapshot_id,
-            kind=SnapshotKind(ref.kind),
-            resume_level=ResumeLevel(ref.resume_level) if ref.resume_level else None,
+            kind=SnapshotKind(str(ref.kind)),
+            resume_level=ResumeLevel(str(ref.resume_level)) if ref.resume_level else None,
         )
 
     async def pause(self, mode: PauseMode = PauseMode.HIBERNATE) -> None:
@@ -203,21 +228,29 @@ class P3bSession(SandboxSession):
         """Return the URL unchanged.
 
         A worker-loopback rewrite is a property of where the sandbox runs
-        relative to the worker, and the service placed it — possibly on another
-        machine, where no alias this worker could name would resolve. A
-        deployment that needs the worker reachable from the sandbox gives the
-        worker a routable address rather than a loopback one.
+        relative to the worker. The service places the sandbox — possibly on
+        another node — so no alias this worker names is guaranteed to resolve
+        there. A deployment that needs the worker reachable from the sandbox
+        gives the worker a routable address, not a loopback.
         """
         return url
 
 
 class P3bBackend(SandboxBackend):
-    """The p3b service as one PSRL backend.
+    """The p3b service as a PSRL backend.
 
-    This backend holds no envelope of its own: `uses_node_capacity` is False
-    because the service's ledger already bounds what may be admitted across the
-    whole fleet, and charging a worker's node envelope as well would refuse a
-    sandbox twice for the same memory.
+    Selecting this backend switches PSRL from in-process sandbox management
+    to the p3b service. The service holds the quota ledger, placement, and
+    reclamation; PSRL is a client.
+
+    Configuration in psrl_rollout.yaml:
+
+        sandbox:
+          default_backend: p3b
+          backends:
+            p3b:
+              _target_: psrl.sandbox.backends.P3bBackend
+              endpoint: unix:///run/sandboxd.sock
     """
 
     def __init__(
@@ -241,176 +274,204 @@ class P3bBackend(SandboxBackend):
 
     @property
     def uses_node_capacity(self) -> bool:
-        """Return False: the service's ledger is the only admission that applies."""
+        """Return False: the service's ledger is the only admission that applies.
+
+        Charging the worker's node envelope as well would refuse a sandbox
+        twice for the same memory.
+        """
         return False
 
     @property
     def capabilities(self) -> SandboxCapabilities:
-        """Declare the union of what the service's backends can serve.
+        """Declare the union of what a fleet running all four backends can serve.
 
         A union rather than an intersection, because the service routes a spec
-        to a backend that can meet it: a request for a full-state resume is
-        servable by the fleet even though its Docker backend alone could not.
-        The service refuses at admission anything no backend can serve, and that
-        refusal names what was missing — so a capability claimed here and absent
-        everywhere fails with a usable message rather than silently degrading.
+        to whichever backend can meet it. A spec no backend can serve is
+        refused at admission, and that refusal names what was missing — so a
+        capability claimed here and absent from every deployed backend fails
+        with a usable message rather than silently degrading.
+
+        Operators running a Docker-only fleet should not reduce this set here:
+        the service's own admission is the gate. Reducing this set would only
+        cause PSRL to refuse before asking the service.
         """
         return SandboxCapabilities(
-            features=frozenset(
-                {
-                    SandboxFeature.FREEZE,
-                    SandboxFeature.HIBERNATE,
-                    SandboxFeature.FILESYSTEM_SNAPSHOT,
-                    SandboxFeature.FULL_STATE_SNAPSHOT,
-                    SandboxFeature.RESTORE,
-                    SandboxFeature.NATIVE_FORK,
-                    SandboxFeature.RESUME_ANYWHERE,
-                    SandboxFeature.WARM_POOL,
-                    SandboxFeature.IMAGE_ON_DEMAND,
-                }
-            ),
+            features=frozenset({
+                SandboxFeature.FREEZE,
+                SandboxFeature.HIBERNATE,
+                SandboxFeature.FILESYSTEM_SNAPSHOT,
+                SandboxFeature.FULL_STATE_SNAPSHOT,
+                SandboxFeature.RESTORE,
+                SandboxFeature.NATIVE_FORK,
+                SandboxFeature.RESUME_ANYWHERE,
+                SandboxFeature.WARM_POOL,
+                SandboxFeature.IMAGE_ON_DEMAND,
+            }),
             resume_level=ResumeLevel.FULL_STATE,
         )
 
     def adopt_owner_id(self, owner_id: str) -> None:
         """Record the owner for this worker's sandboxes.
 
-        The service labels and reclaims by its own owner, so this is carried as
-        spec metadata for correlation rather than used for cleanup here.
+        Carried as spec metadata for correlation. The service reclaims by its
+        own owner labels, not by anything PSRL writes here.
         """
         if not self._owner_id:
             self._owner_id = owner_id
 
     async def create(self, spec: SandboxSpec) -> SandboxSession:
-        """Ask the service for one sandbox."""
         self._require_open()
-        sandbox = await self._client.create(self._to_service_spec(spec))
+        sandbox = await self._client.create(_to_service_spec(spec, self._owner_id, self._resource_class))
         return P3bSession(self, sandbox, spec)
 
     async def connect(self, sandbox_id: str) -> SandboxSession:
-        """Reattach to a sandbox this worker did not create.
+        """Not supported: the agent endpoint only travels with a create reply.
 
-        Not offered: the service owns the handle, and a reattach needs the agent
-        endpoint that only a create reply carries. A worker that lost its
-        session asks for a new sandbox instead.
+        A worker that lost its session asks for a new sandbox. The service's
+        reclamation sweep owns the lifetime of orphaned sandboxes.
         """
         raise NotImplementedError(
-            "The p3b service does not hand out a session for a sandbox a worker did not create; "
-            "the agent endpoint only travels with a create reply."
+            "P3bBackend does not support connect(): the agent endpoint is only "
+            "available in the create reply. Request a new sandbox instead."
         )
 
     async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> SandboxSession:
-        """Start a sandbox from a snapshot the service holds."""
         self._require_open()
-        service_spec = self._to_service_spec(spec) if spec is not None else None
-        sandbox = await self._client.restore(_to_service_snapshot(snapshot), service_spec)
+        service_spec = _to_service_spec(spec, self._owner_id, self._resource_class) if spec is not None else None
+        sandbox = await self._client.restore(
+            ServiceSnapshotRef(
+                backend=snapshot.backend,
+                snapshot_id=snapshot.snapshot_id,
+                kind=str(snapshot.kind.value if hasattr(snapshot.kind, "value") else snapshot.kind),
+            ),
+            service_spec,
+        )
         return P3bSession(self, sandbox, spec)
 
     async def prepare(self, spec: SandboxSpec) -> None:
-        """Warm whatever the service can warm for this spec.
+        """No-op: the service manages its own warm pools and image pulls.
 
-        A no-op rather than an error: image pulls, template builds, and warm
-        pools are the service's, and it does them when a create needs them. A
-        caller that prepares is asking to pay the cost early, and there is no
-        early to pay it at from here.
+        A caller that prepares is asking to pay the cost early. There is no
+        early to pay from here — the service does it on demand.
         """
         return None
 
     async def shutdown(self) -> None:
         """Close the connection to the service.
 
-        The sandboxes outlive it: the service holds the lifetime and reclaims by
-        its own sweep, so a worker exiting does not strand them.
+        Sandboxes outlive the connection: the service holds the lifetime and
+        reclaims by its own sweep, so a worker exiting does not strand them.
         """
         if self._closed:
             return
         self._closed = True
         await self._client.close()
 
+    # -- Metric passthroughs ---------------------------------------------------
+
+    async def fleet_report(self) -> dict[str, Any]:
+        """Return the service's fleet view for PSRL's metric hooks.
+
+        Not part of the SandboxBackend contract, but callable by any code that
+        knows it is talking to a P3bBackend and wants to report fleet state.
+        Delegates directly to the SDK's FleetReport.as_metrics() for a flat
+        metrics dict, and includes per-node state for debugging.
+        """
+        self._require_open()
+        report = await self._client.fleet()
+        result = report.as_metrics()
+        result["nodes"] = [
+            {
+                "node_id": n.node_id,
+                "backend": n.backend,
+                "live_sandboxes": n.live_sandboxes,
+                "cpu_used_pct": n.cpu_used_pct,
+                "mem_used_pct": n.mem_used_pct,
+                "draining": n.draining,
+            }
+            for n in (report.nodes or [])
+        ]
+        return result
+
+    async def quota_report(self) -> dict[str, Any]:
+        """Return the service's quota view for PSRL's metric hooks.
+
+        Delegates to QuotaReport.as_metrics() for a flat metrics dict.
+        """
+        self._require_open()
+        report = await self._client.quota()
+        return report.as_metrics()
+
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError(f"Sandbox backend {self._name!r} is closed.")
 
-    def _to_service_spec(self, spec: SandboxSpec) -> ServiceSpec:
-        """Convert a PSRL spec into the service's.
 
-        Anything the service has no field for is refused here rather than
-        dropped. A sandbox that quietly lost its bind mount, its egress
-        allowlist, or its injected credentials would run and produce a wrong
-        result; one that was refused costs a configuration fix.
-        """
-        if spec.mounts:
-            raise ValueError(
-                "A p3b sandbox runs on a node the service chose, which may not be this worker's, "
-                "so a host bind mount cannot be honoured. Use a volume the service can attach, "
-                "or run the docker backend in-process."
-            )
-        if spec.volumes:
-            raise ValueError("The p3b backend does not yet forward provider volumes.")
-        if spec.egress is not None:
-            raise ValueError("The p3b backend does not yet forward an egress policy.")
-        if spec.credentials or spec.credential_bindings:
-            raise ValueError("The p3b backend does not yet forward injected credentials.")
-        if spec.assigned_gpus:
-            raise ValueError(
-                "A p3b sandbox is placed by the service, which assigns its own devices, "
-                "so a worker cannot pin host GPU indices."
-            )
+# -- Module-level helpers (no PSRL sandbox state, pure conversion) -------------
 
-        metadata = dict(spec.metadata)
-        if self._owner_id:
-            metadata.setdefault("psrl_owner_id", self._owner_id)
+def _to_service_spec(
+    spec: SandboxSpec,
+    owner_id: str,
+    default_resource_class: str,
+) -> ServiceSpec:
+    """Convert a PSRL SandboxSpec into the service's.
 
-        return ServiceSpec(
-            source=ServiceSource(
-                kind=_source_kind(spec.source.kind),
-                reference=spec.source.reference,
-            ),
-            resources=ServiceResources(
-                cpu_count=spec.resources.cpu_count,
-                memory_mb=spec.resources.memory_mb,
-                disk_mb=spec.resources.disk_mb,
-                gpu_count=spec.resources.gpu_count,
-            ),
-            resource_class=spec.resource_class or self._resource_class,
-            workflow_id=spec.workflow_id,
-            idempotency_key=spec.idempotency_key,
-            env=dict(spec.env),
-            metadata=metadata,
+    Anything the service has no field for is refused here rather than dropped.
+    A sandbox that quietly lost a bind mount, an egress policy, or injected
+    credentials would run and produce a wrong result; one that was refused
+    costs a configuration fix.
+    """
+    if spec.mounts:
+        raise ValueError(
+            "A p3b sandbox is placed by the service, which may land on a node "
+            "other than this worker's. A host bind mount cannot be honoured. "
+            "Use a provider volume that the service can attach, or use the "
+            "docker backend to run the sandbox on this worker's own node."
+        )
+    if spec.volumes:
+        raise ValueError(
+            "P3bBackend does not forward provider volumes to the service. "
+            "Declare the volume in the service configuration instead."
+        )
+    if spec.egress is not None:
+        raise ValueError(
+            "P3bBackend does not forward an egress policy to the service. "
+            "Declare the policy in the service configuration instead."
+        )
+    if spec.credentials or spec.credential_bindings:
+        raise ValueError(
+            "P3bBackend does not forward injected credentials to the service. "
+            "Declare the credentials in the service configuration instead."
+        )
+    if spec.assigned_gpus:
+        raise ValueError(
+            "A p3b sandbox is placed by the service, which assigns its own "
+            "GPU indices on the node it chose. A worker cannot pin host GPU "
+            "indices for a remotely placed sandbox."
         )
 
+    metadata = dict(spec.metadata)
+    if owner_id:
+        metadata.setdefault("psrl_owner_id", owner_id)
 
-def _source_kind(kind: SandboxSourceKind) -> str:
-    """Return the service's name for a source kind."""
+    return ServiceSpec(
+        source=ServiceSource(
+            kind=_source_kind_str(spec.source.kind),
+            reference=spec.source.reference,
+        ),
+        resources=ServiceResources(
+            cpu_count=spec.resources.cpu_count,
+            memory_mb=spec.resources.memory_mb,
+            disk_mb=spec.resources.disk_mb,
+            gpu_count=spec.resources.gpu_count,
+        ),
+        resource_class=spec.resource_class or default_resource_class,
+        workflow_id=spec.workflow_id,
+        idempotency_key=spec.idempotency_key,
+        env=dict(spec.env),
+        metadata=metadata,
+    )
+
+
+def _source_kind_str(kind: SandboxSourceKind) -> str:
     return str(kind.value if hasattr(kind, "value") else kind)
-
-
-def _to_service_snapshot(snapshot: SnapshotRef):
-    """Convert a PSRL snapshot reference into the service's."""
-    from psrl.pysandbox import SnapshotRef as ServiceSnapshotRef
-
-    return ServiceSnapshotRef(
-        backend=snapshot.backend,
-        snapshot_id=snapshot.snapshot_id,
-        kind=snapshot.kind,
-    )
-
-
-def _capabilities_from(declared) -> SandboxCapabilities:
-    """Convert the service's capability report into PSRL's.
-
-    The feature vocabularies are the same strings in both modules, so a feature
-    the service names and PSRL does not is dropped rather than failing: a newer
-    service must not break an older worker over a capability it never asked for.
-    """
-    features = set()
-    for feature in getattr(declared, "features", ()) or ():
-        try:
-            features.add(SandboxFeature(str(feature)))
-        except ValueError:
-            psrl_logger.debug(f"The p3b service declared feature {feature!r}, which this worker does not know.")
-    level = getattr(declared, "resume_level", None)
-    return SandboxCapabilities(
-        features=frozenset(features),
-        resume_level=ResumeLevel(str(level)) if level else None,
-    )

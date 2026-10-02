@@ -8,6 +8,7 @@ config dataclasses are reached through the package that owns them.
 from psrl.sandbox.backends.docker import DockerBackend
 from psrl.sandbox.backends.e2b import AgentEnvBackend, CubeSandboxBackend, E2BBackend
 from psrl.sandbox.backends.opensandbox import OpenSandboxBackend
+from psrl.sandbox.backends.p3b import P3bBackend
 
 __all__ = [
     "AgentEnvBackend",
@@ -15,4 +16,5 @@ __all__ = [
     "DockerBackend",
     "E2BBackend",
     "OpenSandboxBackend",
+    "P3bBackend",
 ]

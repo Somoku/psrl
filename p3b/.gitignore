@@ -1,0 +1,6 @@
+# compiled binaries and test binaries
+sandboxd
+*.test
+
+# go workspace artifacts
+vendor/

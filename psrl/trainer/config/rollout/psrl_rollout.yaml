@@ -220,6 +220,33 @@ agent:
 
     backends:
 
+      # The p3b sandbox service. Switch to it with `default_backend: p3b`.
+      #
+      # Choose it over `docker` when more than one worker shares a fleet: the
+      # service holds one quota ledger across every node and backend it drives,
+      # so a class guarantee bounds the whole run rather than each worker's own
+      # node. A single-worker deployment gains nothing from the hop and should
+      # stay on `docker`.
+      #
+      # The service must already be listening before a worker starts — the
+      # backend connects on its first create and a missing socket is a startup
+      # error, not a retry. `p3b/README.md` carries the deployment steps.
+      p3b:
+        _target_: psrl.sandbox.backends.P3bBackend
+
+        # Where the SDK reaches the service. A service per node uses the default
+        # unix socket; one shared control plane is reached by host:port.
+        endpoint: unix:///run/sandboxd.sock
+
+        # The class a sandbox is charged to when its spec names none. The
+        # service's own `classes` block has to declare this same name, or every
+        # create is refused for a class it was never given a share of.
+        resource_class: rollout
+
+        # Bounds a control call — a create, a release, a report. Never a command:
+        # a command carries its own budget, because its duration is the work.
+        control_timeout_s: 60
+
       docker:
         _target_: psrl.sandbox.backends.DockerBackend
 

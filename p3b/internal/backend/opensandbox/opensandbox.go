@@ -1,40 +1,43 @@
-// Package opensandbox runs sandboxes on OpenSandbox nodes.
+// Package opensandbox runs sandboxes on OpenSandbox's runtime.
 //
-// OpenSandbox speaks a versioned REST API at /v1: POST /sandboxes creates from
-// an image or a snapshot, DELETE /sandboxes/{id} destroys, GET /sandboxes/{id}
-// reports state, and /pause+/resume are explicit endpoints. Snapshots land at
-// /sandboxes/{id}/snapshots; the endpoint for in-sandbox commands is fetched at
-// /sandboxes/{id}/endpoints/{port}.
+// OpenSandbox is two separable things, and this adapter treats them as such.
 //
-// Resources are stated as Kubernetes-style quantity strings ("500m", "256Mi"),
-// not raw integers, so this adapter converts from the portable spec's numeric
-// form.
+// Its data plane is a Go agent, execd, that runs inside every sandbox and serves
+// commands, files, PTYs, code contexts, and metrics on port 44772. That agent is
+// the reason to use OpenSandbox at all: it is more capable than driving a bare
+// container, and the work in it is already done.
+//
+// Its control plane is a Python lifecycle server that creates containers, tracks
+// them, allocates ports, and copies the agent in. Every one of those jobs is one
+// this service already does, and does concurrently.
 //
 // # Scheduling modes
 //
-// This adapter supports both scheduling modes defined by the backend contract.
+// In direct mode this service drives the container runtime itself and stages the
+// agent into each sandbox. The Python lifecycle server is not deployed and is not
+// in any path. This removes the create-path serialization that server imposes --
+// one event loop, a thread per create, and a process-wide lock in its port
+// allocator -- which is what a rollout step opening a hundred sandboxes at once
+// actually runs into. The agent is unchanged, so the data plane is identical.
 //
-// In provider mode the adapter sends every request to the Gateway URL and lets
-// OpenSandbox's own scheduler decide the node. This is correct for a k8s-backed
-// deployment where the controller owns placement (FastSandbox top-K,
-// BatchSandbox pool assignment) and p3b does cross-backend quota only.
+// In provider mode the adapter sends every request to a Gateway and lets
+// OpenSandbox's own scheduler decide the node. This is the right shape for a
+// Kubernetes-backed cluster, where the controller owns placement and provides
+// warm pools, template builds, block-level image delivery, and an artifact store
+// that makes a snapshot restorable on any node. There this service does
+// cross-backend quota only.
 //
-// In psrl mode the adapter talks to each OpenSandbox node's docker-mode server
-// directly, and p3b's Placement and Admission own the node decision. This is
-// the right shape when:
-//   - The deployment runs one docker-mode opensandbox-server per node.
-//   - OpenSandbox's own scheduler has nothing to add (no k8s, no pool manager).
-//   - A scheduler ablation must hold everything but the control plane fixed.
+// The two modes declare different capabilities, because they can serve different
+// things. Direct mode adds what the agent serves (persistent sessions, background
+// commands, code contexts, PTYs) and omits what only a cluster has (warm pools,
+// template builds, block delivery, cross-node resume). Provider mode is the
+// reverse. Neither claims more than it can do: a spec requiring an absent feature
+// is refused at admission rather than failing inside an episode.
 //
-// The two shapes diverge in Capabilities: provider mode can declare warm pools,
-// template builds, and image block delivery because those live on the k8s
-// cluster. Docker mode exposes none of them (the server returns 400 or 501),
-// so psrl mode declares only what is verified to work.
-//
-// One specific trap: snapshots in docker mode are node-local. The server calls
-// container.commit() with no registry push, so a snapshot taken in psrl mode
-// cannot be restored on a different node. RESUME_ANYWHERE is therefore not
-// declared in psrl mode, and cross-node restore is not supported.
+// One trap worth stating. A snapshot in direct mode is a container commit, which
+// lands as a local image with no registry push, so it restores on the node that
+// took it and nowhere else. resume_anywhere is therefore not declared, and the
+// node is recorded on the handle so a restore routes back to it.
 package opensandbox
 
 import (
@@ -43,44 +46,71 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"psrl.dev/sandboxd/internal/backend"
 )
 
 const (
-	// execdPort is the standard port for the execd service inside a sandbox.
-	// Commands arrive here; the adapter fetches the public endpoint at create
-	// time so the SDK can reach it without a second round trip.
+	// execdPort is where the agent listens inside a sandbox. In provider mode the
+	// adapter resolves the endpoint for this port at create time so the SDK can
+	// reach the agent without a second round trip.
 	execdPort = 44772
 )
 
 // Config is one OpenSandbox deployment.
+//
+// The fields divide by mode. A field a mode does not use is absent from its
+// configuration rather than ignored, so a deployment that sets a gateway on a
+// directly driven backend sees it do nothing and can tell.
 type Config struct {
 	// Gateway is the cluster entry point, used in provider mode.
 	// Typically https://host/v1.
 	Gateway string
-	// Nodes are the per-node docker-mode server addresses, used in psrl mode.
-	// Each one serves the full sandbox API on its own port, so placement here
-	// means choosing which to call. The key is a node ID; the value is the
-	// base URL of that node's opensandbox-server.
-	Nodes []NodeAddress
-	// APIKey is the OPEN-SANDBOX-API-KEY header value. Empty skips the header.
-	APIKey         string
+	// APIKey is the OPEN-SANDBOX-API-KEY header value, used in provider mode.
+	// Empty skips the header.
+	APIKey string
+
+	// -- direct mode ----------------------------------------------------------
+
+	// ExecdImage carries the agent binary, bootstrap.sh, and bubblewrap. It is
+	// staged once at startup and then bind-mounted into every sandbox, so the
+	// per-sandbox cost is a mount rather than a copy.
+	ExecdImage string
+	// Socket is the Docker daemon this service drives, as unix:// or tcp://.
+	Socket     string
+	APIVersion string
+	// StageDir is where the agent artifacts are extracted on this host. Every
+	// sandbox mounts it read-only.
+	StageDir string
+	// NodeID is this machine's identity, recorded on each handle.
+	NodeID string
+	// OwnerID labels containers this service created, so a sweep never touches
+	// one it did not.
+	OwnerID string
+	// Runtime is an OCI runtime name (gVisor, Kata). Empty uses the daemon's own.
+	Runtime string
+	// NetworkMode is passed to the daemon. "host" removes the per-sandbox veth,
+	// netns, and iptables work from the create path, and lets the agent be reached
+	// on a host port without a mapping.
+	NetworkMode string
+	// MaxCreateConcurrency bounds concurrent container creates. The daemon
+	// serializes parts of container setup in the kernel, so an unbounded burst
+	// turns latency into timeouts rather than throughput. Zero leaves it unbounded.
+	MaxCreateConcurrency int
+	// PortMin and PortMax bound the host ports the agent is published on, when a
+	// mapping is needed at all. Unused under host networking.
+	PortMin int
+	PortMax int
+
+	// -- both modes -----------------------------------------------------------
+
 	RequestTimeout time.Duration
 	// CreateTimeout is separate because a cold start may need to pull layers or
 	// restore a snapshot. The project's latency targets allow minutes; capping
 	// at a coordination deadline reads a slow registry as a node fault.
 	CreateTimeout time.Duration
-}
-
-// NodeAddress is one docker-mode opensandbox-server node.
-type NodeAddress struct {
-	NodeID  string
-	Address string
 }
 
 // Backend is OpenSandbox as a sandbox backend.
@@ -89,25 +119,19 @@ type Backend struct {
 	mode backend.SchedulingMode
 	http *http.Client
 
-	mu    sync.RWMutex
-	nodes map[string]string // nodeID -> base URL
+	// direct is set in direct mode and nil in provider mode. Its presence is what
+	// every lifecycle method dispatches on.
+	direct *directRuntime
 }
 
 // New returns an OpenSandbox backend in the given scheduling mode.
 //
-// Provider mode requires Gateway. Psrl mode requires at least one node address.
-// Configuring both and selecting psrl is valid: the gateway is unused but not
-// an error, so a mixed-fleet deploy.json can share one config stanza.
+// Direct mode dials the Docker daemon and stages the agent here rather than on
+// the first create, so an unreachable daemon or an unusable agent image fails the
+// deployment at startup instead of inside an episode.
 func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 	if !mode.Valid() {
-		return nil, fmt.Errorf("opensandbox scheduling mode %q is not psrl or provider", mode)
-	}
-	if mode == backend.SchedulingProvider && cfg.Gateway == "" {
-		return nil, fmt.Errorf("opensandbox in provider mode needs a gateway address")
-	}
-	if mode == backend.SchedulingPSRL && len(cfg.Nodes) == 0 {
-		return nil, fmt.Errorf(
-			"opensandbox in psrl mode needs its node addresses, because this service chooses the node itself")
+		return nil, fmt.Errorf("opensandbox scheduling mode %q is not direct or provider", mode)
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 60 * time.Second
@@ -115,22 +139,58 @@ func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 	if cfg.CreateTimeout <= 0 {
 		cfg.CreateTimeout = 5 * time.Minute
 	}
-	nodes := make(map[string]string, len(cfg.Nodes))
-	for _, node := range cfg.Nodes {
-		if node.NodeID == "" || node.Address == "" {
-			return nil, fmt.Errorf("an opensandbox node needs both an id and an address")
+
+	if mode == backend.SchedulingProvider {
+		if cfg.Gateway == "" {
+			return nil, fmt.Errorf("opensandbox in provider mode needs a gateway address")
 		}
-		nodes[node.NodeID] = normalize(node.Address)
+		cfg.Gateway = normalize(cfg.Gateway)
+		return &Backend{
+			cfg:  cfg,
+			mode: mode,
+			http: &http.Client{Transport: &http.Transport{
+				MaxIdleConns: 128, MaxIdleConnsPerHost: 32, IdleConnTimeout: 90 * time.Second,
+			}},
+		}, nil
 	}
-	cfg.Gateway = normalize(cfg.Gateway)
-	return &Backend{
-		cfg:   cfg,
-		mode:  mode,
-		nodes: nodes,
-		http: &http.Client{Transport: &http.Transport{
-			MaxIdleConns: 128, MaxIdleConnsPerHost: 32, IdleConnTimeout: 90 * time.Second,
-		}},
-	}, nil
+
+	// Direct mode: this service is the control plane, so it needs a runtime to
+	// drive and an agent image to stage.
+	if cfg.ExecdImage == "" {
+		return nil, fmt.Errorf(
+			"opensandbox in direct mode needs execd_image: the agent is staged from it into every sandbox")
+	}
+	if cfg.Socket == "" {
+		return nil, fmt.Errorf(
+			"opensandbox in direct mode needs socket: this service drives the container runtime itself")
+	}
+	if cfg.NodeID == "" {
+		return nil, fmt.Errorf("opensandbox in direct mode needs a node id to record on each sandbox")
+	}
+	if cfg.StageDir == "" {
+		cfg.StageDir = "/var/lib/sandboxd/opensandbox-agent"
+	}
+	if cfg.OwnerID == "" {
+		cfg.OwnerID = "sandboxd-" + cfg.NodeID
+	}
+
+	runtime, err := newDirectRuntime(context.Background(), directConfig{
+		Socket:               cfg.Socket,
+		APIVersion:           cfg.APIVersion,
+		NodeID:               cfg.NodeID,
+		OwnerID:              cfg.OwnerID,
+		Runtime:              cfg.Runtime,
+		NetworkMode:          cfg.NetworkMode,
+		MaxCreateConcurrency: cfg.MaxCreateConcurrency,
+		ExecdImage:           cfg.ExecdImage,
+		StageDir:             cfg.StageDir,
+		PortMin:              cfg.PortMin,
+		PortMax:              cfg.PortMax,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Backend{cfg: cfg, mode: mode, direct: runtime}, nil
 }
 
 // Name is the registry key for this backend.
@@ -139,98 +199,305 @@ func (b *Backend) Name() string { return "opensandbox" }
 // Mode says who places sandboxes for this deployment.
 func (b *Backend) Mode() backend.SchedulingMode { return b.mode }
 
-// Capabilities declares what this deployment of OpenSandbox actually provides.
+// Capabilities declares what this deployment can actually serve.
 //
-// The two modes have genuinely different capability sets because the underlying
-// server behaviour differs. Provider mode wraps a k8s-backed cluster that has
-// warm pools, image block delivery, template builds, and cross-node snapshots.
-// Psrl mode wraps a docker-mode server that has none of those things: the
-// relevant endpoints return 400 or 501. Declaring them anyway would let a
-// caller's spec require a feature the server will refuse, and that refusal
-// would arrive as a provider error at create time rather than a clean
-// SandboxCapabilityError at admission.
+// The two modes differ because the things underneath them differ, and the
+// difference is not cosmetic. Direct mode runs the agent on a container runtime
+// this service drives, so it can promise everything the agent serves and nothing
+// that needs a cluster. Provider mode runs on OpenSandbox's own cluster, so it is
+// the reverse: warm pools, template builds, block-level image delivery, and an
+// artifact store that makes a snapshot restorable anywhere.
 //
-// What docker mode does retain: egress sidecar, credential vault/proxy, and
-// gVisor/Kata isolation runtimes. Those are confirmed present.
-//
-// Snapshot in docker mode captures the filesystem via container.commit() with
-// no registry push, so a snapshot is node-local and RESUME_ANYWHERE is not
-// declared. FILESYSTEM_SNAPSHOT and RESTORE are declared because they work —
-// the constraint is that a restore must go to the same node, which the service
-// enforces by recording the NodeID on the handle.
+// Declaring a feature a deployment cannot serve is worse than declaring too few.
+// A spec that requires an absent feature is refused at admission with a message
+// naming what was missing; one that is admitted and then refused by the runtime
+// fails inside an episode and costs the sample.
 func (b *Backend) Capabilities() backend.Capabilities {
-	if b.mode == backend.SchedulingProvider {
-		// Provider mode: the k8s cluster provides the full feature set.
+	if b.mode == backend.SchedulingDirect {
+		// Read from the runtime rather than written as a constant: whether the
+		// staged agent carries bubblewrap, and whether an isolation runtime is
+		// configured, are properties of this deployment.
 		return backend.Capabilities{
-			Features: []string{
-				"freeze",
-				"filesystem_snapshot",
-				"restore",
-				"resume_anywhere",
-				"warm_pool",
-				"image_on_demand",
-				"image_block_delivery",
-				"template_build",
-				"volume",
-				"egress_policy",
-				"credential_injection",
-				"isolation_runtime",
-			},
-			// Filesystem-level snapshot only: the sandbox's root FS is captured,
-			// but running processes and memory are not. A restore recreates the
-			// workspace; every process starts fresh.
+			Features: b.direct.features(),
+			// A container commit captures the writable layer and not memory, so a
+			// restore recreates the workspace and every process starts fresh. The
+			// image is local, so the restore is too: resume_anywhere is absent from
+			// the feature list for that reason, and the node travels on the handle.
 			ResumeLevel: "filesystem",
 			PauseModes:  []string{"freeze"},
 		}
 	}
-	// Psrl mode: docker-mode server, per-node deployment. The features above
-	// that require k8s or FastSandbox are absent.
 	return backend.Capabilities{
 		Features: []string{
 			"freeze",
 			"filesystem_snapshot",
 			"restore",
+			"resume_anywhere",
+			"warm_pool",
+			"image_on_demand",
+			"image_block_delivery",
+			"template_build",
+			"volume",
 			"egress_policy",
 			"credential_injection",
 			"isolation_runtime",
 		},
-		// Snapshots are node-local in docker mode, so resume is also local-only.
-		// Declaring filesystem here (not resume_anywhere) is correct: the
-		// service will route a restore to the node that holds the snapshot.
+		// Filesystem-level: the cluster's snapshot captures the root filesystem and
+		// not memory. It restores on any node, which is what resume_anywhere says,
+		// but the restored processes are new.
 		ResumeLevel: "filesystem",
 		PauseModes:  []string{"freeze"},
 	}
 }
 
-// Nodes returns the runtime addresses this service may place against.
+// Nodes reports the nodes this service may place against.
 //
-// Only meaningful in psrl mode; returns an empty list in provider mode because
-// placement is the provider's responsibility.
+// Direct mode drives one daemon, so this backend instance is one node -- the same
+// shape the container backend has, and for the same reason: a Docker daemon is per
+// machine. Provider mode returns nothing, because placement is the provider's.
 func (b *Backend) Nodes(context.Context) ([]string, error) {
 	if b.mode == backend.SchedulingProvider {
 		return nil, nil
 	}
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	ids := make([]string, 0, len(b.nodes))
-	for id := range b.nodes {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return ids, nil
+	return []string{b.cfg.NodeID}, nil
 }
 
-// Headroom is reported by this service's own node admission rather than read
-// from OpenSandbox's metrics.
+// Headroom is reported by this node's own admission rather than read from the
+// runtime.
 //
-// OpenSandbox's docker server reports host metrics at GET /metrics, which
-// describe the host rather than the sandboxes and refresh on the server's own
-// cadence. Admission here tracks every grant exactly and in real time. Reading
-// both would be two disagreeing accounts of one envelope, and the stale one
-// would win during a burst.
+// Admission here tracks every grant exactly and in real time, while a runtime's
+// metrics are a snapshot on its own cadence. Reading both would be two
+// disagreeing accounts of one envelope, and during a burst the stale one would win.
 func (b *Backend) Headroom(context.Context, string) (map[string]backend.Resources, error) {
 	return nil, nil
 }
+
+// RegisterBinding is a no-op.
+//
+// OpenSandbox exposes no assignment RPC for an outside placer to register with,
+// and none is needed: in direct mode this service holds the node on the handle,
+// and in provider mode the provider already knows where it put the sandbox.
+func (b *Backend) RegisterBinding(context.Context, string, string) error {
+	return nil
+}
+
+// Create provisions one sandbox.
+//
+// In direct mode the container is composed and started here, with the agent
+// mounted beside the workload. In provider mode the request goes to the gateway
+// and OpenSandbox's scheduler places it. Both return the resolved agent endpoint,
+// so the SDK speaks to the sandbox directly from the first command either way.
+func (b *Backend) Create(
+	ctx context.Context, nodeID string, spec backend.Spec, _ string,
+) (backend.Created, error) {
+	if b.mode == backend.SchedulingDirect {
+		created, err := b.direct.create(ctx, spec)
+		if err != nil {
+			return backend.Created{}, err
+		}
+		created.Capabilities = b.Capabilities()
+		return created, nil
+	}
+
+	if spec.Source.Kind != "" &&
+		spec.Source.Kind != "image" && spec.Source.Kind != "template" {
+		return backend.Created{},
+			fmt.Errorf("opensandbox runs from an image or a template, not source kind %q", spec.Source.Kind)
+	}
+	if spec.Source.Reference == "" {
+		return backend.Created{},
+			fmt.Errorf("opensandbox needs a source reference (image URI or template id)")
+	}
+
+	req := createRequest{
+		ResourceLimits: resourceLimits(spec),
+		Env:            spec.Env,
+		Metadata:       spec.Metadata,
+	}
+	req.Image = &imageSpec{URI: spec.Source.Reference}
+	applyOptions(&req, spec)
+
+	createCtx, cancel := context.WithTimeout(ctx, b.cfg.CreateTimeout)
+	defer cancel()
+	raw, err := b.call(createCtx, http.MethodPost, b.cfg.Gateway+"/sandboxes", req)
+	if err != nil {
+		return backend.Created{}, fmt.Errorf("opensandbox create: %w", err)
+	}
+	var info sandboxInfo
+	if err := json.Unmarshal(raw, &info); err != nil {
+		return backend.Created{}, fmt.Errorf("opensandbox create reply: %w", err)
+	}
+	if info.ID == "" {
+		return backend.Created{}, fmt.Errorf("opensandbox create returned no sandbox id")
+	}
+
+	// Resolved here so the SDK reaches the agent without a second round trip.
+	agentAddress, agentHeaders := b.fetchEndpoint(ctx, b.cfg.Gateway, info.ID)
+
+	return backend.Created{
+		Handle:       backend.Handle{Backend: b.Name(), SandboxID: info.ID, NodeID: nodeID},
+		Capabilities: b.Capabilities(),
+		Agent: backend.AgentEndpoint{
+			Address: agentAddress,
+			Headers: agentHeaders,
+		},
+	}, nil
+}
+
+// Release destroys one sandbox.
+func (b *Backend) Release(ctx context.Context, handle backend.Handle) error {
+	if b.mode == backend.SchedulingDirect {
+		return b.direct.release(ctx, handle)
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	_, err := b.call(ctx, http.MethodDelete, b.cfg.Gateway+"/sandboxes/"+handle.SandboxID, nil)
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("opensandbox release %s: %w", handle.SandboxID, err)
+	}
+	return nil
+}
+
+// Status reports a sandbox's portable state.
+func (b *Backend) Status(ctx context.Context, handle backend.Handle) (string, error) {
+	if b.mode == backend.SchedulingDirect {
+		return b.direct.status(ctx, handle)
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	raw, err := b.call(ctx, http.MethodGet, b.cfg.Gateway+"/sandboxes/"+handle.SandboxID, nil)
+	if err != nil {
+		if isNotFound(err) {
+			return "terminated", nil
+		}
+		return "", err
+	}
+	var info sandboxInfo
+	if err := json.Unmarshal(raw, &info); err != nil {
+		return "unknown", nil
+	}
+	switch info.Status.State {
+	case "Running":
+		return "running", nil
+	case "Paused", "Pausing":
+		return "paused", nil
+	case "Terminated", "Stopping", "Failed":
+		return "terminated", nil
+	default:
+		return "unknown", nil
+	}
+}
+
+// Pause freezes the sandbox in place.
+//
+// The sandbox stays resident either way: a container freeze keeps its memory, and
+// OpenSandbox's own pause does too. A hibernate would return the sandbox's
+// compute, which neither does, so asking for one is an error rather than a silent
+// downgrade -- a caller that expected its memory written out would otherwise be
+// told it was.
+func (b *Backend) Pause(ctx context.Context, handle backend.Handle, mode string) error {
+	if b.mode == backend.SchedulingDirect {
+		return b.direct.pause(ctx, handle, mode)
+	}
+	if mode != "" && mode != "freeze" {
+		return fmt.Errorf(
+			"opensandbox keeps the sandbox resident on pause, so it freezes rather than %q", mode)
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	_, err := b.call(ctx, http.MethodPost, b.cfg.Gateway+"/sandboxes/"+handle.SandboxID+"/pause", nil)
+	return err
+}
+
+// Resume unfreezes a paused sandbox.
+func (b *Backend) Resume(ctx context.Context, handle backend.Handle) error {
+	if b.mode == backend.SchedulingDirect {
+		return b.direct.resume(ctx, handle)
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	_, err := b.call(ctx, http.MethodPost, b.cfg.Gateway+"/sandboxes/"+handle.SandboxID+"/resume", nil)
+	return err
+}
+
+// Snapshot captures the sandbox's filesystem.
+//
+// Neither mode captures memory, so "full_state" is refused in both. Serving it as
+// a filesystem snapshot would let a conformance run read a workspace restore as
+// proof that a live process survived a move.
+func (b *Backend) Snapshot(ctx context.Context, handle backend.Handle, kind string) (string, error) {
+	if b.mode == backend.SchedulingDirect {
+		return b.direct.snapshot(ctx, handle, kind)
+	}
+	if kind != "" && kind != "filesystem" {
+		return "", fmt.Errorf(
+			"opensandbox captures the filesystem, so it takes a filesystem snapshot rather than %q", kind)
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.CreateTimeout)
+	defer cancel()
+	raw, err := b.call(ctx, http.MethodPost,
+		b.cfg.Gateway+"/sandboxes/"+handle.SandboxID+"/snapshots", map[string]any{})
+	if err != nil {
+		return "", fmt.Errorf("opensandbox snapshot: %w", err)
+	}
+	var info snapshotInfo
+	if err := json.Unmarshal(raw, &info); err != nil {
+		return "", err
+	}
+	if info.ID == "" {
+		return "", fmt.Errorf("opensandbox snapshot returned no id")
+	}
+	return info.ID, nil
+}
+
+// DeleteSnapshot removes a previously captured snapshot.
+func (b *Backend) DeleteSnapshot(ctx context.Context, snapshotID string) error {
+	if b.mode == backend.SchedulingDirect {
+		return b.direct.deleteSnapshot(ctx, snapshotID)
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	_, err := b.call(ctx, http.MethodDelete, b.cfg.Gateway+"/snapshots/"+snapshotID, nil)
+	if err != nil && !isNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// Preflight refuses a deployment this adapter cannot drive, at startup rather
+// than inside the first episode.
+//
+// Direct mode has already done the expensive part in New: the daemon was dialled
+// and the agent staged, and a failure there prevented construction. What is left
+// is to confirm the daemon is still answering.
+func (b *Backend) Preflight(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	if b.mode == backend.SchedulingDirect {
+		if err := b.direct.docker.ping(ctx); err != nil {
+			return fmt.Errorf("the Docker daemon at %s is not answering: %w", b.cfg.Socket, err)
+		}
+		return nil
+	}
+	// A minimal list proves auth and routing, not just that a port is open.
+	if _, err := b.call(ctx, http.MethodGet, b.cfg.Gateway+"/sandboxes?pageSize=1", nil); err != nil {
+		return fmt.Errorf("the opensandbox gateway at %s is not answering: %w", b.cfg.Gateway, err)
+	}
+	return nil
+}
+
+// StagedAgentDigest reports which agent image this backend staged.
+//
+// Exposed for operational reporting: a fleet running two agent versions is a
+// configuration drift an operator wants to see named rather than inferred.
+func (b *Backend) StagedAgentDigest() string {
+	if b.mode != backend.SchedulingDirect {
+		return ""
+	}
+	return b.direct.agent.Digest
+}
+
+// -- provider-mode plumbing ---------------------------------------------------
 
 // imageSpec is the OpenSandbox image spec for a create request.
 type imageSpec struct {
@@ -252,74 +519,15 @@ type sandboxInfo struct {
 	} `json:"status"`
 }
 
-// Create provisions one sandbox.
-//
-// In psrl mode it goes straight to the chosen node's docker server; in provider
-// mode to the gateway, which asks OpenSandbox's own scheduler. The request body
-// is the same in both modes, so the two shapes cannot drift in what they ask.
-//
-// An "image" source becomes an ImageSpec. Resources are converted from the
-// portable numeric form (CPUCount, MemoryMB) to Kubernetes quantity strings,
-// which is the only resource form OpenSandbox accepts.
-func (b *Backend) Create(
-	ctx context.Context, nodeID string, spec backend.Spec, _ string,
-) (backend.Created, error) {
-	if spec.Source.Kind != "" &&
-		spec.Source.Kind != "image" && spec.Source.Kind != "template" {
-		return backend.Created{},
-			fmt.Errorf("opensandbox runs from an image or a template, not source kind %q", spec.Source.Kind)
-	}
-	if spec.Source.Reference == "" {
-		return backend.Created{},
-			fmt.Errorf("opensandbox needs a source reference (image URI or template id)")
-	}
-
-	target, err := b.target(nodeID)
-	if err != nil {
-		return backend.Created{}, err
-	}
-
-	req := createRequest{
-		ResourceLimits: resourceLimits(spec),
-		Env:            spec.Env,
-		Metadata:       spec.Metadata,
-	}
-	req.Image = &imageSpec{URI: spec.Source.Reference}
-	applyOptions(&req, spec)
-
-	createCtx, cancel := context.WithTimeout(ctx, b.cfg.CreateTimeout)
-	defer cancel()
-	raw, err := b.call(createCtx, http.MethodPost, target+"/sandboxes", req)
-	if err != nil {
-		return backend.Created{}, fmt.Errorf("opensandbox create: %w", err)
-	}
-	var info sandboxInfo
-	if err := json.Unmarshal(raw, &info); err != nil {
-		return backend.Created{}, fmt.Errorf("opensandbox create reply: %w", err)
-	}
-	if info.ID == "" {
-		return backend.Created{}, fmt.Errorf("opensandbox create returned no sandbox id")
-	}
-
-	// Fetch the command endpoint so the SDK can reach execd without a second
-	// call. The endpoint is per-port; execd always listens on execdPort.
-	agentAddress, agentHeaders := b.fetchEndpoint(ctx, target, info.ID)
-
-	return backend.Created{
-		Handle:       backend.Handle{Backend: b.Name(), SandboxID: info.ID, NodeID: nodeID},
-		Capabilities: b.Capabilities(),
-		Agent: backend.AgentEndpoint{
-			Address: agentAddress,
-			Headers: agentHeaders,
-		},
-	}, nil
+type snapshotInfo struct {
+	ID string `json:"id"`
 }
 
-// fetchEndpoint retrieves the public execd endpoint for a sandbox.
+// fetchEndpoint retrieves the public agent endpoint for a sandbox.
 //
 // A failure is not fatal: the SDK falls back to the control path for commands,
-// which is slower but functional. The endpoint cache on the server side makes
-// subsequent fetches cheap.
+// which is slower but functional. The cluster caches the resolution, so repeat
+// fetches are cheap.
 func (b *Backend) fetchEndpoint(ctx context.Context, target, sandboxID string) (string, map[string]string) {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
@@ -341,10 +549,9 @@ func (b *Backend) fetchEndpoint(ctx context.Context, target, sandboxID string) (
 // resourceLimits converts the portable numeric spec into OpenSandbox's
 // Kubernetes-style quantity strings.
 //
-// OpenSandbox does not accept raw integers: CPU must be a millicore string
-// ("500m", "2000m") and memory a binary-suffix string ("256Mi", "2Gi").
-// A spec with no stated CPU sends no entry rather than "0m", which the server
-// would reject.
+// The cluster API does not accept raw integers: CPU must be a millicore string
+// ("500m", "2000m") and memory a binary-suffix string ("256Mi", "2Gi"). A spec
+// with no stated CPU sends no entry rather than "0m", which the server rejects.
 func resourceLimits(spec backend.Spec) map[string]string {
 	limits := make(map[string]string, 2)
 	if spec.Resources.CPUCount > 0 {
@@ -374,202 +581,6 @@ func applyOptions(req *createRequest, spec backend.Spec) {
 			req.ResourceLimits["memory"] = value
 		}
 	}
-}
-
-// Release destroys one sandbox.
-func (b *Backend) Release(ctx context.Context, handle backend.Handle) error {
-	target, err := b.target(handle.NodeID)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
-	defer cancel()
-	_, err = b.call(ctx, http.MethodDelete, target+"/sandboxes/"+handle.SandboxID, nil)
-	if err != nil && !isNotFound(err) {
-		return fmt.Errorf("opensandbox release %s: %w", handle.SandboxID, err)
-	}
-	return nil
-}
-
-// Status reports a sandbox's portable state.
-func (b *Backend) Status(ctx context.Context, handle backend.Handle) (string, error) {
-	target, err := b.target(handle.NodeID)
-	if err != nil {
-		return "", err
-	}
-	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
-	defer cancel()
-	raw, err := b.call(ctx, http.MethodGet, target+"/sandboxes/"+handle.SandboxID, nil)
-	if err != nil {
-		if isNotFound(err) {
-			return "terminated", nil
-		}
-		return "", err
-	}
-	var info sandboxInfo
-	if err := json.Unmarshal(raw, &info); err != nil {
-		return "unknown", nil
-	}
-	switch info.Status.State {
-	case "Running":
-		return "running", nil
-	case "Paused", "Pausing":
-		return "paused", nil
-	case "Terminated", "Stopping", "Failed":
-		return "terminated", nil
-	default:
-		return "unknown", nil
-	}
-}
-
-// Pause freezes the sandbox in place.
-//
-// OpenSandbox's pause keeps the sandbox resident (freeze, not hibernate). A
-// sandbox that is frozen still holds its memory and compute on the node; a
-// caller that needed compute to be released should use a backend that supports
-// hibernate instead. Requesting hibernate is an error rather than a silent
-// downgrade, because a caller expecting compute back would be misled.
-func (b *Backend) Pause(ctx context.Context, handle backend.Handle, mode string) error {
-	if mode != "" && mode != "freeze" {
-		return fmt.Errorf(
-			"opensandbox keeps the sandbox resident on pause, so it freezes rather than %q", mode)
-	}
-	target, err := b.target(handle.NodeID)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
-	defer cancel()
-	_, err = b.call(ctx, http.MethodPost, target+"/sandboxes/"+handle.SandboxID+"/pause", nil)
-	return err
-}
-
-// Resume unfreezes a paused sandbox.
-func (b *Backend) Resume(ctx context.Context, handle backend.Handle) error {
-	target, err := b.target(handle.NodeID)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
-	defer cancel()
-	_, err = b.call(ctx, http.MethodPost, target+"/sandboxes/"+handle.SandboxID+"/resume", nil)
-	return err
-}
-
-type snapshotInfo struct {
-	ID string `json:"id"`
-}
-
-// Snapshot captures the sandbox's filesystem.
-//
-// OpenSandbox snapshots capture the filesystem only; "full_state" is refused
-// rather than served as a filesystem snapshot, because a caller that expected
-// its process to survive a resume would read a workspace restore as proof. In
-// psrl mode the snapshot is node-local (docker mode uses container.commit()
-// with no push), so the NodeID is preserved on the handle to route a restore
-// back to the same node.
-func (b *Backend) Snapshot(ctx context.Context, handle backend.Handle, kind string) (string, error) {
-	if kind != "" && kind != "filesystem" {
-		return "", fmt.Errorf(
-			"opensandbox captures the filesystem, so it takes a filesystem snapshot rather than %q", kind)
-	}
-	target, err := b.target(handle.NodeID)
-	if err != nil {
-		return "", err
-	}
-	ctx, cancel := context.WithTimeout(ctx, b.cfg.CreateTimeout)
-	defer cancel()
-	raw, err := b.call(ctx, http.MethodPost,
-		target+"/sandboxes/"+handle.SandboxID+"/snapshots", map[string]any{})
-	if err != nil {
-		return "", fmt.Errorf("opensandbox snapshot: %w", err)
-	}
-	var info snapshotInfo
-	if err := json.Unmarshal(raw, &info); err != nil {
-		return "", err
-	}
-	if info.ID == "" {
-		return "", fmt.Errorf("opensandbox snapshot returned no id")
-	}
-	return info.ID, nil
-}
-
-// DeleteSnapshot removes a previously captured snapshot.
-func (b *Backend) DeleteSnapshot(ctx context.Context, snapshotID string) error {
-	// Snapshot deletion is fleet-scoped in provider mode (the cluster owns the
-	// artifact store) and node-scoped in psrl mode (docker commit, no registry).
-	// In both cases the path is the same; we use anyTarget() which in provider
-	// mode returns the gateway and in psrl mode returns any configured node.
-	target, err := b.anyTarget()
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
-	defer cancel()
-	_, err = b.call(ctx, http.MethodDelete, target+"/snapshots/"+snapshotID, nil)
-	if err != nil && !isNotFound(err) {
-		return err
-	}
-	return nil
-}
-
-// Preflight confirms the deployment is reachable.
-//
-// In provider mode it probes the gateway. In psrl mode it probes every
-// configured node, because each one is a distinct server whose absence would
-// silently halve (or worse) the fleet.
-func (b *Backend) Preflight(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
-	defer cancel()
-	targets := map[string]string{}
-	if b.mode == backend.SchedulingProvider {
-		targets["gateway"] = b.cfg.Gateway
-	} else {
-		b.mu.RLock()
-		for id, address := range b.nodes {
-			targets[id] = address
-		}
-		b.mu.RUnlock()
-	}
-	for name, address := range targets {
-		// A minimal list proves auth and routing, not just TCP connectivity.
-		if _, err := b.call(ctx, http.MethodGet, address+"/health", nil); err != nil {
-			return fmt.Errorf("opensandbox node %s at %s is not answering: %w", name, address, err)
-		}
-	}
-	return nil
-}
-
-// target returns the URL a single-sandbox call goes to.
-//
-// In provider mode every call goes to the gateway, which resolves the sandbox
-// itself. In psrl mode a call goes to the node that holds the sandbox, because
-// this service chose that node and recorded it on the handle.
-func (b *Backend) target(nodeID string) (string, error) {
-	if b.mode == backend.SchedulingProvider {
-		return b.cfg.Gateway, nil
-	}
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if nodeID == "" {
-		// No node ID: the caller did not supply one, which happens for operations
-		// (like deleteSnapshot) that are not tied to a specific sandbox. Return
-		// any configured node as a best-effort target.
-		for _, address := range b.nodes {
-			return address, nil
-		}
-		return "", fmt.Errorf("opensandbox has no configured nodes")
-	}
-	address, known := b.nodes[nodeID]
-	if !known {
-		return "", fmt.Errorf("opensandbox node %q is not configured", nodeID)
-	}
-	return address, nil
-}
-
-// anyTarget returns a target URL for operations that are not tied to a node.
-func (b *Backend) anyTarget() (string, error) {
-	return b.target("")
 }
 
 func (b *Backend) call(ctx context.Context, method, url string, body any) ([]byte, error) {
@@ -617,6 +628,9 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("opensandbox API returned %d: %s", e.status, e.body)
 }
 
+// Status returns the HTTP status, so a caller can tell backpressure from a fault:
+// a cluster answers 429 when it is busy, which clears, and 5xx when it is broken,
+// which does not.
 func (e *apiError) Status() int { return e.status }
 
 func isNotFound(err error) bool {

@@ -390,10 +390,11 @@ configures the service; the worker uses it.
 
 ### Configuration
 
-The deployment names its backends once. `mode` selects which scheduler runs: `psrl`
-uses the service's own Placement and Admission and does not start the backend's control
-plane; `provider` defers to the backend's own scheduler and leaves the service doing
-cross-backend quota only.
+The deployment names its backends once. `mode` selects both who places a sandbox and
+who drives the runtime: `direct` uses the service's own Placement and Admission and
+reaches the node runtime itself, so the backend's control plane is neither started nor
+in the path; `provider` defers to the backend's own scheduler and leaves the service
+doing cross-backend quota only.
 
 ```yaml
 # psrl/trainer/config/psrl/deployment.yaml
@@ -411,12 +412,12 @@ sandbox_service:
 
   backends:
     - type: docker
-      mode: psrl
+      mode: direct
       nodes: [192.168.1.21, 192.168.1.22]
       capacity: {memory_mb: 480000, cpu_cores: 90, gpu_count: 0, utilization: 0.5}
 
     - type: agentenv
-      mode: psrl               # direct to each node runtime; no gateway, no scheduler
+      mode: direct             # straight to each node runtime; no gateway, no scheduler
       nodes: [192.168.1.31, 192.168.1.32]
 
     - type: cubesandbox
@@ -493,7 +494,7 @@ Each phase is independently useful, so none of them is a bet on the next.
 | 0 | On the current Python: collapse timing to three knobs, move reclamation to node level, trim the feature set, split `manager.py` by responsibility, freeze the `.proto` contract | the optimisations land and the contract is generated, not hand-written twice |
 | **Gate** | **Run a real RL workload against the "commands direct, control plane by RPC" shape** | measured episode latency and throughput are acceptable; otherwise the Go rewrite does not start |
 | 1 | Go `sandboxd-control` and `sandboxd-node`, Docker adapter, `pysandbox` | one node, one backend, end to end through the SDK |
-| 2 | AgentEnv adapter in `psrl` mode; **delete the Python control plane** | two backends; no Python control-plane code remains |
+| 2 | AgentEnv adapter in `direct` mode; **delete the Python control plane** | two backends; no Python control-plane code remains |
 | 3 | Provisioner and preflight | a named backend deploys with no per-node manual step |
 | 4 | CubeSandbox and OpenSandbox adapters | a mixed-backend run, and an ablation that holds everything but the backend fixed |
 
@@ -513,7 +514,7 @@ rather than leaving a switch.
 | F4 | The node is the final admission authority | a rejection asks Placement for another node, so a stale fleet view cannot override a local limit |
 | F5 | Reclamation is node-level, one loop, four reasons | a caller that exits leaves nothing behind; idle pause and orphan reclaim stop being two mechanisms on two clocks |
 | F6 | Three timing knobs; everything else derived and asserted in one place | a configuration that inverts an ordering fails at startup instead of leaking |
-| F7 | `mode` is a per-backend deployment property, `psrl` or `provider` | the same backend can run both ways in one fleet, which is what makes a scheduler ablation possible |
+| F7 | `mode` is a per-backend deployment property, `direct` or `provider` | `direct` places and drives the node runtime from here, with the provider's control plane out of the path; `provider` defers to it. The same backend can run both ways in one fleet, which is what makes a scheduler ablation possible |
 | F8 | `backend_options` is namespaced, validated, outside routing and outside spec identity | a provider's own tuning is reachable without making the portable spec unportable |
 | F9 | The SDK serializes, remembers an endpoint, and forwards a deadline | no second control plane, so there is no state machine to drift |
 | F10 | The control plane is Go; the data plane is reused | the deployment boundary decides the language, not the algorithm |

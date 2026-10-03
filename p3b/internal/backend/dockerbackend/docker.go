@@ -47,6 +47,17 @@ type Config struct {
 	OwnerID    string
 	// Runtime selects a stronger isolation boundary when the node provides one.
 	Runtime string
+	// NetworkMode is the Docker network mode for new containers.
+	// "host" removes per-container veth/netns creation and iptables rule churn,
+	// which are the primary kernel-lock bottlenecks under concurrent creates.
+	// Leave empty for the daemon default (bridge).
+	NetworkMode string
+	// MaxCreateConcurrency caps the number of concurrent /containers/create +
+	// /start pairs in-flight to dockerd. Zero means unlimited. Setting this to
+	// match dockerd's own internal worker count (typically GOMAXPROCS) prevents
+	// the daemon's create queue from growing unboundedly under burst creates,
+	// which causes the long-tail latency observed at high concurrency.
+	MaxCreateConcurrency int
 	// RequestTimeout bounds one Engine call. A create that pulls an image can
 	// legitimately exceed it, so the pull is a separate call with its own budget.
 	RequestTimeout time.Duration
@@ -58,6 +69,14 @@ type Backend struct {
 	cfg  Config
 	http *http.Client
 	mode backend.SchedulingMode
+
+	// createSem limits concurrent /containers/create + /start pairs in-flight to
+	// dockerd. At high concurrency dockerd's internal worker pool saturates and all
+	// requests queue on the same kernel locks (cgroup, netns, iptables), inflating
+	// p95 far beyond p50. A bounded semaphore keeps the in-flight count at a level
+	// dockerd can schedule without queueing, which flattens the latency distribution.
+	// nil means unlimited (MaxCreateConcurrency == 0).
+	createSem chan struct{}
 
 	mu    sync.Mutex
 	known map[string]string // sandbox id -> container id
@@ -81,12 +100,17 @@ func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 		cfg.PullTimeout = 10 * time.Minute
 	}
 	if !mode.Valid() {
-		return nil, fmt.Errorf("docker backend scheduling mode %q is not psrl or provider", mode)
+		return nil, fmt.Errorf("docker backend scheduling mode %q is not direct or provider", mode)
+	}
+	var createSem chan struct{}
+	if cfg.MaxCreateConcurrency > 0 {
+		createSem = make(chan struct{}, cfg.MaxCreateConcurrency)
 	}
 	socket := cfg.Socket
 	return &Backend{
-		cfg:  cfg,
-		mode: mode,
+		cfg:       cfg,
+		mode:      mode,
+		createSem: createSem,
 		http: &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -154,6 +178,17 @@ func (b *Backend) Create(ctx context.Context, nodeID string, spec backend.Spec, 
 	if err := b.ensureImage(ctx, spec.Source.Reference); err != nil {
 		return backend.Created{}, err
 	}
+	// Acquire the create semaphore before touching the daemon. This bounds the
+	// number of concurrent /containers/create + /start pairs in-flight, preventing
+	// dockerd's internal queues from growing unboundedly and inflating p95 latency.
+	if b.createSem != nil {
+		select {
+		case b.createSem <- struct{}{}:
+			defer func() { <-b.createSem }()
+		case <-ctx.Done():
+			return backend.Created{}, ctx.Err()
+		}
+	}
 	body := b.createBody(spec, nodeID)
 	var created struct {
 		ID       string   `json:"Id"`
@@ -201,6 +236,11 @@ func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
 		// A sandbox is destroyed by this service, not by the daemon, so its exit
 		// must leave a record a post mortem can read.
 		"AutoRemove": false,
+	}
+	if b.cfg.NetworkMode != "" {
+		// "host" removes per-container veth/netns creation and iptables churn,
+		// eliminating the main kernel-lock bottleneck under concurrent creates.
+		hostConfig["NetworkMode"] = b.cfg.NetworkMode
 	}
 	if spec.Resources.MemoryMB > 0 {
 		hostConfig["Memory"] = spec.Resources.MemoryMB * 1024 * 1024

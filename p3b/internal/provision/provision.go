@@ -9,14 +9,15 @@
 // The three backends that need an external service are:
 //
 //   - agentenv: requires a reachable AgentENV gateway (provider mode) or one
-//     reachable node runtime per configured node (psrl mode).
+//     reachable node runtime per configured node (direct mode).
 //
-//   - opensandbox: requires a reachable OpenSandbox lifecycle server (provider
-//     mode) or one reachable docker-mode opensandbox-server per configured node
-//     (psrl mode).
+//   - opensandbox: in provider mode, a reachable OpenSandbox gateway. In direct
+//     mode there is no OpenSandbox control plane at all -- this service drives the
+//     container runtime and stages the agent itself -- so what is checked instead
+//     is the runtime, the agent image, and the stage directory.
 //
 //   - cubesandbox: requires a reachable CubeSandbox gateway (provider mode) or
-//     one reachable Cubelet per configured node (psrl mode).
+//     one reachable Cubelet per configured node (direct mode).
 //
 // The docker backend requires only a local Docker daemon, whose liveness is
 // already verified by dockerbackend.Preflight.
@@ -33,7 +34,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -60,7 +64,7 @@ func CheckAgentEnvGateway(ctx context.Context, gatewayURL, apiKey string) Result
 		"Install AgentENV and start the gateway, then verify with: curl "+gatewayURL+"/health")
 }
 
-// CheckAgentEnvNode probes one AgentENV node runtime in psrl mode.
+// CheckAgentEnvNode probes one AgentENV node runtime in direct mode.
 //
 // Each node runtime serves the full sandbox API on its own port. The probe
 // checks GET /health; a failure means that specific node is unreachable.
@@ -92,7 +96,7 @@ func CheckOpenSandboxGateway(ctx context.Context, gatewayURL, apiKey string) Res
 			"Check [server].api_key in ~/.sandbox.toml and set OPENSANDBOX_API_KEY accordingly.")
 }
 
-// CheckOpenSandboxNode probes one docker-mode opensandbox-server node in psrl mode.
+// CheckOpenSandboxNode probes one docker-mode opensandbox-server node in direct mode.
 //
 // Each per-node server exposes GET /health. A missing server produces an error
 // that names the node and gives the install command.
@@ -114,6 +118,71 @@ func CheckOpenSandboxNode(ctx context.Context, nodeID, nodeURL, apiKey string) R
 	return Result{Name: label}
 }
 
+// CheckOpenSandboxDirect verifies what a directly driven OpenSandbox needs.
+//
+// Direct mode runs no OpenSandbox control plane at all: this service drives the
+// container runtime and stages OpenSandbox's agent into each sandbox itself. So
+// there is no server to probe. What must hold instead is that the runtime is
+// reachable, that the agent image is available, and that the stage directory can
+// be written -- all three on this machine.
+//
+// The agent image is only checked for presence here. A pull is the operator's
+// decision: doing it inside a preflight would turn a configuration check into a
+// multi-minute network operation, and a deployment pipeline reading the exit code
+// could not tell a slow registry from a wrong reference.
+func CheckOpenSandboxDirect(ctx context.Context, dockerSocket, execdImage, stageDir string) Result {
+	label := "opensandbox direct runtime"
+
+	if execdImage == "" {
+		return Result{Name: label, Err: fmt.Errorf(
+			"%s: no agent image is configured\n"+
+				"To fix: set execd_image on the opensandbox backend. The agent is staged from "+
+				"that image into every sandbox, so direct mode cannot run without it.", label)}
+	}
+	if dockerSocket == "" {
+		return Result{Name: label, Err: fmt.Errorf(
+			"%s: no container runtime socket is configured\n"+
+				"To fix: set socket on the opensandbox backend (for example "+
+				"unix:///var/run/docker.sock). Direct mode drives the runtime itself.", label)}
+	}
+
+	// The runtime, first: nothing else is actionable if it is not answering.
+	if err := pingDockerSocket(ctx, dockerSocket); err != nil {
+		return Result{Name: label, Err: fmt.Errorf(
+			"%s: the container runtime at %s is not answering: %w\n"+
+				"To fix: start the Docker daemon and confirm this process may read its socket "+
+				"(verify with: docker version).", label, dockerSocket, err)}
+	}
+
+	// The agent image. Absent is reported as actionable rather than fatal-sounding,
+	// because one pull resolves it.
+	present, err := dockerImagePresent(ctx, dockerSocket, execdImage)
+	if err != nil {
+		return Result{Name: label, Err: fmt.Errorf(
+			"%s: could not ask the runtime about the agent image %s: %w", label, execdImage, err)}
+	}
+	if !present {
+		return Result{Name: label, Err: fmt.Errorf(
+			"%s: the agent image %s is not present on this host\n"+
+				"To fix: docker pull %s", label, execdImage, execdImage)}
+	}
+
+	// The stage directory. It is written once at startup and then mounted
+	// read-only into every sandbox, so an unwritable path fails every create.
+	if stageDir == "" {
+		stageDir = "/var/lib/sandboxd/opensandbox-agent"
+	}
+	if err := checkWritableDir(stageDir); err != nil {
+		return Result{Name: label, Err: fmt.Errorf(
+			"%s: the agent stage directory %s is not usable: %w\n"+
+				"To fix: create it and make it writable by this process "+
+				"(mkdir -p %s), or set stage_dir to a path that is.",
+			label, stageDir, err, stageDir)}
+	}
+
+	return Result{Name: label}
+}
+
 // CheckCubeSandboxGateway probes a CubeSandbox CubeMaster gateway in provider mode.
 func CheckCubeSandboxGateway(ctx context.Context, gatewayURL, apiKey string) Result {
 	label := "cubesandbox gateway"
@@ -121,7 +190,7 @@ func CheckCubeSandboxGateway(ctx context.Context, gatewayURL, apiKey string) Res
 		"Ensure the CubeSandbox CubeMaster gateway is running and reachable at "+gatewayURL)
 }
 
-// CheckCubeSandboxNode probes one Cubelet node in psrl mode.
+// CheckCubeSandboxNode probes one Cubelet node in direct mode.
 //
 // Each Cubelet serves the full sandbox API on its own port. The probe checks
 // GET /health; a failure means that specific Cubelet is unreachable.
@@ -187,4 +256,91 @@ func normalize(address string) string {
 		address = "http://" + address
 	}
 	return strings.TrimRight(address, "/")
+}
+
+// -- container runtime probes --------------------------------------------------
+
+// dockerSocketClient dials a Docker daemon over a unix socket or a TCP address.
+//
+// A probe-local client rather than a shared one: a check must not be able to
+// disturb a serving backend's connection pool, and it is discarded immediately.
+func dockerSocketClient(socket string) *http.Client {
+	transport := &http.Transport{}
+	if path, found := strings.CutPrefix(socket, "unix://"); found {
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", path)
+		}
+	} else {
+		host := strings.TrimPrefix(strings.TrimPrefix(socket, "tcp://"), "http://")
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", host)
+		}
+	}
+	return &http.Client{Transport: transport}
+}
+
+// pingDockerSocket proves the daemon is answering, which is the cheapest useful
+// check and the one every other runtime check depends on.
+func pingDockerSocket(ctx context.Context, socket string) error {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/_ping", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := dockerSocketClient(socket).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("the daemon answered /_ping with HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// dockerImagePresent reports whether an image is already on this host.
+//
+// A 404 is the answer "not present" rather than a fault, so it is distinguished
+// from a transport failure: the operator's fix differs between a missing image
+// and a daemon that cannot be reached.
+func dockerImagePresent(ctx context.Context, socket, image string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	url := "http://docker/v1.43/images/" + image + "/json"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := dockerSocketClient(socket).Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode >= 400 {
+		return false, fmt.Errorf("the daemon answered HTTP %d", resp.StatusCode)
+	}
+	return true, nil
+}
+
+// checkWritableDir confirms a directory exists and can be written, creating it
+// when it is absent.
+//
+// Creating here is not an installation: the directory is this service's own
+// working state, not third-party software. What it must not do is leave a
+// deployment to discover at the first create that the path was unusable.
+func checkWritableDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	probe := filepath.Join(dir, ".write-probe")
+	if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+		return err
+	}
+	return os.Remove(probe)
 }

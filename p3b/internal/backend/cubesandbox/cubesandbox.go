@@ -14,7 +14,7 @@
 // store, image pipeline) is needed and CubeMaster's placement decisions are
 // acceptable.
 //
-// In psrl mode the adapter talks to each Cubelet directly, bypassing CubeMaster
+// In direct mode the adapter talks to each Cubelet directly, bypassing CubeMaster
 // entirely. This is the correct shape when:
 //   - p3b's Placement and Admission should own the node decision.
 //   - The deployment runs one Cubelet per node addressable at a known port.
@@ -53,7 +53,7 @@ type Config struct {
 	// Gateway is the cluster entry point, used in provider mode.
 	// E.g. https://cube.example.com
 	Gateway string
-	// Nodes are the per-node Cubelet addresses, used in psrl mode. Each one
+	// Nodes are the per-node Cubelet addresses, used in direct mode. Each one
 	// serves the full sandbox API on its own port, so placement here means
 	// choosing which to call.
 	Nodes []NodeAddress
@@ -84,17 +84,17 @@ type Backend struct {
 
 // New returns a CubeSandbox backend in the given scheduling mode.
 //
-// Provider mode requires Gateway. Psrl mode requires at least one node address.
+// Provider mode requires Gateway. Direct mode requires at least one node address.
 func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 	if !mode.Valid() {
-		return nil, fmt.Errorf("cubesandbox scheduling mode %q is not psrl or provider", mode)
+		return nil, fmt.Errorf("cubesandbox scheduling mode %q is not direct or provider", mode)
 	}
 	if mode == backend.SchedulingProvider && cfg.Gateway == "" {
 		return nil, fmt.Errorf("cubesandbox in provider mode needs a gateway address")
 	}
-	if mode == backend.SchedulingPSRL && len(cfg.Nodes) == 0 {
+	if mode == backend.SchedulingDirect && len(cfg.Nodes) == 0 {
 		return nil, fmt.Errorf(
-			"cubesandbox in psrl mode needs its node addresses, because this service chooses the node itself")
+			"cubesandbox in direct mode needs its node addresses, because this service chooses the node itself")
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 60 * time.Second
@@ -129,7 +129,7 @@ func (b *Backend) Mode() backend.SchedulingMode { return b.mode }
 // Capabilities declares what this deployment of CubeSandbox actually provides.
 //
 // Provider mode wraps CubeMaster, which has warm pools, template builds, volume
-// attachment, and egress policy. Psrl mode bypasses CubeMaster and talks
+// attachment, and egress policy. Direct mode bypasses CubeMaster and talks
 // directly to each Cubelet, so those CubeMaster-level features are absent. What
 // a Cubelet provides directly: microVM create/exec/snapshot/pause/resume/delete.
 //
@@ -157,7 +157,7 @@ func (b *Backend) Capabilities() backend.Capabilities {
 			PauseModes:  []string{"freeze"},
 		}
 	}
-	// Psrl mode: direct Cubelet, so the CubeMaster-level features are absent.
+	// Direct mode: direct Cubelet, so the CubeMaster-level features are absent.
 	// A warm pool is managed by CubeMaster, and a template build is a
 	// CubeMaster API; neither is reachable from a Cubelet. Declaring them here
 	// would let a spec requiring one be admitted and then fail at create.
@@ -177,7 +177,7 @@ func (b *Backend) Capabilities() backend.Capabilities {
 
 // Nodes returns the Cubelet addresses this service may place against.
 //
-// Only meaningful in psrl mode; returns nil in provider mode because
+// Only meaningful in direct mode; returns nil in provider mode because
 // CubeMaster owns placement.
 func (b *Backend) Nodes(context.Context) ([]string, error) {
 	if b.mode == backend.SchedulingProvider {
@@ -201,7 +201,7 @@ func (b *Backend) Headroom(context.Context, string) (map[string]backend.Resource
 // RegisterBinding is a no-op for CubeSandbox.
 //
 // CubeMaster has no external RecordAssignment RPC comparable to AgentENV's,
-// so there is nothing to register. In psrl mode this service chose the node
+// so there is nothing to register. In direct mode this service chose the node
 // and holds the NodeID on the handle; no registration is needed for routing.
 func (b *Backend) RegisterBinding(_ context.Context, _, _ string) error {
 	return nil
@@ -225,7 +225,7 @@ type sandboxReply struct {
 
 // Create provisions one microVM sandbox.
 //
-// In psrl mode it goes straight to the chosen Cubelet; in provider mode to the
+// In direct mode it goes straight to the chosen Cubelet; in provider mode to the
 // CubeMaster gateway. The request body is the same in both modes so the two
 // shapes cannot drift in what they ask for.
 //
@@ -395,7 +395,7 @@ type snapshotReply struct {
 //
 // CubeSandbox snapshots capture the writable layer; "full_state" is refused
 // rather than served as a filesystem snapshot, because a caller that expected
-// a live process to survive a resume would be misled. In psrl mode the
+// a live process to survive a resume would be misled. In direct mode the
 // snapshot is node-local unless a shared store is configured externally.
 func (b *Backend) Snapshot(ctx context.Context, handle backend.Handle, kind string) (string, error) {
 	if kind != "" && kind != "filesystem" {
@@ -440,7 +440,7 @@ func (b *Backend) DeleteSnapshot(ctx context.Context, snapshotID string) error {
 
 // Preflight confirms the deployment is reachable.
 //
-// In provider mode it probes the gateway. In psrl mode it probes every
+// In provider mode it probes the gateway. In direct mode it probes every
 // configured Cubelet, because each one is a distinct server.
 func (b *Backend) Preflight(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
@@ -465,7 +465,7 @@ func (b *Backend) Preflight(ctx context.Context) error {
 
 // target returns the URL a single-sandbox call goes to.
 //
-// In provider mode every call goes to the gateway. In psrl mode a call goes
+// In provider mode every call goes to the gateway. In direct mode a call goes
 // to the node that holds the sandbox, recorded on the handle at create time.
 func (b *Backend) target(nodeID string) (string, error) {
 	if b.mode == backend.SchedulingProvider {

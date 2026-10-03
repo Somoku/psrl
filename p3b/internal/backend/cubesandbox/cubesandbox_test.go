@@ -292,18 +292,18 @@ func testSpec() sbbackend.Spec {
 	}
 }
 
-// -- psrl mode ---------------------------------------------------------------
+// -- direct mode ---------------------------------------------------------------
 
-func TestPSRLModeNeedsNodeAddresses(t *testing.T) {
-	if _, err := New(Config{}, sbbackend.SchedulingPSRL); err == nil {
-		t.Fatal("cubesandbox in psrl mode must refuse an empty node list")
+func TestDirectModeNeedsNodeAddresses(t *testing.T) {
+	if _, err := New(Config{}, sbbackend.SchedulingDirect); err == nil {
+		t.Fatal("cubesandbox in direct mode must refuse an empty node list")
 	}
 }
 
-func TestPSRLModeRejectsNodeWithoutAddress(t *testing.T) {
+func TestDirectModeRejectsNodeWithoutAddress(t *testing.T) {
 	_, err := New(Config{
 		Nodes: []NodeAddress{{NodeID: "n1", Address: ""}},
-	}, sbbackend.SchedulingPSRL)
+	}, sbbackend.SchedulingDirect)
 	if err == nil {
 		t.Fatal("a node needs both an id and an address")
 	}
@@ -315,32 +315,32 @@ func TestAnInvalidModeIsRefused(t *testing.T) {
 	}
 }
 
-func TestPSRLModeReportsItsMode(t *testing.T) {
+func TestDirectModeReportsItsMode(t *testing.T) {
 	b, err := New(Config{
 		Nodes: []NodeAddress{{NodeID: "n1", Address: "http://n1:8089"}},
-	}, sbbackend.SchedulingPSRL)
+	}, sbbackend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	if b.Mode() != sbbackend.SchedulingPSRL {
+	if b.Mode() != sbbackend.SchedulingDirect {
 		t.Fatalf("mode: got %q, want psrl", b.Mode())
 	}
 }
 
-func TestPSRLModeDropsCubeMasterFeatures(t *testing.T) {
+func TestDirectModeDropsCubeMasterFeatures(t *testing.T) {
 	// A warm pool and a template build live on CubeMaster, which the direct
 	// Cubelet path bypasses. Declaring them would admit a spec the create
 	// would then refuse.
 	b, err := New(Config{
 		Nodes: []NodeAddress{{NodeID: "n1", Address: "http://n1:8089"}},
-	}, sbbackend.SchedulingPSRL)
+	}, sbbackend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
 	for _, absent := range []string{"warm_pool", "template_build", "volume", "egress_policy"} {
 		for _, declared := range b.Capabilities().Features {
 			if declared == absent {
-				t.Errorf("psrl mode must not declare CubeMaster feature %q", absent)
+				t.Errorf("direct mode must not declare CubeMaster feature %q", absent)
 			}
 		}
 	}
@@ -359,13 +359,13 @@ func TestProviderModeKeepsCubeMasterFeatures(t *testing.T) {
 	}
 }
 
-func TestPSRLModeListsItsNodes(t *testing.T) {
+func TestDirectModeListsItsNodes(t *testing.T) {
 	b, err := New(Config{
 		Nodes: []NodeAddress{
 			{NodeID: "n2", Address: "http://n2:8089"},
 			{NodeID: "n1", Address: "http://n1:8089"},
 		},
-	}, sbbackend.SchedulingPSRL)
+	}, sbbackend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -390,7 +390,7 @@ func TestProviderModeListsNoNodes(t *testing.T) {
 	}
 }
 
-func TestPSRLModeCreateGoesToTheChosenNode(t *testing.T) {
+func TestDirectModeCreateGoesToTheChosenNode(t *testing.T) {
 	// Two Cubelets; a create naming n2 must reach n2 and not n1.
 	var reached string
 	n1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -409,7 +409,7 @@ func TestPSRLModeCreateGoesToTheChosenNode(t *testing.T) {
 			{NodeID: "n1", Address: n1.URL},
 			{NodeID: "n2", Address: n2.URL},
 		},
-	}, sbbackend.SchedulingPSRL)
+	}, sbbackend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -426,10 +426,10 @@ func TestPSRLModeCreateGoesToTheChosenNode(t *testing.T) {
 	}
 }
 
-func TestPSRLModeRefusesAnUnknownNode(t *testing.T) {
+func TestDirectModeRefusesAnUnknownNode(t *testing.T) {
 	b, err := New(Config{
 		Nodes: []NodeAddress{{NodeID: "n1", Address: "http://n1:8089"}},
-	}, sbbackend.SchedulingPSRL)
+	}, sbbackend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -438,7 +438,7 @@ func TestPSRLModeRefusesAnUnknownNode(t *testing.T) {
 	}
 }
 
-func TestPSRLModePreflightProbesEveryNode(t *testing.T) {
+func TestDirectModePreflightProbesEveryNode(t *testing.T) {
 	probed := map[string]bool{}
 	n1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		probed["n1"] = true
@@ -456,7 +456,7 @@ func TestPSRLModePreflightProbesEveryNode(t *testing.T) {
 			{NodeID: "n1", Address: n1.URL},
 			{NodeID: "n2", Address: n2.URL},
 		},
-	}, sbbackend.SchedulingPSRL)
+	}, sbbackend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -468,7 +468,7 @@ func TestPSRLModePreflightProbesEveryNode(t *testing.T) {
 	}
 }
 
-func TestPSRLModePreflightFailsWhenOneNodeIsAbsent(t *testing.T) {
+func TestDirectModePreflightFailsWhenOneNodeIsAbsent(t *testing.T) {
 	// One live node is not enough: a fleet missing a node silently loses that
 	// node's whole capacity, so preflight refuses rather than degrading.
 	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -482,7 +482,7 @@ func TestPSRLModePreflightFailsWhenOneNodeIsAbsent(t *testing.T) {
 			{NodeID: "down", Address: "http://127.0.0.1:1"},
 		},
 		RequestTimeout: time.Second,
-	}, sbbackend.SchedulingPSRL)
+	}, sbbackend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}

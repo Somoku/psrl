@@ -199,3 +199,58 @@ func okServer(t *testing.T) *httptest.Server {
 	t.Cleanup(srv.Close)
 	return srv
 }
+
+// -- opensandbox direct mode --------------------------------------------------
+
+func TestOpenSandboxDirectNeedsAnAgentImage(t *testing.T) {
+	r := provision.CheckOpenSandboxDirect(context.Background(), "unix:///var/run/docker.sock", "", "")
+	if r.Err == nil {
+		t.Fatal("direct mode cannot run without an agent image to stage")
+	}
+	if !strings.Contains(r.Err.Error(), "execd_image") {
+		t.Errorf("the error should name execd_image, got: %v", r.Err)
+	}
+}
+
+func TestOpenSandboxDirectNeedsASocket(t *testing.T) {
+	r := provision.CheckOpenSandboxDirect(context.Background(), "", "opensandbox/execd:latest", "")
+	if r.Err == nil {
+		t.Fatal("direct mode drives the runtime itself, so it needs a socket")
+	}
+	if !strings.Contains(r.Err.Error(), "socket") {
+		t.Errorf("the error should name socket, got: %v", r.Err)
+	}
+}
+
+func TestOpenSandboxDirectReportsAnUnreachableRuntime(t *testing.T) {
+	r := provision.CheckOpenSandboxDirect(
+		context.Background(), "tcp://127.0.0.1:1", "opensandbox/execd:latest", "")
+	if r.Err == nil {
+		t.Fatal("a runtime that is not answering must be reported")
+	}
+	// The operator needs to know it is the daemon rather than the image.
+	if !strings.Contains(r.Err.Error(), "runtime") {
+		t.Errorf("the error should say the runtime is not answering, got: %v", r.Err)
+	}
+}
+
+func TestOpenSandboxDirectHintIsActionable(t *testing.T) {
+	r := provision.CheckOpenSandboxDirect(
+		context.Background(), "tcp://127.0.0.1:1", "opensandbox/execd:latest", "")
+	if r.Err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(r.Err.Error(), "To fix:") {
+		t.Errorf("a provisioning failure must say what to do, got: %v", r.Err)
+	}
+}
+
+func TestOpenSandboxDirectNamesTheRuntimeItChecked(t *testing.T) {
+	r := provision.CheckOpenSandboxDirect(context.Background(), "", "", "")
+	if r.Name == "" {
+		t.Fatal("every result carries the label of what was checked")
+	}
+	if !strings.Contains(r.Name, "opensandbox") {
+		t.Errorf("label should name the backend, got %q", r.Name)
+	}
+}

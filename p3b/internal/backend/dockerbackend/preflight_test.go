@@ -62,7 +62,7 @@ func TestPreflightRefusesARuntimeTheNodeDoesNotHave(t *testing.T) {
 		OwnerID:        fmt.Sprintf("sandboxd-preflight-%d", time.Now().UnixNano()),
 		Runtime:        "runtime-that-is-not-installed",
 		RequestTimeout: 30 * time.Second,
-	}, backend.SchedulingPSRL)
+	}, backend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestPreflightAcceptsTheRuntimeEveryDaemonHas(t *testing.T) {
 		OwnerID:        fmt.Sprintf("sandboxd-preflight-%d", time.Now().UnixNano()),
 		Runtime:        "runc",
 		RequestTimeout: 30 * time.Second,
-	}, backend.SchedulingPSRL)
+	}, backend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestPreflightRefusesAnAPIVersionTheDaemonWillNotServe(t *testing.T) {
 		Socket: socket, APIVersion: "v9.99", NodeID: "test-node",
 		OwnerID:        fmt.Sprintf("sandboxd-preflight-%d", time.Now().UnixNano()),
 		RequestTimeout: 30 * time.Second,
-	}, backend.SchedulingPSRL)
+	}, backend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}

@@ -38,7 +38,7 @@ func liveBackend(t *testing.T) *Backend {
 		OwnerID:        fmt.Sprintf("sandboxd-test-%d", time.Now().UnixNano()),
 		RequestTimeout: 30 * time.Second,
 		PullTimeout:    3 * time.Minute,
-	}, backend.SchedulingPSRL)
+	}, backend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -75,7 +75,7 @@ func createOne(t *testing.T, b *Backend) backend.Created {
 }
 
 func TestPreflightRejectsAMissingDaemon(t *testing.T) {
-	b, err := New(Config{Socket: "/nonexistent/docker.sock", RequestTimeout: 2 * time.Second}, backend.SchedulingPSRL)
+	b, err := New(Config{Socket: "/nonexistent/docker.sock", RequestTimeout: 2 * time.Second}, backend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}

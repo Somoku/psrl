@@ -136,7 +136,7 @@ func dockerNodeFor(t *testing.T, memoryMB int64) (*dockerbackend.Backend, *Node)
 		Socket: socket, APIVersion: "v1.40", NodeID: "node-a",
 		OwnerID:        fmt.Sprintf("sandboxd-mixed-%d", time.Now().UnixNano()),
 		RequestTimeout: 30 * time.Second, PullTimeout: 3 * time.Minute,
-	}, backend.SchedulingPSRL)
+	}, backend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("docker backend: %v", err)
 	}

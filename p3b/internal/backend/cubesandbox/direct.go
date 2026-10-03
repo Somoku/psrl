@@ -236,7 +236,7 @@ func (r *directRuntime) createRequest(spec backend.Spec) *cubebox.RunCubeSandbox
 	container := &cubebox.ContainerConfig{
 		Name:  mainContainer,
 		Image: &images.ImageSpec{Image: spec.Source.Reference},
-		Envs:  keyValues(spec.Env),
+		Envs:  keyValues(withDevicePartition(spec)),
 	}
 	if spec.Workdir != "" {
 		container.WorkingDir = spec.Workdir
@@ -485,6 +485,31 @@ func containerResources(spec backend.Spec) *cubebox.Resource {
 		resources.MemLimit = mem
 	}
 	return resources
+}
+
+// withDevicePartition returns the spec's environment with the granted GPU
+// indices stated as CUDA_VISIBLE_DEVICES.
+//
+// Admission partitions the node's devices and records the grant on the spec, but
+// a partition nothing enforces is a comment: every CUDA process in the sandbox
+// would enumerate the whole machine and contend with a sibling that was granted
+// a different device. A spec that was granted none is returned unchanged rather
+// than being given an empty value, which would hide the node's devices from a
+// sandbox that never asked about them.
+func withDevicePartition(spec backend.Spec) map[string]string {
+	if len(spec.AssignedGPUs) == 0 {
+		return spec.Env
+	}
+	env := make(map[string]string, len(spec.Env)+1)
+	for key, value := range spec.Env {
+		env[key] = value
+	}
+	indices := make([]string, 0, len(spec.AssignedGPUs))
+	for _, index := range spec.AssignedGPUs {
+		indices = append(indices, strconv.Itoa(int(index)))
+	}
+	env["CUDA_VISIBLE_DEVICES"] = strings.Join(indices, ",")
+	return env
 }
 
 func keyValues(env map[string]string) []*cubebox.KeyValue {

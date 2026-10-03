@@ -116,6 +116,8 @@ func specToProto(spec backend.Spec) *v1.SandboxSpec {
 		ExecMode:            execModeValue(spec.ExecMode),
 		RequiredResumeLevel: resumeLevelValue(spec.RequiredResume),
 		Backend:             spec.Backend,
+		RequiredNodeLabel:   spec.RequiredNodeLabel,
+		ForbiddenNodeLabels: spec.ForbiddenNodeLabels,
 		Resources:           &v1.Resources{},
 	}
 	if spec.Resources.CPUCount > 0 {

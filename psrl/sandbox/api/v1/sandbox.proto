@@ -98,6 +98,14 @@ message SandboxSpec {
   // knobs stay reachable without making the portable spec unportable. A key
   // naming a backend this deployment does not run is an error, not a no-op.
   map<string, BackendOptions> backend_options = 19;
+
+  // Where this sandbox may and may not run. A required label pins it to a class
+  // of node, and a forbidden label keeps it off one. They are separate
+  // constraints because neither implies the other: a dedicated request names
+  // where it must go, and a request that must not share a trainer's machine
+  // names where it must not, which holds even when no node is labelled for it.
+  string required_node_label = 20;
+  repeated string forbidden_node_labels = 21;
 }
 
 message BackendOptions {

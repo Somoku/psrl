@@ -82,6 +82,15 @@ type Spec struct {
 	RequiredResume   string
 	Backend          string
 
+	// RequiredNodeLabel pins this sandbox to nodes carrying the label, and
+	// ForbiddenNodeLabels keep it off nodes carrying any of them. They are
+	// separate constraints because neither implies the other: a dedicated
+	// request names where it must go, and a request that must not share a
+	// trainer's machine names where it must not, which holds even when no node
+	// is labelled for it.
+	RequiredNodeLabel   string
+	ForbiddenNodeLabels []string
+
 	// AssignedGPUs are the device indices node admission granted. Written by the
 	// service and never by a caller, which is why it is not part of a spec's
 	// identity.

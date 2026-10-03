@@ -115,9 +115,16 @@ type Request struct {
 	RequiresHostMount bool
 	GPUCount          int32
 	RequiredLabel     string
-	ImageDigests      []string
-	ImageReferences   []string
-	OwnerID           string
+	// ForbiddenLabels keep a request off a class of node rather than pinning it
+	// to one. The two are not the same constraint and neither implies the other:
+	// a GPU sandbox must not land on a trainer node even where no env node is
+	// labelled, and naming the fleet in configuration cannot express that --
+	// it only omits nodes, which a later addition silently undoes. A node
+	// carrying any of these labels is not a candidate.
+	ForbiddenLabels []string
+	ImageDigests    []string
+	ImageReferences []string
+	OwnerID         string
 
 	// What the sandbox will cost the node that takes it, and which class pays.
 	// Zero means the caller stated no footprint, which is not filtered on: a
@@ -336,6 +343,14 @@ func (s *Service) satisfies(view *NodeView, req Request) (string, bool) {
 	}
 	if req.RequiredLabel != "" {
 		if _, has := view.Labels[req.RequiredLabel]; !has {
+			return "", false
+		}
+	}
+	// A forbidden label excludes the node outright, before any capability is
+	// read: a node this request must not run on is not a weaker candidate, it is
+	// not a candidate.
+	for _, forbidden := range req.ForbiddenLabels {
+		if _, has := view.Labels[forbidden]; has {
 			return "", false
 		}
 	}

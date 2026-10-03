@@ -103,6 +103,9 @@ type Config struct {
 	// mapping is needed at all. Unused under host networking.
 	PortMin int
 	PortMax int
+	// WarmPool pre-builds agent-ready sandboxes so a matching create pays neither
+	// the container build nor the agent readiness wait. A zero Size disables it.
+	WarmPool WarmPoolConfig
 
 	// -- both modes -----------------------------------------------------------
 
@@ -186,6 +189,7 @@ func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 		StageDir:             cfg.StageDir,
 		PortMin:              cfg.PortMin,
 		PortMax:              cfg.PortMax,
+		WarmPool:             cfg.WarmPool,
 	})
 	if err != nil {
 		return nil, err
@@ -482,6 +486,34 @@ func (b *Backend) DeleteSnapshot(ctx context.Context, snapshotID string) error {
 		return err
 	}
 	return nil
+}
+
+// Start runs this backend's background work.
+//
+// Only direct mode has any: the warm pool's refill and sweep loops. Provider mode
+// has no local pool, because the provider owns its own and a second one here would
+// double-count the same capacity.
+func (b *Backend) Start(ctx context.Context) {
+	if b.mode == backend.SchedulingDirect {
+		b.direct.pool.Start(ctx)
+	}
+}
+
+// Stop ends the background work and drains what it holds.
+func (b *Backend) Stop(ctx context.Context) {
+	if b.mode == backend.SchedulingDirect {
+		b.direct.pool.Stop(ctx)
+	}
+}
+
+// WarmPool reports what the pool holds, for the metric hook. A pool whose hit
+// ratio is low is a pool whose budget is wrong, and that is only visible as a
+// number.
+func (b *Backend) WarmPool() WarmPoolReport {
+	if b.mode != backend.SchedulingDirect {
+		return WarmPoolReport{}
+	}
+	return b.direct.pool.Snapshot()
 }
 
 // Preflight refuses a deployment this adapter cannot drive, at startup rather

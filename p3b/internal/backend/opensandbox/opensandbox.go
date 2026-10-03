@@ -314,7 +314,14 @@ func (b *Backend) Create(
 		Env:            spec.Env,
 		Metadata:       spec.Metadata,
 	}
-	req.Image = &imageSpec{URI: spec.Source.Reference}
+	if spec.Source.Kind == "template" {
+		req.SnapshotID = spec.Source.Reference
+	} else {
+		req.Image = &imageSpec{URI: spec.Source.Reference}
+		// Required by the server for an image-based create, and it has to block:
+		// see providerEntrypoint.
+		req.Entrypoint = providerEntrypoint
+	}
 	applyOptions(&req, spec)
 
 	createCtx, cancel := context.WithTimeout(ctx, b.cfg.CreateTimeout)
@@ -376,8 +383,21 @@ func (b *Backend) Status(ctx context.Context, handle backend.Handle) (string, er
 	if err := json.Unmarshal(raw, &info); err != nil {
 		return "unknown", nil
 	}
+	// The server's own state set is Pending, Running, Pausing, Paused, Resuming,
+	// Stopping, Terminated, Failed. Every one of them is mapped, because the
+	// portable vocabulary has no "starting" and a state that fell through to
+	// "unknown" would make the lifecycle treat a sandbox it is still being charged
+	// for as one it cannot account for.
 	switch info.Status.State {
 	case "Running":
+		return "running", nil
+	case "Pending", "Resuming":
+		// Live and charged, just not serving commands yet. Reported as running
+		// because the portable status set has no transitional value, and the
+		// alternatives are both worse: "unknown" reads as a lost sandbox, and
+		// "terminated" would have the lifecycle release something that is starting.
+		// Create already waits for readiness, so a caller does not normally observe
+		// this state at all.
 		return "running", nil
 	case "Paused", "Pausing":
 		return "paused", nil
@@ -505,12 +525,27 @@ type imageSpec struct {
 }
 
 type createRequest struct {
-	Image          *imageSpec        `json:"image,omitempty"`
+	Image *imageSpec `json:"image,omitempty"`
+	// Entrypoint is what the sandbox's PID 1 runs. The server requires it
+	// whenever an image is given ("Entrypoint is required when image is
+	// provided"), and rejects the create with a 422 otherwise.
+	//
+	// It must block rather than exit. A sandbox exists to serve commands through
+	// its agent, not to run one workload and finish, so an entrypoint that
+	// returned would take the sandbox down with it the moment it was created.
+	Entrypoint     []string          `json:"entrypoint,omitempty"`
 	SnapshotID     string            `json:"snapshotId,omitempty"`
 	ResourceLimits map[string]string `json:"resourceLimits"`
 	Env            map[string]string `json:"env,omitempty"`
 	Metadata       map[string]string `json:"metadata,omitempty"`
 }
+
+// providerEntrypoint is the blocking PID 1 for a provider-mode sandbox.
+//
+// `tail -f /dev/null` rather than `sleep infinity`: the latter is not present in
+// a BusyBox image, and an entrypoint that is missing from the image fails the
+// create for a reason that reads as a server fault.
+var providerEntrypoint = []string{"tail", "-f", "/dev/null"}
 
 type sandboxInfo struct {
 	ID     string `json:"id"`

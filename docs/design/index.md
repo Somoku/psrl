@@ -41,6 +41,46 @@ and training.
 CPU-based distributed weight storage with unified sharding, RDMA push/pull, and broadcast initialization.
 :::
 
+:::{grid-item-card} {octicon}`arrow-switch;1.5em` Weight Transport
+:link: weight_transport
+:link-type: doc
+
+PS as a zero-byte version authority, trainer-direct reads with same-version peer
+diffusion, redundancy-free planning, and FP8/FP4 wire formats.
+:::
+
+:::{grid-item-card} {octicon}`checklist;1.5em` Weight Transport Review
+:link: weight_transport_review
+:link-type: doc
+
+Self-review of the weight-transport design: feasibility tiers, the corrected
+read/write conflict analysis, and the control-plane bottleneck it missed.
+:::
+
+:::{grid-item-card} {octicon}`graph;1.5em` Weight Transport Review 2
+:link: weight_transport_review2
+:link-type: doc
+
+Second-round review: the metadata-plane blocker at MoE scale, FP4 extension limits,
+and the round-count cost at 1TB.
+:::
+
+:::{grid-item-card} {octicon}`shield-check;1.5em` Weight Transport Review 3
+:link: weight_transport_review3
+:link-type: doc
+
+Third-round review: the communication-stack analysis and the correctness gap under
+all-rollout startup and elastic scaling.
+:::
+
+:::{grid-item-card} {octicon}`verified;1.5em` Weight Transport Review 4
+:link: weight_transport_review4
+:link-type: doc
+
+Fourth-round review: verifies the earlier fixes landed, retires progressive
+availability as unsupported by vLLM, and finds the colocate precision constraint.
+:::
+
 :::{grid-item-card} {octicon}`iterations;1.5em` Flexible Rollout
 :link: flexible_rollout
 :link-type: doc
@@ -114,6 +154,11 @@ architecture
 router_tito
 transfer_queue
 parameter_server
+weight_transport
+weight_transport_review
+weight_transport_review2
+weight_transport_review3
+weight_transport_review4
 flexible_rollout
 staleness_control
 kv_cache

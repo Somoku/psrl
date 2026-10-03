@@ -76,12 +76,20 @@ type Config struct {
 	} `json:"fleet"`
 
 	Node struct {
-		MemoryMB        int64   `json:"memory_mb"`
-		CPUMillis       int64   `json:"cpu_millis"`
-		DiskMB          int64   `json:"disk_mb"`
-		GPUIndices      []int32 `json:"gpu_indices"`
-		LocalCPUCeiling float64 `json:"local_cpu_ceiling"`
-		LocalMemCeiling float64 `json:"local_mem_ceiling"`
+		MemoryMB          int64   `json:"memory_mb"`
+		CPUMillis         int64   `json:"cpu_millis"`
+		DiskMB            int64   `json:"disk_mb"`
+		GPUIndices        []int32 `json:"gpu_indices"`
+		LocalCPUCeiling   float64 `json:"local_cpu_ceiling"`
+		LocalMemCeiling   float64 `json:"local_mem_ceiling"`
+		// Overcommit is the largest multiple of the declared envelope the node may
+		// grant when measurement says reservations are overstated. Zero and one both
+		// mean off. Only memory expands; the expansion withdraws proportionally as
+		// measured utilization rises toward UtilizationTarget.
+		Overcommit        float64 `json:"overcommit"`
+		// UtilizationTarget is the measured memory fraction at which overcommit is
+		// fully withdrawn. Must be set and below LocalMemCeiling when Overcommit > 1.
+		UtilizationTarget float64 `json:"utilization_target"`
 	} `json:"node"`
 
 	Classes map[string]struct {
@@ -234,6 +242,8 @@ func preflight(configPath string, log *slog.Logger) error {
 		GPUIndices:      cfg.Node.GPUIndices,
 		LocalCPUCeiling: cfg.Node.LocalCPUCeiling,
 		LocalMemCeiling: cfg.Node.LocalMemCeiling,
+		Overcommit:        cfg.Node.Overcommit,
+		UtilizationTarget: cfg.Node.UtilizationTarget,
 		LeaseTTL:        spans.CapacityLeaseTTL(),
 	})
 	if err != nil {
@@ -304,6 +314,8 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 		GPUIndices:      cfg.Node.GPUIndices,
 		LocalCPUCeiling: cfg.Node.LocalCPUCeiling,
 		LocalMemCeiling: cfg.Node.LocalMemCeiling,
+		Overcommit:        cfg.Node.Overcommit,
+		UtilizationTarget: cfg.Node.UtilizationTarget,
 		LeaseTTL:        spans.CapacityLeaseTTL(),
 	})
 	if err != nil {
@@ -444,6 +456,8 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 			GPUIndices:      cfg.Node.GPUIndices,
 			LocalCPUCeiling: cfg.Node.LocalCPUCeiling,
 			LocalMemCeiling: cfg.Node.LocalMemCeiling,
+			Overcommit:        cfg.Node.Overcommit,
+			UtilizationTarget: cfg.Node.UtilizationTarget,
 			LeaseTTL:        spans.CapacityLeaseTTL(),
 		})
 		if err != nil {

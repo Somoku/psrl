@@ -102,6 +102,22 @@ type Config struct {
 	// accounting of reservations and this is the machine's actual state.
 	LocalCPUCeiling float64
 	LocalMemCeiling float64
+	// Overcommit is the largest multiple of the declared envelope the node may
+	// grant while measurement says the reservations are overstated.
+	//
+	// A sandbox that reserved 4 GB and is using 500 MB leaves the envelope full
+	// and the machine idle. That gap is the whole reason this knob exists: the
+	// envelope accounts for what was promised, and this admits against what is
+	// actually being used. One means off, which is the default.
+	Overcommit float64
+	// UtilizationTarget is the measured fraction at which the overcommit is fully
+	// withdrawn. Below it the node expands proportionally; at it the node grants
+	// exactly its declared envelope and nothing more.
+	//
+	// It sits below the pressure ceilings by construction: expanding admission up
+	// to the point where the node starts refusing would mean the overcommit is
+	// handing out capacity the next request is rejected for.
+	UtilizationTarget float64
 	// LeaseTTL bounds a grant whose owner stops renewing.
 	LeaseTTL time.Duration
 }
@@ -129,6 +145,26 @@ func (c Config) Validate() error {
 	for _, ceiling := range []float64{c.LocalCPUCeiling, c.LocalMemCeiling} {
 		if ceiling < 0 || ceiling > 1 {
 			return fmt.Errorf("node pressure ceilings must be fractions in [0, 1]")
+		}
+	}
+	if c.Overcommit != 0 && c.Overcommit < 1 {
+		return fmt.Errorf("overcommit factor %.3f must be at least 1 (zero and one both mean off)", c.Overcommit)
+	}
+	if c.Overcommit > 1 {
+		if c.UtilizationTarget <= 0 || c.UtilizationTarget > 1 {
+			return fmt.Errorf(
+				"overcommit is %.3f but utilization target %.3f is not in (0, 1]: "+
+					"the target is the measured fraction at which overcommit is fully withdrawn",
+				c.Overcommit, c.UtilizationTarget)
+		}
+		// The target must sit below the memory pressure ceiling, or the node can
+		// hand out overcommitted capacity that the ceiling then refuses — handing
+		// out capacity and immediately refusing the next request that wants it.
+		if c.LocalMemCeiling > 0 && c.UtilizationTarget >= c.LocalMemCeiling {
+			return fmt.Errorf(
+				"utilization target %.3f must be below the memory pressure ceiling %.3f, "+
+					"or overcommit allocates capacity the ceiling will then refuse",
+				c.UtilizationTarget, c.LocalMemCeiling)
 		}
 	}
 	return nil
@@ -312,6 +348,71 @@ func (a *Admission) Admit(class, owner string, want Resources) (Grant, Refusal, 
 
 func (a *Admission) refuse(reason Refusal) { a.refusals[reason]++ }
 
+// effectiveEnvelopeLocked is what the node will admit against right now.
+//
+// Without overcommit this is the declared envelope, and the whole function is a
+// single return. With overcommit it is the declared envelope scaled by how far
+// measured usage sits below the target, which is the point of the feature: the
+// envelope accounts for what sandboxes reserved, and a fleet of sandboxes that
+// each reserved four times what they use leaves a node simultaneously full and
+// idle.
+//
+// The scale is withdrawn proportionally rather than switched off at a threshold.
+// A step would make the node admit at the full multiple right up to the target
+// and then refuse everything, so a node sitting near the target would oscillate
+// between over-admitting and refusing as each sandbox started and settled. A
+// proportional withdrawal converges instead: every admission raises measured
+// usage, which lowers the next admission's headroom.
+//
+// Memory is the only dimension that expands. CPU is compressible — a cgroup CPU
+// limit throttles and the workload runs slower — so overcommitting it trades
+// latency for density and is a reasonable thing to do by default. Memory is not:
+// exceeding it is an OOM kill, which destroys a sandbox and loses an episode.
+// The asymmetry means CPU is already effectively overcommitted by the scheduler
+// and memory is the dimension where measurement buys real density. Devices and
+// disk never expand: a GPU cannot be shared by two sandboxes that each believe
+// they own it, and disk is not reclaimed by the kernel under pressure.
+func (a *Admission) effectiveEnvelopeLocked() Resources {
+	envelope := a.cfg.Envelope
+	if a.cfg.Overcommit <= 1 || a.cfg.UtilizationTarget <= 0 {
+		return envelope
+	}
+	// A pressure reader that found no cgroup hierarchy reports zero, which must not
+	// read as "idle, expand freely". Treating an absent measurement as full
+	// utilization means a node with no readable cgroup behaves exactly as it did
+	// before overcommit was configured.
+	if a.pressure.MemUsedPct <= 0 {
+		return envelope
+	}
+	// headroomFraction is how far below the target measurement sits: 1.0 when the
+	// node is empty, 0.0 at the target and above.
+	headroomFraction := (a.cfg.UtilizationTarget - a.pressure.MemUsedPct) / a.cfg.UtilizationTarget
+	if headroomFraction <= 0 {
+		return envelope
+	}
+	if headroomFraction > 1 {
+		headroomFraction = 1
+	}
+	scale := 1 + (a.cfg.Overcommit-1)*headroomFraction
+	envelope.MemoryMB = int64(float64(envelope.MemoryMB) * scale)
+	return envelope
+}
+
+// Overcommitted reports the memory multiple the node is currently admitting at.
+//
+// Exposed because an operator tuning the factor has to see what it resolved to:
+// the configured maximum is an upper bound, and the number that matters is what
+// measurement allowed at the moment a request was refused.
+func (a *Admission) Overcommitted() float64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	declared := a.cfg.Envelope.MemoryMB
+	if declared <= 0 {
+		return 1
+	}
+	return float64(a.effectiveEnvelopeLocked().MemoryMB) / float64(declared)
+}
+
 // Headroom returns what one class could be granted right now.
 //
 // This is the number placement must compare against, and it is not the envelope
@@ -323,11 +424,16 @@ func (a *Admission) Headroom(class string) Resources {
 }
 
 func (a *Admission) headroomLocked(class string) Resources {
-	free := a.cfg.Envelope.Sub(a.totalUsedLocked()).Sub(a.reservedForOthersLocked(class))
+	effective := a.effectiveEnvelopeLocked()
+	free := effective.Sub(a.totalUsedLocked()).Sub(a.reservedForOthersLocked(class))
 	share, declared := a.cfg.Classes[class]
 	if !declared || share.Max == 0 {
 		return free
 	}
+	// Class ceilings are expressed as a fraction of the declared envelope, not the
+	// effective one: a ceiling of 0.5 means "half the machine", which is a
+	// configuration the operator stated about the machine, not about the current
+	// overcommit factor.
 	underCeiling := a.cfg.Envelope.Scale(share.Max).Sub(a.used[class])
 	return Resources{
 		MemoryMB:  minI64(free.MemoryMB, underCeiling.MemoryMB),
@@ -472,6 +578,15 @@ type Report struct {
 	Draining      bool
 	Admitted      int64
 	Refusals      map[Refusal]int64
+	// EffectiveEnvelope is what the node is admitting against now. It differs from
+	// Envelope only under overcommit, and the difference is the whole measurement:
+	// an operator tuning the factor needs the resolved number, not the configured
+	// bound.
+	EffectiveEnvelope Resources
+	// Overcommit is EffectiveEnvelope's memory over Envelope's. One means the node
+	// is admitting at its declared envelope, either because overcommit is off or
+	// because measurement has withdrawn all of it.
+	Overcommit float64
 }
 
 // Snapshot returns the gate's state. The planes report and never log.
@@ -490,15 +605,22 @@ func (a *Admission) Snapshot() Report {
 	for _, name := range names {
 		headroom[name] = a.headroomLocked(name)
 	}
+	effective := a.effectiveEnvelopeLocked()
+	overcommit := 1.0
+	if a.cfg.Envelope.MemoryMB > 0 {
+		overcommit = float64(effective.MemoryMB) / float64(a.cfg.Envelope.MemoryMB)
+	}
 	return Report{
-		Envelope:      a.cfg.Envelope,
-		ClassHeadroom: headroom,
-		Granted:       a.totalUsedLocked(),
-		Leases:        len(a.leases),
-		FreeGPUs:      len(a.freeGPUs),
-		Draining:      a.draining,
-		Admitted:      a.admitted,
-		Refusals:      refusals,
+		Envelope:          a.cfg.Envelope,
+		EffectiveEnvelope: effective,
+		Overcommit:        overcommit,
+		ClassHeadroom:     headroom,
+		Granted:           a.totalUsedLocked(),
+		Leases:            len(a.leases),
+		FreeGPUs:          len(a.freeGPUs),
+		Draining:          a.draining,
+		Admitted:          a.admitted,
+		Refusals:          refusals,
 	}
 }
 

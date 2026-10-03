@@ -40,6 +40,7 @@ import time
 from typing import NamedTuple
 
 from sandboxd import SandboxClient, SandboxSpec, Source, Resources
+from sandboxd.execd import execd_agent_factory
 
 # ---------------------------------------------------------------------------
 # Configuration from environment
@@ -91,11 +92,17 @@ async def one_sandbox(client: SandboxClient, idx: int) -> Result:
 
 async def burst(n: int) -> dict:
     """Launch N sandboxes concurrently and collect per-phase latencies."""
-    async with SandboxClient(ENDPOINT) as client:
+    # The agent factory is what lets the SDK reach execd inside each sandbox.
+    # Without it the SDK has no protocol for the agent and the node refuses to
+    # proxy, because an opensandbox sandbox runs its own.
+    agents = execd_agent_factory()
+    async with SandboxClient(ENDPOINT, agent_factory=agents) as client:
         t0 = time.monotonic()
         tasks = [asyncio.create_task(one_sandbox(client, i)) for i in range(n)]
         raw = await asyncio.gather(*tasks, return_exceptions=True)
         total_s = time.monotonic() - t0
+    # The agent pool is separate from the client's, so it is closed explicitly.
+    await agents.close()
 
     errors = [r for r in raw if isinstance(r, Exception)]
     ok: list[Result] = [r for r in raw if isinstance(r, Result)]

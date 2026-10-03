@@ -484,3 +484,111 @@ func BenchmarkChooseFleetSizes(b *testing.B) {
 		})
 	}
 }
+
+// -- dedicated placement: forbidden labels ------------------------------------
+
+// withLabel marks a node as belonging to a class, which is how a trainer node is
+// told apart from an env node.
+func withLabel(names ...string) func(*NodeView) {
+	return func(v *NodeView) {
+		for _, name := range names {
+			v.Labels[name] = struct{}{}
+		}
+	}
+}
+
+func TestAForbiddenLabelKeepsASandboxOffThatNode(t *testing.T) {
+	// The failure this prevents: a GPU sandbox landing on a trainer node, where it
+	// competes with the trainer for the memory the trainer already reserved
+	// outside this service's accounting.
+	service := mustService(t, &fakeMonitor{nodes: []NodeView{
+		node("trainer-1", 1000, withLabel("trainer")),
+	}})
+	req := request(10)
+	req.ForbiddenLabels = []string{"trainer"}
+
+	if _, err := service.Choose(req); err == nil {
+		t.Fatal("a node carrying a forbidden label must not be chosen")
+	}
+}
+
+func TestAForbiddenLabelStillAllowsAnUnlabelledNode(t *testing.T) {
+	service := mustService(t, &fakeMonitor{nodes: []NodeView{
+		node("trainer-1", 1000, withLabel("trainer")),
+		node("env-1", 1000),
+	}})
+	req := request(10)
+	req.ForbiddenLabels = []string{"trainer"}
+
+	decision, err := service.Choose(req)
+	if err != nil {
+		t.Fatalf("choose: %v", err)
+	}
+	if decision.NodeID != "env-1" {
+		t.Errorf("node: got %q, want env-1 (the one without the forbidden label)", decision.NodeID)
+	}
+}
+
+func TestSeveralForbiddenLabelsAreAllExcluded(t *testing.T) {
+	service := mustService(t, &fakeMonitor{nodes: []NodeView{
+		node("trainer-1", 1000, withLabel("trainer")),
+		node("infra-1", 1000, withLabel("infra")),
+		node("env-1", 1000, withLabel("env")),
+	}})
+	req := request(10)
+	req.ForbiddenLabels = []string{"trainer", "infra"}
+
+	decision, err := service.Choose(req)
+	if err != nil {
+		t.Fatalf("choose: %v", err)
+	}
+	if decision.NodeID != "env-1" {
+		t.Errorf("node: got %q, want env-1", decision.NodeID)
+	}
+}
+
+func TestNoForbiddenLabelsLeavesEveryNodeEligible(t *testing.T) {
+	// The common case must not be changed by the mechanism existing: a request
+	// that names no forbidden label is placed exactly as before.
+	service := mustService(t, &fakeMonitor{nodes: []NodeView{
+		node("trainer-1", 1000, withLabel("trainer")),
+	}})
+	if _, err := service.Choose(request(10)); err != nil {
+		t.Fatalf("a request naming no forbidden label must still place: %v", err)
+	}
+}
+
+func TestARequiredAndAForbiddenLabelApplyTogether(t *testing.T) {
+	// They are separate constraints, so both are enforced on one request: the
+	// node must carry the required label and must not carry the forbidden one.
+	service := mustService(t, &fakeMonitor{nodes: []NodeView{
+		node("gpu-trainer", 1000, withLabel("gpu", "trainer")),
+		node("gpu-env", 1000, withLabel("gpu")),
+	}})
+	req := request(10)
+	req.RequiredLabel = "gpu"
+	req.ForbiddenLabels = []string{"trainer"}
+
+	decision, err := service.Choose(req)
+	if err != nil {
+		t.Fatalf("choose: %v", err)
+	}
+	if decision.NodeID != "gpu-env" {
+		t.Errorf("node: got %q, want gpu-env (has gpu, lacks trainer)", decision.NodeID)
+	}
+}
+
+func TestAForbiddenLabelIsRefusedEvenWhenItIsTheOnlyNodeWithRoom(t *testing.T) {
+	// Capacity does not override the constraint. A dedicated request that cannot
+	// be honoured has to fail rather than land somewhere it must not.
+	service := mustService(t, &fakeMonitor{nodes: []NodeView{
+		node("trainer-big", 1<<20, withLabel("trainer")),
+		node("env-full", 0),
+	}})
+	req := request(1000)
+	req.ForbiddenLabels = []string{"trainer"}
+
+	if _, err := service.Choose(req); err == nil {
+		t.Fatal("a forbidden label must hold even when the forbidden node is the only one with room")
+	}
+}

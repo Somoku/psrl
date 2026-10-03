@@ -234,6 +234,8 @@ type jsonSpec struct {
 	RequiredFeatures    []string                     `json:"required_features"`
 	RequiredResumeLevel string                       `json:"required_resume_level"`
 	Backend             string                       `json:"backend"`
+	RequiredNodeLabel   string                       `json:"required_node_label"`
+	ForbiddenNodeLabels []string                     `json:"forbidden_node_labels"`
 	BackendOptions      map[string]map[string]string `json:"backend_options"`
 }
 

@@ -23,15 +23,17 @@ func specFromProto(in *v1.SandboxSpec) backend.Spec {
 		return backend.Spec{}
 	}
 	spec := backend.Spec{
-		ResourceClass:  orDefault(in.GetResourceClass(), "default"),
-		WorkflowID:     in.GetWorkflowId(),
-		IdempotencyKey: in.GetIdempotencyKey(),
-		Env:            in.GetEnv(),
-		Metadata:       in.GetMetadata(),
-		Workdir:        in.GetWorkdir(),
-		ExecMode:       execModeName(in.GetExecMode()),
-		RequiredResume: resumeLevelName(in.GetRequiredResumeLevel()),
-		Backend:        in.GetBackend(),
+		ResourceClass:       orDefault(in.GetResourceClass(), "default"),
+		WorkflowID:          in.GetWorkflowId(),
+		IdempotencyKey:      in.GetIdempotencyKey(),
+		Env:                 in.GetEnv(),
+		Metadata:            in.GetMetadata(),
+		Workdir:             in.GetWorkdir(),
+		ExecMode:            execModeName(in.GetExecMode()),
+		RequiredResume:      resumeLevelName(in.GetRequiredResumeLevel()),
+		Backend:             in.GetBackend(),
+		RequiredNodeLabel:   in.GetRequiredNodeLabel(),
+		ForbiddenNodeLabels: in.GetForbiddenNodeLabels(),
 	}
 	if source := in.GetSource(); source != nil {
 		spec.Source = backend.Source{Kind: sourceKindName(source.GetKind()), Reference: source.GetReference()}
@@ -69,6 +71,8 @@ func placementRequest(spec backend.Spec, backendName, ownerID string) placement.
 		GPUCount:         spec.Resources.GPUCount,
 		OwnerID:          ownerID,
 		ResourceClass:    spec.ResourceClass,
+		RequiredLabel:    spec.RequiredNodeLabel,
+		ForbiddenLabels:  spec.ForbiddenNodeLabels,
 		Footprint: placement.Headroom{
 			MemoryMB:  spec.Resources.MemoryMB,
 			CPUMillis: int64(spec.Resources.CPUCount * 1000),

@@ -392,6 +392,12 @@ func (r *directRuntime) createBody(sandboxID string, spec backend.Spec, hostPort
 			"DeviceIDs":    gpuIDs(spec.AssignedGPUs),
 			"Capabilities": [][]string{{"gpu"}},
 		}}
+		// Restrict the sandbox to exactly its granted devices. The device request
+		// above tells the runtime which to attach; this tells every CUDA process
+		// inside which it may use. Without it a sandbox admitted for one device
+		// enumerates all of them and can contend with a sibling's workload.
+		env = append(env, "CUDA_VISIBLE_DEVICES="+strings.Join(gpuIDs(spec.AssignedGPUs), ","))
+		sort.Strings(env)
 	}
 
 	body := map[string]any{

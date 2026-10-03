@@ -640,6 +640,28 @@ type SandboxSpec struct {
 	// knobs stay reachable without making the portable spec unportable. A key
 	// naming a backend this deployment does not run is an error, not a no-op.
 	BackendOptions map[string]*BackendOptions `protobuf:"bytes,19,rep,name=backend_options,json=backendOptions,proto3" json:"backend_options,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	// Where this sandbox may and may not run. A required label pins it to a
+	// specific class of node. A forbidden label keeps it off a class of node.
+	// Neither implies the other: a dedicated request names where it must go, and
+	// a request that must not share a trainer's memory names where it must not.
+	RequiredNodeLabel   string   `protobuf:"bytes,20,opt,name=required_node_label,json=requiredNodeLabel,proto3" json:"required_node_label,omitempty"`
+	ForbiddenNodeLabels []string `protobuf:"bytes,21,rep,name=forbidden_node_labels,json=forbiddenNodeLabels,proto3" json:"forbidden_node_labels,omitempty"`
+}
+
+// GetRequiredNodeLabel returns the node label this sandbox must be placed on.
+func (x *SandboxSpec) GetRequiredNodeLabel() string {
+	if x != nil {
+		return x.RequiredNodeLabel
+	}
+	return ""
+}
+
+// GetForbiddenNodeLabels returns the node labels this sandbox must not be placed on.
+func (x *SandboxSpec) GetForbiddenNodeLabels() []string {
+	if x != nil {
+		return x.ForbiddenNodeLabels
+	}
+	return nil
 }
 
 func (x *SandboxSpec) Reset() {

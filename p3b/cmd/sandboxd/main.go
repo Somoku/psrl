@@ -28,6 +28,7 @@ import (
 	"psrl.dev/sandboxd/internal/monitor"
 	"psrl.dev/sandboxd/internal/node"
 	"psrl.dev/sandboxd/internal/placement"
+	"psrl.dev/sandboxd/internal/pressure"
 	"psrl.dev/sandboxd/internal/provision"
 	"psrl.dev/sandboxd/internal/quota"
 	"psrl.dev/sandboxd/internal/server"
@@ -309,6 +310,7 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	}
 	agent, err := server.NewNode(server.NodeConfig{
 		NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backends: local,
+		Pressure: nodePressure(log),
 	})
 	if err != nil {
 		return err
@@ -446,6 +448,7 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		}
 		agent, err = server.NewNode(server.NodeConfig{
 			NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backends: local,
+			Pressure: nodePressure(log),
 		})
 		if err != nil {
 			return err
@@ -509,8 +512,7 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 	return server.NewJSONListener(control, agent, log).Serve(ctx, listener)
 }
 
-func republish(ctx context.Context, agent *server.Node, fleet *monitor.Monitor, every time.Duration) {
-	ticker := time.NewTicker(every)
+func republish(ctx context.Context, agent *server.Node, fleet *monitor.Monitor, every time.Duration) {	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
 		select {
@@ -781,4 +783,22 @@ func overrides(raw map[string]float64) map[string]time.Duration {
 		out[name] = seconds(value)
 	}
 	return out
+}
+
+// nodePressure returns the Pressure function this node agent uses to read
+// actual machine utilization from the cgroup hierarchy.
+//
+// When cgroup v2 is not available — a development machine, a container with a
+// different hierarchy, or a host that did not configure it — the function falls
+// back to the zero reading so the service starts rather than refusing. The log
+// line is the only signal an operator has that the ceiling configuration is not
+// being enforced.
+func nodePressure(log *slog.Logger) func() node.Pressure {
+	reader, err := pressure.NewReader()
+	if err != nil {
+		log.Warn("cgroup v2 pressure reading unavailable; utilisation ceilings will not be enforced",
+			"reason", err)
+		return func() node.Pressure { return node.Pressure{} }
+	}
+	return reader.Read
 }

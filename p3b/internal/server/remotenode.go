@@ -390,6 +390,8 @@ func specToWire(spec backend.Spec) map[string]any {
 		"required_resume_level": spec.RequiredResume,
 		"backend":               spec.Backend,
 		"required_features":     spec.RequiredFeatures,
+		"required_node_label":   spec.RequiredNodeLabel,
+		"forbidden_node_labels": spec.ForbiddenNodeLabels,
 	}
 	resources := map[string]any{}
 	if spec.Resources.CPUCount > 0 {

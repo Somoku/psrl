@@ -260,6 +260,12 @@ func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
 			"DeviceIDs":    deviceIDs(spec.AssignedGPUs),
 			"Capabilities": [][]string{{"gpu"}},
 		}}
+		// Restrict the container to exactly its granted devices. Without this the
+		// NVIDIA runtime exposes all devices and two concurrent sandboxes can
+		// interfere with each other's workloads even though admission partitioned
+		// the indices correctly.
+		env = append(env, "CUDA_VISIBLE_DEVICES="+cudaVisibleDevices(spec.AssignedGPUs))
+		sort.Strings(env)
 	}
 
 	body := map[string]any{
@@ -283,6 +289,17 @@ func deviceIDs(indices []int32) []string {
 		out[i] = fmt.Sprint(index)
 	}
 	return out
+}
+
+// cudaVisibleDevices renders the CUDA_VISIBLE_DEVICES value for the granted
+// indices. This restricts what the NVIDIA runtime exposes inside the container,
+// so a sandbox that was admitted for device 2 cannot see device 0 or 1.
+func cudaVisibleDevices(indices []int32) string {
+	parts := make([]string, len(indices))
+	for i, index := range indices {
+		parts[i] = fmt.Sprint(index)
+	}
+	return strings.Join(parts, ",")
 }
 
 // ensureImage pulls an image the node does not have.

@@ -151,7 +151,13 @@ type BackendConfig struct {
 		Address string `json:"address"`
 	} `json:"nodes"`
 
-	// WarmPool, for docker direct mode. A zero Size disables the pool.
+	// WarmPool pre-builds sandboxes for a direct-mode backend, so a matching
+	// create pays neither the container build nor (for opensandbox) the agent
+	// readiness wait. A zero Size disables it.
+	//
+	// For opensandbox the size is also a standing claim on the port range, because
+	// every entry holds a published host port: the backend refuses a pool above a
+	// quarter of port_max-port_min rather than letting it starve cold creates.
 	WarmPool struct {
 		Image           string  `json:"image"`
 		Size            int     `json:"size"`

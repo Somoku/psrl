@@ -173,6 +173,100 @@ func TestProviderModeSendsKubernetesQuantities(t *testing.T) {
 	}
 }
 
+func TestProviderModeSendsABlockingEntrypointWithAnImage(t *testing.T) {
+	// The server refuses an image-based create with no entrypoint
+	// ("Entrypoint is required when image is provided") and returns 422, so a
+	// create that omitted it failed against a real gateway while passing against
+	// any fake that did not enforce the rule. That is why this asserts on the
+	// request body rather than on the create succeeding.
+	//
+	// It must also block. A sandbox serves commands through its agent for as long
+	// as the episode needs it, so an entrypoint that exited would take the sandbox
+	// down the moment it was created.
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "sb-1"})
+	}))
+	defer srv.Close()
+
+	if _, err := providerBackend(t, srv.URL).Create(context.Background(), "", testSpec(), ""); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	raw, present := body["entrypoint"]
+	if !present {
+		t.Fatalf("the create body carries no entrypoint, which the server requires "+
+			"whenever an image is given; body was %v", body)
+	}
+	entrypoint, isList := raw.([]any)
+	if !isList || len(entrypoint) == 0 {
+		t.Fatalf("entrypoint must be a non-empty list, got %v", raw)
+	}
+	if first, _ := entrypoint[0].(string); first == "" {
+		t.Errorf("entrypoint's first element must name a command, got %v", entrypoint[0])
+	}
+}
+
+func TestProviderModeSendsASnapshotRatherThanAnImageForATemplate(t *testing.T) {
+	// A template source is a snapshot id to this server, and sending it as an image
+	// uri would have the server try to pull it as an image reference.
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "sb-1"})
+	}))
+	defer srv.Close()
+
+	spec := testSpec()
+	spec.Source = backend.Source{Kind: "template", Reference: "snap-abc"}
+	if _, err := providerBackend(t, srv.URL).Create(context.Background(), "", spec, ""); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if body["snapshotId"] != "snap-abc" {
+		t.Errorf("snapshotId: got %v, want snap-abc", body["snapshotId"])
+	}
+	if _, sentImage := body["image"]; sentImage {
+		t.Error("a template create must not also send an image: the server would try to pull the id")
+	}
+}
+
+func TestProviderModeMapsEveryStateTheServerReports(t *testing.T) {
+	// The server's states are Pending, Running, Pausing, Paused, Resuming,
+	// Stopping, Terminated, Failed. A state that fell through to "unknown" would
+	// have the lifecycle treat a sandbox it is still charged for as one it cannot
+	// account for, so every one of them is mapped.
+	for state, want := range map[string]string{
+		"Pending":    "running",
+		"Running":    "running",
+		"Resuming":   "running",
+		"Pausing":    "paused",
+		"Paused":     "paused",
+		"Stopping":   "terminated",
+		"Terminated": "terminated",
+		"Failed":     "terminated",
+	} {
+		reported := state
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "sb-1", "status": map[string]string{"state": reported},
+			})
+		}))
+		got, err := providerBackend(t, srv.URL).Status(
+			context.Background(), backend.Handle{Backend: "opensandbox", SandboxID: "sb-1"})
+		srv.Close()
+		if err != nil {
+			t.Fatalf("status for %q: %v", state, err)
+		}
+		if got != want {
+			t.Errorf("state %q mapped to %q, want %q", state, got, want)
+		}
+	}
+}
+
 func TestProviderModePreflightRefusesASilentGateway(t *testing.T) {
 	if err := providerBackend(t, "http://127.0.0.1:1").Preflight(context.Background()); err == nil {
 		t.Fatal("preflight must refuse a gateway that is not answering")

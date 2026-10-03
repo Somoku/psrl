@@ -39,8 +39,8 @@ import (
 
 // fakeExecBackend is a minimal backend that keeps sandboxes in memory.
 type fakeExecBackend struct {
-	name     string
-	created  map[string]bool
+	name    string
+	created map[string]bool
 }
 
 func newFakeExecBackend(name string) *fakeExecBackend {
@@ -273,4 +273,92 @@ func TestTwoPlaneExecOnUnknownNodeReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for sandbox on an unknown node, got nil")
 	}
+}
+
+// TestCapabilitiesSurviveTheLocalNodePath pins a defect that only a
+// single-process deployment could have.
+//
+// The local node client rebuilt capabilities from the proto with the resume
+// level alone, dropping the feature list and the pause modes. The remote client
+// carried all three, so a fleet deployment behaved correctly while a
+// single-machine one reported a backend that declared nothing it could do --
+// and a capability check at the SDK ("can this sandbox take a full-state
+// snapshot?") answered no for a backend whose whole purpose is answering yes.
+//
+// Asserted on the local path specifically, because that is the one that was
+// wrong and the one a developer runs by default.
+func TestCapabilitiesSurviveTheLocalNodePath(t *testing.T) {
+	declared := backend.Capabilities{
+		Features:    []string{"hibernate", "full_state_snapshot", "resume_anywhere", "native_fork"},
+		ResumeLevel: "full_state",
+		PauseModes:  []string{"hibernate"},
+	}
+	b := &capabilityBackend{name: "fake", declared: declared}
+	n := buildNodeForTest(t, "node-caps", b)
+
+	ctx := context.Background()
+	spec := backend.Spec{
+		Source:        backend.Source{Kind: "image", Reference: "alpine:latest"},
+		ResourceClass: "default",
+		WorkflowID:    "wf-caps",
+		Resources:     backend.Resources{MemoryMB: 128},
+	}
+	local := server.NewLocalNodeClient(n)
+	leaseID, _, refusal, err := local.Admit(ctx, "node-caps", spec)
+	if err != nil || refusal != "" {
+		t.Fatalf("admit: err=%v refusal=%q", err, refusal)
+	}
+	created, err := local.CreateOn(ctx, "node-caps", leaseID, "fake", spec, "")
+	if err != nil {
+		t.Fatalf("create_on: %v", err)
+	}
+
+	if created.Capabilities.ResumeLevel != "full_state" {
+		t.Errorf("resume level: got %q, want full_state", created.Capabilities.ResumeLevel)
+	}
+	if len(created.Capabilities.Features) != len(declared.Features) {
+		t.Fatalf("the create returned %d features, want %d: %v",
+			len(created.Capabilities.Features), len(declared.Features), created.Capabilities.Features)
+	}
+	for _, want := range declared.Features {
+		found := false
+		for _, got := range created.Capabilities.Features {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("feature %q was dropped crossing the node boundary", want)
+		}
+	}
+	if len(created.Capabilities.PauseModes) != 1 || created.Capabilities.PauseModes[0] != "hibernate" {
+		t.Errorf("pause modes: got %v, want [hibernate]", created.Capabilities.PauseModes)
+	}
+}
+
+// capabilityBackend is a fake that declares a full capability set, so the test
+// can tell which parts survive the round trip.
+type capabilityBackend struct {
+	name     string
+	declared backend.Capabilities
+}
+
+func (c *capabilityBackend) Name() string                       { return c.name }
+func (c *capabilityBackend) Mode() backend.SchedulingMode       { return backend.SchedulingDirect }
+func (c *capabilityBackend) Capabilities() backend.Capabilities { return c.declared }
+func (c *capabilityBackend) Nodes(context.Context) ([]string, error) {
+	return []string{"node-caps"}, nil
+}
+func (c *capabilityBackend) Create(
+	_ context.Context, nodeID string, spec backend.Spec, _ string,
+) (backend.Created, error) {
+	return backend.Created{
+		Handle:       backend.Handle{Backend: c.name, SandboxID: "sb-caps", NodeID: nodeID},
+		Capabilities: c.declared,
+	}, nil
+}
+func (c *capabilityBackend) Release(context.Context, backend.Handle) error { return nil }
+func (c *capabilityBackend) Status(context.Context, backend.Handle) (string, error) {
+	return "running", nil
 }

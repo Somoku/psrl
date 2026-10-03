@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 
 	v1 "psrl.dev/sandboxd/api/v1"
 	"psrl.dev/sandboxd/internal/backend"
@@ -69,6 +70,36 @@ func (l *LocalNodeClient) ReleaseOn(ctx context.Context, handle backend.Handle) 
 // StatusOn reports one sandbox's state from the node that holds it.
 func (l *LocalNodeClient) StatusOn(ctx context.Context, handle backend.Handle) (string, error) {
 	return l.node.StatusOn(ctx, handle)
+}
+
+// ExecOn runs one command in a sandbox the node holds.
+func (l *LocalNodeClient) ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (int, string, error) {
+	return l.node.Exec(ctx, handle, command, cwd, env)
+}
+
+// ReadBytesOn reads a file from a sandbox the node holds.
+func (l *LocalNodeClient) ReadBytesOn(ctx context.Context, handle backend.Handle, path string) (string, error) {
+	code, output, err := l.node.Exec(ctx, handle, fmt.Sprintf("base64 %q", path), "", nil)
+	if err != nil {
+		return "", err
+	}
+	if code != 0 {
+		return "", fmt.Errorf("reading %q exited %d", path, code)
+	}
+	return compactBase64(output), nil
+}
+
+// WriteBytesOn writes a file into a sandbox the node holds.
+func (l *LocalNodeClient) WriteBytesOn(ctx context.Context, handle backend.Handle, path, data string) error {
+	command := fmt.Sprintf("mkdir -p \"$(dirname %q)\" && printf %%s %q | base64 -d > %q", path, data, path)
+	code, output, err := l.node.Exec(ctx, handle, command, "", nil)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("writing %q exited %d: %s", path, code, output)
+	}
+	return nil
 }
 
 // specToProto renders a spec for the node, which speaks the proto contract even

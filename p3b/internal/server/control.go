@@ -29,6 +29,14 @@ type NodeClient interface {
 	) (backend.Created, error)
 	ReleaseOn(ctx context.Context, handle backend.Handle) error
 	StatusOn(ctx context.Context, handle backend.Handle) (string, error)
+
+	// ExecOn, ReadBytesOn, and WriteBytesOn route command and file traffic to
+	// the node that holds the sandbox. In a single-process deployment they call
+	// the node directly; in a fleet they reach the right machine over the
+	// node-plane protocol so the control plane never proxies data traffic.
+	ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (int, string, error)
+	ReadBytesOn(ctx context.Context, handle backend.Handle, path string) (string, error)
+	WriteBytesOn(ctx context.Context, handle backend.Handle, path, data string) error
 }
 
 // Control is the cluster-level service.

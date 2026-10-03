@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -437,13 +436,14 @@ func (j *JSONListener) deleteSnapshot(ctx context.Context, raw json.RawMessage) 
 	return map[string]any{}, nil
 }
 
-// exec runs one command. It is served by the node rather than the control
-// plane, because command traffic is the hot path and the fleet has no decision
-// to make about it.
+// exec runs one command. In a fleet deployment the control plane forwards to
+// the node that holds the sandbox via NodeClient.ExecOn, so a control-only
+// process can still serve exec without being co-located with the sandbox.
+// In a single-process deployment ExecOn calls the local node directly.
 func (j *JSONListener) exec(ctx context.Context, raw json.RawMessage) (any, error) {
-	if j.node == nil {
+	if j.control.nodes == nil {
 		return nil, status.Error(codes.Unimplemented,
-			"this process runs no node, so a command has nowhere to go; reach the node that holds the sandbox")
+			"no node client is configured; this process cannot route commands")
 	}
 	var payload struct {
 		handlePayload
@@ -454,7 +454,7 @@ func (j *JSONListener) exec(ctx context.Context, raw json.RawMessage) (any, erro
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, err
 	}
-	code, output, err := j.node.Exec(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
+	code, output, err := j.control.nodes.ExecOn(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -462,8 +462,8 @@ func (j *JSONListener) exec(ctx context.Context, raw json.RawMessage) (any, erro
 }
 
 func (j *JSONListener) readBytes(ctx context.Context, raw json.RawMessage) (any, error) {
-	if j.node == nil {
-		return nil, status.Error(codes.Unimplemented, "this process runs no node, so it holds no files")
+	if j.control.nodes == nil {
+		return nil, status.Error(codes.Unimplemented, "no node client is configured; this process cannot route file reads")
 	}
 	var payload struct {
 		handlePayload
@@ -472,21 +472,16 @@ func (j *JSONListener) readBytes(ctx context.Context, raw json.RawMessage) (any,
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, err
 	}
-	// Read through the sandbox's own shell, so one code path serves every backend
-	// that has no file API of its own.
-	code, output, err := j.node.Exec(ctx, payload.handle(), fmt.Sprintf("base64 %q", payload.Path), "", nil)
+	data, err := j.control.nodes.ReadBytesOn(ctx, payload.handle(), payload.Path)
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, err
 	}
-	if code != 0 {
-		return nil, status.Errorf(codes.NotFound, "reading %q exited %d", payload.Path, code)
-	}
-	return map[string]any{"data": compactBase64(output)}, nil
+	return map[string]any{"data": data}, nil
 }
 
 func (j *JSONListener) writeBytes(ctx context.Context, raw json.RawMessage) (any, error) {
-	if j.node == nil {
-		return nil, status.Error(codes.Unimplemented, "this process runs no node, so it holds no files")
+	if j.control.nodes == nil {
+		return nil, status.Error(codes.Unimplemented, "no node client is configured; this process cannot route file writes")
 	}
 	var payload struct {
 		handlePayload
@@ -496,14 +491,8 @@ func (j *JSONListener) writeBytes(ctx context.Context, raw json.RawMessage) (any
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, err
 	}
-	command := fmt.Sprintf("mkdir -p \"$(dirname %q)\" && printf %%s %q | base64 -d > %q",
-		payload.Path, payload.Data, payload.Path)
-	code, output, err := j.node.Exec(ctx, payload.handle(), command, "", nil)
-	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
-	}
-	if code != 0 {
-		return nil, status.Errorf(codes.FailedPrecondition, "writing %q exited %d: %s", payload.Path, code, output)
+	if err := j.control.nodes.WriteBytesOn(ctx, payload.handle(), payload.Path, payload.Data); err != nil {
+		return nil, err
 	}
 	return map[string]any{}, nil
 }

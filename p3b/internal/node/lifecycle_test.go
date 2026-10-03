@@ -78,7 +78,7 @@ func adopt(t *testing.T, life *Lifecycle, gate *Admission, b backend.Backend, id
 	if !ok {
 		t.Fatalf("admit %s: %q", id, refusal)
 	}
-	life.Adopt(backend.Handle{Backend: "fake", SandboxID: id, NodeID: "node-a"}, b, grant.LeaseID, "worker")
+	life.Adopt(backend.Handle{Backend: "fake", SandboxID: id, NodeID: "node-a"}, b, grant.LeaseID, "worker", "")
 }
 
 func TestInvertedWindowsAreRefused(t *testing.T) {
@@ -378,7 +378,7 @@ func BenchmarkSweep(b *testing.B) {
 	// A production node density, so the sweep is measured where it runs.
 	for i := 0; i < 3200; i++ {
 		grant, _, _ := gate.Admit("rollout", "w", Resources{MemoryMB: 1})
-		life.Adopt(backend.Handle{SandboxID: fmt.Sprintf("sb-%04d", i)}, fake, grant.LeaseID, "w")
+		life.Adopt(backend.Handle{SandboxID: fmt.Sprintf("sb-%04d", i)}, fake, grant.LeaseID, "w", "")
 	}
 	ctx := context.Background()
 	b.ReportAllocs()

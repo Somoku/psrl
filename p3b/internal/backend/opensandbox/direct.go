@@ -19,11 +19,19 @@
 // staging the agent (once, in execd.go, rather than per container), allocating
 // the port the agent is reached on, and composing the container so bootstrap.sh
 // starts the agent beside the workload.
+//
+// One constraint shapes the rest. The agent listens on a fixed port and nothing
+// in the bootstrap path can change it, so each sandbox needs its own network
+// namespace and a published port -- host networking would have every sandbox
+// after the first fail to bind. That is why this backend keeps a port pool and
+// refuses network_mode "host", even though the container backend prefers it.
 package opensandbox
 
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,6 +43,32 @@ import (
 
 // agentPort is where execd listens inside every sandbox.
 const agentPort = 44772
+
+// keepaliveCommand is what a sandbox's PID 1 runs so the container stays up.
+//
+// A sandbox exists to serve commands over its agent, not to run one workload and
+// exit, so its init has to block. `sleep infinity` is not portable to a BusyBox
+// image, and `tail -f /dev/null` is the form that works everywhere.
+const keepaliveCommand = "exec tail -f /dev/null"
+
+// agentReadyTimeout bounds the wait for execd to answer after its container
+// starts.
+//
+// A started container is not a usable sandbox: the agent is a process inside it
+// and it binds its port a moment later. Returning before it answers would hand
+// back a sandbox whose first command fails for a reason that looks like a
+// workload fault, so the wait happens here and a startup failure stays in the
+// create where it belongs.
+const agentReadyTimeout = 30 * time.Second
+
+// portQuarantine is how long a released port waits before it can be handed out
+// again.
+//
+// The daemon's userland proxy keeps the host socket for a moment after the
+// container it served is removed, so an immediately reused port fails the next
+// create with "address already in use". That reads as pool exhaustion and is not:
+// it is a reuse race, and a short quarantine removes it.
+const portQuarantine = 15 * time.Second
 
 // Labels this service writes on each container. They are what makes a restart
 // able to find its own sandboxes, and what keeps a reclaim from touching a
@@ -52,11 +86,9 @@ type directRuntime struct {
 	nodeID  string
 	ownerID string
 
-	// networkMode is passed through to the daemon. "host" removes the per-sandbox
-	// veth, netns, and iptables work from the create path, which on a cgroup v1
-	// kernel is the difference between a create that scales and one that does not.
-	// It also means the agent is reached on the host's own port, so no mapping is
-	// allocated.
+	// networkMode is passed through to the daemon. It cannot be "host" here --
+	// New refuses that, because the agent's port is fixed and every sandbox would
+	// contend for it -- so this is "bridge" or a user-defined network.
 	networkMode string
 
 	// runtime is an OCI runtime name (gVisor, Kata). Empty uses the daemon's.
@@ -68,6 +100,11 @@ type directRuntime struct {
 	createSem chan struct{}
 
 	ports *portPool
+
+	// probe is a plain HTTP client for reaching the agent. It cannot be the Docker
+	// client: that one dials a unix socket for every request, so it would send the
+	// agent's probe to the daemon.
+	probe *http.Client
 }
 
 // directConfig is what a direct runtime needs to be built.
@@ -101,6 +138,25 @@ func newDirectRuntime(ctx context.Context, cfg directConfig) (*directRuntime, er
 	if err != nil {
 		return nil, err
 	}
+	// Host networking cannot work here, and the failure it produces is subtle
+	// enough to be worth refusing outright.
+	//
+	// The agent's listening port is a compile-time default overridden only by a
+	// -port flag, and bootstrap.sh execs the agent with a fixed argument list, so
+	// nothing in this path can give two sandboxes different ports. Sharing the
+	// host's network namespace therefore means every sandbox after the first finds
+	// 44772 taken: the container starts, the agent dies, and the create fails at
+	// the readiness wait with no indication that the cause was the network mode.
+	//
+	// A per-sandbox namespace with a published port is the shape that works, and it
+	// is what the port pool exists for.
+	if cfg.NetworkMode == "host" {
+		return nil, fmt.Errorf(
+			"opensandbox in direct mode cannot use network_mode \"host\": the agent's port is " +
+				"fixed at 44772 and every sandbox would contend for it on the host. " +
+				"Use \"bridge\" (or leave network_mode unset) so each sandbox gets its own " +
+				"namespace and a published port")
+	}
 	runtime := &directRuntime{
 		docker:      client,
 		agent:       agent,
@@ -108,19 +164,17 @@ func newDirectRuntime(ctx context.Context, cfg directConfig) (*directRuntime, er
 		ownerID:     cfg.OwnerID,
 		networkMode: cfg.NetworkMode,
 		runtime:     cfg.Runtime,
+		probe: &http.Client{Transport: &http.Transport{
+			MaxIdleConns: 256, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second,
+		}},
 	}
 	if cfg.MaxCreateConcurrency > 0 {
 		runtime.createSem = make(chan struct{}, cfg.MaxCreateConcurrency)
 	}
-	// Only a mapped deployment needs a pool. Under host networking the agent
-	// listens on the host port directly and there is nothing to allocate.
-	if !runtime.hostNetworked() {
-		runtime.ports = newPortPool(cfg.PortMin, cfg.PortMax)
-	}
+	// Every sandbox is published on its own host port, so the pool is always built.
+	runtime.ports = newPortPool(cfg.PortMin, cfg.PortMax)
 	return runtime, nil
 }
-
-func (r *directRuntime) hostNetworked() bool { return r.networkMode == "host" }
 
 // features are the capabilities the staged agent actually serves.
 //
@@ -164,23 +218,19 @@ func (r *directRuntime) create(ctx context.Context, spec backend.Spec) (backend.
 
 	sandboxID := newSandboxID()
 
-	// A mapped deployment needs a host port before the container is composed,
-	// because the mapping is part of the create body.
-	hostPort := agentPort
-	if r.ports != nil {
-		reserved, err := r.ports.take()
-		if err != nil {
-			return backend.Created{}, err
-		}
-		hostPort = reserved
-		defer func() {
-			// Released on every failure path. A port leaked per failed create
-			// would exhaust the range over a long run.
-			if hostPort != 0 {
-				r.ports.release(hostPort)
-			}
-		}()
+	// The host port is reserved before the container is composed, because the
+	// mapping is part of the create body.
+	hostPort, err := r.ports.take()
+	if err != nil {
+		return backend.Created{}, err
 	}
+	defer func() {
+		// Released on every failure path. A port leaked per failed create would
+		// exhaust the range over a long run.
+		if hostPort != 0 {
+			r.ports.release(hostPort)
+		}
+	}()
 
 	body := r.createBody(sandboxID, spec, hostPort)
 
@@ -207,6 +257,17 @@ func (r *directRuntime) create(ctx context.Context, spec backend.Spec) (backend.
 	}
 
 	address := fmt.Sprintf("http://127.0.0.1:%d", hostPort)
+
+	// A started container is not yet a usable sandbox: the agent binds its port a
+	// moment after PID 1 runs. Waiting here keeps a startup failure inside the
+	// create, where it reads as one, instead of surfacing as a failed first command.
+	if err := r.awaitAgent(ctx, address); err != nil {
+		removeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = r.docker.removeContainer(removeCtx, containerID, true)
+		return backend.Created{}, err
+	}
+
 	// Ownership of the port passes to the live sandbox; the deferred release must
 	// not take it back.
 	hostPort = 0
@@ -221,13 +282,62 @@ func (r *directRuntime) create(ctx context.Context, spec backend.Spec) (backend.
 	}, nil
 }
 
+// awaitAgent polls the agent's liveness route until it answers.
+//
+// Any answer proves the agent is listening, including one that reports an error,
+// so the status is not inspected: what is being ruled out is a refused or reset
+// connection, which is what an agent that has not bound yet does.
+func (r *directRuntime) awaitAgent(ctx context.Context, address string) error {
+	ctx, cancel := context.WithTimeout(ctx, agentReadyTimeout)
+	defer cancel()
+
+	// Short interval: the agent binds in tens of milliseconds on a warm node, and
+	// a long first poll would add that delay to every create.
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if r.agentAnswers(ctx, address) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf(
+				"the sandbox agent at %s did not answer within %s: the container started but "+
+					"execd never bound its port", address, agentReadyTimeout)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (r *directRuntime) agentAnswers(ctx context.Context, address string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, address+"/ping", nil)
+	if err != nil {
+		return false
+	}
+	response, err := r.probe.Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 256))
+	return true
+}
+
 // createBody composes the container: the workload image, the agent mounted
 // beside it, and bootstrap.sh as the entrypoint.
 //
 // bootstrap.sh is the contract. It starts the agent, then execs the workload's
 // own command, so a sandbox image needs no awareness of OpenSandbox. What it
 // reads from the environment is set here: which binary to run, whether the agent
-// is the container's init, and what the workload command was.
+// is the container's init, and what the workload command is.
+//
+// That last part is not optional. bootstrap.sh resolves "no command" to a bare
+// non-interactive shell, which reads EOF from a closed stdin and exits at once --
+// and because the agent runs as that shell's init, the whole container exits with
+// it before a single command can arrive. A sandbox is a thing that waits, so the
+// command it waits with is stated explicitly.
 func (r *directRuntime) createBody(sandboxID string, spec backend.Spec, hostPort int) map[string]any {
 	env := []string{
 		// Where bootstrap.sh finds the agent.
@@ -236,6 +346,10 @@ func (r *directRuntime) createBody(sandboxID string, spec backend.Spec, hostPort
 		// sandbox accumulates zombies, because a bare container's PID 1 is the
 		// workload and it does not reap.
 		"EXECD_INIT=true",
+		// The keepalive. A sandbox serves commands over its agent rather than
+		// running one workload to completion, so its PID 1 has to outlive the
+		// create: this blocks forever and costs nothing.
+		"BOOTSTRAP_CMD=" + keepaliveCommand,
 	}
 	for key, value := range spec.Env {
 		env = append(env, key+"="+value)
@@ -243,12 +357,6 @@ func (r *directRuntime) createBody(sandboxID string, spec backend.Spec, hostPort
 	// Sorted so one spec always produces one body: an idempotent retry must not
 	// differ from its first attempt by map order alone.
 	sort.Strings(env)
-
-	// The workload's own command, handed to bootstrap.sh to exec once the agent
-	// is up. Empty leaves the image's own entrypoint, which bootstrap.sh resolves.
-	if spec.Workdir != "" {
-		env = append(env, "EXECD_WORKDIR="+spec.Workdir)
-	}
 
 	labels := map[string]string{
 		sandboxIDLabel: sandboxID,
@@ -296,27 +404,29 @@ func (r *directRuntime) createBody(sandboxID string, spec backend.Spec, hostPort
 	if spec.Workdir != "" {
 		body["WorkingDir"] = spec.Workdir
 	}
-	// Under host networking the agent is already on a host port, so a mapping
-	// would be rejected as well as pointless.
-	if !r.hostNetworked() {
-		port := strconv.Itoa(agentPort) + "/tcp"
-		body["ExposedPorts"] = map[string]any{port: map[string]any{}}
-		hostConfig["PortBindings"] = map[string]any{
-			port: []map[string]string{{"HostIp": "127.0.0.1", "HostPort": strconv.Itoa(hostPort)}},
-		}
+	// The agent is reached through a published port, one per sandbox, because its
+	// in-container port is the same for all of them.
+	port := strconv.Itoa(agentPort) + "/tcp"
+	body["ExposedPorts"] = map[string]any{port: map[string]any{}}
+	hostConfig["PortBindings"] = map[string]any{
+		port: []map[string]string{{"HostIp": "127.0.0.1", "HostPort": strconv.Itoa(hostPort)}},
 	}
 	return body
 }
 
 // release destroys one sandbox and returns its port to the pool.
 func (r *directRuntime) release(ctx context.Context, handle backend.Handle) error {
-	if r.ports != nil {
-		if port := r.portOf(ctx, handle.SandboxID); port > 0 {
-			defer r.ports.release(port)
-		}
-	}
+	port := r.portOf(ctx, handle.SandboxID)
 	if err := r.docker.removeContainer(ctx, handle.SandboxID, true); err != nil {
 		return fmt.Errorf("releasing sandbox %s: %w", handle.SandboxID, err)
+	}
+	if port > 0 {
+		// Returned after a delay rather than at once. The daemon's proxy holds the
+		// listening socket briefly after the container is gone, so a port handed
+		// straight to the next create is rejected with "address already in use" --
+		// a failure that looks like exhaustion but is a reuse race. Quarantining
+		// costs nothing: the pool is far larger than the live sandbox count.
+		r.ports.releaseAfter(port, portQuarantine)
 	}
 	return nil
 }
@@ -439,12 +549,25 @@ type portPool struct {
 	taken map[int]bool
 }
 
+// Default pool bounds, chosen to sit above the kernel's ephemeral range.
+//
+// Linux allocates outbound source ports from net.ipv4.ip_local_port_range,
+// commonly 32768-60999. A pool inside that window collides with transient
+// outbound connections: the port is free when it is handed out and taken by the
+// time the daemon binds it, which surfaces as "address already in use" on a
+// create that did nothing wrong. Staying above the range removes the class of
+// failure rather than retrying through it.
+const (
+	defaultPortMin = 61000
+	defaultPortMax = 65000
+)
+
 func newPortPool(minPort, maxPort int) *portPool {
 	if minPort <= 0 {
-		minPort = 45000
+		minPort = defaultPortMin
 	}
 	if maxPort <= minPort {
-		maxPort = minPort + 10000
+		maxPort = defaultPortMax
 	}
 	return &portPool{next: minPort, min: minPort, max: maxPort, taken: map[int]bool{}}
 }
@@ -473,6 +596,14 @@ func (p *portPool) release(port int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.taken, port)
+}
+
+// releaseAfter returns a port to the pool once the delay has passed.
+//
+// The port stays reserved in the meantime, so no other create can take it while
+// the kernel still holds its socket.
+func (p *portPool) releaseAfter(port int, delay time.Duration) {
+	time.AfterFunc(delay, func() { p.release(port) })
 }
 
 // -- helpers ------------------------------------------------------------------

@@ -401,6 +401,37 @@ type fakeCubelet struct {
 	failCode     errorcode.ErrorCode
 	failMessage  string
 	emptyID      bool
+
+	// block, inFlight and peak let a concurrency test observe how many creates
+	// the backend allowed to reach the node at once. Without holding creates open
+	// the high-water mark is always one and the bound is untested.
+	block    chan struct{}
+	inFlight int
+	peak     int
+}
+
+// blockCreates holds every Create open until releaseCreates, so a test can read
+// the number in flight at the high-water mark.
+func (f *fakeCubelet) blockCreates() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.block = make(chan struct{})
+}
+
+func (f *fakeCubelet) releaseCreates() {
+	f.mu.Lock()
+	gate := f.block
+	f.block = nil
+	f.mu.Unlock()
+	if gate != nil {
+		close(gate)
+	}
+}
+
+func (f *fakeCubelet) inFlightPeak() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.peak
 }
 
 func newFakeCubelet(t *testing.T) *fakeCubelet {
@@ -450,9 +481,20 @@ func (f *fakeCubelet) Create(
 	_ context.Context, in *cubebox.RunCubeSandboxRequest,
 ) (*cubebox.RunCubeSandboxResponse, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.createCount++
 	f.last = in
+	f.inFlight++
+	if f.inFlight > f.peak {
+		f.peak = f.inFlight
+	}
+	gate := f.block
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	f.mu.Lock()
+	f.inFlight--
+	defer f.mu.Unlock()
 	// The zero value is OK, so an unset failCode means "do not fail".
 	if f.failCode != errorcode.ErrorCode_OK {
 		return &cubebox.RunCubeSandboxResponse{

@@ -31,11 +31,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"psrl.dev/sandboxd/internal/backend"
@@ -60,6 +63,20 @@ const keepaliveCommand = "exec tail -f /dev/null"
 // workload fault, so the wait happens here and a startup failure stays in the
 // create where it belongs.
 const agentReadyTimeout = 30 * time.Second
+
+// Readiness probe pacing.
+//
+// The first delay sits below the agent's typical bind time rather than above it,
+// so a warm create is not charged for a sleep it did not need. Backing off from
+// there bounds the cost of a cold create: an image that has to be pulled can take
+// seconds, and a 2 ms spin across that would be thousands of pointless syscalls.
+const (
+	agentProbeFirstDelay = 2 * time.Millisecond
+	agentProbeMaxDelay   = 50 * time.Millisecond
+	// agentDialTimeout bounds one connect attempt. The target is loopback, so a
+	// connect that has not completed in this long is refused rather than slow.
+	agentDialTimeout = 250 * time.Millisecond
+)
 
 // portQuarantine is how long a released port waits before it can be handed out
 // again.
@@ -101,10 +118,20 @@ type directRuntime struct {
 
 	ports *portPool
 
+	// portTurn spreads creates across the pool's shards. A counter rather than a
+	// hash of the sandbox id: round-robin is a perfect distribution, where a hash
+	// is only an approximately uniform one and can collide two concurrent creates
+	// onto one shard for no reason.
+	portTurn atomic.Uint64
+
 	// probe is a plain HTTP client for reaching the agent. It cannot be the Docker
 	// client: that one dials a unix socket for every request, so it would send the
 	// agent's probe to the daemon.
 	probe *http.Client
+
+	// pool holds pre-built, agent-ready sandboxes. Nil when disabled, and every
+	// method on it is nil-safe so the create path needs no branch.
+	pool *warmPool
 }
 
 // directConfig is what a direct runtime needs to be built.
@@ -120,6 +147,8 @@ type directConfig struct {
 	StageDir             string
 	PortMin              int
 	PortMax              int
+	// WarmPool pre-builds agent-ready sandboxes. A zero Size disables it.
+	WarmPool WarmPoolConfig
 }
 
 // newDirectRuntime dials the daemon and stages the agent.
@@ -172,9 +201,33 @@ func newDirectRuntime(ctx context.Context, cfg directConfig) (*directRuntime, er
 		runtime.createSem = make(chan struct{}, cfg.MaxCreateConcurrency)
 	}
 	// Every sandbox is published on its own host port, so the pool is always built.
-	runtime.ports = newPortPool(cfg.PortMin, cfg.PortMax)
+	//
+	// It is sharded for the create concurrency, because that is how many creates
+	// can be inside the allocator at once and therefore how many independent lanes
+	// remove queueing rather than merely shortening it. An unbounded create
+	// concurrency still gets a bounded number of shards: the point is to cover the
+	// creates actually in flight, and the daemon cannot run unboundedly many.
+	shards := cfg.MaxCreateConcurrency
+	if shards <= 0 {
+		shards = defaultPortShards
+	}
+	runtime.ports = newPortPool(cfg.PortMin, cfg.PortMax, shards)
+
+	// The pool draws its ports from the same range cold creates do, so its budget
+	// is validated against that range rather than in isolation.
+	pool, err := newWarmPool(cfg.WarmPool, runtime.ports.span(),
+		runtime.buildWarmEntry, runtime.destroyWarmEntry)
+	if err != nil {
+		return nil, err
+	}
+	runtime.pool = pool
 	return runtime, nil
 }
+
+// defaultPortShards is used when create concurrency is unbounded. It is a
+// compromise: enough lanes that a realistic burst stops colliding, few enough
+// that each shard keeps a useful number of ports.
+const defaultPortShards = 16
 
 // features are the capabilities the staged agent actually serves.
 //
@@ -206,8 +259,31 @@ func (r *directRuntime) features() []string {
 	return features
 }
 
-// create composes and starts one sandbox, and returns where its agent answers.
+// create returns a usable sandbox, from the warm pool when one matches.
+//
+// The pool is tried first because a claim removes the whole cost of this
+// function: the container build, the port publish, the start, and the agent
+// readiness wait all happened before anyone was waiting. A miss falls through to
+// the cold path, which is the correct outcome rather than a failure.
 func (r *directRuntime) create(ctx context.Context, spec backend.Spec) (backend.Created, error) {
+	if entry, claimed := r.pool.claim(ctx, spec); claimed {
+		return backend.Created{
+			Handle: backend.Handle{
+				Backend:   "opensandbox",
+				SandboxID: entry.containerID,
+				NodeID:    r.nodeID,
+			},
+			Agent: backend.AgentEndpoint{Address: entry.address},
+			// Reported so a benchmark can tell a claim from a build. Without it the
+			// pool's effect is invisible in the only number that matters.
+			WarmStart: true,
+		}, nil
+	}
+	return r.createCold(ctx, spec)
+}
+
+// createCold composes and starts one sandbox, and returns where its agent answers.
+func (r *directRuntime) createCold(ctx context.Context, spec backend.Spec) (backend.Created, error) {
 	if spec.Source.Kind != "" && spec.Source.Kind != "image" {
 		return backend.Created{}, fmt.Errorf(
 			"a directly driven sandbox starts from an image, not source kind %q", spec.Source.Kind)
@@ -220,7 +296,7 @@ func (r *directRuntime) create(ctx context.Context, spec backend.Spec) (backend.
 
 	// The host port is reserved before the container is composed, because the
 	// mapping is part of the create body.
-	hostPort, err := r.ports.take()
+	hostPort, err := r.ports.take(r.portTurn.Add(1))
 	if err != nil {
 		return backend.Created{}, err
 	}
@@ -282,31 +358,87 @@ func (r *directRuntime) create(ctx context.Context, spec backend.Spec) (backend.
 	}, nil
 }
 
-// awaitAgent polls the agent's liveness route until it answers.
+// awaitAgent waits until the agent is serving, and returns as soon as it is.
 //
-// Any answer proves the agent is listening, including one that reports an error,
-// so the status is not inspected: what is being ruled out is a refused or reset
-// connection, which is what an agent that has not bound yet does.
+// # Why this is not a fixed-interval poll
+//
+// A fixed interval pays its own period on every create. The agent binds in
+// roughly ten milliseconds on a warm node, so a 25 ms tick spent most of its time
+// sleeping past a sandbox that was already ready, and that sleep was added to
+// every create in the fleet. Worse, each tick was a full HTTP request: a dial, a
+// request line, headers, a response, and a body read, to answer a question that
+// is really just "is the port bound yet".
+//
+// Two changes follow from that. The probe is a TCP connect, which is the actual
+// event -- the kernel completes the handshake the moment the agent calls listen,
+// and nothing cheaper can tell us sooner. And the interval starts far below the
+// expected bind time and backs off, so a warm create returns on its first or
+// second attempt while a cold one does not turn into a spin.
+//
+// The TCP connect is necessary but not sufficient: a bound port proves a listener
+// exists, not that it serves. So one HTTP probe confirms, once, after the connect
+// succeeds. That keeps the guarantee the old loop made -- the create does not
+// return until the agent answers -- while paying for it once instead of per tick.
 func (r *directRuntime) awaitAgent(ctx context.Context, address string) error {
 	ctx, cancel := context.WithTimeout(ctx, agentReadyTimeout)
 	defer cancel()
 
-	// Short interval: the agent binds in tens of milliseconds on a warm node, and
-	// a long first poll would add that delay to every create.
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
+	target, err := hostPortOf(address)
+	if err != nil {
+		return err
+	}
+
+	delay := agentProbeFirstDelay
 	for {
-		if r.agentAnswers(ctx, address) {
-			return nil
+		if r.portIsBound(ctx, target) {
+			// Bound. Confirm it serves, then the sandbox is usable.
+			if r.agentAnswers(ctx, address) {
+				return nil
+			}
+			// Listening but not yet answering is a narrow window between listen and
+			// the handler being ready. Keep the short delay rather than backing off:
+			// the remaining wait is sub-millisecond in practice.
+			delay = agentProbeFirstDelay
 		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf(
 				"the sandbox agent at %s did not answer within %s: the container started but "+
 					"execd never bound its port", address, agentReadyTimeout)
-		case <-ticker.C:
+		case <-time.After(delay):
+		}
+		if delay < agentProbeMaxDelay {
+			delay *= 2
+			if delay > agentProbeMaxDelay {
+				delay = agentProbeMaxDelay
+			}
 		}
 	}
+}
+
+// portIsBound reports whether anything is listening, by completing a handshake.
+//
+// A refused connection is the normal answer before the agent binds, so it is not
+// an error here. The dial timeout is short because the target is loopback: a
+// connect that has not completed in this long is not slow, it is refused.
+func (r *directRuntime) portIsBound(ctx context.Context, hostPort string) bool {
+	dialCtx, cancel := context.WithTimeout(ctx, agentDialTimeout)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", hostPort)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// hostPortOf reduces an agent address to the authority a dialler wants.
+func hostPortOf(address string) (string, error) {
+	parsed, err := url.Parse(address)
+	if err != nil || parsed.Host == "" {
+		return "", fmt.Errorf("the agent address %q is not a URL this backend can dial", address)
+	}
+	return parsed.Host, nil
 }
 
 func (r *directRuntime) agentAnswers(ctx context.Context, address string) bool {
@@ -547,12 +679,49 @@ func (r *directRuntime) deleteSnapshot(ctx context.Context, snapshotID string) e
 // a race between the two, and serializing that behind a lock is exactly the
 // bottleneck this mode exists to avoid. Reserving from a known range under one
 // short critical section is O(1) and never touches the network stack.
+//
+// # Why it is sharded
+//
+// One mutex over the whole range makes every concurrent create contend on the
+// same lock. The critical section is short, so throughput survives, but the
+// tail does not: under a burst of N creates the Nth waiter is queued behind
+// N-1 predecessors, and that queueing is what shows up as a p95 several times
+// the p50 while the median is unchanged. The work per create did not grow; the
+// waiting did.
+//
+// Sharding removes the contention rather than shortening it. The range is cut
+// into independent shards, each with its own lock, cursor, and reservation set,
+// and a create is routed to one shard. Two creates collide only when they land
+// on the same shard, so with S shards the expected contention falls by a factor
+// of S. Nothing is shared between shards, so there is no coordination to pay
+// for: this is a partition, not a finer-grained lock over shared state.
+//
+// A shard that is exhausted does not fail the create. It falls through to its
+// neighbours in order, because a shard is an optimisation for the common case
+// and must not become an artificial capacity limit -- a create refused while
+// thousands of ports sat free in the next shard would be a scheduling defect
+// introduced by a performance change.
 type portPool struct {
+	shards []*portShard
+	min    int
+	max    int
+	// width is the ports per shard, kept so shardOf is arithmetic rather than a
+	// scan. The last shard is wider by the range's remainder.
+	width int
+}
+
+// portShard owns a disjoint slice of the range.
+type portShard struct {
 	mu    sync.Mutex
 	next  int
 	min   int
 	max   int
 	taken map[int]bool
+	// free holds ports whose quarantine has elapsed, newest last. Taking from
+	// here is a slice pop rather than a scan over `taken`, which is what keeps
+	// the critical section constant-time once a node reaches steady state and
+	// every port in the shard has been used at least once.
+	free []int
 }
 
 // Default pool bounds, chosen to sit above the kernel's ephemeral range.
@@ -566,31 +735,76 @@ type portPool struct {
 const (
 	defaultPortMin = 61000
 	defaultPortMax = 65000
+
+	// minPortsPerShard keeps a shard large enough to be worth having.
+	//
+	// Sharding a small range produces shards that exhaust immediately and send
+	// every create through the fall-through path, which is slower than the single
+	// lock it replaced. Below this many ports per shard the pool stays unsharded.
+	minPortsPerShard = 64
 )
 
-func newPortPool(minPort, maxPort int) *portPool {
+// newPortPool builds a pool over the range, sharded for the stated concurrency.
+//
+// shards is normally the create concurrency: that is the number of creates that
+// can be in the allocator at once, so it is the number of independent lanes that
+// removes queueing entirely. It is clamped by the range size, because shards
+// smaller than minPortsPerShard cost more than they save.
+func newPortPool(minPort, maxPort, shards int) *portPool {
 	if minPort <= 0 {
 		minPort = defaultPortMin
 	}
 	if maxPort <= minPort {
 		maxPort = defaultPortMax
 	}
-	return &portPool{next: minPort, min: minPort, max: maxPort, taken: map[int]bool{}}
+	span := maxPort - minPort + 1
+	if shards <= 0 {
+		shards = 1
+	}
+	if limit := span / minPortsPerShard; shards > limit {
+		shards = limit
+	}
+	if shards < 1 {
+		shards = 1
+	}
+
+	width := span / shards
+	pool := &portPool{min: minPort, max: maxPort, width: width, shards: make([]*portShard, 0, shards)}
+	// Contiguous, disjoint slices. The last shard absorbs the remainder so no
+	// port in the configured range is left unreachable.
+	for i := 0; i < shards; i++ {
+		low := minPort + i*width
+		high := low + width - 1
+		if i == shards-1 {
+			high = maxPort
+		}
+		pool.shards = append(pool.shards, &portShard{
+			next: low, min: low, max: high, taken: map[int]bool{},
+		})
+	}
+	return pool
 }
 
-// take reserves the next free port, wrapping once before giving up.
-func (p *portPool) take() (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	span := p.max - p.min + 1
-	for tried := 0; tried < span; tried++ {
-		port := p.next
-		p.next++
-		if p.next > p.max {
-			p.next = p.min
-		}
-		if !p.taken[port] {
-			p.taken[port] = true
+// shardCount reports how many independent lanes the pool was built with.
+func (p *portPool) shardCount() int { return len(p.shards) }
+
+// span is how many ports the pool covers, which is what sizes a warm pool's
+// standing claim against it.
+func (p *portPool) span() int { return p.max - p.min + 1 }
+
+// take reserves a port, preferring the caller's own shard.
+//
+// hint selects the shard. Callers pass something stable and well distributed for
+// the request (a counter, or a hash of the sandbox id); the value only has to
+// spread, not to be meaningful.
+func (p *portPool) take(hint uint64) (int, error) {
+	count := uint64(len(p.shards))
+	start := int(hint % count)
+	// The preferred shard first, then every other one. A create is refused only
+	// when the whole configured range is reserved, which is the same condition the
+	// unsharded pool refused on.
+	for offset := 0; offset < len(p.shards); offset++ {
+		if port, ok := p.shards[(start+offset)%len(p.shards)].take(); ok {
 			return port, nil
 		}
 	}
@@ -598,10 +812,65 @@ func (p *portPool) take() (int, error) {
 		"every port in %d-%d is reserved; this clears as sandboxes are released", p.min, p.max)
 }
 
+// take reserves a port from this shard, or reports that it has none.
+func (s *portShard) take() (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A port that has already served and outlived its quarantine is the cheapest
+	// one to hand out: no scan, no cursor arithmetic.
+	if n := len(s.free); n > 0 {
+		port := s.free[n-1]
+		s.free = s.free[:n-1]
+		s.taken[port] = true
+		return port, true
+	}
+	span := s.max - s.min + 1
+	for tried := 0; tried < span; tried++ {
+		port := s.next
+		s.next++
+		if s.next > s.max {
+			s.next = s.min
+		}
+		if !s.taken[port] {
+			s.taken[port] = true
+			return port, true
+		}
+	}
+	return 0, false
+}
+
+// shardOf returns the shard that owns a port.
+//
+// Computed rather than searched. The shards are contiguous and equal-width by
+// construction, so the owner follows from the offset by division -- a scan here
+// would make every release O(shards) and spend more than the sharding saved,
+// which is exactly what a first cut of this measured.
+func (p *portPool) shardOf(port int) *portShard {
+	if port < p.min || port > p.max {
+		return nil
+	}
+	index := (port - p.min) / p.width
+	// The last shard absorbs the range's remainder, so an offset past the final
+	// boundary still belongs to it.
+	if index >= len(p.shards) {
+		index = len(p.shards) - 1
+	}
+	return p.shards[index]
+}
+
+// release returns a port for immediate reuse.
+//
+// Used on a failed create, where the daemon never bound the port, so there is no
+// socket lingering and no quarantine to serve.
 func (p *portPool) release(port int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.taken, port)
+	shard := p.shardOf(port)
+	if shard == nil {
+		return
+	}
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	delete(shard.taken, port)
+	shard.free = append(shard.free, port)
 }
 
 // releaseAfter returns a port to the pool once the delay has passed.
@@ -610,6 +879,18 @@ func (p *portPool) release(port int) {
 // the kernel still holds its socket.
 func (p *portPool) releaseAfter(port int, delay time.Duration) {
 	time.AfterFunc(delay, func() { p.release(port) })
+}
+
+// reserved reports how many ports are held across every shard, for a test and
+// for the metric hook.
+func (p *portPool) reserved() int {
+	total := 0
+	for _, shard := range p.shards {
+		shard.mu.Lock()
+		total += len(shard.taken)
+		shard.mu.Unlock()
+	}
+	return total
 }
 
 // -- helpers ------------------------------------------------------------------

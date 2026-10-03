@@ -76,17 +76,17 @@ type Config struct {
 	} `json:"fleet"`
 
 	Node struct {
-		MemoryMB          int64   `json:"memory_mb"`
-		CPUMillis         int64   `json:"cpu_millis"`
-		DiskMB            int64   `json:"disk_mb"`
-		GPUIndices        []int32 `json:"gpu_indices"`
-		LocalCPUCeiling   float64 `json:"local_cpu_ceiling"`
-		LocalMemCeiling   float64 `json:"local_mem_ceiling"`
+		MemoryMB        int64   `json:"memory_mb"`
+		CPUMillis       int64   `json:"cpu_millis"`
+		DiskMB          int64   `json:"disk_mb"`
+		GPUIndices      []int32 `json:"gpu_indices"`
+		LocalCPUCeiling float64 `json:"local_cpu_ceiling"`
+		LocalMemCeiling float64 `json:"local_mem_ceiling"`
 		// Overcommit is the largest multiple of the declared envelope the node may
 		// grant when measurement says reservations are overstated. Zero and one both
 		// mean off. Only memory expands; the expansion withdraws proportionally as
 		// measured utilization rises toward UtilizationTarget.
-		Overcommit        float64 `json:"overcommit"`
+		Overcommit float64 `json:"overcommit"`
 		// UtilizationTarget is the measured memory fraction at which overcommit is
 		// fully withdrawn. Must be set and below LocalMemCeiling when Overcommit > 1.
 		UtilizationTarget float64 `json:"utilization_target"`
@@ -151,7 +151,13 @@ type BackendConfig struct {
 		Address string `json:"address"`
 	} `json:"nodes"`
 
-	// WarmPool, for docker direct mode. A zero Size disables the pool.
+	// WarmPool pre-builds sandboxes for a direct-mode backend, so a matching
+	// create pays neither the container build nor (for opensandbox) the agent
+	// readiness wait. A zero Size disables it.
+	//
+	// For opensandbox the size is also a standing claim on the port range, because
+	// every entry holds a published host port: the backend refuses a pool above a
+	// quarter of port_max-port_min rather than letting it starve cold creates.
 	WarmPool struct {
 		Image           string  `json:"image"`
 		Size            int     `json:"size"`
@@ -238,13 +244,13 @@ func preflight(configPath string, log *slog.Logger) error {
 		Envelope: node.Resources{
 			MemoryMB: cfg.Node.MemoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB,
 		},
-		Classes:         nodeClasses(cfg),
-		GPUIndices:      cfg.Node.GPUIndices,
-		LocalCPUCeiling: cfg.Node.LocalCPUCeiling,
-		LocalMemCeiling: cfg.Node.LocalMemCeiling,
+		Classes:           nodeClasses(cfg),
+		GPUIndices:        cfg.Node.GPUIndices,
+		LocalCPUCeiling:   cfg.Node.LocalCPUCeiling,
+		LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 		Overcommit:        cfg.Node.Overcommit,
 		UtilizationTarget: cfg.Node.UtilizationTarget,
-		LeaseTTL:        spans.CapacityLeaseTTL(),
+		LeaseTTL:          spans.CapacityLeaseTTL(),
 	})
 	if err != nil {
 		return err
@@ -309,14 +315,14 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 		return fmt.Errorf("role \"node\" requires at least one direct backend")
 	}
 	gate, err := node.NewAdmission(node.Config{
-		Envelope:        node.Resources{MemoryMB: cfg.Node.MemoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB},
-		Classes:         nodeClasses(cfg),
-		GPUIndices:      cfg.Node.GPUIndices,
-		LocalCPUCeiling: cfg.Node.LocalCPUCeiling,
-		LocalMemCeiling: cfg.Node.LocalMemCeiling,
+		Envelope:          node.Resources{MemoryMB: cfg.Node.MemoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB},
+		Classes:           nodeClasses(cfg),
+		GPUIndices:        cfg.Node.GPUIndices,
+		LocalCPUCeiling:   cfg.Node.LocalCPUCeiling,
+		LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 		Overcommit:        cfg.Node.Overcommit,
 		UtilizationTarget: cfg.Node.UtilizationTarget,
-		LeaseTTL:        spans.CapacityLeaseTTL(),
+		LeaseTTL:          spans.CapacityLeaseTTL(),
 	})
 	if err != nil {
 		return err
@@ -452,13 +458,13 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 			Envelope: node.Resources{
 				MemoryMB: cfg.Node.MemoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB,
 			},
-			Classes:         nodeClasses(cfg),
-			GPUIndices:      cfg.Node.GPUIndices,
-			LocalCPUCeiling: cfg.Node.LocalCPUCeiling,
-			LocalMemCeiling: cfg.Node.LocalMemCeiling,
+			Classes:           nodeClasses(cfg),
+			GPUIndices:        cfg.Node.GPUIndices,
+			LocalCPUCeiling:   cfg.Node.LocalCPUCeiling,
+			LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 			Overcommit:        cfg.Node.Overcommit,
 			UtilizationTarget: cfg.Node.UtilizationTarget,
-			LeaseTTL:        spans.CapacityLeaseTTL(),
+			LeaseTTL:          spans.CapacityLeaseTTL(),
 		})
 		if err != nil {
 			return err
@@ -544,7 +550,8 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 	return server.NewJSONListener(control, agent, log).Serve(ctx, listener)
 }
 
-func republish(ctx context.Context, agent *server.Node, fleet *monitor.Monitor, every time.Duration) {	ticker := time.NewTicker(every)
+func republish(ctx context.Context, agent *server.Node, fleet *monitor.Monitor, every time.Duration) {
+	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
 		select {
@@ -638,6 +645,14 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 				MaxCreateConcurrency: declared.MaxCreateConcurrency,
 				PortMin:              declared.PortMin,
 				PortMax:              declared.PortMax,
+				WarmPool: opensandbox.WarmPoolConfig{
+					Image:          declared.WarmPool.Image,
+					Size:           declared.WarmPool.Size,
+					MemoryMB:       declared.WarmPool.MemoryMB,
+					CPUCount:       declared.WarmPool.CPUCount,
+					EntryTTL:       seconds(declared.WarmPool.EntryTTLS),
+					RefillInterval: seconds(declared.WarmPool.RefillIntervalS),
+				},
 			}, mode)
 		case "docker":
 			b, err = dockerbackend.New(dockerbackend.Config{

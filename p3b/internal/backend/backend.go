@@ -27,10 +27,15 @@ import (
 type SchedulingMode string
 
 const (
-	// SchedulingPSRL means this service places sandboxes itself, against its own
-	// fleet view and its own node admission, and the backend's control plane is
-	// not started. Used where the backend's own scheduler has nothing to add.
-	SchedulingPSRL SchedulingMode = "psrl"
+	// SchedulingDirect means this service both places the sandbox and drives the
+	// node runtime itself: its own fleet view and node admission choose the node,
+	// and the call goes straight to that node's runtime. The backend's own control
+	// plane is not started and is not in the path, so nothing between this service
+	// and the runtime can add a hop or serialize a burst of creates.
+	//
+	// Used where the backend's own scheduler has nothing to add, and where its
+	// control plane would only be a relay.
+	SchedulingDirect SchedulingMode = "direct"
 	// SchedulingProvider means the backend's control plane chooses the node and
 	// this service does cross-backend quota only. Used where the backend has a real
 	// scheduler whose decisions would be lost by overriding it.
@@ -39,7 +44,7 @@ const (
 
 // Valid reports whether a mode is one of the two shapes.
 func (m SchedulingMode) Valid() bool {
-	return m == SchedulingPSRL || m == SchedulingProvider
+	return m == SchedulingDirect || m == SchedulingProvider
 }
 
 // Source is where a sandbox's filesystem comes from.

@@ -2,7 +2,7 @@
 //
 // AgentENV ships a gateway and a scheduler above its node runtimes, and this
 // adapter can use either shape. In provider mode it talks to the gateway and
-// lets AgentENV place. In psrl mode it talks to each node runtime directly,
+// lets AgentENV place. In direct mode it talks to each node runtime directly,
 // because AgentENV's own placement is round-robin over a boolean filter that
 // discards the resource hint it is given, and it holds no reservation between
 // choosing a node and the node charging the work -- so a burst of concurrent
@@ -36,7 +36,7 @@ import (
 type Config struct {
 	// Gateway is the cluster entry point, used in provider mode.
 	Gateway string
-	// Nodes are the runtime addresses, used in psrl mode. Each one serves the
+	// Nodes are the runtime addresses, used in direct mode. Each one serves the
 	// whole sandbox API, so placement here is choosing which to call.
 	Nodes []NodeAddress
 	// Scheduler is where a binding is registered after this service places a
@@ -71,14 +71,14 @@ type Backend struct {
 // New returns an AgentENV backend in the given scheduling mode.
 func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 	if !mode.Valid() {
-		return nil, fmt.Errorf("agentenv scheduling mode %q is not psrl or provider", mode)
+		return nil, fmt.Errorf("agentenv scheduling mode %q is not direct or provider", mode)
 	}
 	if mode == backend.SchedulingProvider && cfg.Gateway == "" {
 		return nil, fmt.Errorf("agentenv in provider mode needs a gateway address")
 	}
-	if mode == backend.SchedulingPSRL && len(cfg.Nodes) == 0 {
+	if mode == backend.SchedulingDirect && len(cfg.Nodes) == 0 {
 		return nil, fmt.Errorf(
-			"agentenv in psrl mode needs its node addresses, because this service chooses the node itself")
+			"agentenv in direct mode needs its node addresses, because this service chooses the node itself")
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 60 * time.Second
@@ -164,7 +164,7 @@ func (b *Backend) Headroom(context.Context, string) (map[string]backend.Resource
 // placing: a later lookup for the sandbox resolves to the right node instead of
 // failing. A deployment running no scheduler configures none and skips it.
 func (b *Backend) RegisterBinding(ctx context.Context, nodeID, sandboxID string) error {
-	if b.cfg.Scheduler == "" || b.mode != backend.SchedulingPSRL {
+	if b.cfg.Scheduler == "" || b.mode != backend.SchedulingDirect {
 		return nil
 	}
 	b.mu.RLock()
@@ -207,7 +207,7 @@ type sandboxReply struct {
 
 // Create provisions one microVM.
 //
-// In psrl mode it goes straight to the chosen node; in provider mode to the
+// In direct mode it goes straight to the chosen node; in provider mode to the
 // gateway, which asks AgentENV's scheduler. The request body is the same, so
 // the two modes cannot drift in what they ask for.
 func (b *Backend) Create(ctx context.Context, nodeID string, spec backend.Spec, callback string) (backend.Created, error) {
@@ -444,7 +444,7 @@ func (b *Backend) post(ctx context.Context, handle backend.Handle, path string) 
 // target returns the address a call goes to.
 //
 // In provider mode every call goes to the gateway, which resolves the sandbox
-// itself. In psrl mode a call goes to the node holding it, because this service
+// itself. In direct mode a call goes to the node holding it, because this service
 // chose that node and knows where the sandbox is.
 func (b *Backend) target(nodeID string) (string, error) {
 	if b.mode == backend.SchedulingProvider {

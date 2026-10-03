@@ -65,7 +65,7 @@ func newStack(t *testing.T, fleetMemoryMB int64) *stack {
 		OwnerID:        fmt.Sprintf("sandboxd-int-%d", time.Now().UnixNano()),
 		RequestTimeout: 30 * time.Second,
 		PullTimeout:    3 * time.Minute,
-	}, backend.SchedulingPSRL)
+	}, backend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("docker backend: %v", err)
 	}

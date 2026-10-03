@@ -1,33 +1,33 @@
 """Concurrency stress test for the OpenSandbox backend via the p3b service.
 
-Two modes:
+The two scheduling modes put a different amount of software in the create path,
+and that is what this measures.
 
-  psrl mode  — the benchmark talks to a p3b service whose opensandbox backend
-               is configured in psrl mode. p3b's own Placement and Admission
-               own the node decision; each docker-mode opensandbox-server is
-               a direct target. This is the apples-to-apples comparison with
-               bench_p3b_concurrency.py: the same p3b control plane, a
-               different data plane underneath.
+direct mode
+    p3b drives the container runtime itself and stages OpenSandbox's agent into
+    each sandbox. No OpenSandbox control plane is deployed. Creates are bounded
+    only by p3b's own semaphore and the daemon, so concurrency is real.
 
-               Required env: SANDBOXD_ENDPOINT (default unix:///run/sandboxd.sock)
+provider mode
+    p3b sends every request to an OpenSandbox gateway and its scheduler places
+    the sandbox. p3b does cross-backend quota only.
 
-  provider mode — the benchmark talks to a p3b service whose opensandbox
-               backend is in provider mode, pointing at an OpenSandbox cluster
-               gateway. p3b does cross-backend quota only; OpenSandbox's own
-               scheduler chooses the node.
+What the two modes share is the data plane: the agent is the same Go binary, it
+listens on the same port, and the SDK reaches it directly either way. So exec
+latency should be flat across modes, while create latency should not -- that
+asymmetry is the result worth reading.
 
-               Required env: SANDBOXD_ENDPOINT + OPENSANDBOX_BACKEND=provider
+Both shapes are driven through the same sandboxd SDK, so the numbers include
+everything a caller actually pays.
 
-Both modes use the same sandboxd Python SDK (SandboxClient), so the
-measurement captures the whole stack from the caller's perspective.
+Usage, against whichever mode the service is configured for:
 
-Usage — psrl mode (default):
     SANDBOXD_ENDPOINT=unix:///run/sandboxd.sock \\
         python bench_opensandbox_concurrency.py
 
-Usage — provider mode:
-    SANDBOXD_ENDPOINT=unix:///run/sandboxd.sock \\
-    OPENSANDBOX_BACKEND=provider \\
+Label the run so the output says which shape produced it:
+
+    SANDBOX_MODE=direct CONCURRENCIES=8,16,32,64,128 \\
         python bench_opensandbox_concurrency.py
 """
 from __future__ import annotations
@@ -46,7 +46,9 @@ from sandboxd import SandboxClient, SandboxSpec, Source, Resources
 # ---------------------------------------------------------------------------
 
 ENDPOINT       = os.environ.get("SANDBOXD_ENDPOINT", "unix:///run/sandboxd.sock")
-BACKEND_MODE   = os.environ.get("OPENSANDBOX_BACKEND", "psrl")   # "psrl" or "provider"
+# A label for the output only. The service's own configuration decides which mode
+# is actually in use; naming it here is how a saved run says what it measured.
+SANDBOX_MODE   = os.environ.get("SANDBOX_MODE", "unspecified")
 SANDBOX_IMAGE  = os.environ.get("SANDBOX_IMAGE", "alpine:latest")
 SANDBOX_MEMORY = int(os.environ.get("SANDBOX_MEMORY_MB", "256"))
 RESOURCE_CLASS = os.environ.get("RESOURCE_CLASS", "rollout")
@@ -136,7 +138,7 @@ async def main() -> None:
     print()
     print("=== OpenSandbox Concurrency Benchmark ===")
     _hdr("Endpoint:",          ENDPOINT)
-    _hdr("Backend mode:",      BACKEND_MODE)
+    _hdr("Scheduling mode:",   SANDBOX_MODE)
     _hdr("Image:",             SANDBOX_IMAGE)
     _hdr("Memory per sandbox:", f"{SANDBOX_MEMORY} MB")
     _hdr("Resource class:",    RESOURCE_CLASS)

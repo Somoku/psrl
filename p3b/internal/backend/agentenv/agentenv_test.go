@@ -131,7 +131,7 @@ func psrlBackend(t *testing.T, fake *fakeAgentENV, scheduler string) *Backend {
 	b, err := New(Config{
 		Nodes:     []NodeAddress{{NodeID: "node-a", Address: fake.server.URL}},
 		Scheduler: scheduler,
-	}, backend.SchedulingPSRL)
+	}, backend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -149,8 +149,8 @@ func spec() backend.Spec {
 
 func TestPsrlModeNeedsItsNodeAddresses(t *testing.T) {
 	// This service chooses the node, so it has to know what the nodes are.
-	if _, err := New(Config{Gateway: "http://gw:8080"}, backend.SchedulingPSRL); err == nil {
-		t.Fatal("psrl mode without node addresses must be refused")
+	if _, err := New(Config{Gateway: "http://gw:8080"}, backend.SchedulingDirect); err == nil {
+		t.Fatal("direct mode without node addresses must be refused")
 	}
 }
 
@@ -162,7 +162,7 @@ func TestProviderModeNeedsAGateway(t *testing.T) {
 }
 
 func TestANodeWithoutAnIdIsRefused(t *testing.T) {
-	_, err := New(Config{Nodes: []NodeAddress{{Address: "http://a:8000"}}}, backend.SchedulingPSRL)
+	_, err := New(Config{Nodes: []NodeAddress{{Address: "http://a:8000"}}}, backend.SchedulingDirect)
 	if err == nil {
 		t.Fatal("a node this service places against must be identifiable")
 	}
@@ -286,7 +286,7 @@ func TestAFailedRegistrationDoesNotFailTheCreate(t *testing.T) {
 	b, err := New(Config{
 		Nodes:     []NodeAddress{{NodeID: "node-a", Address: fake.server.URL}},
 		Scheduler: "http://127.0.0.1:1",
-	}, backend.SchedulingPSRL)
+	}, backend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -439,7 +439,7 @@ func TestPreflightRefusesADeploymentThatIsNotAnswering(t *testing.T) {
 	b, err := New(Config{
 		Nodes:          []NodeAddress{{NodeID: "node-a", Address: "http://127.0.0.1:1"}},
 		RequestTimeout: time.Second,
-	}, backend.SchedulingPSRL)
+	}, backend.SchedulingDirect)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}

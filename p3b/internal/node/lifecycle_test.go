@@ -20,7 +20,7 @@ type fakeBackend struct {
 }
 
 func (f *fakeBackend) Name() string                 { return "fake" }
-func (f *fakeBackend) Mode() backend.SchedulingMode { return backend.SchedulingPSRL }
+func (f *fakeBackend) Mode() backend.SchedulingMode { return backend.SchedulingDirect }
 func (f *fakeBackend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{Features: f.features}
 }

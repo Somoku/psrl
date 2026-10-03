@@ -1,27 +1,100 @@
 # Deploy OpenSandbox
 
-OpenSandbox is an external sandbox platform: the provider runs and schedules the
-sandbox, so a deployment that uses it needs no Docker daemon on the worker's node
-and consumes none of the node's envelope. What it needs instead is a reachable
-server, and a runtime that serves the features the recipe asks for.
+OpenSandbox separates into two parts, and a deployment chooses how much of it to
+run. Its data plane is `execd`, a Go agent that runs inside every sandbox and
+serves commands, files, PTYs, code contexts, and metrics. Its control plane is a
+Python lifecycle server that creates containers and tracks them.
 
-This page is the deployment path. For the backend's request mapping, read
-[sandbox_opensandbox](../../docs/design/sandbox_opensandbox.md).
+The two modes differ in how much of that you deploy.
 
-Placeholders:
+| | `direct` | `provider` |
+|---|---|---|
+| OpenSandbox server | not deployed | required |
+| Who places the sandbox | p3b | OpenSandbox |
+| What you install | the agent image | the server, or a cluster |
+| Create concurrency | bounded by p3b and the daemon | bounded by the server |
+| Warm pools, template builds, block delivery | no | yes, on Kubernetes |
+| Cross-node snapshot restore | no | yes, on Kubernetes |
 
-| Placeholder | Meaning |
-|---|---|
-| `${OPENSANDBOX_URL}` | The server's base URL, for example `http://sandbox-api.internal:8080` |
-| `${OPENSANDBOX_API_KEY}` | The key set as `[server].api_key` in the server's TOML |
-| `${SANDBOX_IMAGE}` | A task image reference, ideally pinned by digest |
-| `${PUBLISH_TARGET}` | An S3-compatible target for golden images, for example `s3://bucket/psrl` |
+Both modes reach the agent directly for every command, so the data plane is the
+same either way. The difference is in the create path.
 
 ---
 
-## Steps
+## direct mode
 
-### 1. Install the server
+p3b drives the container runtime itself and stages the agent into each sandbox.
+No OpenSandbox server runs. This is the shape to use when p3b should own
+placement and the create path should be as short as it can be.
+
+### 1. Pull the agent image
+
+```bash
+docker pull opensandbox/execd:latest
+```
+
+That image carries `execd`, `bootstrap.sh`, and `bwrap`. They are extracted once
+when the service starts and then bind-mounted read-only into every sandbox, so
+the per-sandbox cost is a mount rather than a copy.
+
+### 2. Declare the backend
+
+```json
+{
+  "type": "opensandbox",
+  "mode": "direct",
+  "execd_image": "opensandbox/execd:latest",
+  "socket": "unix:///var/run/docker.sock",
+  "stage_dir": "/var/lib/sandboxd/opensandbox-agent",
+  "network_mode": "host",
+  "max_create_concurrency": 16
+}
+```
+
+`network_mode: host` removes the per-sandbox veth, netns, and iptables work from
+the create path, and lets the agent be reached on a host port with no mapping to
+allocate. On a cgroup v1 kernel that is the difference between a create path that
+scales and one that does not.
+
+`max_create_concurrency` bounds concurrent container creates. The daemon
+serializes parts of container setup in the kernel, so an unbounded burst turns
+latency into timeouts rather than throughput.
+
+Set `port_min` and `port_max` only if you are not using host networking; they
+bound where the agent is published when a mapping is needed.
+
+### 3. Verify before serving
+
+```bash
+sandboxd -preflight -config deploy.json
+```
+
+Preflight checks the runtime, the agent image, and the stage directory, and names
+what to run if any of the three is missing. It installs nothing.
+
+### 4. What direct mode cannot serve
+
+An outbound network policy and the credential vault both need OpenSandbox's
+egress sidecar, which direct mode does not compose. They are also mutually
+exclusive with host networking in OpenSandbox itself. A workload that needs
+either should use `provider` mode.
+
+A snapshot in direct mode is a container commit: a local image, no registry push.
+It restores on the node that took it and nowhere else, so `resume_anywhere` is
+not declared and the node travels on the handle.
+
+---
+
+## provider mode
+
+OpenSandbox's own control plane places and runs the sandbox; p3b does
+cross-backend quota only. Use this for a Kubernetes-backed cluster, or when you
+need warm pools, template builds, block-level image delivery, or a snapshot that
+restores on any node.
+
+### Steps
+
+#### 1. Install the server
 
 Pin the version. The `1.1.0` wheel does not import, because it ships without
 `opensandbox_server.services.fast_sandbox.generated`, so a plain install fails at
@@ -40,7 +113,7 @@ Requirements, from the provider's own installation page:
 | Kubernetes, for the Kubernetes runtime | 1.21.1 or newer |
 | Host OS | Linux, macOS, or Windows with WSL2 |
 
-### 1b. Pre-pull the execution sidecar
+#### 1b. Pre-pull the execution sidecar
 
 Every sandbox runs an `execd` sidecar, and the server pulls its image on the first
 create. Pull it ahead of the run, or the first acquire pays the pull inside its own
@@ -53,7 +126,7 @@ docker pull "$(grep -oP '(?<=^execd_image = ")[^"]+' ~/.sandbox.toml)"
 The image reference is `[runtime].execd_image` in the config written by step 2, so
 run this after that step.
 
-### 2. Write a configuration
+#### 2. Write a configuration
 
 ```bash
 opensandbox-server init-config ~/.sandbox.toml --example docker
@@ -75,7 +148,7 @@ Set `[server].api_key`. With it empty the server runs unauthenticated, and a
 non-interactive environment needs `OPENSANDBOX_INSECURE_SERVER=YES` to acknowledge
 that rather than refusing to start.
 
-### 3. Start the server
+#### 3. Start the server
 
 ```bash
 opensandbox-server --config ~/.sandbox.toml
@@ -84,7 +157,7 @@ opensandbox-server --config ~/.sandbox.toml
 It listens on `[server].host` and `[server].port`, and serves the lifecycle API under
 `/v1`. Point `DOCKER_HOST` at a non-default daemon if the Docker runtime needs one.
 
-### 4. Verify it answers
+#### 4. Verify it answers
 
 ```bash
 curl --fail http://127.0.0.1:8080/health
@@ -97,7 +170,7 @@ curl --fail -H "OPEN-SANDBOX-API-KEY: ${OPENSANDBOX_API_KEY}" \
 The second call is the one that matters: `/health` needs no key, so it says nothing
 about whether the key and the URL a worker will use are correct.
 
-### 5. Point PSRL at it
+#### 5. Point PSRL at it
 
 ```yaml
 sandbox:
@@ -113,7 +186,7 @@ sandbox:
 `api_url` is the lifecycle base URL without the `/v1` suffix. `execd` is resolved per
 sandbox from that URL, so no execution-plane address is configured.
 
-### 6. Declare what the server actually provides
+#### 6. Declare what the server actually provides
 
 Each of these is a property of the deployment rather than of the API, so the backend
 declares the matching capability only where the deployment sets it. A recipe that
@@ -126,7 +199,7 @@ than served without it.
 | `template_publish` | `TEMPLATE_BUILD` | A Kubernetes or fast-sandbox runtime **and** `${PUBLISH_TARGET}`. The template API answers 501 on the Docker runtime, so a Docker deployment can never build a golden image |
 | `warm_pool_ref` | `WARM_POOL` | A pool the operator pre-created as a Kubernetes CRD. A create sends `extensions.poolRef` and the pool's pod fixes the workload shape, so the provider rejects a network policy, a credential proxy, a volume, and a snapshot beside it |
 
-### 7. Run one sandboxed episode
+#### 7. Run one sandboxed episode
 
 ```bash
 python -m examples.airs_bench.scripted_episode --task-id "${TASK_ID}"

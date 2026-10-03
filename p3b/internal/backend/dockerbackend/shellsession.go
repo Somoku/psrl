@@ -297,10 +297,27 @@ func (s *shellSession) wrap(command, workdir string, env map[string]string) stri
 		b.WriteString(" && ")
 	}
 
-	// Run the command in a subshell with stdin closed, capture exit status.
-	b.WriteString("( ")
+	// Run the command in the shell's own context -- NOT a subshell.
+	//
+	// A subshell would defeat the entire point of a persistent shell: `cd`,
+	// `export`, and a venv activation all mutate the shell they run in, and a
+	// subshell discards those mutations when it exits. The symptom is a shell that
+	// is demonstrably the same process across calls (same $$) while every state
+	// change silently fails to carry over.
+	//
+	// Stdin is still redirected per command, because a command that reads stdin
+	// would otherwise consume the next queued command from the shell's own input.
+	// Applying the redirect to the command alone keeps that protection without
+	// introducing a subshell: `cmd </dev/null` redirects only cmd, whereas
+	// `( cmd ) </dev/null` would also create one.
+	//
+	// The trade-off this accepts is that a command ending in an unterminated
+	// construct (an open quote, a trailing `&&`) leaves the shell waiting for more
+	// input rather than failing inside a disposable subshell. That surfaces as the
+	// silence timeout, and the session is then rebuilt -- which is the correct
+	// outcome for a caller that sent a syntactically incomplete command.
 	b.WriteString(command)
-	b.WriteString(" </dev/null ); _exit=$?; printf '%s%d%s\\n' ")
+	b.WriteString(" </dev/null; _exit=$?; printf '%s%d%s\\n' ")
 	b.WriteString(shellQuote(sentinelPrefix))
 	b.WriteString(" $_exit ")
 	b.WriteString(shellQuote(sentinelSuffix))

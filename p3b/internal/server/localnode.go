@@ -48,7 +48,7 @@ func (l *LocalNodeClient) CreateOn(
 			SandboxID: resp.GetHandle().GetSandboxId(),
 			NodeID:    resp.GetHandle().GetNodeId(),
 		},
-		Capabilities: backend.Capabilities{ResumeLevel: resumeLevelName(resp.GetCapabilities().GetResumeLevel())},
+		Capabilities: capabilitiesFromProto(resp.GetCapabilities()),
 		Agent: backend.AgentEndpoint{
 			Address:           resp.GetAgent().GetAddress(),
 			Headers:           resp.GetAgent().GetHeaders(),

@@ -143,6 +143,29 @@ func capabilitiesToProto(capabilities backend.Capabilities) *v1.Capabilities {
 	return out
 }
 
+// capabilitiesFromProto is the inverse of capabilitiesToProto.
+//
+// It exists because reading back only the resume level silently dropped the
+// feature list and the pause modes on every create that crossed the node
+// boundary. The caller then saw a backend that declared nothing it could do, so
+// a capability check at the SDK -- "does this sandbox support a full-state
+// snapshot?" -- answered no for a backend whose whole purpose is that it
+// answers yes.
+func capabilitiesFromProto(capabilities *v1.Capabilities) backend.Capabilities {
+	out := backend.Capabilities{ResumeLevel: resumeLevelName(capabilities.GetResumeLevel())}
+	for _, feature := range capabilities.GetFeatures() {
+		if name := featureName(feature); name != "" {
+			out.Features = append(out.Features, name)
+		}
+	}
+	for _, mode := range capabilities.GetPauseModes() {
+		if name := pauseModeName(mode); name != "" {
+			out.PauseModes = append(out.PauseModes, name)
+		}
+	}
+	return out
+}
+
 func headroomToProto(r node.Resources) *v1.Headroom {
 	return &v1.Headroom{MemoryMb: r.MemoryMB, CpuMillis: r.CPUMillis, GpuCount: r.GPUCount, DiskMb: r.DiskMB}
 }

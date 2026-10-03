@@ -60,6 +60,7 @@ type resident struct {
 	backend   backend.Backend
 	leaseID   string
 	owner     string
+	execMode  string // "persistent" | "one_shot" | "" (one-shot default)
 	createdAt time.Time
 	// lastActivity moves on both command boundaries, start and return. A stamp
 	// written only when a command returns stays stale for the whole of a long
@@ -128,14 +129,25 @@ func (l *Lifecycle) SetOwnerLiveness(alive func(owner string) bool) {
 }
 
 // Adopt records a sandbox this node now owns.
-func (l *Lifecycle) Adopt(handle backend.Handle, b backend.Backend, leaseID, owner string) {
+func (l *Lifecycle) Adopt(handle backend.Handle, b backend.Backend, leaseID, owner, execMode string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
 	l.residents[handle.SandboxID] = &resident{
-		handle: handle, backend: b, leaseID: leaseID, owner: owner,
+		handle: handle, backend: b, leaseID: leaseID, owner: owner, execMode: execMode,
 		createdAt: now, lastActivity: now,
 	}
+}
+
+// ExecMode returns the exec mode recorded for a sandbox, for the node server to
+// select the right execution strategy.
+func (l *Lifecycle) ExecMode(sandboxID string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if held, ok := l.residents[sandboxID]; ok {
+		return held.execMode
+	}
+	return ""
 }
 
 // Lookup returns one owned sandbox's handle and backend.

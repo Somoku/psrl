@@ -134,7 +134,7 @@ func (n *Node) CreateOn(ctx context.Context, req *v1.CreateOnRequest) (*v1.Creat
 		n.forgetLease(grant.LeaseID)
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	n.lifecycle.Adopt(created.Handle, hosted, grant.LeaseID, ownerOf(spec))
+	n.lifecycle.Adopt(created.Handle, hosted, grant.LeaseID, ownerOf(spec), spec.ExecMode)
 	n.forgetLease(grant.LeaseID)
 	return createdToProto(created), nil
 }
@@ -267,15 +267,29 @@ func (n *Node) Sweep(ctx context.Context, _ *v1.Empty) (*v1.SweepReport, error) 
 
 // Exec runs one command in a sandbox this node holds.
 //
-// It lives on the node rather than the control plane because command traffic is
-// the hot path: an episode issues dozens of commands, and routing them through
-// the cluster would add a hop and a serialization each without making a
-// decision. A backend whose sandboxes run their own agent is reached directly by
-// the SDK and never arrives here at all.
+// It routes to the exec strategy the sandbox was created with. A persistent
+// shell keeps shell state (working directory, environment, activated venv)
+// alive between calls, which is what a multi-turn harness needs. One-shot
+// starts a fresh process per call, which is cheaper and correct for a grader.
+// The strategy is chosen at sandbox creation time and stored on the lifecycle
+// resident so this path cannot diverge from what the spec asked for.
 func (n *Node) Exec(ctx context.Context, handle backend.Handle, command, workdir string, env map[string]string) (int, string, error) {
 	_, held, owned := n.lifecycle.Lookup(handle.SandboxID)
 	if !owned {
 		return 0, "", fmt.Errorf("sandbox %q is not held by node %q", handle.SandboxID, n.nodeID)
+	}
+	// A backend whose sandboxes run their own in-sandbox agent is never reached
+	// here — the SDK contacts the agent directly.
+	type execModer interface {
+		ExecWithMode(context.Context, backend.Handle, string, string, string, map[string]string) (int, string, error)
+	}
+	// Mark the sandbox busy for the whole command, so the reclamation sweep
+	// cannot read a long command as idle and pause a running test suite.
+	done := n.lifecycle.Begin(handle.SandboxID)
+	defer done()
+	if moded, ok := held.(execModer); ok {
+		execMode := n.lifecycle.ExecMode(handle.SandboxID)
+		return moded.ExecWithMode(ctx, handle, execMode, command, workdir, env)
 	}
 	runner, canRun := held.(interface {
 		Exec(context.Context, backend.Handle, string, string, map[string]string) (int, string, error)
@@ -283,10 +297,6 @@ func (n *Node) Exec(ctx context.Context, handle backend.Handle, command, workdir
 	if !canRun {
 		return 0, "", fmt.Errorf("backend %q runs commands through its own in-sandbox agent", held.Name())
 	}
-	// Mark the sandbox busy for the whole command, so the reclamation sweep
-	// cannot read a long command as idle and pause a running test suite.
-	done := n.lifecycle.Begin(handle.SandboxID)
-	defer done()
 	return runner.Exec(ctx, handle, command, workdir, env)
 }
 

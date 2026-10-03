@@ -62,6 +62,10 @@ type Config struct {
 	// legitimately exceed it, so the pull is a separate call with its own budget.
 	RequestTimeout time.Duration
 	PullTimeout    time.Duration
+	// WarmPool, when enabled, keeps pre-created containers ready so a create
+	// that matches the pool's spec claims one instantly rather than paying the
+	// container-build cost. Zero-value Size disables the pool.
+	WarmPool WarmPoolConfig
 }
 
 // Backend is the Docker runtime for one node.
@@ -77,6 +81,15 @@ type Backend struct {
 	// dockerd can schedule without queueing, which flattens the latency distribution.
 	// nil means unlimited (MaxCreateConcurrency == 0).
 	createSem chan struct{}
+
+	// shells holds the persistent shell sessions, one per sandbox. A sandbox
+	// created with ExecMode "persistent" keeps a login shell open between calls;
+	// one with ExecMode "one_shot" (or empty) creates a fresh process per call.
+	shells *shellSessions
+
+	// pool holds pre-created containers that are claimed on Create when the spec
+	// matches. nil when the pool is disabled or not configured.
+	pool *warmPool
 
 	mu    sync.Mutex
 	known map[string]string // sandbox id -> container id
@@ -107,7 +120,7 @@ func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 		createSem = make(chan struct{}, cfg.MaxCreateConcurrency)
 	}
 	socket := cfg.Socket
-	return &Backend{
+	b := &Backend{
 		cfg:       cfg,
 		mode:      mode,
 		createSem: createSem,
@@ -120,8 +133,21 @@ func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 				MaxIdleConnsPerHost: 64,
 			},
 		},
-		known: map[string]string{},
-	}, nil
+		known:  map[string]string{},
+		shells: newShellSessions(),
+	}
+	// Built after the backend exists, because the pool drives this backend's own
+	// create and remove: a pool with its own transport would be a second way to
+	// reach the daemon and could disagree with this one about concurrency.
+	pool, err := newWarmPool(cfg.WarmPool,
+		b.createPoolEntry,
+		b.remove,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("docker warm pool: %w", err)
+	}
+	b.pool = pool
+	return b, nil
 }
 
 // Name is the registry key for this backend.
@@ -168,12 +194,19 @@ func (b *Backend) RegisterBinding(context.Context, string, string) error { retur
 
 // Create starts one container and waits until it can run a command.
 //
-// Readiness is a probe rather than a state: a container reported running has not
-// necessarily finished starting its entrypoint, and handing it out early turns a
-// startup failure into a confusing first command.
+// When the warm pool holds a matching entry the container is claimed rather
+// than built, which removes the per-container namespace and cgroup overhead
+// from the create latency entirely. A spec that does not match the pool spec
+// (different image, larger footprint, GPU request) falls through to a cold
+// create so the pool never silently degrades a caller's resource constraints.
 func (b *Backend) Create(ctx context.Context, nodeID string, spec backend.Spec, callback string) (backend.Created, error) {
 	if spec.Source.Kind != "" && spec.Source.Kind != "image" {
 		return backend.Created{}, fmt.Errorf("docker runs an image, so source kind %q cannot be served", spec.Source.Kind)
+	}
+	// Try the warm pool first. A cache hit skips image pull, container creation,
+	// and the start call — the three steps whose latency scales with concurrency.
+	if containerID, ok := b.pool.claim(ctx, spec); ok {
+		return b.adoptWarm(containerID, spec, nodeID), nil
 	}
 	if err := b.ensureImage(ctx, spec.Source.Reference); err != nil {
 		return backend.Created{}, err
@@ -327,6 +360,9 @@ func (b *Backend) ensureImage(ctx context.Context, reference string) error {
 // it, the container still holds the memory its reservation covers, so returning
 // the reservation here would over-commit the node.
 func (b *Backend) Release(ctx context.Context, handle backend.Handle) error {
+	// Close any persistent shell first, so its process exits with the container
+	// rather than being orphaned against a container that is already gone.
+	b.shells.drop(handle.SandboxID)
 	if err := b.remove(ctx, handle.SandboxID); err != nil {
 		return err
 	}
@@ -434,6 +470,28 @@ func (b *Backend) DeleteSnapshot(ctx context.Context, snapshotID string) error {
 // reached through the node agent rather than the control plane, so command
 // traffic still stays node-local.
 func (b *Backend) Exec(ctx context.Context, handle backend.Handle, command string, workdir string, env map[string]string) (int, string, error) {
+	return b.execOneShot(ctx, handle, command, workdir, env)
+}
+
+// ExecWithMode runs a command under the strategy the spec asked for.
+//
+// A persistent shell keeps working directory, exported variables, and an
+// activated environment alive between calls, which is what a multi-turn harness
+// needs. One shot starts a process per command, which is cheaper and is right
+// for a grader step that runs exactly once. The strategy is a property of the
+// workload rather than of the backend, so it travels on the spec and the node
+// passes it here.
+func (b *Backend) ExecWithMode(
+	ctx context.Context, handle backend.Handle, execMode, command, workdir string, env map[string]string,
+) (int, string, error) {
+	if execMode == "persistent" {
+		return b.execPersistent(ctx, handle, command, workdir, env)
+	}
+	return b.execOneShot(ctx, handle, command, workdir, env)
+}
+
+// execOneShot starts a new process per command, holding no state between calls.
+func (b *Backend) execOneShot(ctx context.Context, handle backend.Handle, command string, workdir string, env map[string]string) (int, string, error) {
 	envList := make([]string, 0, len(env))
 	for key, value := range env {
 		envList = append(envList, key+"="+value)
@@ -530,6 +588,28 @@ func (b *Backend) Sweep(ctx context.Context) ([]backend.Handle, error) {
 // the daemon will actually serve, and a configured runtime has to exist: both
 // are declared as capabilities, and a capability the node cannot honour is
 // worse than one it never claimed.
+// Start begins the warm pool's refill and sweep loops.
+//
+// It is separate from New because the pool creates containers, and construction
+// has to be able to happen inside a preflight that is not allowed to change the
+// node's state. A backend whose pool is disabled does nothing here.
+func (b *Backend) Start(ctx context.Context) {
+	b.pool.Start(ctx)
+}
+
+// Stop ends the pool's loops and destroys every entry it still holds, so a
+// shutdown leaves no unowned container behind for the next start to reclaim.
+func (b *Backend) Stop(ctx context.Context) {
+	b.pool.Stop(ctx)
+}
+
+// WarmPool reports what the pool holds, for the metric hook. A backend with no
+// pool reports a zero value rather than nothing, so the family is present either
+// way and a reader does not have to special-case its absence.
+func (b *Backend) WarmPool() WarmPoolReport {
+	return b.pool.Snapshot()
+}
+
 func (b *Backend) Preflight(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()

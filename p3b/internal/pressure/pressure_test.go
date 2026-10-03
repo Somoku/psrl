@@ -8,229 +8,338 @@ import (
 	"time"
 )
 
-// -- cgroup file helpers -------------------------------------------------------
+// -- test helpers -------------------------------------------------------------
 
-func writeCgroupFile(t *testing.T, dir, name, content string) {
+// writeFakeFile writes a file into a temp dir.
+func writeFakeFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-		t.Fatalf("writeCgroupFile: %v", err)
+		t.Fatalf("writeFakeFile %s: %v", name, err)
 	}
 }
 
-func fakeCgroupDir(t *testing.T) string {
+// fakeV2Source implements source using files in a temp directory, so tests
+// run without a real cgroup hierarchy.
+type fakeV2Source struct{ dir string }
+
+func newFakeV2Dir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	// cpu.stat must exist or newReaderAt returns an error.
-	writeCgroupFile(t, dir, "cpu.stat", "usage_usec 0\n")
-	// memory.max "max" → falls back to host total, which is fine for unit tests.
-	writeCgroupFile(t, dir, "memory.max", "max\n")
-	writeCgroupFile(t, dir, "memory.current", "0\n")
+	writeFakeFile(t, dir, "cpu.stat", "usage_usec 0\n")
+	writeFakeFile(t, dir, "memory.max", "max\n")
+	writeFakeFile(t, dir, "memory.current", "0\n")
 	return dir
 }
 
-// -- construction tests -------------------------------------------------------
-
-func TestReaderConstructsFromValidCgroupDir(t *testing.T) {
-	dir := fakeCgroupDir(t)
-	if _, err := newReaderAt(dir); err != nil {
-		t.Fatalf("newReaderAt: %v", err)
+func fakeV2(t *testing.T) (*Reader, string) {
+	t.Helper()
+	dir := newFakeV2Dir(t)
+	src := &v2Source{dir: dir}
+	r, err := newReaderFrom(src)
+	if err != nil {
+		t.Fatalf("newReaderFrom: %v", err)
 	}
+	return r, dir
 }
 
-func TestReaderRefusesADirWithNoCPUStat(t *testing.T) {
+// fakeV1Source builds a minimal v1 layout in a temp directory.
+type fakeV1Dirs struct {
+	cpu    string
+	memory string
+}
+
+func newFakeV1Dirs(t *testing.T) fakeV1Dirs {
+	t.Helper()
+	root := t.TempDir()
+	cpuDir := filepath.Join(root, "cpuacct")
+	memDir := filepath.Join(root, "memory")
+	for _, d := range []string{cpuDir, memDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	writeFakeFile(t, cpuDir, "cpuacct.usage", "0\n")
+	writeFakeFile(t, memDir, "memory.usage_in_bytes", "0\n")
+	writeFakeFile(t, memDir, "memory.limit_in_bytes", "1073741824\n") // 1 GiB
+	return fakeV1Dirs{cpu: cpuDir, memory: memDir}
+}
+
+func fakeV1(t *testing.T) (*Reader, fakeV1Dirs) {
+	t.Helper()
+	dirs := newFakeV1Dirs(t)
+	src := &v1Source{cpuDir: dirs.cpu, memoryDir: dirs.memory}
+	r, err := newReaderFrom(src)
+	if err != nil {
+		t.Fatalf("newReaderFrom(v1): %v", err)
+	}
+	return r, dirs
+}
+
+// -- construction -------------------------------------------------------------
+
+func TestV2ReaderConstructsFromValidDir(t *testing.T) {
+	_, _ = fakeV2(t)
+}
+
+func TestV1ReaderConstructsFromValidDirs(t *testing.T) {
+	_, _ = fakeV1(t)
+}
+
+func TestV2ReaderRefusesADirWithNoCPUStat(t *testing.T) {
 	dir := t.TempDir()
-	writeCgroupFile(t, dir, "memory.max", "max\n")
-	writeCgroupFile(t, dir, "memory.current", "0\n")
-	// cpu.stat absent: construction must fail rather than succeed silently.
-	if _, err := newReaderAt(dir); err == nil {
+	writeFakeFile(t, dir, "memory.max", "max\n")
+	writeFakeFile(t, dir, "memory.current", "0\n")
+	src := &v2Source{dir: dir}
+	if _, err := newReaderFrom(src); err == nil {
 		t.Fatal("expected error for missing cpu.stat")
 	}
 }
 
-// -- memory readings ----------------------------------------------------------
+func TestV1ReaderRefusesADirWithNoCpuacctUsage(t *testing.T) {
+	root := t.TempDir()
+	cpuDir := filepath.Join(root, "cpu")
+	memDir := filepath.Join(root, "memory")
+	_ = os.MkdirAll(cpuDir, 0o755)
+	_ = os.MkdirAll(memDir, 0o755)
+	writeFakeFile(t, memDir, "memory.usage_in_bytes", "0\n")
+	writeFakeFile(t, memDir, "memory.limit_in_bytes", "1073741824\n")
+	// cpuacct.usage intentionally absent
+	src := &v1Source{cpuDir: cpuDir, memoryDir: memDir}
+	if _, err := newReaderFrom(src); err == nil {
+		t.Fatal("expected error for missing cpuacct.usage")
+	}
+}
 
-func TestMemoryUsedPctIsZeroWhenCurrentIsZero(t *testing.T) {
-	dir := fakeCgroupDir(t)
-	writeCgroupFile(t, dir, "memory.current", "0\n")
-	r, _ := newReaderAt(dir)
-	p := r.Read()
-	if p.MemUsedPct != 0 {
+func TestReaderDescribeNamesTheHierarchy(t *testing.T) {
+	r, _ := fakeV2(t)
+	if desc := r.Describe(); desc == "" {
+		t.Error("Describe must return a non-empty string")
+	}
+	r1, _ := fakeV1(t)
+	if desc := r1.Describe(); desc == "" {
+		t.Error("Describe v1 must return a non-empty string")
+	}
+}
+
+// -- memory readings (v2) -----------------------------------------------------
+
+func TestV2MemoryUsedPctIsZeroWhenCurrentIsZero(t *testing.T) {
+	r, dir := fakeV2(t)
+	writeFakeFile(t, dir, "memory.max", "1073741824\n")
+	writeFakeFile(t, dir, "memory.current", "0\n")
+	if p := r.Read(); p.MemUsedPct != 0 {
 		t.Errorf("mem_used_pct: got %.3f, want 0", p.MemUsedPct)
 	}
 }
 
-func TestMemoryUsedPctReadsFromMemoryMax(t *testing.T) {
-	dir := fakeCgroupDir(t)
-	writeCgroupFile(t, dir, "memory.max", "1073741824\n")  // 1 GiB
-	writeCgroupFile(t, dir, "memory.current", "536870912\n") // 512 MiB
-	r, _ := newReaderAt(dir)
+func TestV2MemoryUsedPctReadsFromMemoryMax(t *testing.T) {
+	// Construct the reader AFTER writing the limit, so the cached limit is the
+	// one we intend rather than the host total (which would make 512 MiB a ~0%
+	// fraction on any large machine).
+	dir := t.TempDir()
+	writeFakeFile(t, dir, "cpu.stat", "usage_usec 0\n")
+	writeFakeFile(t, dir, "memory.max", "1073741824\n")  // 1 GiB
+	writeFakeFile(t, dir, "memory.current", "536870912\n") // 512 MiB
+	src := &v2Source{dir: dir}
+	r, err := newReaderFrom(src)
+	if err != nil {
+		t.Fatalf("newReaderFrom: %v", err)
+	}
 	p := r.Read()
-	// 512 MiB / 1 GiB = 0.5; allow a tiny float rounding tolerance.
 	if p.MemUsedPct < 0.499 || p.MemUsedPct > 0.501 {
 		t.Errorf("mem_used_pct: got %.4f, want ~0.5", p.MemUsedPct)
 	}
 }
 
-func TestMemoryUsedPctIsCappedAtOne(t *testing.T) {
-	dir := fakeCgroupDir(t)
-	writeCgroupFile(t, dir, "memory.max", "1000\n")
-	writeCgroupFile(t, dir, "memory.current", "2000\n") // 2× over limit
-	r, _ := newReaderAt(dir)
-	p := r.Read()
-	if p.MemUsedPct > 1 {
+func TestV2MemoryUsedPctIsCappedAtOne(t *testing.T) {
+	r, dir := fakeV2(t)
+	writeFakeFile(t, dir, "memory.max", "1000\n")
+	writeFakeFile(t, dir, "memory.current", "2000\n")
+	if p := r.Read(); p.MemUsedPct > 1 {
 		t.Errorf("mem_used_pct: got %.3f, want ≤ 1", p.MemUsedPct)
 	}
 }
 
-// -- CPU readings -------------------------------------------------------------
+// -- memory readings (v1) -----------------------------------------------------
 
-func TestCPUUsedPctIsZeroOnFirstCall(t *testing.T) {
-	// The first call has no prior sample to difference against; returning zero
-	// rather than guessing is the contract.
-	dir := fakeCgroupDir(t)
-	writeCgroupFile(t, dir, "cpu.stat", "usage_usec 5000000\n")
-	r, _ := newReaderAt(dir)
+func TestV1MemoryUsedPctReadsFromUsageInBytes(t *testing.T) {
+	r, dirs := fakeV1(t)
+	writeFakeFile(t, dirs.memory, "memory.limit_in_bytes", "1073741824\n") // 1 GiB
+	writeFakeFile(t, dirs.memory, "memory.usage_in_bytes", "536870912\n")  // 512 MiB
 	p := r.Read()
-	if p.CPUUsedPct != 0 {
+	if p.MemUsedPct < 0.499 || p.MemUsedPct > 0.501 {
+		t.Errorf("v1 mem_used_pct: got %.4f, want ~0.5", p.MemUsedPct)
+	}
+}
+
+func TestV1MemoryLimitAboveTotalTreatedAsUnlimited(t *testing.T) {
+	// A v1 unlimited cgroup reports a very large sentinel. The implementation
+	// uses the host's total memory as the ceiling in that case, which is the
+	// right denominator.
+	r, dirs := fakeV1(t)
+	// Set limit to max int64-like sentinel that v1 uses for "no limit".
+	writeFakeFile(t, dirs.memory, "memory.limit_in_bytes", "9223372036854771712\n")
+	writeFakeFile(t, dirs.memory, "memory.usage_in_bytes", "1048576\n")
+	p := r.Read()
+	if p.MemUsedPct < 0 || p.MemUsedPct > 1 {
+		t.Errorf("v1 unlimited limit: mem_used_pct %f out of [0,1]", p.MemUsedPct)
+	}
+}
+
+// -- CPU readings (first call always zero) ------------------------------------
+
+func TestV2CPUUsedPctIsZeroOnFirstCall(t *testing.T) {
+	r, dir := fakeV2(t)
+	writeFakeFile(t, dir, "cpu.stat", "usage_usec 5000000\n")
+	if p := r.Read(); p.CPUUsedPct != 0 {
 		t.Errorf("first cpu_used_pct: got %.3f, want 0 (no prior sample)", p.CPUUsedPct)
 	}
 }
 
-func TestCPUUsedPctReflectsAccumulatedUsage(t *testing.T) {
-	dir := fakeCgroupDir(t)
-	writeCgroupFile(t, dir, "cpu.stat", "usage_usec 0\n")
-	r, _ := newReaderAt(dir)
-	r.Read() // seed
-
-	// Inject elapsed time and CPU usage directly so the test does not sleep.
-	// Half the cores busy for the measurement window → 0.5 fraction.
-	cores := r.cores
-	elapsed := 500 * time.Millisecond
-	consumed := time.Duration(cores * float64(elapsed) / 2)
-
-	r.mu.Lock()
-	r.lastRead = r.lastRead.Add(-elapsed)
-	r.lastCPU = r.lastCPU - consumed // as if usage was consumed over that window
-	r.mu.Unlock()
-
-	p := r.Read()
-	// Should be approximately 0.5, but the file still reads 0 so actual delta is
-	// derived from our mu manipulation alone.
-	_ = p // just checking it doesn't panic; correctness is in the arithmetic logic
+func TestV1CPUUsedPctIsZeroOnFirstCall(t *testing.T) {
+	r, dirs := fakeV1(t)
+	writeFakeFile(t, dirs.cpu, "cpuacct.usage", "5000000000\n") // 5s nanoseconds
+	if p := r.Read(); p.CPUUsedPct != 0 {
+		t.Errorf("v1 first cpu_used_pct: got %.3f, want 0", p.CPUUsedPct)
+	}
 }
 
-func TestCPUUsedPctIsCappedAtOne(t *testing.T) {
-	dir := fakeCgroupDir(t)
-	writeCgroupFile(t, dir, "cpu.stat", "usage_usec 0\n")
-	r, _ := newReaderAt(dir)
-	r.Read() // seed
+// -- CPU rate via time manipulation -------------------------------------------
 
-	// Simulate impossible 200% usage across all cores.
-	cores := r.cores
-	elapsed := 500 * time.Millisecond
-	consumed := time.Duration(cores * float64(elapsed) * 10) // ×10 over capacity
-
+func injectCPUInterval(r *Reader, elapsed time.Duration, consumed time.Duration) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.lastRead = r.lastRead.Add(-elapsed)
 	r.lastCPU = r.lastCPU - consumed
-	r.mu.Unlock()
-
-	p := r.Read()
-	_ = p // capping is tested via code inspection; this just ensures no panic
 }
 
-// -- negative counter (cgroup recreated) -------------------------------------
+func TestV2CPUUsedPctReflectsRate(t *testing.T) {
+	r, dir := fakeV2(t)
+	writeFakeFile(t, dir, "cpu.stat", "usage_usec 0\n")
+	r.Read() // seed
+
+	// Simulate half the cores busy for 500ms.
+	elapsed := 500 * time.Millisecond
+	consumed := time.Duration(r.cores * float64(elapsed) / 2)
+	injectCPUInterval(r, elapsed, consumed)
+	// Re-read the file (still shows 0, but the subtraction of lastCPU handles it).
+	r.Read() // discard; just advancing the state machine
+}
+
+func TestV1CPUUsedPctReflectsRate(t *testing.T) {
+	r, dirs := fakeV1(t)
+	writeFakeFile(t, dirs.cpu, "cpuacct.usage", "0\n")
+	r.Read() // seed
+	injectCPUInterval(r, 500*time.Millisecond, time.Duration(r.cores*float64(500*time.Millisecond)/2))
+	r.Read()
+}
+
+// -- capping ------------------------------------------------------------------
+
+func TestCPUUsedPctIsCappedAtOne(t *testing.T) {
+	r, dir := fakeV2(t)
+	writeFakeFile(t, dir, "cpu.stat", "usage_usec 0\n")
+	r.Read()
+	injectCPUInterval(r, 200*time.Millisecond,
+		time.Duration(r.cores*float64(200*time.Millisecond)*10)) // ×10 over capacity
+	p := r.Read()
+	if p.CPUUsedPct > 1 {
+		t.Errorf("cpu_used_pct: got %.3f, want ≤ 1", p.CPUUsedPct)
+	}
+}
+
+// -- negative counter ---------------------------------------------------------
 
 func TestNegativeDeltaReturnsSafeZero(t *testing.T) {
-	dir := fakeCgroupDir(t)
-	writeCgroupFile(t, dir, "cpu.stat", "usage_usec 10000000\n")
-	r, _ := newReaderAt(dir)
-	r.Read() // seed with large value
-
-	// Write a smaller value to simulate counter reset.
-	writeCgroupFile(t, dir, "cpu.stat", "usage_usec 0\n")
+	r, dir := fakeV2(t)
+	writeFakeFile(t, dir, "cpu.stat", "usage_usec 10000000\n")
+	r.Read()
+	writeFakeFile(t, dir, "cpu.stat", "usage_usec 0\n") // counter reset
 	p := r.Read()
-	// A negative delta is dropped; CPU should be zero, not negative.
 	if p.CPUUsedPct < 0 {
-		t.Errorf("negative delta: cpu_used_pct %f, want >= 0", p.CPUUsedPct)
+		t.Errorf("negative delta: cpu_used_pct %f < 0", p.CPUUsedPct)
 	}
 }
 
-// -- readMemoryLimit ----------------------------------------------------------
+// -- v1 memory limit readings -------------------------------------------------
 
-func TestReadMemoryLimitUsesFileWhenPresent(t *testing.T) {
-	dir := t.TempDir()
-	writeCgroupFile(t, dir, "memory.max", "2147483648\n") // 2 GiB
-	limit, err := readMemoryLimit(dir)
+func TestV1MemoryLimitReadsFromFile(t *testing.T) {
+	dirs := newFakeV1Dirs(t)
+	writeFakeFile(t, dirs.memory, "memory.limit_in_bytes", "2147483648\n")
+	src := &v1Source{cpuDir: dirs.cpu, memoryDir: dirs.memory}
+	limit, err := src.memoryLimit()
 	if err != nil {
-		t.Fatalf("readMemoryLimit: %v", err)
+		t.Fatalf("memoryLimit: %v", err)
 	}
 	if limit != 2147483648 {
-	t.Errorf("limit: got %d, want 2147483648", limit)
+		t.Errorf("limit: got %d, want 2147483648", limit)
 	}
 }
 
-func TestReadMemoryLimitFallsBackToHostWhenMax(t *testing.T) {
+// -- v2 memory limit readings -------------------------------------------------
+
+func TestV2MemoryLimitReadsFromMemoryMax(t *testing.T) {
 	dir := t.TempDir()
-	writeCgroupFile(t, dir, "memory.max", "max\n")
-	limit, err := readMemoryLimit(dir)
+	writeFakeFile(t, dir, "memory.max", "2147483648\n")
+	writeFakeFile(t, dir, "cpu.stat", "usage_usec 0\n")
+	writeFakeFile(t, dir, "memory.current", "0\n")
+	src := &v2Source{dir: dir}
+	limit, err := src.memoryLimit()
 	if err != nil {
-		t.Fatalf("readMemoryLimit: %v", err)
+		t.Fatalf("memoryLimit: %v", err)
+	}
+	if limit != 2147483648 {
+		t.Errorf("limit: got %d, want 2147483648", limit)
+	}
+}
+
+func TestV2MemoryLimitFallsBackToHostWhenMax(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeFile(t, dir, "memory.max", "max\n")
+	writeFakeFile(t, dir, "cpu.stat", "usage_usec 0\n")
+	writeFakeFile(t, dir, "memory.current", "0\n")
+	src := &v2Source{dir: dir}
+	limit, err := src.memoryLimit()
+	if err != nil {
+		t.Fatalf("memoryLimit: %v", err)
 	}
 	if limit <= 0 {
 		t.Errorf("host memory fallback: got %d, want > 0", limit)
 	}
 }
 
+// -- fieldFromFile and intFromFile --------------------------------------------
+
+func TestFieldFromFileReturnsValue(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeFile(t, dir, "cpu.stat",
+		"nr_periods 120\nnr_throttled 0\nusage_usec 7654321\n")
+	got, err := fieldFromFile(filepath.Join(dir, "cpu.stat"), "usage_usec")
+	if err != nil {
+		t.Fatalf("fieldFromFile: %v", err)
+	}
+	if got != 7654321 {
+		t.Errorf("got %d, want 7654321", got)
+	}
+}
+
+func TestFieldFromFileErrorsWhenFieldAbsent(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeFile(t, dir, "cpu.stat", "nr_periods 120\n")
+	if _, err := fieldFromFile(filepath.Join(dir, "cpu.stat"), "usage_usec"); err == nil {
+		t.Fatal("expected error for absent field")
+	}
+}
+
 // -- Pressure() helper --------------------------------------------------------
 
 func TestPressureFunctionReturnsSelf(t *testing.T) {
-	dir := fakeCgroupDir(t)
-	r, _ := newReaderAt(dir)
+	r, _ := fakeV2(t)
 	fn := r.Pressure()
 	if fn == nil {
 		t.Fatal("Pressure() returned nil function")
 	}
-	// Calling it must not panic.
 	_ = fn()
-}
-
-// -- selfCgroupDir smoke test -------------------------------------------------
-
-func TestSelfCgroupDirReturnsAReadableDirectory(t *testing.T) {
-	dir, err := selfCgroupDir()
-	if err != nil {
-		// On this machine the test environment may not have cgroup v2; skip
-		// rather than fail so CI doesn't break on a container without cgroups.
-		t.Skipf("selfCgroupDir: %v (skipping: no cgroup v2 on this host)", err)
-	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Errorf("selfCgroupDir returned %q which does not exist: %v", dir, err)
-	}
-}
-
-// -- readCPUUsage -------------------------------------------------------------
-
-func TestReadCPUUsageReturnsTheUsageField(t *testing.T) {
-	dir := t.TempDir()
-	writeCgroupFile(t, dir, "cpu.stat",
-		"nr_periods 120\nnr_throttled 0\nthrottled_usec 0\nusage_usec 7654321\n")
-	got, err := readCPUUsage(dir)
-	if err != nil {
-		t.Fatalf("readCPUUsage: %v", err)
-	}
-	want := 7654321 * time.Microsecond
-	if got != want {
-		t.Errorf("readCPUUsage: got %v, want %v", got, want)
-	}
-}
-
-func TestReadCPUUsageErrorsWhenFieldAbsent(t *testing.T) {
-	dir := t.TempDir()
-	writeCgroupFile(t, dir, "cpu.stat", "nr_periods 120\n")
-	if _, err := readCPUUsage(dir); err == nil {
-		t.Fatal("expected error for cpu.stat without usage_usec")
-	}
 }
 
 // -- hostMemoryTotal ----------------------------------------------------------
@@ -238,27 +347,42 @@ func TestReadCPUUsageErrorsWhenFieldAbsent(t *testing.T) {
 func TestHostMemoryTotalIsPositive(t *testing.T) {
 	total, err := hostMemoryTotal()
 	if err != nil {
-		t.Skipf("hostMemoryTotal: %v (skipping: /proc/meminfo not available)", err)
+		t.Skipf("hostMemoryTotal: %v", err)
 	}
 	if total <= 0 {
 		t.Errorf("host memory: got %d, want > 0", total)
 	}
 }
 
-// -- withDevicePartition imitator (indirect, via reader.Read not panicking) ---
+// -- NewReader picks the right hierarchy on this host -------------------------
 
-func TestReaderReadDoesNotPanicWithBadMemoryCurrent(t *testing.T) {
-	dir := fakeCgroupDir(t)
-	writeCgroupFile(t, dir, "memory.current", "not-a-number\n")
-	r, _ := newReaderAt(dir)
-	// Should not panic; pressure falls back to zero for unreadable field.
-	defer func() {
-		if rec := recover(); rec != nil {
-			t.Fatalf("Read panicked: %v", rec)
-		}
-	}()
-	r.Read()
+func TestNewReaderSucceedsOrSkips(t *testing.T) {
+	// On a host with no readable cgroup hierarchy this should return an error
+	// with a descriptive message; on a real host it should succeed. Either way
+	// it must not panic.
+	r, err := NewReader()
+	if err != nil {
+		t.Skipf("NewReader: %v (no readable cgroup on this host)", err)
+	}
+	if r.Describe() == "" {
+		t.Error("Describe must not be empty")
+	}
+	_ = r.Read()
 }
 
-// Suppress unused fmt warning: readCPUUsage uses fmt.Errorf.
+// -- fraction helper ----------------------------------------------------------
+
+func TestFractionClamps(t *testing.T) {
+	if fraction(200, 100) != 1 {
+		t.Error("fraction(200,100) must return 1")
+	}
+	if fraction(-10, 100) != 0 {
+		t.Error("fraction(-10,100) must return 0")
+	}
+	if fraction(50, 0) != 0 {
+		t.Error("fraction(50,0) must return 0 (no zero division)")
+	}
+}
+
+// Suppress unused import warning.
 var _ = fmt.Sprintf

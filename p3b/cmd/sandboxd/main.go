@@ -142,6 +142,16 @@ type BackendConfig struct {
 		NodeID  string `json:"node_id"`
 		Address string `json:"address"`
 	} `json:"nodes"`
+
+	// WarmPool, for docker direct mode. A zero Size disables the pool.
+	WarmPool struct {
+		Image           string  `json:"image"`
+		Size            int     `json:"size"`
+		MemoryMB        int64   `json:"memory_mb"`
+		CPUCount        float64 `json:"cpu_count"`
+		EntryTTLS       float64 `json:"entry_ttl_s"`
+		RefillIntervalS float64 `json:"refill_interval_s"`
+	} `json:"warm_pool"`
 }
 
 func main() {
@@ -317,6 +327,8 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	}
 	life.Start(ctx)
 	defer life.Stop()
+	startBackends(ctx, local, log)
+	defer stopBackends(local)
 
 	listener, err := listen(cfg.NodeListen)
 	if err != nil {
@@ -488,6 +500,12 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 	if agent != nil {
 		life.Start(ctx)
 		defer life.Stop()
+		// A backend with background work of its own -- the docker warm pool is the
+		// one that has any -- is started here and drained on the way out. It is
+		// reached through an interface rather than a type switch so a backend added
+		// later gets the same treatment without this file naming it.
+		startBackends(ctx, local, log)
+		defer stopBackends(local)
 		go republish(ctx, agent, fleet, spans.LoadReportInterval())
 
 		// If node_listen is set in combined mode, also serve the node-plane
@@ -616,6 +634,14 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 				Runtime:              declared.Runtime,
 				NetworkMode:          declared.NetworkMode,
 				MaxCreateConcurrency: declared.MaxCreateConcurrency,
+				WarmPool: dockerbackend.WarmPoolConfig{
+					Image:          declared.WarmPool.Image,
+					Size:           declared.WarmPool.Size,
+					MemoryMB:       declared.WarmPool.MemoryMB,
+					CPUCount:       declared.WarmPool.CPUCount,
+					EntryTTL:       seconds(declared.WarmPool.EntryTTLS),
+					RefillInterval: seconds(declared.WarmPool.RefillIntervalS),
+				},
 			}, mode)
 		default:
 			return nil, fmt.Errorf("sandbox backend type %q is not built into this binary", declared.Type)
@@ -783,6 +809,37 @@ func overrides(raw map[string]float64) map[string]time.Duration {
 		out[name] = seconds(value)
 	}
 	return out
+}
+
+// startBackends begins any background work a backend owns.
+//
+// Only a backend that has something to run implements this, so the assertion is
+// an interface check rather than a flag: a backend with no pool and no loop is
+// simply skipped.
+func startBackends(ctx context.Context, backends []backend.Backend, log *slog.Logger) {
+	for _, b := range backends {
+		starter, can := b.(interface{ Start(context.Context) })
+		if !can {
+			continue
+		}
+		starter.Start(ctx)
+		log.Info("backend background work started", "backend", b.Name())
+	}
+}
+
+// stopBackends drains what startBackends began.
+//
+// The context is fresh rather than the service's, because the service's is
+// already cancelled by the time a deferred stop runs and a drain that needs to
+// reach the daemon would be cancelled before it could.
+func stopBackends(backends []backend.Backend) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, b := range backends {
+		if stopper, can := b.(interface{ Stop(context.Context) }); can {
+			stopper.Stop(ctx)
+		}
+	}
 }
 
 // nodePressure returns the Pressure function this node agent uses to read

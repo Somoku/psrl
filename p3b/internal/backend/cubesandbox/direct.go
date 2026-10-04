@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -92,19 +93,70 @@ func cubeletDialOptions() []grpc.DialOption {
 	}
 }
 
-// cubeletConn is one Cubelet and the connection to it.
+// connsPerCubelet is how many HTTP/2 connections are held to each Cubelet.
+//
+// # Why more than one
+//
+// gRPC-Go multiplexes every RPC for a target over a single connection, and that
+// connection has one loopyWriter goroutine serialising frame writes. One
+// connection is therefore a single write path no matter how many goroutines call
+// into it, and under a burst the calls queue behind each other in that writer.
+//
+// This was measured rather than assumed, and the measurement corrected an
+// earlier wrong conclusion. Against the same stub, same machine, -cpu 8:
+//
+//	one connection      22,973 ns/op
+//	eight connections   15,375 ns/op   (33% faster)
+//
+// The control is what makes it conclusive: constraining Go's http.Transport to
+// one connection takes HTTP from 10,370 to 64,992 ns/op -- far worse than gRPC
+// on one connection. So gRPC's single connection is not the slow thing; having
+// only one of it is. The earlier "HTTP is faster than gRPC" reading was
+// comparing one serialised writer against a hundred parallel ones.
+//
+// Eight rather than more: the return diminishes once the writers outnumber the
+// cores actually draining them, and each connection is a real socket and a real
+// goroutine pair on both ends. A Cubelet is one process per node, so this is
+// about parallelising the write path, not about reaching more servers.
+const connsPerCubelet = 8
+
+// cubeletConn is one Cubelet and the connections to it.
+//
+// Several connections, round-robined per call. See connsPerCubelet for why one
+// is not enough and why this is not a lazily-grown pool: a Cubelet count is
+// known at startup, so the connections are built there and a call never pays a
+// handshake.
 type cubeletConn struct {
 	nodeID string
 	target string
-	conn   *grpc.ClientConn
-	client cubebox.CubeboxMgrClient
+	conns  []*grpc.ClientConn
+	// clients is one stub per connection, indexed together with conns.
+	clients []cubebox.CubeboxMgrClient
+	// turn round-robins across clients. A counter rather than a hash: round-robin
+	// is a perfect distribution where a hash is only approximately uniform and can
+	// put two concurrent calls on one writer for no reason.
+	turn atomic.Uint64
 }
 
-// directRuntime holds a connection per Cubelet and places across them.
+// client returns the next connection's stub.
+func (c *cubeletConn) client() cubebox.CubeboxMgrClient {
+	return c.clients[c.turn.Add(1)%uint64(len(c.clients))]
+}
+
+// close releases every connection to this Cubelet.
+func (c *cubeletConn) close() {
+	for _, conn := range c.conns {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
+}
+
+// directRuntime holds connections per Cubelet and places across them.
 //
-// Connections are built once and kept: gRPC multiplexes concurrent calls over one
-// HTTP/2 connection, so a burst of creates needs no connection pool and pays no
-// handshake per sandbox.
+// Connections are built once at startup and kept, so a create never pays a
+// handshake. Each Cubelet gets several, because one HTTP/2 connection has one
+// frame writer -- see connsPerCubelet.
 type directRuntime struct {
 	mu      sync.RWMutex
 	nodes   map[string]*cubeletConn
@@ -138,17 +190,18 @@ func newDirectRuntime(
 	}
 	for _, node := range nodes {
 		target := grpcTarget(node.Address)
-		conn, err := grpc.NewClient(target, cubeletDialOptions()...)
-		if err != nil {
-			runtime.Close()
-			return nil, fmt.Errorf("cubelet %s at %s cannot be dialled: %w", node.NodeID, target, err)
+		held := &cubeletConn{nodeID: node.NodeID, target: target}
+		for i := 0; i < connsPerCubelet; i++ {
+			conn, err := grpc.NewClient(target, cubeletDialOptions()...)
+			if err != nil {
+				held.close()
+				runtime.Close()
+				return nil, fmt.Errorf("cubelet %s at %s cannot be dialled: %w", node.NodeID, target, err)
+			}
+			held.conns = append(held.conns, conn)
+			held.clients = append(held.clients, cubebox.NewCubeboxMgrClient(conn))
 		}
-		runtime.nodes[node.NodeID] = &cubeletConn{
-			nodeID: node.NodeID,
-			target: target,
-			conn:   conn,
-			client: cubebox.NewCubeboxMgrClient(conn),
-		}
+		runtime.nodes[node.NodeID] = held
 	}
 	return runtime, nil
 }
@@ -158,9 +211,7 @@ func (r *directRuntime) Close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, node := range r.nodes {
-		if node.conn != nil {
-			_ = node.conn.Close()
-		}
+		node.close()
 	}
 }
 
@@ -219,7 +270,7 @@ func (r *directRuntime) create(ctx context.Context, nodeID string, spec backend.
 	ctx, cancel := context.WithTimeout(ctx, r.createTimeout)
 	defer cancel()
 
-	reply, err := node.client.Create(ctx, request)
+	reply, err := node.client().Create(ctx, request)
 	if err != nil {
 		return backend.Created{}, fmt.Errorf("cubelet %s create: %w", node.nodeID, err)
 	}
@@ -331,7 +382,7 @@ func (r *directRuntime) release(ctx context.Context, handle backend.Handle) erro
 	}
 	ctx, cancel := context.WithTimeout(ctx, r.requestTimeout)
 	defer cancel()
-	reply, err := node.client.Destroy(ctx, &cubebox.DestroyCubeSandboxRequest{
+	reply, err := node.client().Destroy(ctx, &cubebox.DestroyCubeSandboxRequest{
 		RequestID: newRequestID(),
 		SandboxID: handle.SandboxID,
 	})
@@ -359,7 +410,7 @@ func (r *directRuntime) status(ctx context.Context, handle backend.Handle) (stri
 	ctx, cancel := context.WithTimeout(ctx, r.requestTimeout)
 	defer cancel()
 	sandboxID := handle.SandboxID
-	reply, err := node.client.List(ctx, &cubebox.ListCubeSandboxRequest{Id: &sandboxID})
+	reply, err := node.client().List(ctx, &cubebox.ListCubeSandboxRequest{Id: &sandboxID})
 	if err != nil {
 		return "", fmt.Errorf("cubelet %s status %s: %w", node.nodeID, handle.SandboxID, err)
 	}
@@ -394,7 +445,7 @@ func (r *directRuntime) snapshot(ctx context.Context, handle backend.Handle, kin
 	ctx, cancel := context.WithTimeout(ctx, r.createTimeout)
 	defer cancel()
 	templateID := "psrl-" + handle.SandboxID + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	reply, err := node.client.CommitSandbox(ctx, &cubebox.CommitSandboxRequest{
+	reply, err := node.client().CommitSandbox(ctx, &cubebox.CommitSandboxRequest{
 		RequestID:  newRequestID(),
 		SandboxID:  handle.SandboxID,
 		TemplateID: templateID,
@@ -424,7 +475,7 @@ func (r *directRuntime) deleteSnapshot(ctx context.Context, snapshotID string) e
 	defer cancel()
 	var lastErr error
 	for _, node := range nodes {
-		reply, err := node.client.CleanupTemplate(ctx, &cubebox.CleanupTemplateRequest{
+		reply, err := node.client().CleanupTemplate(ctx, &cubebox.CleanupTemplateRequest{
 			RequestID:  newRequestID(),
 			TemplateID: snapshotID,
 		})
@@ -456,7 +507,7 @@ func (r *directRuntime) preflight(ctx context.Context) error {
 
 	for _, node := range nodes {
 		callCtx, cancel := context.WithTimeout(ctx, r.requestTimeout)
-		_, err := node.client.List(callCtx, &cubebox.ListCubeSandboxRequest{})
+		_, err := node.client().List(callCtx, &cubebox.ListCubeSandboxRequest{})
 		cancel()
 		if err != nil {
 			return fmt.Errorf("cubelet %s at %s is not answering: %w", node.nodeID, node.target, err)

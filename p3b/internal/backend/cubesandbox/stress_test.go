@@ -769,3 +769,128 @@ func BenchmarkRawGRPCNoKeepaliveNoWindow(b *testing.B) {
 		}
 	})
 }
+
+// -- is gRPC's cost structural, or is it one connection? -----------------------
+//
+// The earlier conclusion -- "the gap is the transport, so there is nothing to
+// optimise" -- tested the dial options but not the thing most likely to matter:
+// how many connections carry the load.
+//
+// gRPC-Go multiplexes every RPC for one target over a single HTTP/2 connection,
+// and that connection has one loopyWriter goroutine serialising frame writes.
+// Go's http.Transport does the opposite: up to MaxIdleConnsPerHost separate TCP
+// connections, each with its own write path. So the comparison may have been
+// measuring one serialised writer against a hundred parallel ones rather than
+// anything intrinsic to the protocols.
+//
+// If that is the cause, fanning the same calls over several connections should
+// recover most of the gap, and the fix is a connection pool rather than nothing.
+
+// BenchmarkRawGRPCRoundTripPooled issues the same calls over a pool of
+// connections, round-robined, so no single loopyWriter carries the whole burst.
+func BenchmarkRawGRPCRoundTripPooled(b *testing.B) {
+	const poolSize = 8
+	node := newFakeCubeletB(b)
+	clients := make([]cubebox.CubeboxMgrClient, 0, poolSize)
+	for i := 0; i < poolSize; i++ {
+		conn, err := grpc.NewClient(node.address, cubeletDialOptions()...)
+		if err != nil {
+			b.Fatalf("dial %d: %v", i, err)
+		}
+		defer conn.Close()
+		clients = append(clients, cubebox.NewCubeboxMgrClient(conn))
+	}
+
+	var turn atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			client := clients[turn.Add(1)%poolSize]
+			if _, err := client.List(context.Background(), &cubebox.ListCubeSandboxRequest{}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkRawHTTPRoundTripSingleConn is the mirror control: HTTP held to one
+// connection, which is what gRPC does by default. If HTTP's advantage was
+// parallel sockets rather than a lighter protocol, constraining it this way
+// should erase most of that advantage.
+func BenchmarkRawHTTPRoundTripSingleConn(b *testing.B) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	client := &http.Client{Transport: &http.Transport{
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		MaxConnsPerHost:     1,
+		IdleConnTimeout:     90 * time.Second,
+	}}
+
+	b.ResetTimer()
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			resp, err := client.Get(srv.URL)
+			if err != nil {
+				b.Fatal(err)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	})
+}
+
+func TestEveryConnectionToACubeletIsUsed(t *testing.T) {
+	// The pool exists to parallelise the frame writer, which only works if calls
+	// actually spread across the connections. A round-robin that always returned
+	// index 0 would compile, pass every other test, and quietly restore the
+	// single-writer bottleneck the pool was added to remove.
+	node := newFakeCubelet(t)
+	b := directBackend(t, map[string]*fakeCubelet{"cube-1": node})
+
+	held, err := b.direct.node("cube-1")
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	if len(held.clients) != connsPerCubelet {
+		t.Fatalf("the Cubelet holds %d connections, want %d", len(held.clients), connsPerCubelet)
+	}
+
+	// Distinct stubs across one full cycle.
+	seen := map[cubebox.CubeboxMgrClient]bool{}
+	for i := 0; i < connsPerCubelet; i++ {
+		seen[held.client()] = true
+	}
+	if len(seen) != connsPerCubelet {
+		t.Errorf("one round-robin cycle used %d distinct connections, want %d: calls are "+
+			"collapsing onto a subset of the pool", len(seen), connsPerCubelet)
+	}
+}
+
+func TestClosingTheRuntimeReleasesEveryConnection(t *testing.T) {
+	// Eight connections per Cubelet means a leak is eight sockets per node, not
+	// one, so Close has to walk the whole pool.
+	node := newFakeCubelet(t)
+	addresses := []NodeAddress{{NodeID: "cube-1", Address: node.address}}
+	backendUnderTest, err := New(Config{
+		Nodes: addresses, RequestTimeout: 5 * time.Second,
+	}, sbbackend.SchedulingDirect)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	held, err := backendUnderTest.direct.node("cube-1")
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	conns := held.conns
+	backendUnderTest.direct.Close()
+
+	for i, conn := range conns {
+		// Shutdown is the state a closed ClientConn reports.
+		if state := conn.GetState().String(); state != "SHUTDOWN" {
+			t.Errorf("connection %d is %q after Close, want SHUTDOWN", i, state)
+		}
+	}
+}

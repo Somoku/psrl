@@ -38,6 +38,7 @@ from typing import Any
 from sandboxd import SandboxClient
 from sandboxd import SandboxSpec as ServiceSpec
 from sandboxd import (
+    ExecMode as ServiceExecMode,
     Resources as ServiceResources,
     SnapshotRef as ServiceSnapshotRef,
     Source as ServiceSource,
@@ -454,6 +455,16 @@ def _to_service_spec(
     if owner_id:
         metadata.setdefault("psrl_owner_id", owner_id)
 
+    # Translate exec_mode. The PSRL and SDK enums share the same string values
+    # ("persistent", "one_shot"), so a direct string round-trip is safe. None
+    # means "let the service use its own default", which is what we want when
+    # the spec made no declaration.
+    service_exec_mode: ServiceExecMode | None = None
+    if spec.exec_mode is not None:
+        service_exec_mode = ServiceExecMode(
+            spec.exec_mode.value if hasattr(spec.exec_mode, "value") else str(spec.exec_mode)
+        )
+
     return ServiceSpec(
         source=ServiceSource(
             kind=_source_kind_str(spec.source.kind),
@@ -470,6 +481,7 @@ def _to_service_spec(
         idempotency_key=spec.idempotency_key,
         env=dict(spec.env),
         metadata=metadata,
+        exec_mode=service_exec_mode,
     )
 
 

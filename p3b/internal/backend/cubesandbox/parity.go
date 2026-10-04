@@ -247,7 +247,7 @@ func (r *directRuntime) runDetached(
 
 	callCtx, cancel := context.WithTimeout(ctx, r.requestTimeout)
 	defer cancel()
-	reply, err := node.client.Exec(callCtx, request)
+	reply, err := node.client().Exec(callCtx, request)
 	if err != nil {
 		return fmt.Errorf("cubesandbox exec on %s: %w", handle.SandboxID, err)
 	}
@@ -311,7 +311,7 @@ func (r *directRuntime) restore(ctx context.Context, handle backend.Handle, snap
 	// control call.
 	callCtx, cancel := context.WithTimeout(ctx, r.createTimeout)
 	defer cancel()
-	reply, err := node.client.RollbackSandbox(callCtx, &cubebox.RollbackSandboxRequest{
+	reply, err := node.client().RollbackSandbox(callCtx, &cubebox.RollbackSandboxRequest{
 		RequestID:  newRequestID(),
 		SandboxID:  handle.SandboxID,
 		SnapshotID: snapshotID,
@@ -357,7 +357,7 @@ func (r *directRuntime) storageMetrics(ctx context.Context) map[string]map[strin
 	out := make(map[string]map[string]uint64, len(nodes))
 	for _, node := range nodes {
 		callCtx, cancel := context.WithTimeout(ctx, r.requestTimeout)
-		reply, err := node.client.GetStorageMetrics(callCtx, &cubebox.GetStorageMetricsRequest{
+		reply, err := node.client().GetStorageMetrics(callCtx, &cubebox.GetStorageMetricsRequest{
 			RequestID: newRequestID(),
 		})
 		cancel()

@@ -137,7 +137,7 @@ rollout_is_threshold=2.0
 
 # --- Performance ---
 use_dynamic_bsz=True
-offload=False
+offload=True
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -164,7 +164,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.logging_path=${PSRL_PATH}/examples/mini_swe/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.agentic_rl.batch_agg_mode=request \
-    psrl.agentic_rl.trajectory_output.enable=True \
+    psrl.agentic_rl.trajectory_output.enable=False \
     psrl.agentic_rl.trajectory_output.dir=${PSRL_PATH}/examples/mini_swe/megatron_psrl_log/${experiment_name}/trajectories \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
@@ -175,6 +175,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.total_nnodes=${NNODES} \
+    psrl.deployment.sandbox_placement.enabled=true \
     psrl.nixl.server_port=23456 \
     psrl.rollout_gateway.trajectory_id_strategy=auto \
     psrl.rollout_gateway.tito_debug=false \
@@ -269,7 +270,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
     data.return_raw_chat=True \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=False \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
@@ -277,7 +278,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.default_local_dir="${default_local_dir}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.log_val_generations=5 \
     trainer.test_freq=5 \
     trainer.save_freq=50 \

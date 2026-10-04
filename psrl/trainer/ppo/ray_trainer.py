@@ -80,6 +80,7 @@ from psrl.trainer.ppo.session_loss import compute_session_loss_weights
 from psrl.trainer.ppo.utils import (
     PSRL_Role,
     ResourcePoolManager,
+    _compute_staleness_metrics,
     _compute_termination_metrics,
     compute_advantage_for_multi_trajectories,
 )
@@ -3478,7 +3479,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps):
         # Fetch only real samples because schedule-local padding keys can collide after cleanup.
-        real_keys = [key for key, tag in zip(batch.keys, batch.tags) if not tag.get("is_padding", False)]
+        # Read the generation versions here, while `batch` is still the `KVBatchMeta`: the tags
+        # are batch metadata that do not survive the `DataProto` materialization below.
+        real_keys: list[str] = []
+        version_tags: list[int | None] = []
+        for key, tag in zip(batch.keys, batch.tags):
+            if tag.get("is_padding", False):
+                continue
+            real_keys.append(key)
+            version_tags.append(tag.get("version_tag"))
         fields = [
             "prompts",
             "responses",
@@ -3553,6 +3562,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 "training/num_turns/min": num_turns.min(),
             }
         )
+
+        # Staleness of the consumed batch, from the generation versions read off the
+        # `KVBatchMeta` above. The version this step trains on is the buffer it
+        # consumes, `global_steps - 1`, matching `AgentLoopManager.log_buffer`.
+        metrics.update(_compute_staleness_metrics(version_tags, train_version=global_steps - 1))
 
         metrics.update(self._sandbox_capacity_metrics())
 

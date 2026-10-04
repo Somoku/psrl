@@ -71,6 +71,40 @@ def _compute_termination_metrics(
     return metrics
 
 
+def _compute_staleness_metrics(version_tags: list[int | None], train_version: int) -> dict[str, float]:
+    """Summarise per-sample staleness for one training batch.
+
+    A sample's staleness is ``train_version - version_tag``: the number of policy
+    versions that elapsed between when its generation started and the version
+    consumed by this training step. It is the quantity that makes async training
+    off-policy, so it is worth tracking directly rather than inferring it from the
+    reward curve.
+
+    Samples whose generation version is unknown (``None`` or ``-1``) are excluded
+    because the buffer reserves every trainable request with a concrete version;
+    a placeholder would otherwise inflate ``max`` by the whole window. When no
+    sample carries a valid tag, the metrics are omitted rather than reported as
+    zero, so a broken tag pipeline shows up as a missing series instead of a
+    plausible-looking one.
+
+    Args:
+        version_tags (list[int | None]): Per-sample generation-time policy versions.
+        train_version (int): Policy version consumed by this training step.
+
+    Returns:
+        dict[str, float]: ``staleness/max`` and ``staleness/avg``, or ``{}`` when no
+            sample carries a valid version tag.
+    """
+    valid = [tag for tag in version_tags if isinstance(tag, (int, np.integer)) and tag >= 0]
+    if not valid:
+        return {}
+    staleness = train_version - np.asarray(valid, dtype=np.float32)
+    return {
+        "staleness/max": float(np.max(staleness)),
+        "staleness/avg": float(np.mean(staleness)),
+    }
+
+
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 

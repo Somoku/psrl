@@ -1,4 +1,4 @@
-"""The SDK against a running service and a real Docker daemon.
+"""The shipped SDK against a running service and a real Docker daemon.
 
 Every layer is the real one: the Python SDK, the Go control plane and node, and
 the node's own daemon. A test with a fake service would only prove the SDK
@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 import pytest
-from psrl.pysandbox import (
+from sandboxd import (
     Feature,
     Resources,
     SandboxCapabilityError,
@@ -54,7 +54,7 @@ def service_config(directory: Path, fleet_memory_mb: int) -> Path:
         "fleet": {"memory_mb": fleet_memory_mb, "cpu_millis": 100000, "disk_mb": 100000},
         "node": {"memory_mb": fleet_memory_mb, "cpu_millis": 100000, "disk_mb": 100000},
         "classes": {"rollout": {"guaranteed_share": 0.7}, "grader": {"guaranteed_share": 0.2}},
-        "backends": [{"type": "docker", "mode": "psrl", "socket": DOCKER_SOCKET, "api_version": "v1.40"}],
+        "backends": [{"type": "docker", "mode": "direct", "socket": DOCKER_SOCKET, "api_version": "v1.40"}],
         "default_backend": "docker",
     }
     path = directory / "sandboxd.json"
@@ -257,7 +257,7 @@ async def test_a_snapshot_captures_the_filesystem(service):
 async def test_pause_and_resume_keep_the_sandbox_usable(service):
     async with client_for(service) as client:
         async with await client.create(spec()) as sandbox:
-            from psrl.pysandbox import PauseMode
+            from sandboxd import PauseMode
 
             await sandbox.pause(PauseMode.FREEZE)
             assert await sandbox.status() is SandboxStatus.PAUSED

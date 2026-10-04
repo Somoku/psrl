@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 
 	sbbackend "psrl.dev/sandboxd/internal/backend"
 	cubebox "psrl.dev/sandboxd/internal/backend/cubesandbox/cubeletpb/services/cubebox/v1"
@@ -574,4 +577,195 @@ func TestARestoreNeedsASnapshotID(t *testing.T) {
 		sbbackend.Handle{SandboxID: "sb-1", NodeID: "cube-1"}, ""); err == nil {
 		t.Fatal("a restore with no snapshot id must be refused")
 	}
+}
+
+// -- isolating where the direct/provider gap actually comes from ---------------
+//
+// The earlier comparison of BenchmarkDirectModeCreate against
+// BenchmarkProviderModeCreate is not a protocol measurement, and reading it as
+// one is a mistake worth preventing. The two benchmarks differ in three ways at
+// once: the wire protocol, the size and shape of the request body, and what the
+// stub server does on receipt. Attributing the whole gap to gRPC framing would
+// be an unsupported conclusion.
+//
+// These benchmarks separate the variables so the real contributor is visible.
+
+// BenchmarkMarshalDirectRequest measures serialising a direct-mode create body
+// and nothing else: no connection, no server, no framing.
+func BenchmarkMarshalDirectRequest(b *testing.B) {
+	runtime := &directRuntime{ownerID: "owner-1"}
+	request, err := runtime.createRequest(stressSpec("wf-marshal"))
+	if err != nil {
+		b.Fatalf("createRequest: %v", err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := proto.Marshal(request); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkMarshalProviderRequest is the same for the provider body.
+//
+// Run as a pair with the above, this is what says whether protobuf-vs-JSON is
+// the gap. It is not: the provider body is six scalars and the direct body is a
+// nested message with three maps and two slices, so this measures payload shape
+// far more than it measures encoding.
+func BenchmarkMarshalProviderRequest(b *testing.B) {
+	body := newSandbox{
+		TemplateID: "tpl-stress",
+		Timeout:    -1,
+		AutoPause:  false,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := json.Marshal(body); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkBuildDirectRequest measures assembling the body, with no encoding at
+// all. This is the part this service owns and can therefore optimise.
+func BenchmarkBuildDirectRequest(b *testing.B) {
+	runtime := &directRuntime{ownerID: "owner-1"}
+	spec := stressSpec("wf-build")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := runtime.createRequest(spec); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDirectCreateEqualisedPayload is BenchmarkDirectModeCreate with the
+// body reduced toward the provider body's shape -- no annotations beyond the
+// owner, no labels, no resources. What remains of the gap after this is the
+// transport, which is the number the protocol comparison actually wanted.
+func BenchmarkDirectCreateEqualisedPayload(b *testing.B) {
+	node := newFakeCubeletB(b)
+	addresses := []NodeAddress{{NodeID: "cube-1", Address: node.address}}
+	backendUnderTest, err := New(Config{
+		Nodes: addresses, RequestTimeout: 10 * time.Second,
+	}, sbbackend.SchedulingDirect)
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	defer backendUnderTest.direct.Close()
+
+	// Source and nothing else: the smallest body this RPC accepts.
+	spec := sbbackend.Spec{Source: sbbackend.Source{Kind: "template", Reference: "tpl"}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			if _, err := backendUnderTest.Create(context.Background(), "cube-1", spec, ""); err != nil {
+				b.Fatalf("create: %v", err)
+			}
+		}
+	})
+}
+
+// BenchmarkRawGRPCRoundTrip and BenchmarkRawHTTPRoundTrip strip the adapter out
+// entirely: one trivial call against each stub server, same machine, no body
+// worth measuring. What is left is the transport plus the stub itself.
+//
+// This is the control the earlier protocol comparison lacked. If these two differ
+// by about what the full create benchmarks differ by, then the adapter is not
+// where the gap lives and there is nothing in this package to optimise.
+func BenchmarkRawGRPCRoundTrip(b *testing.B) {
+	node := newFakeCubeletB(b)
+	conn, err := grpc.NewClient(node.address, cubeletDialOptions()...)
+	if err != nil {
+		b.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	client := cubebox.NewCubeboxMgrClient(conn)
+
+	b.ResetTimer()
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			if _, err := client.List(context.Background(), &cubebox.ListCubeSandboxRequest{}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkRawHTTPRoundTrip(b *testing.B) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	client := &http.Client{Transport: gatewayTransport()}
+
+	b.ResetTimer()
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			resp, err := client.Get(srv.URL)
+			if err != nil {
+				b.Fatal(err)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	})
+}
+
+// BenchmarkRawGRPCRoundTripSharedContext isolates one thing the adapter does
+// control: whether each call allocates a fresh context with a timeout.
+//
+// Every lifecycle method here wraps context.WithTimeout, which allocates a
+// cancelCtx, registers a timer with the runtime, and on return deregisters it.
+// At gRPC's ~21us round trip that is noise; this measures whether it is.
+func BenchmarkRawGRPCRoundTripSharedContext(b *testing.B) {
+	node := newFakeCubeletB(b)
+	conn, err := grpc.NewClient(node.address, cubeletDialOptions()...)
+	if err != nil {
+		b.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	client := cubebox.NewCubeboxMgrClient(conn)
+
+	b.ResetTimer()
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, err := client.List(ctx, &cubebox.ListCubeSandboxRequest{})
+			cancel()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkRawGRPCNoKeepaliveNoWindow is the dial options A/B.
+//
+// cubeletDialOptions raises the stream windows and enables idle keepalive. The
+// windows help a large message; the keepalive is a liveness mechanism that
+// cannot help latency. This measures whether either costs anything on the hot
+// path, so the tuning is justified by measurement rather than plausibility.
+func BenchmarkRawGRPCNoKeepaliveNoWindow(b *testing.B) {
+	node := newFakeCubeletB(b)
+	conn, err := grpc.NewClient(node.address,
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		b.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	client := cubebox.NewCubeboxMgrClient(conn)
+
+	b.ResetTimer()
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			if _, err := client.List(context.Background(), &cubebox.ListCubeSandboxRequest{}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

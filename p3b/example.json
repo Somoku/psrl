@@ -11,7 +11,7 @@
     "prepare": { "guaranteed_share": 0.1 }
   },
   "backends": [
-    { "type": "docker", "mode": "psrl", "socket": "/var/run/docker.sock", "api_version": "v1.40" }
+    { "type": "docker", "mode": "direct", "socket": "/var/run/docker.sock", "api_version": "v1.40" }
   ],
   "default_backend": "docker"
 }

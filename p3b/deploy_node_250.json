@@ -1,0 +1,42 @@
+{
+  "role": "node",
+  "listen": "unix:///run/sandboxd.sock",
+  "node_listen": "0.0.0.0:36001",
+  "node_id": "node-250",
+  "timing": {
+    "episode_deadline_s": 1800,
+    "node_ttl_s": 120,
+    "rpc_timeout_s": 60
+  },
+  "fleet": {
+    "memory_mb": 960000,
+    "cpu_millis": 307200,
+    "disk_mb": 2000000
+  },
+  "node": {
+    "memory_mb": 960000,
+    "cpu_millis": 307200,
+    "disk_mb": 2000000,
+    "local_cpu_ceiling": 0.95,
+    "local_mem_ceiling": 0.9
+  },
+  "classes": {
+    "rollout": {
+      "guaranteed_share": 0.45
+    },
+    "grader": {
+      "guaranteed_share": 0.45
+    }
+  },
+  "backends": [
+    {
+      "type": "docker",
+      "mode": "direct",
+      "socket": "/var/run/docker.sock",
+      "api_version": "v1.40",
+      "network_mode": "host",
+      "max_create_concurrency": 16
+    }
+  ],
+  "default_backend": "docker"
+}

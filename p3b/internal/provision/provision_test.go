@@ -2,11 +2,15 @@ package provision_test
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
+
+	cubebox "psrl.dev/sandboxd/internal/backend/cubesandbox/cubeletpb/services/cubebox/v1"
 	"psrl.dev/sandboxd/internal/provision"
 )
 
@@ -144,11 +148,61 @@ func TestCubeSandboxGatewayDown(t *testing.T) {
 }
 
 func TestCubeSandboxNodePass(t *testing.T) {
-	srv := okServer(t)
-	r := provision.CheckCubeSandboxNode(context.Background(), "n1", srv.URL, "")
+	// A real gRPC Cubelet, not an HTTP server. The address this backend is given
+	// is Cubelet's gRPC TCP endpoint, where CubeboxMgr is served; its HTTP
+	// listener is a different port carrying metrics and no /health route. An HTTP
+	// probe here would fail against a correctly deployed Cubelet.
+	r := provision.CheckCubeSandboxNode(context.Background(), "n1", fakeCubeletAddress(t), "")
 	if r.Err != nil {
 		t.Fatalf("expected pass, got: %v", r.Err)
 	}
+}
+
+func TestCubeSandboxNodeRejectsAnHTTPEndpoint(t *testing.T) {
+	// The defect this pins: pointing the check at Cubelet's HTTP port (or at any
+	// HTTP server) must fail, because CubeboxMgr is not served there. A check that
+	// passed against HTTP would report a misconfigured deployment as healthy, and
+	// the first create would then fail inside a rollout.
+	srv := okServer(t)
+	r := provision.CheckCubeSandboxNode(context.Background(), "n1", srv.URL, "")
+	if r.Err == nil {
+		t.Fatal("an HTTP endpoint must not satisfy a Cubelet gRPC probe")
+	}
+}
+
+func TestCubeSandboxNodeAcceptsASchemePrefix(t *testing.T) {
+	// A gRPC target is a host:port authority. An "http://" written out of habit
+	// would otherwise be taken as part of the hostname and fail to resolve, which
+	// reads as an unreachable node rather than a malformed address.
+	r := provision.CheckCubeSandboxNode(context.Background(), "n1", "http://"+fakeCubeletAddress(t), "")
+	if r.Err != nil {
+		t.Fatalf("a scheme prefix should be stripped, got: %v", r.Err)
+	}
+}
+
+// fakeCubeletAddress starts a gRPC server answering CubeboxMgr and returns its
+// address.
+func fakeCubeletAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := grpc.NewServer()
+	cubebox.RegisterCubeboxMgrServer(server, &stubCubelet{})
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(server.Stop)
+	return listener.Addr().String()
+}
+
+type stubCubelet struct {
+	cubebox.UnimplementedCubeboxMgrServer
+}
+
+func (s *stubCubelet) List(
+	context.Context, *cubebox.ListCubeSandboxRequest,
+) (*cubebox.ListCubeSandboxResponse, error) {
+	return &cubebox.ListCubeSandboxResponse{}, nil
 }
 
 func TestCubeSandboxNodeDown(t *testing.T) {

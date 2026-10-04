@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -311,8 +312,10 @@ func TestTheTwoModesDeclareDifferentCapabilitiesOnPurpose(t *testing.T) {
 	directFeatures := direct.Capabilities().Features
 	providerFeatures := provider.Capabilities().Features
 
-	// CubeMaster-level features: provider only.
-	for _, cubeMasterOnly := range []string{"warm_pool", "template_build", "volume", "egress_policy"} {
+	// CubeMaster-level features: provider only. volume is absent from this list
+	// because a Cubelet mounts storage natively, so direct mode serves it too --
+	// the divergence is only what genuinely has no CubeboxMgr equivalent.
+	for _, cubeMasterOnly := range []string{"warm_pool", "template_build", "egress_policy"} {
 		if !has(providerFeatures, cubeMasterOnly) {
 			t.Errorf("provider mode should declare %q: CubeMaster provides it", cubeMasterOnly)
 		}
@@ -335,8 +338,8 @@ func TestTheTwoModesDeclareDifferentCapabilitiesOnPurpose(t *testing.T) {
 		t.Error("a CubeSandbox snapshot captures the filesystem and not memory, so neither " +
 			"mode may declare a resume level")
 	}
-	// What a Cubelet does serve must still be declared.
-	for _, cubeletServes := range []string{"filesystem_snapshot", "restore", "image_on_demand"} {
+	// What a Cubelet does serve must still be declared, including volume.
+	for _, cubeletServes := range []string{"filesystem_snapshot", "restore", "image_on_demand", "volume"} {
 		if !has(directFeatures, cubeletServes) {
 			t.Errorf("direct mode should declare %q: a Cubelet serves it", cubeletServes)
 		}
@@ -403,4 +406,172 @@ func newFakeCubeletB(b *testing.B) *fakeCubelet {
 	go func() { _ = server.Serve(listener) }()
 	b.Cleanup(server.Stop)
 	return fake
+}
+
+// -- direct-mode feature parity ------------------------------------------------
+
+func TestDirectModeServesVolumesNatively(t *testing.T) {
+	// The gap that was closable. A Cubelet mounts storage itself, so a volume
+	// request must reach it as a real Volume plus a matching VolumeMount -- both
+	// halves, keyed by name. A volume with no mount is storage the sandbox cannot
+	// see; a mount with no volume fails the create.
+	node := newFakeCubelet(t)
+	b := directBackend(t, map[string]*fakeCubelet{"cube-1": node})
+
+	spec := stressSpec("wf-vol")
+	spec.BackendOptions = map[string]map[string]string{"cubesandbox": {
+		"volume.workspace": "/workspace",
+		"volume.dataset":   "/data:ro:driver=cubecow",
+		"volume.scratch":   "/scratch:size=4Gi",
+	}}
+	if _, err := b.Create(context.Background(), "cube-1", spec, ""); err != nil {
+		t.Fatalf("create with volumes: %v", err)
+	}
+
+	request := node.lastCreate()
+	if len(request.GetVolumes()) != 3 {
+		t.Fatalf("the create carried %d volumes, want 3", len(request.GetVolumes()))
+	}
+	// Sorted by name, so one spec always produces one request body.
+	names := make([]string, 0, 3)
+	for _, volume := range request.GetVolumes() {
+		names = append(names, volume.GetName())
+	}
+	if names[0] != "dataset" || names[1] != "scratch" || names[2] != "workspace" {
+		t.Errorf("volumes are not in a stable order: %v", names)
+	}
+
+	// A driver means a plugin volume -- the shape CubeMaster's named volumes
+	// resolve to, so the same cubecow plumbing is reached either way.
+	var dataset, scratch *cubebox.Volume
+	for _, volume := range request.GetVolumes() {
+		switch volume.GetName() {
+		case "dataset":
+			dataset = volume
+		case "scratch":
+			scratch = volume
+		}
+	}
+	if dataset.GetVolumeSource().GetPluginVolume().GetDriver() != "cubecow" {
+		t.Errorf("a volume naming a driver must become a plugin volume, got %v",
+			dataset.GetVolumeSource())
+	}
+	// No driver means node-local scratch, and a size applies to it.
+	if scratch.GetVolumeSource().GetEmptyDir().GetSizeLimit() != "4Gi" {
+		t.Errorf("an emptyDir volume lost its size limit: %v", scratch.GetVolumeSource())
+	}
+
+	// Every volume must have its mount, with read-only carried through.
+	mounts := request.GetContainers()[0].GetVolumeMounts()
+	if len(mounts) != 3 {
+		t.Fatalf("the container carried %d mounts for 3 volumes", len(mounts))
+	}
+	byName := map[string]*cubebox.VolumeMounts{}
+	for _, mount := range mounts {
+		byName[mount.GetName()] = mount
+	}
+	if byName["workspace"].GetContainerPath() != "/workspace" {
+		t.Errorf("workspace mounted at %q", byName["workspace"].GetContainerPath())
+	}
+	if !byName["dataset"].GetReadonly() {
+		t.Error("a volume marked ro must mount read-only, or a task can edit data it was given to read")
+	}
+	if byName["workspace"].GetReadonly() {
+		t.Error("a volume with no ro attribute must mount writable")
+	}
+}
+
+func TestAMalformedVolumeFailsTheCreateRatherThanBeingDropped(t *testing.T) {
+	// A typo would otherwise start a sandbox whose storage is silently missing, and
+	// the task inside it would fail for a reason that looks like its own bug.
+	node := newFakeCubelet(t)
+	b := directBackend(t, map[string]*fakeCubelet{"cube-1": node})
+
+	for name, value := range map[string]string{
+		"relative target":   "workspace",
+		"empty target":      "",
+		"unknown attribute": "/workspace:shared",
+	} {
+		spec := stressSpec("wf-bad")
+		spec.BackendOptions = map[string]map[string]string{"cubesandbox": {"volume.v": value}}
+		if _, err := b.Create(context.Background(), "cube-1", spec, ""); err == nil {
+			t.Errorf("%s (%q) was accepted; it must fail the create", name, value)
+		}
+	}
+	// None of them should have reached the node.
+	if node.creates() != 0 {
+		t.Errorf("a malformed volume spec reached the Cubelet %d times", node.creates())
+	}
+}
+
+func TestAVolumeOptionDoesNotLeakIntoAnnotations(t *testing.T) {
+	// volume.* is consumed into real volumes. Passing it through as an annotation
+	// as well would send Cubelet a key it ignores and make the request body lie
+	// about what was asked for.
+	node := newFakeCubelet(t)
+	b := directBackend(t, map[string]*fakeCubelet{"cube-1": node})
+
+	spec := stressSpec("wf-vol-ann")
+	spec.BackendOptions = map[string]map[string]string{"cubesandbox": {
+		"volume.workspace": "/workspace",
+		"custom.key":       "kept",
+	}}
+	if _, err := b.Create(context.Background(), "cube-1", spec, ""); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	annotations := node.lastCreate().GetAnnotations()
+	if _, leaked := annotations["volume.workspace"]; leaked {
+		t.Error("a volume option leaked into the annotations")
+	}
+	if annotations["custom.key"] != "kept" {
+		t.Error("an unrecognised option should still pass through as an annotation")
+	}
+}
+
+func TestProviderModeRefusesADetachedRun(t *testing.T) {
+	// In provider mode the sandbox's envd agent is the command path and p3b is not
+	// in it. Accepting the call and doing nothing would be worse than refusing.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"sandboxID": "cube-1"})
+	}))
+	defer srv.Close()
+	b, err := New(Config{Gateway: srv.URL}, sbbackend.SchedulingProvider)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	err = b.RunDetached(context.Background(),
+		sbbackend.Handle{Backend: "cubesandbox", SandboxID: "cube-1"}, "echo hi", "", nil)
+	if err == nil {
+		t.Fatal("provider mode must refuse a detached run and point at the agent endpoint")
+	}
+	if !strings.Contains(err.Error(), "agent") {
+		t.Errorf("the refusal should name the agent endpoint, got: %v", err)
+	}
+}
+
+func TestProviderModeRefusesAnInPlaceRestore(t *testing.T) {
+	// CubeMaster restores by creating a sandbox from a snapshot id, which is the
+	// create path. Two ways to do one thing is how the modes drift.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	b, err := New(Config{Gateway: srv.URL}, sbbackend.SchedulingProvider)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Restore(context.Background(),
+		sbbackend.Handle{SandboxID: "cube-1"}, "snap-1"); err == nil {
+		t.Fatal("provider mode must refuse an in-place restore")
+	}
+}
+
+func TestARestoreNeedsASnapshotID(t *testing.T) {
+	// An empty id would roll the sandbox back to nothing, which the node would
+	// either refuse confusingly or honour destructively.
+	b := directBackend(t, map[string]*fakeCubelet{"cube-1": newFakeCubelet(t)})
+	if err := b.Restore(context.Background(),
+		sbbackend.Handle{SandboxID: "sb-1", NodeID: "cube-1"}, ""); err == nil {
+		t.Fatal("a restore with no snapshot id must be refused")
+	}
 }

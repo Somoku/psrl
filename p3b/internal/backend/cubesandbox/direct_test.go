@@ -46,17 +46,20 @@ func TestDirectModeReportsItsMode(t *testing.T) {
 // -- capabilities ---------------------------------------------------------------
 
 func TestDirectModeDropsCubeMasterFeatures(t *testing.T) {
-	// A warm pool and a template build live on CubeMaster, which the direct path
-	// bypasses. Freeze is dropped too: CubeboxMgr has no pause RPC, so declaring it
-	// would let the reclaimer pause-on-idle and believe compute was released.
-	b := directBackend(t, map[string]*fakeCubelet{"n1": newFakeCubelet(t)})
-	declared := map[string]bool{}
-	for _, feature := range b.Capabilities().Features {
-		declared[feature] = true
-	}
-	for _, absent := range []string{"warm_pool", "template_build", "volume", "egress_policy", "freeze"} {
-		if declared[absent] {
-			t.Errorf("direct mode must not declare %q", absent)
+	// warm_pool and template_build are CubeMaster APIs with no CubeboxMgr
+	// equivalent: there is no RPC that builds a template, and a warm pool is a
+	// pool CubeMaster holds across nodes. egress_policy is CubeEgress, configured
+	// above the node. Declaring any of them would get a spec admitted and then
+	// failed at create, which costs a sample.
+	//
+	// volume is deliberately NOT in this list: a Cubelet mounts storage natively,
+	// so direct mode serves it. See TestDirectModeServesVolumesNatively.
+	b := directBackend(t, map[string]*fakeCubelet{"c1": newFakeCubelet(t)})
+	for _, cubeMasterOnly := range []string{"warm_pool", "template_build", "egress_policy"} {
+		for _, declared := range b.Capabilities().Features {
+			if declared == cubeMasterOnly {
+				t.Errorf("direct mode must not declare %q", cubeMasterOnly)
+			}
 		}
 	}
 }

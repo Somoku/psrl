@@ -113,6 +113,43 @@ The orderings are still asserted against it:
 "timing": { "episode_deadline_s": 1800, "overrides": { "reap_window_s": 600 } }
 ```
 
+## One control plane over several nodes
+
+The quickstart runs both planes in one process, which serves one machine. A
+fleet splits them: one control process, and one node process per machine.
+
+| Field | Role `control` | Role `node` |
+|---|---|---|
+| `role` | `"control"` | `"node"` |
+| `listen` | where the SDK connects, `host:port` so every worker can reach it | unused |
+| `node_listen` | unused | where the control plane reaches this node |
+| `fleet_nodes` | every node, as `node_id` and `address` | unused |
+| `node` | unused | this machine's envelope |
+| `fleet` | the whole fleet's ceiling | unused |
+| `backends` | declared, for capability routing | declared, and driven |
+
+Both roles declare `backends` and `classes`, and the two declarations have to
+agree: the control plane routes a spec by capability, and the node it picks is
+the one that actually creates. A class named in a spec must exist in both.
+
+Start the nodes first, then the control plane; a control process whose nodes are
+absent starts, but places nothing until they report.
+
+```bash
+# on each node
+sandboxd -config node.json
+# on the control host
+sandboxd -config control.json
+```
+
+Then point the rollout at `host:port` rather than at a socket. Confirm the fleet
+is whole before a run — a control plane reports every node it has heard from,
+and the count is the answer:
+
+```python
+print(await client.fleet())
+```
+
 ## Scheduling modes
 
 `mode` is a property of one backend's deployment, not of the backend. The same
@@ -149,8 +186,9 @@ run works on a machine that has none.
 PSRL reaches the service through the `p3b` backend, which is a client and
 nothing more: placement, admission, and reclamation stay here. Two steps.
 
-1. Start a service where the sandboxes should run. One per node is the usual
-   shape; `listen` is the socket the worker will reach.
+1. Start a service where the sandboxes should run. One combined process per
+   node is the simplest shape; a fleet runs one control plane over several node
+   processes instead. `listen` is what the worker reaches.
 2. Point the rollout at it, in
    `psrl/trainer/config/rollout/psrl_rollout.yaml`:
 

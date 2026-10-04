@@ -31,6 +31,7 @@ as the offending line rather than as whatever the import happened to break.
 from __future__ import annotations
 
 import ast
+import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -109,6 +110,32 @@ def test_there_is_exactly_one_copy_of_the_sdk() -> None:
     )
     assert (SDK.parent / "pyproject.toml").is_file(), (
         "p3b/sdk has no pyproject.toml, so `pip install p3b/sdk` cannot work."
+    )
+
+
+def test_every_sdk_module_is_tracked_by_git() -> None:
+    # Existing on disk is not the same as shipping. `p3b/.gitignore` carried a
+    # bare "sandboxd" for the build output, and a bare pattern matches at any
+    # depth, so it also excluded the SDK package at `p3b/sdk/sandboxd/`: the
+    # files were importable in a working tree and absent from a fresh clone,
+    # where `pip install p3b/sdk` then installed a package with no modules in
+    # it. Nothing caught it, because every test ran in a tree that had them.
+    tracked = subprocess.run(
+        ["git", "ls-files", str(SDK.relative_to(REPO))],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    tracked_names = {Path(path).name for path in tracked}
+
+    missing = sorted(
+        module.name for module in SDK.glob("*.py") if module.name not in tracked_names
+    )
+    assert not missing, (
+        f"These SDK modules exist on disk but are not tracked by git, so they are "
+        f"absent from a clone and `pip install {SDK.parent.relative_to(REPO)}` "
+        f"installs a package without them:\n  " + "\n  ".join(missing)
     )
 
 

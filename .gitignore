@@ -262,3 +262,7 @@ dmypy.json
 *.swp
 # macOS
 .DS_Store
+
+# Compiled Go test binaries, which shadow the sandboxd SDK as a namespace
+# package when left at the repo root.
+*.test

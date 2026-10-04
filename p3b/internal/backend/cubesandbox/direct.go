@@ -33,6 +33,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 
 	"psrl.dev/sandboxd/internal/backend"
 	cubebox "psrl.dev/sandboxd/internal/backend/cubesandbox/cubeletpb/services/cubebox/v1"
@@ -55,6 +56,41 @@ const (
 // mainContainer is the name given to the sandbox's single container. Cubelet
 // addresses containers by name within a sandbox, and Exec needs one.
 const mainContainer = "sandbox"
+
+// cubeletDialOptions is how this service connects to a Cubelet.
+//
+// The connection is long-lived and mostly idle: a rollout step opens a burst of
+// sandboxes and then goes quiet for the length of an episode. That idle period
+// is the problem a keepalive solves. A stateful firewall or a load balancer
+// between this service and a Cubelet drops an idle TCP flow without telling
+// either end, and the failure surfaces at the next create as a hung RPC that
+// waits out its whole deadline -- an episode lost to a connection that died
+// minutes earlier.
+//
+// PermitWithoutStream matters specifically here. Without it the client only
+// pings while an RPC is in flight, which is exactly when the connection is
+// demonstrably alive and the ping is worthless; the dead-idle case it is meant
+// to catch goes unprobed.
+//
+// The window sizes are raised above the 64 KiB default because a create carries
+// a RunCubeSandboxRequest with containers, volumes, and annotations, and a
+// snapshot listing returns a catalog. At the default the stream stalls for a
+// window update mid-message, which costs a round trip per create for no reason.
+func cubeletDialOptions() []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			// Long enough that an idle fleet is not chatty, short enough to stay
+			// inside the idle timeout of a typical stateful firewall.
+			Time:    30 * time.Second,
+			Timeout: 10 * time.Second,
+			// Probe while idle: the idle connection is the one that dies silently.
+			PermitWithoutStream: true,
+		}),
+		grpc.WithInitialWindowSize(1 << 20),
+		grpc.WithInitialConnWindowSize(1 << 20),
+	}
+}
 
 // cubeletConn is one Cubelet and the connection to it.
 type cubeletConn struct {
@@ -102,7 +138,7 @@ func newDirectRuntime(
 	}
 	for _, node := range nodes {
 		target := grpcTarget(node.Address)
-		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(target, cubeletDialOptions()...)
 		if err != nil {
 			runtime.Close()
 			return nil, fmt.Errorf("cubelet %s at %s cannot be dialled: %w", node.NodeID, target, err)
@@ -173,10 +209,17 @@ func (r *directRuntime) create(ctx context.Context, nodeID string, spec backend.
 		}
 	}
 
+	// Built before the deadline starts: a malformed volume request is the caller's
+	// error and must not consume the create budget or reach the node at all.
+	request, err := r.createRequest(spec)
+	if err != nil {
+		return backend.Created{}, err
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, r.createTimeout)
 	defer cancel()
 
-	reply, err := node.client.Create(ctx, r.createRequest(spec))
+	reply, err := node.client.Create(ctx, request)
 	if err != nil {
 		return backend.Created{}, fmt.Errorf("cubelet %s create: %w", node.nodeID, err)
 	}
@@ -207,7 +250,7 @@ func (r *directRuntime) create(ctx context.Context, nodeID string, spec backend.
 // fields it does not reach are left at their zero value rather than guessed:
 // Cubelet treats an empty runtime handler as "the default", which is the right
 // behaviour for a spec that asked for no particular one.
-func (r *directRuntime) createRequest(spec backend.Spec) *cubebox.RunCubeSandboxRequest {
+func (r *directRuntime) createRequest(spec backend.Spec) (*cubebox.RunCubeSandboxRequest, error) {
 	annotations := map[string]string{
 		annotationOwner: r.ownerID,
 	}
@@ -225,6 +268,11 @@ func (r *directRuntime) createRequest(spec backend.Spec) *cubebox.RunCubeSandbox
 			case "runtime_handler", "network_type", "namespace", "backend":
 				// Handled below, where the request field exists.
 			default:
+				if strings.HasPrefix(key, volumeOptionPrefix) {
+					// Handled by parseVolumeOptions into real volumes, not passed through
+					// as an annotation Cubelet would ignore.
+					continue
+				}
 				annotations[key] = value
 			}
 		}
@@ -245,11 +293,25 @@ func (r *directRuntime) createRequest(spec backend.Spec) *cubebox.RunCubeSandbox
 		container.Resources = resources
 	}
 
+	// Volumes close the gap with provider mode: a Cubelet mounts storage natively,
+	// so what CubeMaster adds above it is a named-volume registry rather than the
+	// mount itself. A malformed request fails the create rather than starting a
+	// sandbox whose storage is silently missing.
+	volumeRequests, err := parseVolumeOptions(spec)
+	if err != nil {
+		return nil, err
+	}
+	volumes, mounts := volumesFor(volumeRequests)
+	if len(mounts) > 0 {
+		container.VolumeMounts = mounts
+	}
+
 	request := &cubebox.RunCubeSandboxRequest{
 		RequestID:   newRequestID(),
 		Containers:  []*cubebox.ContainerConfig{container},
 		Annotations: annotations,
 		Labels:      labelsFrom(spec),
+		Volumes:     volumes,
 	}
 	if options, named := spec.Options("cubesandbox"); named {
 		request.RuntimeHandler = options["runtime_handler"]
@@ -258,7 +320,7 @@ func (r *directRuntime) createRequest(spec backend.Spec) *cubebox.RunCubeSandbox
 		request.Backend = options["backend"]
 		request.InstanceType = instanceType
 	}
-	return request
+	return request, nil
 }
 
 // release destroys one sandbox.

@@ -40,6 +40,11 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	cubebox "psrl.dev/sandboxd/internal/backend/cubesandbox/cubeletpb/services/cubebox/v1"
 )
 
 const probeTimeout = 15 * time.Second
@@ -192,12 +197,61 @@ func CheckCubeSandboxGateway(ctx context.Context, gatewayURL, apiKey string) Res
 
 // CheckCubeSandboxNode probes one Cubelet node in direct mode.
 //
-// Each Cubelet serves the full sandbox API on its own port. The probe checks
-// GET /health; a failure means that specific Cubelet is unreachable.
+// A Cubelet is probed over gRPC, not HTTP, and the distinction is not academic.
+// Cubelet binds four listeners on independently configured addresses: an HTTP
+// one, a TTRPC socket, a gRPC TCP port, and a gRPC unix socket. The address this
+// backend is configured with is the gRPC TCP one, because that is where
+// CubeboxMgr -- the service every lifecycle call uses -- is served. Cubelet's
+// HTTP listener serves metrics and snhost, and has no /health route at all.
+//
+// So an HTTP GET /health against the configured address fails twice over: it
+// asks for a path that does not exist, at a port speaking a different protocol.
+// It would fail on a correctly deployed Cubelet, which makes it worse than no
+// check: --preflight exists to catch a misconfiguration before the service
+// serves, and a check that reports a working deployment as broken trains an
+// operator to ignore it.
+//
+// The probe is a real CubeboxMgr call rather than the gRPC health service,
+// because Cubelet does not register grpc.health.v1 (no health.NewServer anywhere
+// in its tree). List with an empty request is the cheapest call that proves the
+// service is routable and answering, which is the same thing the backend's own
+// Preflight does.
 func CheckCubeSandboxNode(ctx context.Context, nodeID, nodeURL, apiKey string) Result {
 	label := "cubesandbox node " + nodeID
-	return probe(ctx, label, normalize(nodeURL)+"/health", apiKey, "X-Api-Key",
-		"Ensure the CubeSandbox Cubelet is running and reachable at "+nodeURL+" (node "+nodeID+")")
+	hint := "Ensure the CubeSandbox Cubelet is running and its gRPC TCP endpoint is reachable at " +
+		nodeURL + " (node " + nodeID + "). This is the grpc.tcp_address in the Cubelet " +
+		"configuration, not its HTTP metrics port."
+
+	target := grpcTarget(nodeURL)
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return Result{Name: label, Err: fmt.Errorf(
+			"%s: %s cannot be dialled: %w\nTo fix: %s", label, target, err, hint)}
+	}
+	defer conn.Close()
+
+	if _, err := cubebox.NewCubeboxMgrClient(conn).List(
+		ctx, &cubebox.ListCubeSandboxRequest{},
+	); err != nil {
+		return Result{Name: label, Err: fmt.Errorf(
+			"%s is not answering CubeboxMgr at %s: %w\nTo fix: %s", label, target, err, hint)}
+	}
+	return Result{Name: label}
+}
+
+// grpcTarget strips a scheme a caller may have written out of habit.
+//
+// A gRPC target is a host:port authority. An "http://" prefix left in place is
+// taken as part of the host name and fails to resolve, which reads as an
+// unreachable node rather than a malformed address.
+func grpcTarget(address string) string {
+	for _, scheme := range []string{"http://", "https://", "grpc://"} {
+		address = strings.TrimPrefix(address, scheme)
+	}
+	return strings.TrimSuffix(address, "/")
 }
 
 // probe fires one HTTP GET and maps the result to a Result.

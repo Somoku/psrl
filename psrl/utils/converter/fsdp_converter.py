@@ -1,10 +1,7 @@
 import math
-import warnings
 from collections import OrderedDict
 
 import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.api import StateDictType
 from torch.distributed.tensor import DTensor
 from verl.utils.fsdp_utils import fsdp_version
 
@@ -223,45 +220,34 @@ def split_fused_moe_fsdp_param(
 
 
 class FSDPConverter(BaseConverter):
-    """Converter for FSDP/FSDP2 model."""
+    """Converter for FSDP2 model."""
 
-    def __init__(self, fsdp_strategy: str, parameter_mapping: ParameterMapping):
+    def __init__(self, parameter_mapping: ParameterMapping):
         """
         Args:
-            fsdp_strategy (str): FSDP strategy, either 'fsdp' or 'fsdp2'.
             parameter_mapping (ParameterMapping): Parameter mapping instance carrying
                 model_info (num_heads, num_kv_heads, head_size). Use FSDPParameterMapping
                 to enable Q/K/V 3D reshaping for NIXL shape compatibility between
                 FSDP train workers and the PS.
         """
         super().__init__(parameter_mapping)
-        self.fsdp_strategy = fsdp_strategy
 
     def convert_state_and_sharding_dict(self, model) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
         """
-        Convert FSDP/FSDP2 model to unified state dict and sharding info.
+        Convert FSDP2 model to unified state dict and sharding info.
 
         Args:
-            model: The FSDP/FSDP2 model instance.
+            model: The FSDP2 model instance.
 
         Returns:
             tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]: A pair of
                 (converted_state_dict, sharding_dict).
         """
-        # Determine the FSDP strategy and convert accordingly.
-        # fsdp_state_dict will be (name, DTensor) pairs.
-        if self.fsdp_strategy == "fsdp":
-            warnings.warn(
-                "FSDP strategy is deprecated beacause it cannot "
-                "guarantee the in-place representation of the state dict.",
-                stacklevel=2,
-            )
-            with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
-                fsdp_state_dict = model.state_dict()
-        elif self.fsdp_strategy == "fsdp2":
-            fsdp_state_dict = model.state_dict()
-        else:
-            raise ValueError(f"Unsupported FSDP strategy: {self.fsdp_strategy}")
+        # FSDP2's state_dict is already (name, DTensor) pairs over the live parameter
+        # storage, which is what trainer-direct supply registers with NIXL. FSDP1 is
+        # rejected at config validation because flat_param cannot guarantee that
+        # in-place representation.
+        fsdp_state_dict = model.state_dict()
 
         # Convert the FSDP state dict to a unified format.
         converted_state_dict = {}
@@ -335,20 +321,44 @@ class FSDPConverter(BaseConverter):
                 "shard_mesh": OrderedDict([(shard_dim, param.device_mesh.size(mesh_dim=1))]),
                 "shard_indices": [(param.device_mesh.get_local_rank(mesh_dim=1),)],
             }
+        _assert_even_sharding(param_name, param, shard_dim, kwargs["shard_mesh"][shard_dim])
         return NIXLSharding(**kwargs)
+
+
+def _assert_even_sharding(param_name: str, param: DTensor, shard_dim: int, shard_count: int) -> None:
+    """Fail at declaration time when FSDP2 has padded a dimension.
+
+    DTensor tolerates a dimension that does not divide evenly across the mesh -- it
+    pads the last rank's local shard. `NIXLSharding.get_local_sharded_tensors`
+    (`nixl_spec.py`) does not: it requires exact divisibility and raises deep inside
+    the transfer.
+
+    Checking here converts a mid-transfer failure with no useful context into a
+    startup error that names the parameter and the fix, which is to reduce
+    `fsdp_size` so the mesh divides the dimension (keeping it within a node also
+    bounds the shard-count amplification discussed in design doc 3.9.2.1).
+    """
+    dim_size = param.shape[shard_dim]
+    if dim_size % shard_count == 0:
+        return
+    raise ValueError(
+        f"FSDP2 shards {param_name!r} dim{shard_dim} (size {dim_size}) across "
+        f"{shard_count} ranks, which does not divide evenly. DTensor pads this but "
+        f"the NIXL weight transport requires exact shards, and the failure would "
+        f"otherwise surface during transfer rather than here. Reduce fsdp_size to a "
+        f"divisor of {dim_size} (ideally within a single node)."
+    )
 
 
 def convert_fsdp_inplace(
     parameter_mapping: ParameterMapping,
     model,
-    fsdp_strategy: str = "fsdp2",
 ) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
     """
-    Convert FSDP/FSDP2 model to unified state dict and sharding info.
+    Convert FSDP2 model to unified state dict and sharding info.
 
     Args:
-        fsdp_strategy (str): FSDP strategy, either 'fsdp' or 'fsdp2'.
-        model: The FSDP/FSDP2 model instance.
+        model: The FSDP2 model instance.
         parameter_mapping (ParameterMapping): Parameter mapping instance carrying
             model_info. Use FSDPParameterMapping to enable Q/K/V 3D reshaping for
             NIXL shape compatibility between FSDP train workers and the PS.
@@ -357,15 +367,10 @@ def convert_fsdp_inplace(
         tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]: A pair of
             (converted_state_dict, sharding_dict).
     """
-    if fsdp_strategy == "fsdp":
-        assert fsdp_version(model) == 1, (
-            f"FSDP version 1 is expected for 'fsdp' strategy, but got {fsdp_version(model)}"
-        )
-    elif fsdp_strategy == "fsdp2":
-        assert fsdp_version(model) == 2, (
-            f"FSDP version 2 is expected for 'fsdp2' strategy, but got {fsdp_version(model)}"
-        )
-    else:
-        raise ValueError(f"Unsupported FSDP strategy: {fsdp_strategy}")
-    converter = FSDPConverter(fsdp_strategy, parameter_mapping)
+    assert fsdp_version(model) == 2, (
+        f"Only FSDP2 is supported by the NIXL weight transport, but got FSDP version "
+        f"{fsdp_version(model)}. FSDP1's flat_param cannot guarantee the in-place "
+        f"representation that registering parameters with NIXL requires."
+    )
+    converter = FSDPConverter(parameter_mapping)
     return converter.convert_state_and_sharding_dict(model)

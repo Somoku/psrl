@@ -7,6 +7,7 @@ from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
 from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLCommPlan
+from psrl.utils.nixl.join_admission import JoinDecision, JoinVerdict, classify_join
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
     NIXLClientType,
@@ -15,6 +16,14 @@ from psrl.utils.nixl.nixl_spec import (
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+
+
+def _mesh_total(mesh: dict[int, int]) -> int:
+    """Total shard count a mesh implies, i.e. the product over its dimensions."""
+    total = 1
+    for count in mesh.values():
+        total *= count
+    return total
 
 
 class NIXLMetaServer:
@@ -30,6 +39,9 @@ class NIXLMetaServer:
         self.client_infos: dict[str, NIXLClientInfo] = {}
 
         self.client_unified_sharding_dicts: dict[str, dict[str, NIXLSharding]] = {}
+        #: key -> the established finest (LCM) shard mesh. Written by
+        #: make_unified_sharding, read by join admission and the observability log.
+        self.finest_shard_meshes: dict[str, dict[int, int]] = {}
         self.comm_plan: NIXLCommPlan | None = None
         self._client_temp_mappings: dict[str, dict] = {}
 
@@ -167,6 +179,7 @@ class NIXLMetaServer:
                     sharding_dict[key] = NIXLSharding.empty()
                 shard_mesh_list.append(sharding_dict[key].shard_mesh)
             finest_shard_mesh = NIXLSharding.find_finest_shard_mesh(shard_mesh_list)
+            self.finest_shard_meshes[key] = dict(finest_shard_mesh)
             for client_name, sharding_dict in self.client_sharding_dicts.items():
                 if client_name not in self.client_unified_sharding_dicts:
                     self.client_unified_sharding_dicts[client_name] = {}
@@ -180,6 +193,58 @@ class NIXLMetaServer:
             f"refactor={time.time() - _t_keys:.3f}s, "
             f"n_clients={len(self.client_sharding_dicts)}, n_keys={len(all_keys)}"
         )
+        self.log_finest_mesh_summary()
+
+    def log_finest_mesh_summary(self, top_n: int = 5) -> None:
+        """Report the finest-mesh sizes so metadata blow-up is visible at handshake.
+
+        The global LCM is the second metadata amplifier after MoE key expansion: a
+        single client with a coprime parallelism degree multiplies every key's shard
+        count. Without this line, that only shows up later as a descriptor count
+        nobody can attribute. Keeping `fsdp_size` within a node is the usual fix.
+        """
+        if not self.finest_shard_meshes:
+            return
+        worst = sorted(
+            self.finest_shard_meshes.items(),
+            key=lambda kv: -_mesh_total(kv[1]),
+        )[:top_n]
+        total_shards = sum(_mesh_total(m) for m in self.finest_shard_meshes.values())
+        psrl_logger.info(
+            "[finest mesh] n_keys=%d total_shards=%d; largest: %s",
+            len(self.finest_shard_meshes),
+            total_shards,
+            ", ".join(f"{k}={dict(m)} ({_mesh_total(m)} shards)" for k, m in worst),
+        )
+
+    def classify_incoming_client(
+        self,
+        new_sharding_dict: dict[str, NIXLSharding],
+        tensor_shapes: dict[str, tuple[int, ...]] | None = None,
+    ) -> dict[str, JoinDecision]:
+        """Classify a would-be joiner against the established finest mesh, per key.
+
+        Returns one `JoinDecision` per key whose verdict is not FAST_PATH, so an
+        empty result means the join costs nothing. Callers must refuse the join if
+        any verdict is REJECT -- admitting it makes every *existing* client raise
+        during re-registration (design doc 3.3.1d).
+
+        Not yet wired into `nixl_protocol`, which is still a one-shot barrier; that
+        is implementation item 9c-b. Exposed now so the elasticity boundary is
+        defined and testable before the handshake is restructured.
+        """
+        decisions: dict[str, JoinDecision] = {}
+        for key, sharding in new_sharding_dict.items():
+            established = self.finest_shard_meshes.get(key)
+            if established is None:
+                continue
+            shapes = {}
+            if tensor_shapes and key in tensor_shapes:
+                shapes[key] = tensor_shapes[key]
+            decision = classify_join(established, sharding.shard_mesh, shapes)
+            if decision.verdict is not JoinVerdict.FAST_PATH:
+                decisions[key] = decision
+        return decisions
 
     def make_comm_plan(self):
         """

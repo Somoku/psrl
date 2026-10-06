@@ -46,7 +46,8 @@ CPU-based distributed weight storage with unified sharding, RDMA push/pull, and 
 :link-type: doc
 
 PS as a zero-byte version authority, trainer-direct reads with same-version peer
-diffusion, redundancy-free planning, and FP8/FP4 wire formats.
+diffusion, redundancy-free planning, FP8/FP4 wire formats, and the Megatron/FSDP
+backend matrix across colocate and disaggregate.
 :::
 
 :::{grid-item-card} {octicon}`checklist;1.5em` Weight Transport Review
@@ -79,6 +80,22 @@ all-rollout startup and elastic scaling.
 
 Fourth-round review: verifies the earlier fixes landed, retires progressive
 availability as unsupported by vLLM, and finds the colocate precision constraint.
+:::
+
+:::{grid-item-card} {octicon}`search;1.5em` Weight Transport Review 5
+:link: weight_transport_review5
+:link-type: doc
+
+Fifth-round review: closes the NCCL gap as a non-issue, finds the epoch/version
+interaction, and sizes what the existing e2e test can actually cover.
+:::
+
+:::{grid-item-card} {octicon}`tasklist;1.5em` Weight Transport Implementation
+:link: weight_transport_implementation
+:link-type: doc
+
+The ordered work breakdown: six phases, every design item mapped to files, an
+executable completion criterion per task, and the indivisible direct-supply block.
 :::
 
 :::{grid-item-card} {octicon}`iterations;1.5em` Flexible Rollout
@@ -159,6 +176,8 @@ weight_transport_review
 weight_transport_review2
 weight_transport_review3
 weight_transport_review4
+weight_transport_review5
+weight_transport_implementation
 flexible_rollout
 staleness_control
 kv_cache

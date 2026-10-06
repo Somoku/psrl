@@ -30,8 +30,7 @@ from psrl.workers.ps import (
 )
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.api import ShardingStrategy
+from torch.distributed.fsdp import fully_shard
 from transformers import AutoConfig, AutoModelForCausalLM
 from verl.models.mcore import hf_to_mcore_config
 from verl.utils.fs import copy_to_local
@@ -39,6 +38,20 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.engine.megatron.utils import set_random_seed
 
 NUM_GPU_PER_NODE = 8
+
+
+def _fully_shard_transformer(model, mesh) -> None:
+    """Apply FSDP2 ``fully_shard`` bottom-up, mirroring verl's wrap policy.
+
+    Each transformer block is sharded as its own unit before the root, which is what
+    produces per-parameter DTensors rather than one flat buffer. The order matters:
+    `fully_shard` must see children already sharded when it reaches the root.
+    """
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is not None:
+        for block in layers:
+            fully_shard(block, mesh=mesh)
+    fully_shard(model, mesh=mesh)
 
 
 def resolve_torch_dtype(dtype_name: str | None) -> torch.dtype:
@@ -256,30 +269,28 @@ class TrainClientActor:
             for p in model.parameters():
                 p.data.fill_(1)
             torch.manual_seed(42)
-            # FSDP
+            # FSDP2 (fully_shard). FSDP1 is rejected by config validation because
+            # flat_param cannot guarantee the in-place parameter representation that
+            # registering with NIXL requires, so the harness must not build it either.
             if engine_type == "fsdp":
-                self.model = FSDP(
-                    model,
-                    sharding_strategy=ShardingStrategy.FULL_SHARD,
-                    device_id=torch.cuda.current_device(),
-                    sync_module_states=False,
-                    device_mesh=init_device_mesh("cuda", mesh_shape=(world_size,)),
-                )
+                mesh = init_device_mesh("cuda", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+                _fully_shard_transformer(model, mesh)
+                self.model = model
             elif engine_type == "fsdp_hybrid":
-                # HSDP
+                # HSDP: replicate across ddp_size, shard within fsdp_size.
                 ddp_size = fsdp_hybrid_config.get("ddp_size", 2)
                 fsdp_size = fsdp_hybrid_config.get("fsdp_size", 4)
                 assert world_size % (ddp_size * fsdp_size) == 0, (
                     f"DDP*FSDP does not divide world_size. world_size={world_size!r}, "
                     f"product={ddp_size * fsdp_size!r}."
                 )
-                self.model = FSDP(
-                    model,
-                    sharding_strategy=ShardingStrategy.HYBRID_SHARD,
-                    device_id=torch.cuda.current_device(),
-                    sync_module_states=False,
-                    device_mesh=init_device_mesh("cuda", mesh_shape=(ddp_size, fsdp_size)),
+                mesh = init_device_mesh(
+                    "cuda",
+                    mesh_shape=(ddp_size, fsdp_size),
+                    mesh_dim_names=("replicate", "shard"),
                 )
+                _fully_shard_transformer(model, mesh)
+                self.model = model
         elif engine_type == "megatron":
             set_random_seed(42)
             self._init_megatron_model(model_path)
@@ -383,7 +394,7 @@ class TrainClientActor:
 
             model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=self.trust_remote_code)
             parameter_mapping = create_parameter_mapping("FSDP", model_config)
-            state_dict, sharding = convert_fsdp_inplace(parameter_mapping, self.model, fsdp_strategy="fsdp")
+            state_dict, sharding = convert_fsdp_inplace(parameter_mapping, self.model)
         elif self.engine_type == "megatron":
             from transformers import AutoConfig
 

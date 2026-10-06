@@ -105,6 +105,86 @@ def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:
     return granularity, chunk_groups
 
 
+def resolve_train_model_dtype(config: DictConfig) -> str:
+    """The dtype the trainer's parameters are actually stored in.
+
+    Megatron's DistributedOptimizer keeps bf16 model params alongside fp32 master
+    params. FSDP2 has no master params: `model_dtype` (default "fp32", but set to
+    "bf16" by many production recipes) *is* the storage dtype, and that is the dtype
+    NIXL registers.
+
+    Reading `model_dtype` rather than branching on the backend matters because the
+    buffer the weight transport prepares must match the real bytes -- assuming fp32
+    under `model_dtype=bf16` sizes every buffer 2x too large and silently
+    misinterprets the wire format.
+    """
+    strategy = config.train_actor_rollout_ref.actor.strategy
+    if strategy == "megatron":
+        return "bf16"
+    engine_cfg = config.train_actor_rollout_ref.actor.get("engine", {}) or {}
+    return engine_cfg.get("model_dtype", "fp32")
+
+
+def _validate_nixl_offload_flags(config: DictConfig) -> None:
+    """Reject both FSDP2 parameter-offload switches (design doc 3.9.3c).
+
+    `offload_fsdp2_model_to_cpu` reallocates every DTensor's local storage between
+    steps, which dangles the GPU pointers NIXL registered; `CPUOffloadPolicy` keeps
+    parameters on the host entirely. Both break trainer-direct supply.
+
+    Both flags must be checked separately: verl forces `_is_offload_param` to False
+    whenever `offload_policy` is set (`transformer_impl.py:460`), so inspecting only
+    `param_offload` silently misses the `offload_policy` case.
+
+    `optimizer_offload` is deliberately *not* rejected -- it is the only existing way
+    to free optimizer state across a colocate switch (design doc 3.7.3.1).
+    """
+    actor_cfg = config.train_actor_rollout_ref.actor
+    engine_cfg = actor_cfg.get("engine", {}) or {}
+
+    if actor_cfg.get("param_offload", False):
+        raise ValueError(
+            "actor.param_offload=True is incompatible with the NIXL weight transport: "
+            "offloading FSDP2 parameters to CPU reallocates each DTensor's local "
+            "storage, dangling the GPU pointers registered with NIXL. Disable "
+            "param_offload (optimizer_offload may stay enabled)."
+        )
+    if engine_cfg.get("offload_policy", False):
+        raise ValueError(
+            "actor.engine.offload_policy=True is incompatible with the NIXL weight "
+            "transport: CPUOffloadPolicy keeps parameters on the host, so there is no "
+            "stable GPU address to register. Disable offload_policy "
+            "(optimizer_offload may stay enabled)."
+        )
+
+
+def _validate_nixl_lora(config: DictConfig) -> None:
+    """Reject un-merged LoRA, which the weight transport cannot express (3.11).
+
+    The converters walk `state_dict()` / `named_parameters()`, which under PEFT yield
+    the frozen base weights plus `lora_A`/`lora_B`. vLLM keeps its adapters in
+    `lora_a_stacked` / `lora_b_stacked`, which are plain tensors -- neither
+    parameters nor registered buffers -- so NIXL has no landing site for them.
+
+    Without this check the run starts and silently synchronises the *base* model:
+    reward never moves and nothing errors. `merge=true` is expressible because the
+    merged weights have the same shape as full fine-tuning.
+    """
+    model_cfg = config.train_actor_rollout_ref.model
+    lora_cfg = model_cfg.get("lora", {}) or {}
+    lora_rank = lora_cfg.get("rank", 0) or model_cfg.get("lora_rank", 0)
+    if lora_rank <= 0 and model_cfg.get("lora_adapter_path") is None:
+        return
+    if not lora_cfg.get("merge", False):
+        raise ValueError(
+            "LoRA adapter synchronisation is not supported by the NIXL weight "
+            "transport: vLLM stores adapters in lora_a_stacked/lora_b_stacked, which "
+            "are neither parameters nor buffers, so they cannot be registered. "
+            "Set model.lora.merge=true to synchronise merged weights, or disable LoRA. "
+            "Leaving it unmerged would silently sync the base model only."
+        )
+
+
 def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
@@ -303,6 +383,8 @@ def validate_config(
         assert config.train_actor_rollout_ref.actor.strategy != "fsdp", (
             "FSDP1 is not supported for NIXL because it uses flat_param"
         )
+        _validate_nixl_offload_flags(config)
+        _validate_nixl_lora(config)
         print(f"NOTICE: NIXL is enabled. Actor strategy used is {config.train_actor_rollout_ref.actor.strategy}")
 
     # Check validate mode

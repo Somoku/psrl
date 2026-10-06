@@ -78,7 +78,11 @@ fi
 echo "2. Install nixl"
 mkdir -p $THIRD_PARTY_PATH/nixl_src
 pushd $THIRD_PARTY_PATH/nixl_src
-git clone -b v1.2.0 https://github.com/ai-dynamo/nixl.git
+# v1.5.0 is the first release whose prepXferDlist accepts an Nx5 strided numpy
+# array (src/bindings/python/nixl_bindings.cpp to_stride_dlist). PSRL's weight
+# transport relies on it to collapse per-shard descriptors; v1.2.0 silently lacks
+# the overload and falls back to one descriptor per shard.
+git clone -b v1.5.0 https://github.com/ai-dynamo/nixl.git
 cd nixl
 mkdir -p build
 # Disable obj backend

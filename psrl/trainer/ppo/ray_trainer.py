@@ -85,6 +85,7 @@ from psrl.trainer.ppo.utils import (
 )
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import WorkerKey, ps_agent_name, train_client_name
+from psrl.utils.config import resolve_train_model_dtype
 from psrl.utils.dataset import DataProcessor
 from psrl.utils.elastic_rm.cluster_topology import ClusterTopology
 from psrl.utils.elastic_rm.elastic_executor import ElasticExecutor
@@ -1959,9 +1960,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # ---- Step 3: Create and init PS WorkerGroup ----
         psrl_logger.info("Create PS WorkerGroup")
-        train_model_dtype = (
-            torch.bfloat16 if self.config.train_actor_rollout_ref.actor.strategy == "megatron" else torch.float32
-        )
+        train_model_dtype = PrecisionType.to_dtype(resolve_train_model_dtype(self.config))
         storage_plan = PSStoragePlan(
             train_model_dtype=train_model_dtype,
             gen_model_dtype=PrecisionType.to_dtype(self.config.gen_actor_rollout_ref.rollout.dtype),

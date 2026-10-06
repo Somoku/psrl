@@ -181,7 +181,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             self.unified_state_dict, self.local_sharding_dict = convert_fsdp_inplace(
                 parameter_mapping,
                 self.actor.engine.module,
-                fsdp_strategy=self.config.actor.strategy,
             )
             self.param_sync_plan = ParamSyncPlan()
         elif strategy == "megatron":

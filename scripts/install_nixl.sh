@@ -5,7 +5,12 @@ trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
 CUDA_PATH=${CUDA_PATH:-"/usr/local/cuda"}
 MAX_JOBS=${MAX_JOBS:-32}
-REQUIRED_UCX_VERSION="1.20.0"
+# 1.22.0 is the first release carrying the UCP GPU device API
+# (ucp_device_local_mem_list_h and friends) that nixl_ep's kernels compile against, and
+# the first to vendor DOCA GPUNetIO as a submodule instead of requiring a system DOCA
+# whose macro names must happen to match. On 1.20.x the EP build fails to link the
+# device API; against a system DOCA 3.5 it also fails on a renamed volatile-read macro.
+REQUIRED_UCX_VERSION="1.22.0"
 UCX_PREFIX="/usr"
 INSTALL_UCX=true
 
@@ -25,8 +30,16 @@ if command -v ucx_info >/dev/null 2>&1; then
     fi
 
     if [ -n "$DETECTED_VERSION" ] && [ "$(printf '%s\n%s\n' "$DETECTED_VERSION" "$REQUIRED_UCX_VERSION" | sort -V | head -n1)" = "$REQUIRED_UCX_VERSION" ]; then
-        echo "UCX version $DETECTED_VERSION found at $UCX_PREFIX (>= $REQUIRED_UCX_VERSION), skipping UCX build."
-        INSTALL_UCX=false
+        # A new enough UCX can still have been built without GPUNetIO, in which case it
+        # installs uct_device_impl.h but not the gdaki.cuh that header includes. The
+        # version alone cannot see that, so check for the header itself; nixl_ep fails
+        # to compile without it.
+        if [ -f "$UCX_PREFIX/include/uct/ib/mlx5/gdaki/gdaki.cuh" ]; then
+            echo "UCX version $DETECTED_VERSION found at $UCX_PREFIX (>= $REQUIRED_UCX_VERSION) with GDAKI headers, skipping UCX build."
+            INSTALL_UCX=false
+        else
+            echo "UCX version $DETECTED_VERSION at $UCX_PREFIX lacks GDAKI headers (built without GPUNetIO), will rebuild UCX $REQUIRED_UCX_VERSION."
+        fi
     else
         echo "UCX version $DETECTED_VERSION found at $UCX_PREFIX (< $REQUIRED_UCX_VERSION), will build UCX $REQUIRED_UCX_VERSION."
     fi
@@ -41,6 +54,11 @@ if $INSTALL_UCX; then
     pushd $THIRD_PARTY_PATH/ucx_src
     git clone -b $REQUIRED_UCX_VERSION https://github.com/openucx/ucx.git
     cd ucx
+    # GDAKI (the GPU-initiated RDMA path nixl_ep needs) lives behind HAVE_GPUNETIO, and
+    # its headers come from this submodule. Without it, configure reports no GPUNetIO,
+    # omits uct/ib/mlx5/gdaki/gdaki.cuh from the install, and the nixl_ep kernels then
+    # fail on a header UCX's own uct_device_impl.h includes unconditionally.
+    git submodule update --init --recursive
 
     # Checking Mellanox NICs
     MLX_OPTS=""

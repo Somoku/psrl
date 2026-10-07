@@ -675,6 +675,35 @@ for key, shape in all_tensor_shapes:
 
 ---
 
+**第二层附录:GPU 实测发现的两条握手时序硬约束。**
+
+实现 9c-b/9c-c 时必须遵守,否则远端 prep 会失败或静默少搬数据
+（`tests/nixl/conftest_agents.py` 已把两条编码进 fixture 并注明原因）：
+
+**(i) 注册必须早于元数据交换。** MD blob 记录「哪个 backend 服务哪种内存类型」,
+在任何 VRAM 注册之前交换的 blob **不含 VRAM backend**,
+之后远端 `prep_xfer_dlist` 报 `no available backends for mem type 'VRAM_SEG'`。
+**而本地 prep 仍然成功**,所以故障看起来像 descriptor 问题而不是握手顺序问题。
+
+**(ii) 握手之后新注册的内存,远端看不见,必须重新发布 MD。** 实测:
+
+```
+注册 keepalive -> 交换 MD -> 再注册新 buffer -> 远端 prep
+  -> failed to prepare the descriptors for any of the specified or potential backends
+重新 add_remote_agent(fresh metadata) -> 远端 prep: OK
+```
+
+**这正是 9c-c 的机制来源**:增量 join 不能「注册完就用」,必须重新发布元数据。
+`getLocalPartialMD` 的价值因此从「可选优化」变成「让这次重发布只花 ~400 字节
+而不是全量 blob」——没有它,每次扩容都要全量重发一遍。
+
+**(iii) 等待完成必须有 progress thread。** `enable_prog_thread=False` 下
+传输提交成功但**永远停在 `PROC`**：没有线程推进 UCX worker。
+benchmark 可以关掉它,只因为它只测提交开销、从不等完成。
+**凡是要等 DONE 的代码路径都必须开着它。**
+
+---
+
 **第三层:全量 MD 广播让 join 的代价随集群规模平方增长。**
 
 今天 `notify_all_client_infos_and_comm_plan`（`server.py:260`）
@@ -1611,8 +1640,10 @@ expert 维度表达为 `NIXLSharding` 的一个分片维度（`shard_mesh` 是
 
 **(b) 描述符用 Nx5 strided 表达。** expert 维度分片通常是规则跨步的，
 一条 strided desc 替代 `count` 条普通 desc。
-**已实测**：16384:1 压缩比，prep 与 submit 开销都降到与 count 无关
-（0.002ms / 0.001ms）。**前提是 NIXL ≥ 1.5.0**（§3.6.3）。这与 §3.6 的 strided 改造是同一件事，
+**已实测**：descriptor **列表**压缩 16384:1，prep 开销降到与 count 无关（0.002ms）。
+**但提交索引不压缩**——strided 行在 prepped handle 内部展开为 `count` 个可索引条目，
+提交时仍要给 `count` 个索引（§3.6.3 的更正）。所以收益在元数据与 prep，不在提交。
+**前提是 NIXL ≥ 1.5.0**（§3.6.3）。这与 §3.6 的 strided 改造是同一件事，
 此处确认它还有元数据压缩收益。
 
 **(c) 万卡规模：优先用 NIXL 的 partial MD，自研指针表降为备选。**
@@ -2002,8 +2033,28 @@ per-descriptor 开销又加了回来**，而且不会报错。
 | 16384 条 plain descriptor | 0.085 ms | 0.014 ms |
 | **1 条 strided descriptor**（等价表达） | **0.002 ms** | **0.001 ms** |
 
-**压缩比 16384:1，且两项开销都与 count 无关。**
-这对 §3.5.5 的元数据扇出与 §3.9.2.1 的 FSDP2 shard 数放大都是直接的解。
+**descriptor 列表压缩 16384:1，prep 开销与 count 无关。**
+这对 §3.5.5 的元数据扇出与 §3.9.2.1 的 FSDP2 shard 数放大是直接的解。
+
+##### 一处实测更正：strided 压缩的是 descriptor 列表，不是提交索引
+
+初稿据 benchmark 的 `strided_submit_ms=0.001` 推断「提交开销也与 count 无关」。
+**GPU 实测证伪**（`tests/nixl/test_descriptor_correctness_gpu.py`）：
+一条 strided 行在 prepped handle 内部**展开为 `count` 个可索引条目**，
+提交时必须给 `count` 个索引。只给 1 个索引时：
+
+```
+indices=[0]        -> state=DONE, 8 个 slice 里只有 1 个被搬运
+indices=[0..7]     -> state=DONE, 8/8 正确
+```
+
+**失败形态是静默的**：状态返回 `DONE`，只是大部分字节没动。
+benchmark 测到的 0.001ms 是「提交 1 个索引」的耗时，不是「提交等价于 16384 条
+descriptor 的传输」的耗时——这两件事被混为一谈了。
+
+**所以 strided 的真实收益是**：元数据体积（descriptor 列表 16384→1）
+与 prep 时间（与 count 无关），**不含提交时间**。
+这不改变做 A2 的理由（元数据扇出是 §3.5.5 的硬阻塞），但要修正收益预期。
 
 **落地要求**：`scripts/install_nixl.sh` 的 `git clone -b v1.2.0` 必须升到 v1.5.0。
 **注意 `nixlXferDList` 在任何版本下都只接受 Nx3**——
@@ -3480,7 +3531,7 @@ Megatron 不存在这个问题：TP / ETP 切分沿 canonical 维度且
 - **shard 数的放大是 strided descriptor 的用例**（§3.6）：
   FSDP2 的 64 条索引在内存上是规则跨步的，一条 Nx5 strided desc 即可表达。
   所以 §3.5.5 的 strided 改造对 FSDP2 的收益比对 Megatron 更大。
-  **已实测可用**（NIXL 1.5.0，16384:1 压缩，§3.6.3），
+  **已实测可用**（NIXL 1.5.0，descriptor 列表 16384:1 压缩；提交索引不压缩，§3.6.3），
   与 HSDP 是互补的两条缓解路径，不是二选一。
 
 **另有一条今天未校验的 divisibility 约束。**

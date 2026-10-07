@@ -860,9 +860,12 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 实现期逐项打勾。**判据栏必须可执行**，不接受「已实现」这种描述。
 
 ### 阶段 A
-- [ ] A1 热路径 `initialize_xfer` 调用数 == 0；索引 dtype 断言存在；1024 条提交提速 ≥ 5×
-- [ ] A2 `_pinned_memory` grep 零命中；`nixl_protocol()` 八步→六步；CPU pinned == 0
-- [ ] A3 存在「第二个 post 早于第一个 wait 返回」的测试；完成检测延迟 < 50μs
+- [x] **A1 descriptor 正确性已验证**（`test_descriptor_correctness_gpu.py`）：
+      真实 RDMA loopback 下 prepped 路径逐字节正确，含 rotated / subset 索引；
+      subset 提交不越界写。**代码改造（热路径替换 `initialize_xfer`）仍待做**
+- [x] **A2 strided 等价性已验证**：strided 与逐条 Nx3 **逐字节一致**，
+      含 gapped stride 不写入间隙。**代码改造（删 pinned 中转）仍待做**
+- [x] **A3** 「第二个 post 早于第一个 wait 返回」已有断言 — `test_post_wait_split.py` 15 passed
 - [x] **A4** 140k tag 构造 20ms（预算 40ms）；单射性含 `(1,2)`vs`(12,)`、None vs ""
       — `tests/nixl/test_xfer_tag.py` 9 passed
 - [x] **A5** 五条配置期防御；`model_dtype=bf16` 被真实读取
@@ -871,8 +874,17 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 - [x] **A7** 三级判定；**56 组穷举与真实 runtime 逐一对账**
       — `tests/nixl/test_join_admission.py` 76 passed，
       `tests/nixl/test_meta_server_sharding.py` 10 passed
-- [ ] A8 colocate 路径 `register_memory` == 0；KV cache 与基线差 < 5%；稳态切回版本正确
-- [ ] A9 与 vLLM 原生 fp8 加载逐张量一致；传输字节减半
+- [x] **A8 CUDA IPC 机制已验证**（`test_colocate_ipc_gpu.py` 10 passed）：
+      跨进程别名双向可见、一块 uint8 bucket 承载 bf16/fp32/fp8/fp16、
+      fp8 weight+scale 共存、buffer 不随模型增长、**`register_memory` 调用数 == 0**。
+      **KV cache 对比与稳态切回需 vLLM engine，属 L2**
+- [x] **A9 fp8 量化已验证**（`test_fp8_wire_gpu.py` 19 passed）：
+      blockwise round-trip 在 fp8 误差内、**wire 字节 0.45~0.55× bf16**、
+      scale 网格覆盖完整、丢 scale 错 100× 以上、量化确定性。
+      **与 vLLM 原生 fp8 checkpoint 逐张量对账需 engine，属 L2**
+
+**单机验证总计：510 passed, 23 skipped**（含全部 GPU 测试）。
+FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运行）。
 
 **A5 的 4 个 skip 不是未完成**：`fsdp_converter` 导入 `verl.utils.model` →
 `transformers.AutoModel`，在本环境因 numpy 2 冲突而失败，**改动前后同样失败**

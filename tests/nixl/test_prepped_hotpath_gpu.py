@@ -59,8 +59,34 @@ def _client(agent, name: str):
 
 
 def _fill(buffer: torch.Tensor) -> None:
+    """Write a position-dependent pattern and wait for it to land.
+
+    The synchronize is load-bearing: `copy_` only enqueues the fill on torch's stream,
+    while NIXL's RDMA engine reads device memory from its progress thread with no
+    knowledge of that stream. Without it a transfer posted straight afterwards races the
+    fill, reports DONE, and moves pre-fill bytes.
+    """
     indices = torch.arange(buffer.numel(), dtype=torch.int64, device=buffer.device)
     buffer.copy_((indices % 251).to(torch.uint8))
+    torch.cuda.synchronize(buffer.device)
+
+
+def _clear(buffer: torch.Tensor) -> None:
+    """Zero a destination and wait, so the zeroing cannot land after the NIC's write."""
+    buffer.zero_()
+    torch.cuda.synchronize(buffer.device)
+
+
+def _bytes_equal(got: torch.Tensor, want: torch.Tensor) -> bool:
+    """Compare device buffers an RDMA transfer wrote, synchronizing before the read."""
+    torch.cuda.synchronize(got.device)
+    return torch.equal(got, want)
+
+
+def _all_equal(buffer: torch.Tensor, value: int) -> bool:
+    """Check every byte of an RDMA-written buffer, synchronizing before the read."""
+    torch.cuda.synchronize(buffer.device)
+    return bool(torch.all(buffer == value))
 
 
 def _queue_read(client, destination, source, slice_indices, tag: str, target: str):
@@ -78,7 +104,7 @@ class TestPreppedHotPathDeliversCorrectBytes:
         source = registered_buffer(TOTAL_BYTES)
         destination = registered_buffer(TOTAL_BYTES)
         _fill(source)
-        destination.zero_()
+        _clear(destination)
         return source, destination
 
     def test_full_round_is_byte_exact(self, agent_pair, buffers):
@@ -90,7 +116,7 @@ class TestPreppedHotPathDeliversCorrectBytes:
         posted = client.post_cached_xfer()
         client.wait_posted_xfer(posted, timeout=120.0)
 
-        assert torch.equal(destination, source), "prepped hot path delivered wrong bytes"
+        assert _bytes_equal(destination, source), "prepped hot path delivered wrong bytes"
         assert client._prepped_cache is not None, "prepped path fell back unexpectedly"
         assert client._prepped_cache.submit_count == 1
 
@@ -108,7 +134,7 @@ class TestPreppedHotPathDeliversCorrectBytes:
             posted = client.post_cached_xfer()
             client.wait_posted_xfer(posted, timeout=120.0)
 
-        assert torch.equal(destination, source), "multi-round transfer lost or misplaced bytes"
+        assert _bytes_equal(destination, source), "multi-round transfer lost or misplaced bytes"
         cache = client._prepped_cache
         assert cache.submit_count == 3
         # Each round covers a different third of the buffer, so the dlist grows to the
@@ -137,8 +163,8 @@ class TestPreppedHotPathDeliversCorrectBytes:
         client.wait_posted_xfer(client.post_cached_xfer(), timeout=120.0)
 
         transferred = 4 * SLICE_BYTES
-        assert torch.equal(destination[:transferred], source[:transferred])
-        assert torch.all(destination[transferred:] == 0), "wrote outside the submitted subset"
+        assert _bytes_equal(destination[:transferred], source[:transferred])
+        assert _all_equal(destination[transferred:], 0), "wrote outside the submitted subset"
 
     def test_no_initialize_xfer_on_the_hot_path(self, agent_pair, buffers, monkeypatch):
         """The A1 criterion, measured against the real agent rather than a fake."""
@@ -162,7 +188,7 @@ class TestPreppedHotPathDeliversCorrectBytes:
             client.wait_posted_xfer(client.post_cached_xfer(), timeout=120.0)
 
         assert calls == [], f"hot path called initialize_xfer {len(calls)} times, expected 0"
-        assert torch.equal(destination, source)
+        assert _bytes_equal(destination, source)
 
     def test_reregistration_repreps_and_stays_correct(self, agent_pair, registered_buffer):
         """A moved buffer must invalidate the cached dlist, not read the old address.
@@ -177,21 +203,21 @@ class TestPreppedHotPathDeliversCorrectBytes:
         first_source = registered_buffer(TOTAL_BYTES)
         first_destination = registered_buffer(TOTAL_BYTES)
         _fill(first_source)
-        first_destination.zero_()
+        _clear(first_destination)
         _queue_read(client, first_destination, first_source, range(8), "a", "pytest-peer")
         client.wait_posted_xfer(client.post_cached_xfer(), timeout=120.0)
-        assert torch.equal(first_destination[: 8 * SLICE_BYTES], first_source[: 8 * SLICE_BYTES])
+        assert _bytes_equal(first_destination[: 8 * SLICE_BYTES], first_source[: 8 * SLICE_BYTES])
         preps_after_first = client._prepped_cache.prep_count
 
         # New allocations: different addresses, so the cached dlist cannot serve them.
         second_source = registered_buffer(TOTAL_BYTES)
         second_destination = registered_buffer(TOTAL_BYTES)
         second_source.copy_(torch.full_like(second_source, 7))
-        second_destination.zero_()
+        _clear(second_destination)
         _queue_read(client, second_destination, second_source, range(8), "b", "pytest-peer")
         client.wait_posted_xfer(client.post_cached_xfer(), timeout=120.0)
 
-        assert torch.all(second_destination[: 8 * SLICE_BYTES] == 7), (
+        assert _all_equal(second_destination[: 8 * SLICE_BYTES], 7), (
             "after re-registration the transfer read the wrong memory"
         )
         assert client._prepped_cache.prep_count > preps_after_first, "stale dlist was reused"

@@ -44,10 +44,41 @@ def _fill_pattern(buffer: torch.Tensor) -> None:
     uint8 wraps every 256 bytes, so this detects any shift that is not a multiple of
     256. Slices here are 64KiB, far larger, so a whole-slice displacement always lands
     on a different value sequence.
+
+    The synchronize is load-bearing. `copy_` only *enqueues* the fill on torch's current
+    stream, whereas NIXL's RDMA engine reads device memory from its own progress thread
+    with no knowledge of that stream. Posting a transfer straight after this call races
+    the fill: the transfer still reports DONE, but it moves whatever was in the buffer
+    when the NIC read it -- typically zeros, with the occasional leading byte that the
+    kernel had already written. The resulting failures look like misaddressed
+    descriptors and move between runs.
     """
     length = buffer.numel()
     indices = torch.arange(length, dtype=torch.int64, device=buffer.device)
     buffer.copy_((indices % 251).to(torch.uint8))
+    torch.cuda.synchronize(buffer.device)
+
+
+def _clear(buffer: torch.Tensor) -> None:
+    """Zero a destination buffer and wait for the zeroing to actually land.
+
+    Same stream hazard as `_fill_pattern`, in the opposite direction: an unsynchronized
+    `zero_()` can execute *after* the NIC has written the buffer, erasing the bytes the
+    assertions are about to check.
+    """
+    buffer.zero_()
+    torch.cuda.synchronize(buffer.device)
+
+
+def _bytes_equal(got: torch.Tensor, want: torch.Tensor) -> bool:
+    """Compare two device buffers that an RDMA transfer wrote.
+
+    Synchronizes first: the NIC writes outside any torch stream, so a comparison kernel
+    enqueued immediately after `check_xfer_state` returns DONE may read the destination
+    before the written bytes are visible to the device.
+    """
+    torch.cuda.synchronize(got.device)
+    return torch.equal(got, want)
 
 
 def _assert_slice_matches(
@@ -57,6 +88,9 @@ def _assert_slice_matches(
     length: int,
     label: str,
 ) -> None:
+    # The NIC wrote this buffer outside any torch stream, so make the device quiescent
+    # before reading it back through torch.
+    torch.cuda.synchronize(destination.device)
     got = destination[offset : offset + length]
     want = source[offset : offset + length]
     if not torch.equal(got, want):
@@ -94,7 +128,7 @@ class TestPreppedDescriptorCorrectness:
         source = registered_buffer(TOTAL_BYTES)
         destination = registered_buffer(TOTAL_BYTES)
         _fill_pattern(source)
-        destination.zero_()
+        _clear(destination)
         return source, destination
 
     def test_prepped_transfer_moves_correct_bytes(self, agent_pair, buffers):
@@ -129,7 +163,7 @@ class TestPreppedDescriptorCorrectness:
             local.release_dlist_handle(local_handle)
             local.release_dlist_handle(remote_handle)
 
-        assert torch.equal(destination, source), "prepped transfer delivered wrong bytes"
+        assert _bytes_equal(destination, source), "prepped transfer delivered wrong bytes"
 
     def test_reordered_indices_move_the_same_bytes(self, agent_pair, buffers):
         """Chunk-offset staggering submits rotated index sets over one handle."""
@@ -161,7 +195,7 @@ class TestPreppedDescriptorCorrectness:
 
         # Rotating both sides identically is a permutation of the pairing, so the
         # result must still be a faithful copy.
-        assert torch.equal(destination, source), "rotated indices delivered wrong bytes"
+        assert _bytes_equal(destination, source), "rotated indices delivered wrong bytes"
 
     def test_subset_indices_touch_only_their_slices(self, agent_pair, buffers):
         """Commit-group submission sends a subset; the rest must stay untouched."""
@@ -249,8 +283,8 @@ class TestStridedDescriptorEquivalence:
         plain_destination = registered_buffer(TOTAL_BYTES)
         strided_destination = registered_buffer(TOTAL_BYTES)
         _fill_pattern(source)
-        plain_destination.zero_()
-        strided_destination.zero_()
+        _clear(plain_destination)
+        _clear(strided_destination)
         return source, plain_destination, strided_destination
 
     @staticmethod
@@ -305,8 +339,8 @@ class TestStridedDescriptorEquivalence:
             local.release_dlist_handle(local_handle)
             local.release_dlist_handle(remote_handle)
 
-        assert torch.equal(plain_destination, source), "plain path is wrong; test invalid"
-        assert torch.equal(strided_destination, plain_destination), (
+        assert _bytes_equal(plain_destination, source), "plain path is wrong; test invalid"
+        assert _bytes_equal(strided_destination, plain_destination), (
             "strided descriptor is not byte-equivalent to the plain descriptor list"
         )
 
@@ -322,7 +356,7 @@ class TestStridedDescriptorEquivalence:
         source = registered_buffer(span)
         destination = registered_buffer(span)
         _fill_pattern(source)
-        destination.zero_()
+        _clear(destination)
 
         local_handle = local.prep_xfer_dlist(
             "NIXL_INIT_AGENT",

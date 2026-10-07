@@ -120,7 +120,13 @@ class RolloutConfig(_VeRLRolloutConfig):
     chat_template: str | None = None
 
     sampler_distribution: str = "disabled"
-    sampler_max_tokens: int = 128
+    sampler_max_tokens: int = 32
+    # Per-row capture validation (duplicate ids, probability mass, sampled-token agreement) sorts each
+    # row and is expensive over long responses, so normal training skips it. Enable for CI runs.
+    sampler_strict_validation: bool = False
+    # Support mode only: ship per-row support lengths + flat support ids instead of a dense id head.
+    # Not supported with context_parallel_size>1.
+    sampler_compact_support: bool = False
 
 
 __all__ = [

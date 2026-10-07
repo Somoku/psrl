@@ -12,27 +12,89 @@ import numpy as np
 
 def capture_width(mode: str, max_tokens: int) -> int:
     """
-    Reserve a sentinel entry to prove support completeness within the budget.
+    Per-token wire width the gateway returns for a capture mode.
+
+    The request asks the engine for exactly this many log-prob slots per token and the gateway
+    filters the engine's ``rank <= width`` entries, so a returned row has exactly ``width`` columns:
+
+    - ``topk``: the ``max_tokens``-wide head.
+    - ``support``: ``max_tokens`` support slots plus one sentinel slot witnessing completeness.
+
+    The engine returns one column more than it is asked for (the sampled token is prepended), which
+    is why the gateway's ``rank <= width`` filter, not the request value alone, defines the wire
+    width. Kept here so the request, the buffer and the trainer padding share one definition.
     """
     if mode not in ("disabled", "topk", "support") or not 1 <= max_tokens < 2**31 - 1:
         raise ValueError("Invalid sampler distribution mode or sampler_max_tokens budget.")
     return 0 if mode == "disabled" else max_tokens + (mode == "support")
 
 
-def configure_capture(body: dict, mode: str, max_tokens: int) -> None:
+@dataclass(frozen=True)
+class SamplerCapture:
     """
-    Apply the sampler capture contract to a chat request.
+    Resolved capture configuration shared by the rollout request and the training batch.
+
+    Bundles the mode, the per-token budget and the compact-transport flag so the request width, the
+    TITO validation and the trainer padding all derive from one object instead of parallel fields.
     """
-    body["logprobs"] = True
-    body["top_logprobs"] = 0
-    body["sampler_top_logprobs"] = capture_width(mode, max_tokens)
+
+    mode: str = "disabled"
+    budget: int = 32
+    compact_support: bool = False
+
+    @property
+    def enabled(self) -> bool:
+        """Whether any sampler capture is requested."""
+        return self.mode != "disabled"
+
+    @property
+    def width(self) -> int:
+        """Per-token wire width, see :func:`capture_width`."""
+        return capture_width(self.mode, self.budget)
+
+    @classmethod
+    def from_rollout_config(cls, rollout_config) -> SamplerCapture:
+        """Build the capture config from a (structured or OmegaConf) rollout config."""
+        return cls(
+            mode=rollout_config.get("sampler_distribution", "disabled"),
+            budget=int(rollout_config.get("sampler_max_tokens", 32)),
+            compact_support=bool(rollout_config.get("sampler_compact_support", False)),
+        )
+
+
+def resolve_capture_mode(mode: str, *, top_p: float, top_k: int) -> str:
+    """
+    Resolve ``auto`` from the sampling parameters.
+
+    Truncated sampling (``top_p < 1`` or ``top_k > 0``) draws only from the realized support, so the
+    capture must be exact and the support mode applies. Untruncated sampling uses the top-k head.
+    """
     if mode == "disabled":
+        return "disabled"
+    if mode == "auto":
+        return "support" if float(top_p) < 1.0 or int(top_k) > 0 else "topk"
+    return mode
+
+
+def configure_capture(body: dict, capture: SamplerCapture, *, set_response_fields: bool = True) -> None:
+    """
+    Apply the sampler capture contract to a request body.
+
+    ``set_response_fields`` writes the OpenAI ``logprobs``/``top_logprobs`` pair. It is used for the
+    chat and Responses protocols. Anthropic Messages lowers to the canonical chat IR inside SMG and
+    only carries ``sampler_top_logprobs``.
+    """
+    if set_response_fields:
+        body["logprobs"] = True
+        body["top_logprobs"] = 0
+    body["sampler_top_logprobs"] = capture.width
+    if not capture.enabled:
         return
     if float(body.get("temperature", 1.0)) <= 0:
         raise ValueError("Sampler distribution capture requires positive temperature.")
-    if mode == "topk" and (
-        float(body.get("top_p", 1.0)) < 1 or int(body.get("top_k", -1)) > 0 or float(body.get("min_p", 0.0)) > 0
-    ):
+    if float(body.get("min_p", 0.0)) > 0:
+        raise ValueError("Sampler distribution capture requires min_p=0.")
+    if capture.mode == "topk" and (float(body.get("top_p", 1.0)) < 1 or int(body.get("top_k", -1)) > 0):
         raise ValueError("Truncated sampling requires sampler_distribution=support.")
 
 
@@ -77,9 +139,14 @@ class SamplerDistribution:
         )
 
     @classmethod
-    def from_wire(cls, payload: dict, sampled: list) -> SamplerDistribution:
+    def from_wire(cls, payload: dict, sampled: list, *, strict: bool = True) -> SamplerDistribution:
         """
         Decode and validate a TITO distribution against its sampled tokens.
+
+        ``strict`` enables the per-row checks that sort each row (duplicate ids, probability mass,
+        sampled-token agreement). Those are the expensive part over long responses, so normal training
+        skips them and relies on the structural checks plus the sampler's own fail-closed capture. Set
+        ``strict`` in CI-style validation runs.
         """
         offsets = np.asarray(payload["offsets"], dtype=np.int64)
         ids = np.frombuffer(base64.b64decode(payload["token_ids"], validate=True), dtype="<i4")
@@ -98,6 +165,8 @@ class SamplerDistribution:
             raise ValueError("Sampler distribution offsets do not align with sampled tokens.")
         if np.any(ids < 0) or not np.isfinite(log_probs).all() or np.any(log_probs > 1e-6):
             raise ValueError("Sampler distribution contains invalid IDs or log probabilities.")
+        if not strict:
+            return cls(offsets, ids, log_probs, complete)
         for row, (sample_logprob, sample_id) in enumerate(sampled):
             if not np.isfinite(sample_logprob) or sample_logprob > 1e-6 or sample_id < 0:
                 raise ValueError(f"Invalid sampled token or log probability at row {row}.")
@@ -114,6 +183,31 @@ class SamplerDistribution:
             if selected.any() and not np.isclose(row_lp[selected][0], sample_logprob, rtol=1e-5, atol=1e-5):
                 raise ValueError(f"Sampler head and sampled log probability disagree at row {row}.")
         return cls(offsets, ids, log_probs, complete)
+
+    @classmethod
+    def from_topk_rows(cls, token_ids, log_probs) -> SamplerDistribution:
+        """
+        Build a distribution from a fixed-width head decoded from the /generate response.
+
+        Finite entries form the sampler support. An ``-inf`` entry is the completeness sentinel for
+        its row and its id is dropped. The /generate endpoint has no environment turns, so every row
+        is present and offsets follow the per-row finite counts.
+        """
+        ids = np.asarray(token_ids, dtype=np.int32)
+        logps = np.asarray(log_probs, dtype=np.float32)
+        if ids.ndim != 2 or ids.shape != logps.shape or ids.shape[0] < 1:
+            raise ValueError(f"topk rows must be a shared [R, k] shape, got {ids.shape} and {logps.shape}.")
+        finite = np.isfinite(logps)
+        complete = (~finite).any(-1)
+        counts = finite.sum(-1)
+        offsets = np.zeros(len(ids) + 1, dtype=np.int64)
+        np.cumsum(counts, out=offsets[1:])
+        return cls(
+            offsets=offsets,
+            token_ids=ids[finite].astype(np.int32),
+            log_probs=logps[finite].astype(np.float32),
+            complete=complete,
+        )
 
     @classmethod
     def concatenate(cls, segments: list[SamplerDistribution]) -> SamplerDistribution:
@@ -133,33 +227,20 @@ class SamplerDistribution:
             np.concatenate([segment.complete for segment in segments]),
         )
 
-    def validate_capture(self, mode: str, max_tokens: int, response_mask: list[int]) -> None:
+    def validate_capture(self, capture: SamplerCapture, response_mask: list[int]) -> None:
         """
-        Reject incomplete support and missing active rows before training.
+        Reject an incomplete support or misaligned rows before training.
+
+        The row-alignment and support-completeness checks read the mode and budget from ``capture``,
+        so the request width and the validation cannot drift apart.
         """
         active = np.asarray(response_mask, dtype=np.bool_)
         if active.shape != (len(self),):
             raise ValueError("Sampler distribution and response mask lengths differ.")
+        if not capture.enabled:
+            raise ValueError("Sampler distribution present while capture is disabled.")
         counts = np.diff(self.offsets)
         if np.any(counts[active] == 0) or np.any(counts[~active] != 0):
             raise ValueError("Sampler distribution rows do not match the response mask.")
-        if mode == "support" and (not self.complete[active].all() or np.any(counts > max_tokens)):
+        if capture.mode == "support" and (not self.complete[active].all() or np.any(counts > capture.budget)):
             raise ValueError("Sampler support exceeds the capture budget. Increase sampler_max_tokens.")
-
-    def as_tensor_fields(self, prompt_length: int) -> dict:
-        """
-        Place sparse rows at next-token prediction positions for packed training.
-        """
-        import torch
-
-        if prompt_length < 1:
-            raise ValueError("Sampler distributions require a nonempty prompt.")
-        # Entries remain compact. Only row offsets and completeness cover the full sequence.
-        offsets = np.concatenate((np.zeros(prompt_length - 1, dtype=np.int64), self.offsets, self.offsets[-1:]))
-        complete = np.concatenate((np.zeros(prompt_length - 1, dtype=np.bool_), self.complete, [False]))
-        return {
-            "sampler_offsets": torch.from_numpy(offsets),
-            "sampler_token_ids": torch.from_numpy(self.token_ids.copy()),
-            "sampler_log_probs": torch.from_numpy(self.log_probs.copy()),
-            "sampler_complete": torch.from_numpy(complete),
-        }

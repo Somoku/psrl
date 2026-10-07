@@ -68,6 +68,7 @@ def build_training_data(
     records: list[dict],
     max_trim_tokens: int = 0,
     prompt_ids_override: list[int] | None = None,
+    strict_validation: bool = False,
 ) -> dict:
     """Convert one TITO trajectory into canonical training data.
 
@@ -124,7 +125,7 @@ def build_training_data(
             if payload is None and raw_lps:
                 raise ValueError(f"Missing sampler distribution at TITO turn {i}.")
             distribution = (
-                SamplerDistribution.from_wire(payload, raw_lps)
+                SamplerDistribution.from_wire(payload, raw_lps, strict=strict_validation)
                 if payload is not None
                 else SamplerDistribution.empty(0)
             )
@@ -244,14 +245,19 @@ def build_training_data(
             len(prompt_ids),
         )
 
+    sampler_distribution = SamplerDistribution.concatenate(distribution_segments) if capture_distribution else None
+    if sampler_distribution is not None and len(sampler_distribution) != len(all_response_ids):
+        raise ValueError(
+            f"sampler distribution has {len(sampler_distribution)} rows but the multi-turn response "
+            f"has {len(all_response_ids)} tokens; the two must stay in lockstep across turns."
+        )
+
     return {
         "prompt_ids": prompt_ids,
         "response_ids": all_response_ids,
         "response_mask": all_response_mask,
         "logprobs": all_logprobs,
         "routed_experts": routed_experts,
-        "sampler_distribution": (
-            SamplerDistribution.concatenate(distribution_segments) if capture_distribution else None
-        ),
+        "sampler_distribution": sampler_distribution,
         "num_turns": len(records),
     }

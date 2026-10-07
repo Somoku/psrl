@@ -20,9 +20,12 @@ mode: psrl_async
 # logprobs mode for rollout logprobs
 logprobs_mode: raw_logprobs
 
-# Capture a topk head or a complete support with a bounded per-token budget.
+# Sampler capture for score centering: "disabled", "topk", "support", or "auto" from top_p/top_k.
+# `sampler_max_tokens` is the per-token budget (32 default, roughly 8 * budget bytes per token).
 sampler_distribution: disabled
-sampler_max_tokens: 128
+sampler_max_tokens: 32
+# Support mode only: ship per-row lengths + flat support ids instead of a dense id head (needs CP=1).
+sampler_compact_support: false
 
 # Select the rollout weight loader. Large safetensors models should set `use_shm=True`.
 load_format: dummy

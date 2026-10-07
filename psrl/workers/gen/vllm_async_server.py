@@ -353,9 +353,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         args.update(self.kv_cache_manager.get_engine_kwargs())
         capture_mode = self.config.get("sampler_distribution", "disabled")
         if capture_mode != "disabled":
-            from psrl.utils.sampler_distribution import capture_width
+            from psrl.utils.sampler_distribution import SamplerCapture
 
-            width = capture_width(capture_mode, self.config.get("sampler_max_tokens", 128))
+            width = SamplerCapture.from_rollout_config(self.config).width
             if args["logprobs_mode"] != "processed_logprobs":
                 raise ValueError("Sampler distribution capture requires logprobs_mode=processed_logprobs.")
             configured_max = args.get("max_logprobs", width)

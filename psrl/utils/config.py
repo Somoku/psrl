@@ -1,4 +1,4 @@
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from verl.utils.config import omega_conf_to_dataclass
 
 from psrl.trainer.ppo.batch_schedule import (
@@ -105,6 +105,34 @@ def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:
     return granularity, chunk_groups
 
 
+def mirror_bypass_config_to_actor(config: DictConfig) -> None:
+    """Mirror ``algorithm.rollout_correction`` into the actor's static ``policy_loss``.
+
+    The actor worker picks its loss function once, in ``init_model``, from its own config snapshot
+    (a separate process). A runtime mutation on the driver never reaches it. Upstream therefore
+    requires the actor-side mirror in the config (``docs/algo/rollout_corr.md``). Doing it here, in
+    ``validate_config`` before ``init_workers``, is what makes bypass mode and the score-centering
+    loss actually take effect. A no-op unless ``bypass_mode`` is set.
+    """
+    rollout_correction = config.algorithm.get("rollout_correction", None) or {}
+    if not rollout_correction.get("bypass_mode", False):
+        return
+    actor_policy_loss = config.train_actor_rollout_ref.actor.policy_loss
+    # The default (yaml) is "vanilla". Anything else means the user set a different loss explicitly,
+    # which bypass would silently override. Fail loudly instead of discarding their choice.
+    configured_loss_mode = actor_policy_loss.get("loss_mode", "vanilla")
+    if configured_loss_mode not in ("vanilla", "bypass_mode"):
+        raise ValueError(
+            "algorithm.rollout_correction.bypass_mode=True requires "
+            "train_actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode, but it is set to "
+            f"{configured_loss_mode!r}. Remove that override or drop bypass mode."
+        )
+    with open_dict(actor_policy_loss):
+        # A deep copy, so later mutations of the algorithm node cannot alias into the actor node.
+        actor_policy_loss["rollout_correction"] = OmegaConf.create(OmegaConf.to_container(rollout_correction))
+        actor_policy_loss["loss_mode"] = "bypass_mode"
+
+
 def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
@@ -123,24 +151,69 @@ def validate_config(
     actor_config = config.train_actor_rollout_ref.actor
     rollout_config = config.gen_actor_rollout_ref.rollout
     capture_mode = rollout_config.get("sampler_distribution", "disabled")
-    if capture_mode != "disabled":
-        from psrl.utils.sampler_distribution import configure_capture
+    if capture_mode == "auto":
+        from psrl.utils.sampler_distribution import resolve_capture_mode
 
+        resolved = resolve_capture_mode("auto", top_p=rollout_config.top_p, top_k=rollout_config.top_k)
+        # Write the resolved mode back so every consumer (rollout server, agent loops, trainer)
+        # sees a concrete mode instead of ``auto``.
+        with open_dict(rollout_config):
+            rollout_config.sampler_distribution = resolved
+        capture_mode = resolved
+    if capture_mode not in ("disabled", "topk", "support"):
+        raise ValueError(f"Unknown sampler_distribution mode {capture_mode!r}.")
+    if capture_mode in ("topk", "support"):
+        from psrl.utils.sampler_distribution import SamplerCapture, configure_capture
+
+        capture = SamplerCapture.from_rollout_config(rollout_config)
         configure_capture(
             {
                 "temperature": rollout_config.temperature,
                 "top_p": rollout_config.top_p,
                 "top_k": rollout_config.top_k,
+                "min_p": rollout_config.get("min_p", 0.0),
             },
-            capture_mode,
-            rollout_config.get("sampler_max_tokens", 128),
+            capture,
         )
+        # Mirror the resolved mode onto the veRL rollout config so its own init validation
+        # (top_p/top_k, max_logprobs) agrees with the capture mode instead of an untruncated sampler.
+        with open_dict(rollout_config):
+            rollout_config.sampler_support = capture_mode == "support"
         if rollout_config.logprobs_mode != "processed_logprobs":
             raise ValueError("Sampler capture requires rollout.logprobs_mode=processed_logprobs.")
         if OmegaConf.select(rollout_config, "mtp.enable", default=False) or OmegaConf.select(
             rollout_config, "engine_kwargs.vllm.speculative_config", default=None
         ):
             raise ValueError("Sampler capture requires a non-speculative rollout sampler.")
+    if capture_mode == "support" and rollout_config.get("sampler_compact_support", False):
+        engine_mount = "megatron" if actor_config.strategy == "megatron" else "fsdp_config"
+        cp_size = OmegaConf.select(actor_config, f"{engine_mount}.context_parallel_size", default=1)
+        if cp_size and int(cp_size) > 1:
+            raise NotImplementedError(
+                "rollout.sampler_compact_support is not supported with context_parallel_size>1; "
+                "disable it or use context_parallel_size=1."
+            )
+    # Score centering must be enabled in the actor's *static* policy_loss: the worker selects its
+    # loss_fn once in init_model, before this runtime mutation exists on the driver.
+    mirror_bypass_config_to_actor(config)
+    rollout_correction = config.algorithm.get("rollout_correction", None) or {}
+    if rollout_correction.get("score_centering", False):
+        from dataclasses import fields as dataclass_fields
+
+        from verl.trainer.config.algorithm import RolloutCorrectionConfig
+
+        # Validate the score-centering contract (bypass_mode=True, loss_type="reinforce",
+        # rollout_is None/"token", no batch normalize) over the dataclass fields only.
+        known_fields = {field.name for field in dataclass_fields(RolloutCorrectionConfig)}
+        RolloutCorrectionConfig(**{key: value for key, value in rollout_correction.items() if key in known_fields})
+        if capture_mode == "disabled":
+            raise ValueError(
+                "algorithm.rollout_correction.score_centering requires "
+                "gen_actor_rollout_ref.rollout.sampler_distribution=topk or support (or auto with a "
+                "truncated/untruncated sampler) so the sampler head is captured."
+            )
+        if (config.get("distillation") or {}).get("enabled", False):
+            raise ValueError("score centering cannot be combined with distillation.")
     engine_mount = "megatron" if actor_config.strategy == "megatron" else "fsdp_config"
     actor_router_replay = OmegaConf.select(actor_config, f"{engine_mount}.router_replay.mode", default="disabled")
     rollout_routing_replay = config.gen_actor_rollout_ref.rollout.enable_rollout_routing_replay
@@ -500,6 +573,5 @@ def validate_config(
                 "per-chunk reward normalization uses chunk-level statistics, not full-batch statistics. "
                 "Use reward_normalization='group' for exact equivalence with the full-batch path."
             )
-
 
     print("[validate_config] All configuration checks passed successfully!")

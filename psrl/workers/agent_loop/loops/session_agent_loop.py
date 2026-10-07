@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from psrl.utils.common.http_utils import delete, get, post
 from psrl.utils.rollout.vision_utils import normalize_messages
-from psrl.utils.sampler_distribution import configure_capture
+from psrl.utils.sampler_distribution import SamplerCapture, configure_capture
 from psrl.utils.tito.training_data import build_training_data
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.context import AgentLoopContext
@@ -191,15 +191,8 @@ class SessionAgentLoop(AgentLoopBase):
         }
         if request.get("seed") is not None:
             params["seed"] = int(request["seed"])
-        configure_capture(
-            params,
-            (
-                "disabled"
-                if request.get("validate", False)
-                else self.rollout_config.get("sampler_distribution", "disabled")
-            ),
-            self.rollout_config.get("sampler_max_tokens", 128),
-        )
+        capture = SamplerCapture() if request.get("validate", False) else self.sampler_capture
+        configure_capture(params, capture)
         return params
 
     async def chat_completion(
@@ -283,14 +276,11 @@ class SessionAgentLoop(AgentLoopBase):
             trajectory.get("accumulated_token_ids", []),
             records,
             max_trim_tokens=session_data.get("max_trim_tokens", 0),
+            strict_validation=self.rollout_config.get("sampler_strict_validation", False),
         )
         distribution = training_data.get("sampler_distribution")
         if distribution is not None:
-            distribution.validate_capture(
-                self.rollout_config.get("sampler_distribution", "disabled"),
-                self.rollout_config.get("sampler_max_tokens", 128),
-                training_data["response_mask"],
-            )
+            distribution.validate_capture(self.sampler_capture, training_data["response_mask"])
         training_data["trajectory_id"] = trajectory["trajectory_id"]
         header_info = session_data.get("header_info", {})
         if header_info.get("base_worker_id") is not None and header_info.get("target_dp_rank") is not None:
@@ -326,11 +316,7 @@ class SessionAgentLoop(AgentLoopBase):
         distribution = training_data.get("sampler_distribution")
         if distribution is not None:
             distribution = distribution.prefix(len(response_ids))
-            distribution.validate_capture(
-                self.rollout_config.get("sampler_distribution", "disabled"),
-                self.rollout_config.get("sampler_max_tokens", 128),
-                response_mask,
-            )
+            distribution.validate_capture(self.sampler_capture, response_mask)
         return TokenOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
@@ -338,6 +324,7 @@ class SessionAgentLoop(AgentLoopBase):
             response_log_probs=response_log_probs,
             routed_experts=routed_experts,
             sampler_distribution=distribution,
+            sampler_capture=self.sampler_capture,
             stop_reason=training_data.get("finish_reason"),
             num_turns=training_data["num_turns"],
             rollout_instance_id=training_data.get("rollout_instance_id"),

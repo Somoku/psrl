@@ -31,6 +31,7 @@ from psrl.utils.rollout.vision_utils import (
     messages_contain_images,
     resolve_message_image_refs,
 )
+from psrl.utils.sampler_distribution import SamplerCapture, SamplerDistribution
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.budget import (
     EpisodeBudget,
@@ -52,7 +53,7 @@ class AgentLoopBase(ABC):
     A loop that provisions a sandbox before doing episode work sets
     `episode_starts_after_provisioning` and calls `arm_episode_budget` once the
     sandbox and environment are ready. That keeps node capacity admission, which is
-    scheduling latency, out of the episode budget; the admission deadline bounds it
+    scheduling latency, out of the episode budget. The admission deadline bounds it
     instead. Loops that do no provisioning keep the default and are timed from the call.
     """
 
@@ -70,10 +71,10 @@ class AgentLoopBase(ABC):
         self.config = context.config
         self.model_config = self.config.gen_actor_rollout_ref.model
         self.rollout_config = self.config.gen_actor_rollout_ref.rollout
+        self.sampler_capture = SamplerCapture.from_rollout_config(self.rollout_config)
         self.rollout_gateway_url = context.rollout_gateway_url.rstrip("/")
-        # One ladder for every deadline this loop enforces, derived from the episode budget
-        # so the harness cap, the setup allowance, and the manager's stall threshold cannot
-        # disagree with each other.
+        # One ladder for every deadline this loop enforces, derived from the episode budget so the
+        # harness cap, the setup allowance, and the manager's stall threshold cannot disagree.
         self.timeouts = resolve_from_config(self.config)
 
         self.reward_manager = context.reward_manager
@@ -311,8 +312,7 @@ class AgentLoopBase(ABC):
         is_sticky_session: bool,
     ) -> "TokenOutput":
         """Call SMG /generate and consume its token-native response."""
-        if not request_input.is_validate and self.rollout_config.get("sampler_distribution", "disabled") != "disabled":
-            raise ValueError("Sampler distribution capture requires a session agent using chat completions.")
+        capture_mode = "disabled" if request_input.is_validate else self.sampler_capture.mode
         request_url = f"{self.rollout_gateway_url}/generate"
 
         payload_sampling_params = dict(sampling_params)
@@ -342,6 +342,10 @@ class AgentLoopBase(ABC):
             "stream": False,
             "return_logprob": sampling_params.get("logprobs") is not None,
         }
+        if capture_mode != "disabled":
+            # SMG /generate returns the sampler head in meta_info.output_topk_* (mirrors routed_experts).
+            # Request the resolved wire width (support mode adds the completeness sentinel slot).
+            payload["sampler_top_logprobs"] = self.sampler_capture.width
 
         # Multimodal payload.
         mm_data = request_input.multi_modal_data or {}
@@ -425,12 +429,20 @@ class AgentLoopBase(ABC):
         if self.rollout_config.enable_rollout_routing_replay:
             routed_experts = self._decode_routed_experts_payload(meta_info.get("routed_experts"))
 
+        sampler_distribution = None
+        if capture_mode != "disabled":
+            sampler_distribution = self._decode_sampler_head_payload(
+                meta_info, len(token_ids), self.sampler_capture.width
+            )
+
         return TokenOutput(
             prompt_ids=prompt_ids,
             response_ids=token_ids,
             response_mask=[1] * len(token_ids),
             response_log_probs=log_probs,
             routed_experts=routed_experts,
+            sampler_distribution=sampler_distribution,
+            sampler_capture=self.sampler_capture,
             multi_modal_data=request_input.multi_modal_data,
             mm_processor_kwargs=request_input.mm_processor_kwargs,
             stop_reason=finish_reason,
@@ -602,6 +614,35 @@ class AgentLoopBase(ABC):
         raw_bytes = base64.b64decode(routed_experts_b64)
         return np.load(io.BytesIO(raw_bytes)).copy()
 
+    @staticmethod
+    def _decode_sampler_head_payload(meta_info: dict, rows: int, expected_width: int) -> "SamplerDistribution":
+        """Decode SMG's /generate sampler head into a compact distribution (top-k or support)."""
+
+        ids_b64 = meta_info.get("output_topk_token_ids")
+        logps_b64 = meta_info.get("output_topk_log_probs")
+        shape = meta_info.get("output_topk_shape")
+        if ids_b64 is None or logps_b64 is None or shape is None:
+            raise RuntimeError(
+                "SMG /generate was asked for sampler_top_logprobs but returned no meta_info.output_topk_* metadata."
+            )
+        shape = [int(value) for value in shape]
+        if len(shape) != 2 or shape[0] != rows:
+            raise RuntimeError(f"sampler head shape {shape} does not match {rows} generated tokens.")
+        width = shape[1]
+        if width != expected_width:
+            # See capture_width: the wire width must equal the resolved capture width. A mismatch
+            # means the engine truncated logprobs (raise max_logprobs) and the support would be silent.
+            raise RuntimeError(
+                f"sampler head width {width} does not match the requested capture width {expected_width}; "
+                "the engine likely truncated logprobs (check max_logprobs >= sampler_max_tokens, "
+                "plus one for support mode)."
+            )
+        # .frombuffer() yields a read-only view over the decoded bytes. from_topk_rows only
+        # boolean-indexes it (which already copies), so no defensive .copy() is needed.
+        ids = np.frombuffer(base64.b64decode(ids_b64), dtype="<i4").reshape(rows, width)
+        log_probs = np.frombuffer(base64.b64decode(logps_b64), dtype="<f4").reshape(rows, width)
+        return SamplerDistribution.from_topk_rows(ids, log_probs)
+
     async def _post_generate(
         self,
         url: str,
@@ -728,9 +769,8 @@ class AgentLoopBase(ABC):
                 else:
                     psrl_logger.exception(f"Unsupported value: type={type(v)!r}, key={k!r}.")
 
-            # The budget excludes sandbox admission and preparation for loops that provision
-            # a sandbox, because that time is scheduling latency rather than episode work.
-            # The setup allowance is what keeps the excluded region bounded.
+            # The budget excludes sandbox admission and preparation for loops that provision a
+            # sandbox, since that time is scheduling latency rather than episode work.
             self.episode_budget = EpisodeBudget(
                 self.timeouts.episode_timeout_s,
                 starts_after_provisioning=self.episode_starts_after_provisioning,
@@ -842,7 +882,7 @@ class AgentLoopBase(ABC):
 
         Called by loops that declare `episode_starts_after_provisioning`. Until this
         runs, time spent on capacity admission and preparation is not charged to the
-        episode; the admission deadline bounds that region on its own.
+        episode. The admission deadline bounds that region on its own.
         """
         self.episode_budget.arm()
 

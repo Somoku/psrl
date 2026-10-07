@@ -13,7 +13,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.ray_utils import get_event_loop
 
 from psrl.environments.base import ConversationType, Environment
-from psrl.utils.sampler_distribution import SamplerDistribution
+from psrl.utils.sampler_distribution import SamplerCapture, SamplerDistribution
 from psrl.workers.gen.utils import RolloutInstanceId, TokenOutput, rollout_token_budget
 
 psrl_logger = logging.getLogger(__name__)
@@ -228,6 +228,8 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         self.gamma = self.config.gen_actor_rollout_ref.rollout.agent.gamma
         # Coefficient for reward shaping (default: 0.0)
         self.reward_bonus_coeff = self.config.gen_actor_rollout_ref.rollout.agent.reward_bonus_coeff
+        # Resolved sampler capture config, shared with the trainer padding and TITO validation.
+        self.sampler_capture = SamplerCapture.from_rollout_config(self.config.gen_actor_rollout_ref.rollout)
 
     @classmethod
     def init_class(cls, config: DictConfig, **kwargs):
@@ -650,6 +652,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                     if trajectory.sampler_distribution is not None
                     else None
                 ),
+                sampler_capture=self.sampler_capture,
                 multi_modal_data=multi_modal_data,
                 # TODO(linsh): Check whether to use the global turn count.
                 num_turns=self.session_data.assistant_turns + self.session_data.user_turns + 1,

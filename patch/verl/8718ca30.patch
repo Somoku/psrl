@@ -1,3 +1,216 @@
+From d51da7584f8f4cff42e926bda6b7ba0792914936 Mon Sep 17 00:00:00 2001
+From: PSRL <psrl@local>
+Date: Wed, 7 Oct 2026 15:58:10 +0800
+Subject: [PATCH] PSRL veRL patch
+
+---
+ .../ppo/test_score_centering_on_cpu.py        | 111 +++-
+ verl/models/transformers/qwen3_5.py           |  10 +
+ verl/protocol.py                              |  38 +-
+ verl/single_controller/ray/base.py            |   6 +-
+ verl/trainer/config/data/legacy_data.yaml     |   2 +-
+ verl/trainer/config/engine/fsdp.yaml          |   2 +
+ verl/trainer/config/engine/megatron.yaml      |   4 +
+ verl/trainer/config/model/hf_model.yaml       |   2 +-
+ verl/trainer/ppo/core_algos.py                |  15 +-
+ verl/trainer/ppo/metric_utils.py              |  38 +-
+ verl/trainer/ppo/padding_utils.py             |  54 +-
+ verl/trainer/ppo/rollout_corr_helper.py       |  40 +-
+ verl/trainer/ppo/score_centering.py           | 545 +++++++++++++++---
+ .../checkpoint/megatron_checkpoint_manager.py | 118 ++--
+ verl/utils/config.py                          |  52 +-
+ verl/utils/dataset/rl_dataset.py              |  35 +-
+ verl/utils/experimental/torch_functional.py   |  13 +-
+ verl/utils/megatron/dist_checkpointing.py     |  46 ++
+ verl/utils/tokenizer/tokenizer.py             |   6 +-
+ verl/workers/config/actor.py                  |   1 +
+ verl/workers/config/engine.py                 |   7 +
+ verl/workers/config/rollout.py                |  18 +-
+ verl/workers/engine/fsdp/transformer_impl.py  | 161 ++++--
+ .../engine/megatron/transformer_impl.py       | 256 +++++---
+ verl/workers/engine_workers.py                |   6 +-
+ verl/workers/utils/losses.py                  |  24 +-
+ 26 files changed, 1255 insertions(+), 355 deletions(-)
+
+diff --git a/tests/trainer/ppo/test_score_centering_on_cpu.py b/tests/trainer/ppo/test_score_centering_on_cpu.py
+index b7cf0526..c23bfecb 100644
+--- a/tests/trainer/ppo/test_score_centering_on_cpu.py
++++ b/tests/trainer/ppo/test_score_centering_on_cpu.py
+@@ -27,12 +27,15 @@ from verl.trainer.config.algorithm import RolloutCorrectionConfig
+ from verl.trainer.ppo.core_algos import compute_policy_loss_bypass_mode, compute_policy_loss_reinforce
+ from verl.trainer.ppo.padding_utils import construct_minimal_padding_template
+ from verl.trainer.ppo.score_centering import (
++    HEAD_PADDING_ID,
++    _reconstruct_compact_field,
++    _rows_per_chunk,
+     dummy_rollout_topk,
++    importance_sampling,
+     pad_rollout_topk,
+     score_centering_correction,
+     score_centering_logits_processor,
+     score_centering_ppo_loss,
+-    score_centering_weight_fn,
+     topk_log_probs_from_logits,
+ )
+ from verl.utils import tensordict_utils as tu
+@@ -179,7 +182,9 @@ def test_correction_is_zero_on_policy():
+     log_p = torch.log_softmax(logits, dim=-1)
+     ids = torch.topk(log_p, k=4, dim=-1).indices
+     head = log_p.gather(-1, ids)
+-    correction, q_mass, p_mass = score_centering_correction(head, head, score_centering_weight_fn(None, 2.0))
++    correction, q_mass, p_mass, _ = score_centering_correction(
++        head, head, torch.ones_like(head, dtype=torch.bool), importance_sampling(None, 2.0)
++    )
+     torch.testing.assert_close(correction, torch.zeros(3), atol=1e-6, rtol=0)
+     torch.testing.assert_close(q_mass, p_mass)
+ 
+@@ -193,7 +198,9 @@ def test_topk_correction_gradient_equals_full_vocab_when_k_is_vocab():
+     sampler_log_probs = torch.log_softmax(torch.randn(4, vocab), dim=-1)
+     ids = torch.arange(vocab).expand(4, vocab)
+     head = topk_log_probs_from_logits(trainer_logits, ids)
+-    correction, _, _ = score_centering_correction(head, sampler_log_probs, score_centering_weight_fn(None, 2.0))
++    correction, _, _, _ = score_centering_correction(
++        head, sampler_log_probs, torch.ones_like(head, dtype=torch.bool), importance_sampling(None, 2.0)
++    )
+     ref = _full_vocab_centering(trainer_logits, sampler_log_probs)
+     grad_a = torch.autograd.grad(correction.sum(), trainer_logits)[0]
+     grad_b = torch.autograd.grad(ref.sum(), trainer_logits)[0]
+@@ -209,8 +216,11 @@ def test_topk_correction_gradient_matches_tail_model():
+     sampler_log_probs = torch.log_softmax(torch.randn(2, vocab), dim=-1)
+     ids = torch.topk(sampler_log_probs, k=k, dim=-1).indices
+     head = topk_log_probs_from_logits(trainer_logits, ids)
+-    correction, q_mass, p_mass = score_centering_correction(
+-        head, sampler_log_probs.gather(-1, ids), score_centering_weight_fn(None, 2.0)
++    correction, q_mass, p_mass, _ = score_centering_correction(
++        head,
++        sampler_log_probs.gather(-1, ids),
++        torch.ones_like(head, dtype=torch.bool),
++        importance_sampling(None, 2.0),
+     )
+     log_p = torch.log_softmax(trainer_logits, dim=-1)
+     p = log_p.exp().detach()
+@@ -233,7 +243,9 @@ def test_drift_cancels_under_constant_reward():
+     sampler_log_probs = torch.log_softmax(torch.randn(1, vocab), dim=-1)
+     ids = torch.arange(vocab).expand(1, vocab)
+     head = topk_log_probs_from_logits(trainer_logits, ids)
+-    correction, _, _ = score_centering_correction(head, sampler_log_probs, score_centering_weight_fn(None, 2.0))
++    correction, _, _, _ = score_centering_correction(
++        head, sampler_log_probs, torch.ones_like(head, dtype=torch.bool), importance_sampling(None, 2.0)
++    )
+     log_p = torch.log_softmax(trainer_logits, dim=-1)
+     q = sampler_log_probs.exp()
+     expected_vanilla = torch.autograd.grad((q * log_p).sum(), trainer_logits, retain_graph=True)[0]
+@@ -242,32 +254,60 @@ def test_drift_cancels_under_constant_reward():
+     torch.testing.assert_close(expected_centered, torch.zeros_like(expected_centered), atol=1e-6, rtol=0)
+ 
+ 
+-def test_weight_fn_matches_tis_and_icepop_rules():
+-    ratio = torch.tensor([0.1, 0.7, 1.0, 3.0, 9.0])
+-    torch.testing.assert_close(score_centering_weight_fn(None, 2.0)(ratio), torch.ones(5))
+-    torch.testing.assert_close(score_centering_weight_fn("token", 2.0)(ratio), ratio.clamp(max=2.0))
++def test_importance_sampling_head_and_tail_rules():
++    p = torch.tensor([0.10, 0.40, 0.20, 0.05])
++    q = torch.tensor([0.20, 0.20, 0.20, 0.05])
++    log_ratio = (p / q).log()
++    # none: q * f(p/q) with f == 1
++    torch.testing.assert_close(importance_sampling(None, 2.0).head_mass(p, q, log_ratio), q)
++    # tis: q * min(p/q, c) == min(p, c*q)
+     torch.testing.assert_close(
+-        score_centering_weight_fn("token", "0.5_5.0")(ratio), torch.tensor([0.0, 0.7, 1.0, 3.0, 0.0])
++        importance_sampling("token", 2.0).head_mass(p, q, log_ratio), torch.minimum(p, 2.0 * q)
++    )
++    # mis: q * (p/q) * 1[inside] == p inside the band, else 0
++    band = importance_sampling("token", "0.5_2.0")
++    inside = (log_ratio >= torch.tensor(0.5).log()) & (log_ratio <= torch.tensor(2.0).log())
++    torch.testing.assert_close(band.head_mass(p, q, log_ratio), torch.where(inside, p, torch.zeros_like(p)))
++    # tail_scale = rho * f(1 / rho)
++    rho = torch.tensor([0.25, 1.0, 4.0])
++    torch.testing.assert_close(importance_sampling(None, 2.0).tail_scale(rho, torch.float32), rho)
++    torch.testing.assert_close(
++        importance_sampling("token", 2.0).tail_scale(rho, torch.float32), (2.0 * rho).clamp_max(1)
++    )
++
++
++def test_support_mode_drops_the_tail_model():
++    torch.manual_seed(7)
++    p = torch.log_softmax(torch.randn(3, 5), dim=-1)
++    q = torch.log_softmax(torch.randn(3, 5), dim=-1)
++    mask = torch.ones_like(p, dtype=torch.bool)
++    correction, _, _, tail_ratio = score_centering_correction(
++        p, q, mask, importance_sampling(None, 2.0), support=True
+     )
++    # No tail: tail_ratio is neutral and the residual is exactly q, so the correction is sum(q * log p).
++    torch.testing.assert_close(tail_ratio, torch.ones(3))
++    torch.testing.assert_close(correction, (q.exp() * p).sum(-1))
+ 
+ 
+ def test_composed_correction_uses_alpha_rho_f_one_over_rho():
+     torch.manual_seed(5)
+     head_p = torch.log_softmax(torch.randn(2, 6), dim=-1)[:, :3]
+     head_q = torch.log_softmax(torch.randn(2, 6), dim=-1)[:, :3]
+-    tis = score_centering_weight_fn("token", 2.0)
+-    correction, q_mass, p_mass = score_centering_correction(head_p, head_q, tis)
+-    rho = (1 - q_mass) / (1 - p_mass)
+-    alpha = rho * tis(1 / rho)
+-    residual = head_q.exp() * tis((head_p - head_q).exp()) - alpha.unsqueeze(-1) * head_p.exp()
++    mask = torch.ones_like(head_p, dtype=torch.bool)
++    tis = importance_sampling("token", 2.0)
++    correction, q_mass, p_mass, _ = score_centering_correction(head_p, head_q, mask, tis)
++    rho = (1 - q_mass).clamp_min(1e-6) / (1 - p_mass).clamp_min(1e-6)
++    alpha = tis.tail_scale(rho, head_p.dtype)
++    head_mass = tis.head_mass(head_p.exp(), head_q.exp(), head_p - head_q)
++    residual = head_mass - alpha.unsqueeze(-1) * head_p.exp()
+     torch.testing.assert_close(correction, (residual * head_p).sum(-1))
+ 
+ 
+-def test_dummy_rows_are_finite_distributions():
++def test_dummy_rows_are_padding_sentinels():
+     ids, log_probs = dummy_rollout_topk(3, 4)
+     assert ids.dtype == torch.int32 and log_probs.dtype == torch.float32
+-    assert ids.tolist() == [[0, 1, 2, 3]] * 3
+-    torch.testing.assert_close(log_probs.exp().sum(-1), torch.ones(3))
++    assert ids.tolist() == [[-1, -1, -1, -1]] * 3
++    assert torch.isneginf(log_probs).all()
+ 
+ 
+ def test_pad_rollout_topk_places_heads_after_last_prompt_token():
+@@ -625,3 +665,36 @@ def test_score_centering_loss_rejects_missing_correction():
+     config = _actor_config(RolloutCorrectionConfig.bypass_pg_token_tis_sc())
+     with pytest.raises(RuntimeError, match="logits processor did not run"):
+         score_centering_ppo_loss(config, model_output={"log_probs": torch.zeros(1, 2)}, data=None)
++
++
++def test_rows_per_chunk_derives_row_count_from_the_element_budget():
++    # A fixed row count would scale the fp32 workspace by V; the budget is in elements instead.
++    assert _rows_per_chunk(64 * 1024 * 1024, 150000, 8192) == 64 * 1024 * 1024 // 150000
++    assert _rows_per_chunk(64 * 1024 * 1024, 37_500, 8192) == 64 * 1024 * 1024 // 37_500
++    assert _rows_per_chunk(0, 150000, 8192) == 8192  # <= 0 disables chunking
++    assert _rows_per_chunk(1024, 4096, 100) == 1  # never zero rows
++
++
++def test_reconstruct_compact_field_roundtrips_ragged_rows():
++    # Rows: [3 values, 0 values, 2 values]; the flat buffer is their concatenation.
++    lengths = torch.tensor([3, 0, 2], dtype=torch.long)
++    flat_ids = torch.tensor([10, 11, 12, 20, 21], dtype=torch.int32)
++    ids = _reconstruct_compact_field(lengths, flat_ids, width=3, fill=HEAD_PADDING_ID, dtype=torch.int32)
++    assert ids.shape == (1, 3, 3)
++    assert ids[0, 0].tolist() == [10, 11, 12]
++    assert ids[0, 1].tolist() == [HEAD_PADDING_ID] * 3
++    assert ids[0, 2].tolist() == [20, 21, HEAD_PADDING_ID]
++
++    flat_lp = torch.tensor([-0.1, -0.2, -0.3, -0.4, -0.5], dtype=torch.float32)
++    log_probs = _reconstruct_compact_field(lengths, flat_lp, width=3, fill=float("-inf"), dtype=torch.float32)
++    assert log_probs[0, 0].tolist() == [-0.1, -0.2, -0.3]
++    assert torch.isneginf(log_probs[0, 1]).all()
++    assert log_probs[0, 2].tolist() == [-0.4, -0.5, float("-inf")]
++
++
++def test_reconstruct_compact_field_fails_closed_on_length_mismatch():
++    lengths = torch.tensor([3, 0, 2], dtype=torch.long)
++    with pytest.raises(ValueError, match="inconsistent"):
++        _reconstruct_compact_field(
++            lengths, torch.tensor([1, 2, 3], dtype=torch.int32), 3, fill=HEAD_PADDING_ID, dtype=torch.int32
++        )
 diff --git a/verl/models/transformers/qwen3_5.py b/verl/models/transformers/qwen3_5.py
 index 0e2bb902..acf41723 100644
 --- a/verl/models/transformers/qwen3_5.py
@@ -78,7 +291,7 @@ index e18f5849..c055b42c 100644
              # Flatten list of dicts to dict of lists for consistent metrics structure
              if all_metrics:
 diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
-index cfbc74d4..9a234cee 100644
+index b2f1859b..9e564c0d 100644
 --- a/verl/single_controller/ray/base.py
 +++ b/verl/single_controller/ray/base.py
 @@ -119,6 +119,7 @@ class RayResourcePool(ResourcePool):
@@ -87,9 +300,9 @@ index cfbc74d4..9a234cee 100644
          accelerator_type: Optional[str] = None,
 +        resource_num_per_bundle: Optional[float] = 1.0,
      ) -> None:
-         super().__init__(process_on_nodes, max_colocate_count)
-         self.use_gpu = use_gpu
-@@ -127,6 +128,7 @@ class RayResourcePool(ResourcePool):
+         # TPU claims a chip exclusively per process, so colocating more than one
+         # WorkerGroup builds a placement group that can never be satisfied.
+@@ -131,6 +132,7 @@ class RayResourcePool(ResourcePool):
          self.pgs = None
          self.detached = detached
          self.accelerator_type = accelerator_type
@@ -97,7 +310,7 @@ index cfbc74d4..9a234cee 100644
  
      def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
          if self.pgs is not None:
-@@ -145,7 +147,7 @@ class RayResourcePool(ResourcePool):
+@@ -149,7 +151,7 @@ class RayResourcePool(ResourcePool):
  
          bundle = {"CPU": self.max_colocate_count}
          if self.use_gpu:
@@ -106,7 +319,7 @@ index cfbc74d4..9a234cee 100644
              if self.accelerator_type is not None:
                  bundle[self.accelerator_type] = 1e-4
          pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
-@@ -626,7 +628,7 @@ class RayWorkerGroup(WorkerGroup):
+@@ -634,7 +636,7 @@ class RayWorkerGroup(WorkerGroup):
          if self.use_gpu and not use_gpu:
              raise ValueError("use_gpu is True but resource_pool.use_gpu is False")
          local_world_size = resource_pool.store[0]
@@ -142,7 +355,7 @@ index a14ec2af..43d6735f 100644
  full_determinism: false
  
 diff --git a/verl/trainer/config/engine/megatron.yaml b/verl/trainer/config/engine/megatron.yaml
-index 01c5dc51..7366e827 100644
+index 0ed6528e..c89a2cf9 100644
 --- a/verl/trainer/config/engine/megatron.yaml
 +++ b/verl/trainer/config/engine/megatron.yaml
 @@ -63,6 +63,10 @@ entropy_from_logits_chunk_size: 2048
@@ -170,7 +383,7 @@ index 6e8a2535..28dcf868 100644
  # whether to trust remote code.
  trust_remote_code: False
 diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
-index 9d08b846..6357af94 100644
+index afa86c25..2da754ac 100644
 --- a/verl/trainer/ppo/core_algos.py
 +++ b/verl/trainer/ppo/core_algos.py
 @@ -1145,6 +1145,7 @@ def agg_loss(
@@ -280,7 +493,7 @@ index 3de61d36..d8693de8 100644
                  has_pred = (
                      pred_vals is not None
 diff --git a/verl/trainer/ppo/padding_utils.py b/verl/trainer/ppo/padding_utils.py
-index 284b7f54..29c56cc3 100644
+index 6e44c915..439fce82 100644
 --- a/verl/trainer/ppo/padding_utils.py
 +++ b/verl/trainer/ppo/padding_utils.py
 @@ -23,7 +23,6 @@ from __future__ import annotations
@@ -291,7 +504,7 @@ index 284b7f54..29c56cc3 100644
  from typing import Any
  
  import torch
-@@ -73,13 +72,18 @@ def construct_minimal_padding_template(
+@@ -74,13 +73,18 @@ def construct_minimal_padding_template(
      source_td: dict,
      source_tag: dict,
      eos_token_id: int,
@@ -310,7 +523,7 @@ index 284b7f54..29c56cc3 100644
  
      Returns:
          A tuple of (template_sample, template_tag) ready for padding.
-@@ -88,8 +92,18 @@ def construct_minimal_padding_template(
+@@ -89,8 +93,18 @@ def construct_minimal_padding_template(
      template_sample = {}
      for key in source_td.keys():
          value = source_td[key]
@@ -329,7 +542,7 @@ index 284b7f54..29c56cc3 100644
      # Deep copy the template tag from an existing sample.
      template_tag = copy.deepcopy(source_tag)
  
-@@ -102,6 +116,12 @@ def construct_minimal_padding_template(
+@@ -103,6 +117,12 @@ def construct_minimal_padding_template(
      position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
      routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
  
@@ -342,15 +555,24 @@ index 284b7f54..29c56cc3 100644
      sequence_length = input_ids.size(0)
      teacher_ids = template_sample.get("teacher_ids")
      if teacher_ids is not None:
-@@ -113,6 +133,7 @@ def construct_minimal_padding_template(
+@@ -118,8 +138,16 @@ def construct_minimal_padding_template(
+         template_sample["rollout_topk_ids"] = ids
+         template_sample["rollout_topk_log_probs"] = log_probs
  
++    # Compact support transport: padding rows contribute no support (zero-length rows, no ids/values).
++    rollout_topk_lengths = template_sample.get("rollout_topk_lengths")
++    if rollout_topk_lengths is not None:
++        template_sample["rollout_topk_lengths"] = rollout_topk_lengths.new_zeros(sequence_length)
++        template_sample["rollout_support_ids"] = rollout_topk_lengths.new_empty(0)
++        template_sample["rollout_support_log_probs"] = torch.empty(0, dtype=torch.float32)
++
      # Update the fields and remove redundant parts
      template_sample.update(
 +        uid=pad_uid,
          prompts=prompts,
          responses=responses,
          input_ids=input_ids,
-@@ -124,6 +145,9 @@ def construct_minimal_padding_template(
+@@ -131,6 +159,9 @@ def construct_minimal_padding_template(
          rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
          rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
      )
@@ -360,7 +582,7 @@ index 284b7f54..29c56cc3 100644
      if "multi_modal_inputs" in template_sample:
          template_sample["multi_modal_inputs"] = {}
      if routed_experts is not None:
-@@ -137,6 +161,7 @@ def construct_minimal_padding_template(
+@@ -144,6 +175,7 @@ def construct_minimal_padding_template(
          prompt_len=SYNTHETIC_PADDING_SEQ_LEN - 1,
          response_len=1,
          seq_len=SYNTHETIC_PADDING_SEQ_LEN,
@@ -368,7 +590,7 @@ index 284b7f54..29c56cc3 100644
      )
      return template_sample, template_tag
  
-@@ -171,26 +196,18 @@ def upsample_batch_to_divisible_size(
+@@ -178,26 +210,18 @@ def upsample_batch_to_divisible_size(
      source_key = batch.keys[source_idx]
      source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
  
@@ -452,11 +674,710 @@ index eed6de70..522c8077 100644
  
      return metrics
  
+diff --git a/verl/trainer/ppo/score_centering.py b/verl/trainer/ppo/score_centering.py
+index f27bbd3f..8900c72f 100644
+--- a/verl/trainer/ppo/score_centering.py
++++ b/verl/trainer/ppo/score_centering.py
+@@ -19,9 +19,11 @@ sampler's tail mass, so the centering term only needs the k head log-probs of th
+ 
+ import math
+ from collections.abc import Callable
+-from typing import Optional
++from dataclasses import dataclass
++from typing import Literal, Optional
+ 
+ import torch
++import torch.distributed as dist
+ from tensordict import TensorDict
+ 
+ from verl.trainer.ppo.rollout_corr_helper import _parse_rollout_is_threshold
+@@ -29,36 +31,69 @@ from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, slice_i
+ from verl.workers.config import ActorConfig
+ from verl.workers.utils.losses import ppo_loss
+ 
+-TOPK_LOG_PROB_CHUNK_SIZE = 4096
++TOPK_LOG_PROB_CHUNK_ELEMS = 64 * 1024 * 1024
++"""fp32 workspace budget per chunk, in elements (64M elements is 256 MiB).
++
++The head-log-prob primitives keep an fp32 ``(rows, vocab)`` workspace; a fixed row count would scale
++that by the vocabulary (a 150k vocab makes 4096 rows ~2.5 GiB), so the budget is expressed in
++elements and the row count is derived from the local vocabulary size.
++"""
++
++
++def _rows_per_chunk(chunk_elems: int, vocab_local: int, rows: int) -> int:
++    """Rows per chunk that keep the fp32 workspace near ``chunk_elems`` for this vocabulary shard."""
++    if chunk_elems <= 0:
++        return max(rows, 1)
++    return max(chunk_elems // max(vocab_local, 1), 1)
++
++
++HEAD_PADDING_ID = -1
++"""Sentinel token id for head slots the loss masks out (prompt, padding, environment tokens)."""
+ 
+ 
+ def dummy_rollout_topk(
+     num_rows: int, k: int, device: Optional[torch.device] = None
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Build a uniform top-k head for rows the loss masks out (e.g. prompt or padding positions).
++    """Build a padding head for rows the loss masks out (prompt, padding, environment tokens).
+ 
+-    Args:
+-        num_rows: Number of rows to fill.
+-        k: Head size.
+-        device: Device for the returned tensors, default None (CPU).
++    Padding slots carry the ``HEAD_PADDING_ID`` sentinel and ``-inf`` log-probability, so the head
++    mask built from the ids excludes them and they never contribute to the centering term. This is
++    cheaper and numerically cleaner than filling a uniform dummy distribution, whose mass otherwise
++    leaks into the tail-mass ratio.
+ 
+     Returns:
+-        Tuple containing:
+-            ids: Token ids 0..k-1 repeated per row, shape (num_rows, k), dtype int32.
+-            log_probs: Uniform log-probs -log(k), shape (num_rows, k), dtype float32.
++        ids: ``-1`` per slot, shape (num_rows, k), dtype int32.
++        log_probs: ``-inf`` per slot, shape (num_rows, k), dtype float32.
+     """
+-    ids = torch.arange(k, dtype=torch.int32, device=device).expand(num_rows, k).clone()
+-    log_probs = torch.full((num_rows, k), -math.log(k), dtype=torch.float32, device=device)
++    ids = torch.full((num_rows, k), HEAD_PADDING_ID, dtype=torch.int32, device=device)
++    log_probs = torch.full((num_rows, k), -math.inf, dtype=torch.float32, device=device)
+     return ids, log_probs
+ 
+ 
++def pad_rollout_topk_log_probs(
++    response_topk_log_probs: torch.Tensor | list, prompt_length: int
++) -> torch.Tensor:
++    """Lay response-token top-k log-probs over the unpadded prompt+response sequence.
++
++    Response token r is predicted by the logits row ``prompt_length - 1 + r``; the other rows (prompt
++    and the final position) carry ``-inf``. This is the log-prob half of ``pad_rollout_topk``, split
++    out so a caller that only needs the log-probs (the compact support transport) does not have to
++    build a throwaway id tensor.
++    """
++    log_probs = torch.as_tensor(response_topk_log_probs, dtype=torch.float32)
++    response_length, k = log_probs.shape
++    full = torch.full((prompt_length + response_length, k), -math.inf, dtype=torch.float32)
++    full[prompt_length - 1 : prompt_length - 1 + response_length] = log_probs
++    return full
++
++
+ def pad_rollout_topk(
+     response_topk_ids: torch.Tensor | list, response_topk_log_probs: torch.Tensor | list, prompt_length: int
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Lay the sampler's response-token heads over the unpadded prompt+response sequence.
+ 
+     Response token r is predicted by the logits row ``prompt_length - 1 + r``, so its sampler head
+-    goes there; the other rows get the uniform dummy head.
++    goes there; the other rows get the sentinel dummy head.
+ 
+     Args:
+         response_topk_ids: Sampler top-k token ids per response token, shape (R, k), array-like of ints.
+@@ -71,13 +106,11 @@ def pad_rollout_topk(
+             log_probs: Full-sequence top-k log-probs matching ``ids``, same shape, dtype float32.
+     """
+     ids = torch.as_tensor(response_topk_ids, dtype=torch.int32)
+-    log_probs = torch.as_tensor(response_topk_log_probs, dtype=torch.float32)
+     response_length, k = ids.shape
+-    full_ids, full_log_probs = dummy_rollout_topk(prompt_length + response_length, k)
++    full_ids, _ = dummy_rollout_topk(prompt_length + response_length, k)
+     start = prompt_length - 1
+     full_ids[start : start + response_length] = ids
+-    full_log_probs[start : start + response_length] = log_probs
+-    return full_ids, full_log_probs
++    return full_ids, pad_rollout_topk_log_probs(response_topk_log_probs, prompt_length)
+ 
+ 
+ class _TopKLogProbsFromLogits(torch.autograd.Function):
+@@ -127,31 +160,236 @@ class _TopKLogProbsFromLogits(torch.autograd.Function):
+         return grad_input, None, None
+ 
+ 
++class _VocabParallelTopKLogProbs(torch.autograd.Function):
++    """Full-vocab-normalized log-probs at arbitrary ids under a sharded (tensor-parallel) vocabulary.
++
++    ``logits`` is this rank's contiguous vocabulary shard ``[vocab_start, vocab_start + V_local)``; the
++    ``token_ids`` are global. The softmax normalizer is reduced across ranks and only the selected
++    logits are exchanged, so no rank materializes the full vocabulary. The fp32 workspace stays
++    ``O(chunk_size * V_local)`` in forward and backward (the softmax is recomputed in backward).
++    Outputs are replicated across ranks; the returned gradient is this rank's shard only, because the
++    replicated loss must not be all-reduced a second time (that would scale it by the world size).
++    """
++
++    @staticmethod
++    def forward(ctx, logits, token_ids, process_group, vocab_size, chunk_size):
++        n, local_vocab = logits.shape
++        rank = dist.get_rank(process_group)
++        vocab_start = rank * local_vocab
++        valid = max(0, min(local_vocab, vocab_size - vocab_start))
++        chunk_size = chunk_size if chunk_size > 0 else max(n, 1)
++        output = torch.empty(token_ids.shape, device=logits.device, dtype=torch.float32)
++        maxima = torch.empty((n, 1), device=logits.device, dtype=torch.float32)
++        denominators = torch.empty_like(maxima)
++        for start in range(0, n, chunk_size):
++            end = min(start + chunk_size, n)
++            work = logits[start:end].to(dtype=torch.float32, copy=True)
++            if valid < local_vocab:
++                work[:, valid:] = -torch.inf
++            maximum = work.max(dim=-1, keepdim=True).values
++            dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=process_group)
++            ids = token_ids[start:end]
++            owned = (ids >= vocab_start) & (ids < vocab_start + valid)
++            local_ids = (ids - vocab_start).clamp_(0, local_vocab - 1)
++            targets = work.gather(-1, local_ids).masked_fill_(~owned, 0.0)
++            dist.all_reduce(targets, op=dist.ReduceOp.SUM, group=process_group)
++            work.sub_(maximum).exp_()
++            denominator = work.sum(dim=-1, keepdim=True)
++            dist.all_reduce(denominator, group=process_group)
++            output[start:end] = (targets - maximum) - denominator.log()
++            maxima[start:end] = maximum
++            denominators[start:end] = denominator
++            del work
++        ctx.save_for_backward(logits, token_ids, maxima, denominators)
++        ctx.chunk_size = chunk_size
++        ctx.vocab_start = vocab_start
++        ctx.valid = valid
++        ctx.process_group = process_group
++        return output
++
++    @staticmethod
++    @torch.autograd.function.once_differentiable
++    def backward(ctx, grad_output):
++        logits, token_ids, maxima, denominators = ctx.saved_tensors
++        n, local_vocab = logits.shape
++        grad_input = torch.empty_like(logits)
++        for start in range(0, n, ctx.chunk_size):
++            end = min(start + ctx.chunk_size, n)
++            work = logits[start:end].to(dtype=torch.float32, copy=True)
++            if ctx.valid < local_vocab:
++                work[:, ctx.valid:] = -torch.inf
++            work.sub_(maxima[start:end]).exp_().div_(denominators[start:end])
++            grad = grad_output[start:end].float()
++            work.mul_(-grad.sum(dim=-1, keepdim=True))
++            ids = token_ids[start:end]
++            owned = (ids >= ctx.vocab_start) & (ids < ctx.vocab_start + ctx.valid)
++            local_ids = (ids - ctx.vocab_start).clamp_(0, local_vocab - 1)
++            work.scatter_add_(-1, local_ids, grad.masked_fill(~owned, 0.0))
++            grad_input[start:end] = work
++            del work
++        return grad_input, None, None, None, None
++
++
+ def topk_log_probs_from_logits(
+-    logits: torch.Tensor, token_ids: torch.Tensor, chunk_size: int = TOPK_LOG_PROB_CHUNK_SIZE
++    logits: torch.Tensor,
++    token_ids: torch.Tensor,
++    chunk_elems: int = TOPK_LOG_PROB_CHUNK_ELEMS,
++    process_group=None,
++    vocab_size: Optional[int] = None,
+ ) -> torch.Tensor:
+     """Compute full-vocab-normalized log-probs of ``logits`` at ``token_ids``, chunked for memory.
+ 
+     Equivalent to ``torch.log_softmax(logits, dim=-1).gather(-1, token_ids)`` but never
+     materializes the full (N, V) softmax at once: the normalizer is recomputed per chunk in
+-    forward and backward, bounding the extra fp32 workspace to (chunk_size, V).
++    forward and backward, bounding the extra fp32 workspace to ``chunk_elems`` elements.
+ 
+     Args:
+-        logits: Trainer logits, shape (N, V), any float dtype.
+-        token_ids: Token ids to gather, shape (N, k), any integer dtype.
+-        chunk_size: Number of rows processed per chunk. Default: 4096.
++        logits: Trainer logits, shape (N, V), any float dtype. With ``process_group`` set, ``V`` is
++            this rank's vocabulary shard and the normalizer is reduced across the group.
++        token_ids: Token ids to gather, shape (N, k), any integer dtype. Global ids under sharding.
++        chunk_elems: fp32 workspace budget per chunk, in elements; the row count is derived from the
++            local vocabulary size. ``<= 0`` disables chunking. Default: 64M elements (256 MiB).
++        process_group: Tensor-parallel vocabulary group, or None when the local logits are the full
++            vocabulary (the FSDP path gathers the DTensor shards before calling here).
++        vocab_size: Logical vocabulary size excluding padded entries. Defaults to the full sharded
++            size; pass the real size when the vocabulary is padded to divide across ranks.
+ 
+     Returns:
+         Log-probs of ``token_ids`` under the full-vocab softmax of ``logits``, shape (N, k),
+         dtype float32, with gradient to ``logits``.
+     """
+-    return _TopKLogProbsFromLogits.apply(logits, token_ids.long(), chunk_size)
++    rows_per_chunk = _rows_per_chunk(chunk_elems, logits.shape[-1], logits.shape[0])
++    if process_group is None:
++        return _TopKLogProbsFromLogits.apply(logits, token_ids.long(), rows_per_chunk)
++    total = dist.get_world_size(process_group) * logits.shape[-1]
++    vocab_size = total if vocab_size is None else vocab_size
++    return _VocabParallelTopKLogProbs.apply(logits, token_ids.long(), process_group, vocab_size, rows_per_chunk)
++
++
++class _SupportHeadLogProbs(torch.autograd.Function):
++    """Log-probs of head ids renormalized over each row's recorded support.
++
++    ``token_ids`` is (N, K) with ``HEAD_PADDING_ID`` in unused slots. Each row is normalized over its
++    own valid ids, so the trainer distribution lives on the same support the sampler drew from and no
++    vocabulary-sized normalizer is needed. Renormalizing over the support keeps ``sum_H p_v score_v``
++    at zero, so the tail term ``alpha * p`` contributes nothing and the correction reduces to the
++    exact expected score on the support. Under vocabulary sharding only the selected logits are
++    reduced across ranks, and the returned gradient stays on this rank's shard.
++    """
+ 
++    @staticmethod
++    def forward(ctx, logits, token_ids, process_group, vocab_size, chunk_size):
++        n, local_vocab = logits.shape
++        world = dist.get_world_size(process_group) if process_group is not None else 1
++        rank = dist.get_rank(process_group) if process_group is not None else 0
++        vocab_start = rank * local_vocab
++        if vocab_size is None:
++            vocab_size = world * local_vocab
++        valid = token_ids >= 0
++        if bool(((token_ids >= vocab_size) & valid).any()):
++            raise ValueError("score centering support id is outside the model vocabulary.")
++        local_ids = (token_ids - vocab_start).clamp_(0, local_vocab - 1)
++        owned = valid & (token_ids >= vocab_start) & (token_ids < vocab_start + local_vocab)
++        selected = torch.where(owned, logits.gather(-1, local_ids).float(), 0.0)
++        if process_group is not None:
++            dist.all_reduce(selected, group=process_group)
++        head = selected.masked_fill(~valid, -math.inf)
++        has_support = valid.any(-1, keepdim=True)
++        normalizer = torch.logsumexp(head, dim=-1, keepdim=True)
++        normalizer = torch.where(has_support, normalizer, torch.zeros_like(normalizer))
++        output = torch.where(valid, selected - normalizer, torch.zeros_like(selected))
++        ctx.logits_shape = logits.shape
++        ctx.logits_dtype = logits.dtype
++        ctx.chunk_size = chunk_size if chunk_size and chunk_size > 0 else max(logits.shape[0], 1)
++        ctx.save_for_backward(selected, local_ids, owned, valid, normalizer)
++        return output
+ 
+-def score_centering_weight_fn(
+-    rollout_is: Optional[str], rollout_is_threshold: str | float
+-) -> Callable[[torch.Tensor], torch.Tensor]:
+-    """Build the token-level IS rule as a function of a ratio, shared by the head and sampled token.
++    @staticmethod
++    @torch.autograd.function.once_differentiable
++    def backward(ctx, grad_output):
++        selected, local_ids, owned, valid, normalizer = ctx.saved_tensors
++        # The returned gradient must match the trainer logits, so allocate it in the logits dtype
++        # (not fp32) exactly like the top-k primitive; only the head slices need fp32 work, and those
++        # are chunked. Support ids are unique per row, so the scatter never accumulates.
++        grad_logits = torch.zeros(ctx.logits_shape, dtype=ctx.logits_dtype, device=selected.device)
++        rows = selected.shape[0]
++        for start in range(0, rows, ctx.chunk_size):
++            end = min(start + ctx.chunk_size, rows)
++            grad = grad_output[start:end].float().masked_fill(~valid[start:end], 0.0)
++            softmax = torch.where(valid[start:end], (selected[start:end] - normalizer[start:end]).exp(), 0.0)
++            coefficient = grad - softmax * grad.sum(dim=-1, keepdim=True)
++            grad_logits.scatter_add_(
++                -1, local_ids[start:end], torch.where(owned[start:end], coefficient, 0.0)
++            )
++        return grad_logits, None, None, None, None
++
++
++def support_head_log_probs(
++    logits: torch.Tensor,
++    token_ids: torch.Tensor,
++    process_group=None,
++    vocab_size: Optional[int] = None,
++    chunk_elems: int = TOPK_LOG_PROB_CHUNK_ELEMS,
++) -> torch.Tensor:
++    """Per-row log-probs renormalized over each row's recorded support (exact top-p<1 mode).
++
++    Args:
++        logits: Trainer logits, shape (N, V), any float dtype; (N, V/TP) with ``process_group``.
++        token_ids: Support ids, shape (N, K), with ``HEAD_PADDING_ID`` in unused slots.
++        process_group: Tensor-parallel vocabulary group, or None for a local full vocabulary.
++        vocab_size: Real vocabulary size excluding padded entries; defaults to the full sharded size.
++        chunk_elems: fp32 workspace budget per backward chunk, in elements; the row count is derived
++            from the local vocabulary size (the forward only touches (N, K) head slices).
++
++    Returns:
++        Support-normalized log-probs, shape (N, K), dtype float32, with gradient to ``logits``.
++    """
++    row_chunk = _rows_per_chunk(chunk_elems, logits.shape[-1], logits.shape[0])
++    return _SupportHeadLogProbs.apply(logits, token_ids, process_group, vocab_size, row_chunk)
++
++
++@dataclass(frozen=True)
++class ImportanceSampling:
++    """Importance-weight strategy for the head and the sampled token (arXiv Eq. 12, A.2/A.3).
++
++    ``head_mass`` evaluates ``q * f(p / q)`` on the head and ``tail_scale`` evaluates
++    ``alpha = rho * f(1 / rho)``. Everything works on probabilities or log-ratios so an unbounded
++    ratio is never exponentiated, and the TIS head term avoids the ``0 * inf`` that
++    ``q * min(p / q, c)`` would produce at ``q = 0``. The sampled token's own weight ``f(p / q)`` is
++    applied by ``compute_policy_loss_reinforce`` through ``rollout_is_weights``, so it lives there,
++    not here.
++
++    ``kind`` is one of ``none`` (no weight), ``tis`` (upper clip), or ``mis`` (band mask); every
++    method dispatches on it, and only ``mis`` uses the ``low``/``high`` band.
++    """
++
++    kind: Literal["none", "tis", "mis"] = "none"
++    clip: float = 2.0
++    low: float = 0.5
++    high: float = 5.0
++
++    def head_mass(self, p: torch.Tensor, q: torch.Tensor, log_ratio: torch.Tensor) -> torch.Tensor:
++        """``q * f(p / q)`` on the head candidates."""
++        if self.kind == "none":
++            return q
++        if self.kind == "tis":
++            return torch.minimum(p, self.clip * q)
++        return torch.where(self._inside(log_ratio), p, torch.zeros_like(p))
++
++    def tail_scale(self, rho: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
++        """``alpha = rho * f(1 / rho)``."""
++        if self.kind == "none":
++            return rho
++        if self.kind == "tis":
++            return (self.clip * rho).clamp_max(1)
++        return ((rho >= 1.0 / self.high) & (rho <= 1.0 / self.low)).to(dtype)
++
++    def _inside(self, log_ratio: torch.Tensor) -> torch.Tensor:
++        return (log_ratio >= math.log(self.low)) & (log_ratio <= math.log(self.high))
++
++
++def importance_sampling(rollout_is: Optional[str], rollout_is_threshold: str | float) -> ImportanceSampling:
++    """Resolve the IS strategy from the rollout-correction config.
+ 
+     Args:
+         rollout_is: None for no IS weight, "token" for TIS or IcePop depending on
+@@ -159,40 +397,49 @@ def score_centering_weight_fn(
+         rollout_is_threshold: Threshold specification, see ``_parse_rollout_is_threshold``: a
+             single float or float-like string upper-clamps (TIS); a "lower_upper" string zeros
+             ratios outside the band (IcePop).
+-
+-    Returns:
+-        A function mapping a ratio tensor to its weight tensor of the same shape.
+     """
+     if rollout_is is None:
+-        return torch.ones_like
++        return ImportanceSampling("none")
+     upper, lower = _parse_rollout_is_threshold(rollout_is_threshold)
+     if lower is None:
+-        return lambda ratio: ratio.clamp(max=upper)
+-    return lambda ratio: torch.where((ratio >= lower) & (ratio <= upper), ratio, torch.zeros_like(ratio))
++        return ImportanceSampling("tis", clip=float(upper))
++    return ImportanceSampling("mis", low=float(lower), high=float(upper))
++
++
++def _scored_log_probs(log_probs: torch.Tensor, coefficient: torch.Tensor) -> torch.Tensor:
++    """Head log-probs that enter the loss, zeroed where the coefficient is zero or the value is not finite.
++
++    Masking before the multiply keeps ``0 * -inf`` (a padding head slot) from turning the loss into
++    NaN.
++    """
++    scored = (coefficient != 0) & torch.isfinite(log_probs)
++    return torch.where(scored, log_probs, torch.zeros_like(log_probs))
+ 
+ 
+ def score_centering_correction(
+     train_head_log_probs: torch.Tensor,
+     sampler_head_log_probs: torch.Tensor,
+-    weight_fn: Callable[[torch.Tensor], torch.Tensor],
++    head_mask: torch.Tensor,
++    sampling: ImportanceSampling,
++    support: bool = False,
+     eps: float = 1e-6,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Compute the per-token centering term ``sum_H sg[q w - alpha p] log p`` and the head masses.
+ 
+-    The sampler's tail (outside the top-k head H) is modeled as the trainer's tail rescaled by
+-    ``alpha = rho * weight_fn(1 / rho)`` with ``rho = (1 - q_mass) / (1 - p_mass)``, so the
+-    correction only needs the k head log-probs of both distributions. When the head covers the
+-    whole vocabulary, ``rho`` is ill-conditioned and the correction's value is not meaningful;
+-    only its gradient is (it still matches the exact full-vocabulary centering term).
++    The sampler's tail (outside the head H, given by ``head_mask``) is modeled as the trainer's tail
++    rescaled by ``alpha = rho * f(1 / rho)`` with ``rho = (1 - q_mass) / (1 - p_mass)``, so the
++    correction only needs the head log-probs of both distributions. When ``support`` is set the head
++    is the sampler's complete support, so there is no tail: the ``alpha * p`` term is exactly zero and
++    is dropped rather than evaluated on float-noise tail masses, leaving the exact expected score.
+ 
+     Args:
+-        train_head_log_probs: Trainer's full-vocab-normalized log-probs at the head ids,
+-            shape (N, k), any float dtype, with gradient to the trainer logits.
+-        sampler_head_log_probs: Sampler's full-vocab-normalized log-probs at the same head ids,
+-            shape (N, k), any float dtype.
+-        weight_fn: IS weight rule applied to the ratio p/q on the head, as returned by
+-            ``score_centering_weight_fn``.
+-        eps: Numerical floor for the tail masses in ``rho``. Default: 1e-6.
++        train_head_log_probs: Trainer's log-probs at the head ids, shape (N, k), with gradient to
++            the trainer logits. Full-vocab-normalized for top-k mode, support-normalized otherwise.
++        sampler_head_log_probs: Sampler's log-probs at the same head ids, shape (N, k).
++        head_mask: Boolean mask, shape (N, k); False marks padding slots (``HEAD_PADDING_ID``).
++        sampling: IS strategy, as returned by ``importance_sampling``.
++        support: True for the exact top-p support model, whose complete head has no tail to model.
++        eps: Numerical floor for the tail masses in ``rho`` (top-k mode only). Default: 1e-6.
+ 
+     Returns:
+         Tuple containing:
+@@ -200,57 +447,191 @@ def score_centering_correction(
+                 dtype float32, with gradient to the trainer logits.
+             sampler_head_mass: Sampler's head probability mass, shape (N,), dtype float32.
+             train_head_mass: Trainer's head probability mass, shape (N,), dtype float32.
++            tail_ratio: Trainer-to-sampler tail-mass ratio ``rho`` (ones in support mode), shape (N,).
+     """
+     train_head_log_probs = train_head_log_probs.float()
++    sampler_head_log_probs = sampler_head_log_probs.float()
+     with torch.no_grad():
+-        p = train_head_log_probs.exp()
+-        q = sampler_head_log_probs.float().exp()
++        p = train_head_log_probs.exp().masked_fill(~head_mask, 0.0)
++        q = sampler_head_log_probs.exp().masked_fill(~head_mask, 0.0)
+         p_mass, q_mass = p.sum(-1), q.sum(-1)
+-        rho = (1 - q_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
+-        alpha = rho * weight_fn(1.0 / rho)
+-        head_weights = weight_fn((train_head_log_probs - sampler_head_log_probs.float()).exp())
+-        residual = q * head_weights - alpha.unsqueeze(-1) * p
+-    correction = (residual * train_head_log_probs).sum(-1)
+-    return correction, q_mass, p_mass
++        head_mass = sampling.head_mass(p, q, train_head_log_probs - sampler_head_log_probs)
++        if support:
++            # A complete support has no tail, so alpha is exactly zero: dropping the term avoids
++            # evaluating rho on float-noise masses (it would be meaningless and can be O(10)).
++            residual = head_mass
++            tail_ratio = torch.ones_like(q_mass)
++        else:
++            rho = (1 - q_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
++            alpha = sampling.tail_scale(rho, p.dtype)
++            residual = head_mass - alpha.unsqueeze(-1) * p
++            tail_ratio = rho
++        residual = residual.masked_fill(~head_mask, 0.0)
++    correction = (residual * _scored_log_probs(train_head_log_probs, residual)).sum(-1)
++    return correction, q_mass, p_mass, tail_ratio
++
++
++def _flatten_rows(tensor: torch.Tensor) -> torch.Tensor:
++    """Flatten a packed per-sample score-centering field to its flat ``(rows, ...)`` form.
++
++    The rollout fields arrive either as a nested tensor (the usual case, since response lengths
++    differ) or, when every sample in the micro-batch happens to share a shape, as a regular stacked
++    tensor. ``.values()`` only exists on the former, so handle both instead of silently depending on
++    the collation layout.
++    """
++    if getattr(tensor, "is_nested", False):
++        return tensor.values()
++    if tensor.dim() <= 1:
++        return tensor.reshape(-1)
++    return tensor.reshape(-1, *tensor.shape[2:])
++
++
++def _reconstruct_compact_field(
++    lengths: torch.Tensor, flat: torch.Tensor, width: int, *, fill, dtype: torch.dtype
++) -> torch.Tensor:
++    """Rebuild a dense ``[1, T, width]`` field from per-row lengths plus a flat buffer.
++
++    Inverse of the compact support transport (``psrl.utils.sampler_adapter.to_compact_support``): each
++    row keeps its ``lengths[row]`` values from the flat ``flat`` buffer, and unused slots carry
++    ``fill``. Fails closed on an inconsistent transport rather than scattering to the wrong slots: the
++    per-row lengths must sum to the shipped value count and must not exceed ``width``.
++    """
++    lengths = lengths.reshape(-1)
++    total_rows = lengths.numel()
++    device = lengths.device
++    out = torch.full((1, total_rows, width), fill, dtype=dtype, device=device)
++    if total_rows == 0:
++        return out
++    if bool((lengths < 0).any()):
++        raise ValueError("compact support transport has a negative row length.")
++    if bool((lengths > width).any()):
++        raise ValueError(f"compact support row length exceeds the shipped width {width}.")
++    expected = int(lengths.sum().item())
++    if flat.numel() != expected:
++        raise ValueError(
++            f"compact support transport is inconsistent: {total_rows} rows carry {expected} values "
++            f"but {flat.numel()} were shipped."
++        )
++    if expected == 0:
++        return out
++    offsets = torch.cumsum(lengths, 0) - lengths
++    row_idx = torch.repeat_interleave(torch.arange(total_rows, device=device), lengths)
++    col_idx = torch.arange(flat.numel(), device=device) - torch.repeat_interleave(offsets, lengths)
++    out[0, row_idx, col_idx] = flat.to(device=device, dtype=dtype)
++    return out
+ 
+ 
+ def score_centering_logits_processor(
+-    student_logits: torch.Tensor, data: TensorDict, config: ActorConfig, data_format: str = "thd"
++    student_logits: torch.Tensor,
++    data: TensorDict,
++    config: ActorConfig,
++    data_format: str = "thd",
++    process_group=None,
++    vocab_size: Optional[int] = None,
++    sampling_support: bool = False,
++    cp_split: Optional[str] = None,
++    chunk_elems: int = TOPK_LOG_PROB_CHUNK_ELEMS,
+ ) -> dict[str, torch.Tensor]:
+     """Per-token centering term from the trainer logits, in the engine's logits-processor slot.
+ 
+     Args:
+-        student_logits: Trainer logits, already temperature-scaled, shape (1, nnz/sp, V).
+-        data: Micro input batch, holding the nested ``rollout_topk_ids``/``rollout_topk_log_probs``
+-            sampler heads of shape [B, j, k].
++        student_logits: Trainer logits, already temperature-scaled, shape (1, nnz/sp, V); V is this
++            rank's vocabulary shard under tensor parallelism.
++        data: Micro input batch. Carries either the dense ``rollout_topk_ids`` /
++            ``rollout_topk_log_probs`` ``[B, j, k]`` pair or, for compact support transport, the
++            ``rollout_topk_lengths`` ``[B, j]`` plus the flat ``rollout_support_ids`` and
++            ``rollout_support_log_probs`` buffers (reconstructed to dense here).
+         config: Actor configuration, used for ``policy_loss.rollout_correction``.
+         data_format: "thd" or "bshd". Only "thd" is supported.
++        process_group: Tensor-parallel vocabulary group, or None for a local full vocabulary.
++        vocab_size: Real vocabulary size excluding padded entries; defaults to the full sharded size.
++        sampling_support: True for exact support mode (renormalize over the recorded support); False
++            for the top-k head plus rescaled-tail model.
++        cp_split: "thd"/"bshd" to slice the full-sequence sampler heads to this context-parallel
++            rank's rows (mirroring distillation), or None when context parallel is disabled.
++        chunk_elems: fp32 workspace budget per normalizer chunk, in elements; the row count is
++            derived from the local vocabulary size. Default: 64M elements (256 MiB).
+ 
+     Returns:
+         Dict with, each of shape (1, nnz/sp):
+             sc_correction: Centering term, with gradient to ``student_logits``.
+             sc_sampler_head_mass: Sampler's head probability mass, detached.
+             sc_train_head_mass: Trainer's head probability mass, detached.
++            sc_tail_ratio: Trainer-to-sampler tail-mass ratio, detached.
+     """
+     if data_format != "thd":
+         raise NotImplementedError("score centering supports the thd (remove padding) format only.")
+-    topk_ids = data["rollout_topk_ids"].values().unsqueeze(0)
+-    topk_log_probs = data["rollout_topk_log_probs"].values().unsqueeze(0)
+-    if get_ulysses_sequence_parallel_world_size() > 1:
+-        topk_ids = slice_input_tensor(topk_ids, dim=1)
+-        topk_log_probs = slice_input_tensor(topk_log_probs, dim=1)
++    has_dense = "rollout_topk_ids" in data.keys() and "rollout_topk_log_probs" in data.keys()
++    has_compact = (
++        "rollout_topk_lengths" in data.keys()
++        and "rollout_support_ids" in data.keys()
++        and "rollout_support_log_probs" in data.keys()
++    )
++    if not (has_dense or has_compact):
++        raise RuntimeError(
++            "score centering is enabled but the micro-batch carries no sampler head: expected the "
++            "dense rollout_topk_ids/rollout_topk_log_probs pair or the compact "
++            "rollout_topk_lengths/rollout_support_ids/rollout_support_log_probs triple."
++        )
++    compact = not has_dense
++    if compact and cp_split:
++        raise NotImplementedError(
++            "compact support transport is not supported with context parallel; disable "
++            "rollout.sampler_compact_support or use context_parallel_size=1."
++        )
++    if cp_split:
++        # Context-parallel trainer: slice the full-sequence sampler heads to this rank's rows exactly
++        # the way distillation slices its teacher tensors, so they align with the CP-local logits.
++        from verl.models.mcore.util import preprocess_bshd_engine, preprocess_thd_engine
++
++        split = preprocess_thd_engine if cp_split == "thd" else preprocess_bshd_engine
++        topk_ids, *_ = split(data["rollout_topk_ids"], pre_process=True)
++        topk_log_probs, *_ = split(data["rollout_topk_log_probs"], pre_process=True)
++    else:
++        if compact:
++            # The compact transport ships per-row lengths and flat buffers; rebuild the dense heads.
++            # The rows only need to be as wide as the largest realized support (unused slots are
++            # masked), so derive the width from the realized counts instead of a config value.
++            lengths = _flatten_rows(data["rollout_topk_lengths"]).to(torch.long)
++            width = max(int(lengths.max().item()), 1) if lengths.numel() else 1
++            topk_ids = _reconstruct_compact_field(
++                lengths, _flatten_rows(data["rollout_support_ids"]), width, fill=HEAD_PADDING_ID, dtype=torch.int32
++            )
++            topk_log_probs = _reconstruct_compact_field(
++                lengths, _flatten_rows(data["rollout_support_log_probs"]), width, fill=-math.inf, dtype=torch.float32
++            )
++        else:
++            topk_ids = _flatten_rows(data["rollout_topk_ids"]).unsqueeze(0)
++            topk_log_probs = _flatten_rows(data["rollout_topk_log_probs"]).unsqueeze(0)
++        if get_ulysses_sequence_parallel_world_size() > 1:
++            topk_ids = slice_input_tensor(topk_ids, dim=1)
++            topk_log_probs = slice_input_tensor(topk_log_probs, dim=1)
+     rollout_correction = config.policy_loss.rollout_correction
+-    weight_fn = score_centering_weight_fn(
++    sampling = importance_sampling(
+         rollout_correction.get("rollout_is", None), rollout_correction.get("rollout_is_threshold", 2.0)
+     )
+-    train_head_log_probs = topk_log_probs_from_logits(student_logits.squeeze(0), topk_ids.squeeze(0))
+-    correction, sampler_head_mass, train_head_mass = score_centering_correction(
+-        train_head_log_probs, topk_log_probs.squeeze(0), weight_fn
++    ids = topk_ids.squeeze(0)
++    head_mask = ids >= 0
++    logits_2d = student_logits.squeeze(0)
++
++    def _head_log_probs(logits_input: torch.Tensor) -> torch.Tensor:
++        if sampling_support:
++            return support_head_log_probs(
++                logits_input, ids, process_group=process_group, vocab_size=vocab_size, chunk_elems=chunk_elems
++            )
++        return topk_log_probs_from_logits(
++            logits_input, ids.clamp_min(0), chunk_elems=chunk_elems, process_group=process_group, vocab_size=vocab_size
++        ).masked_fill(~head_mask, 0.0)
++
++    train_head_log_probs = _head_log_probs(logits_2d)
++    correction, sampler_head_mass, train_head_mass, tail_ratio = score_centering_correction(
++        train_head_log_probs, topk_log_probs.squeeze(0), head_mask, sampling, support=sampling_support
+     )
+     return {
+         "sc_correction": correction.unsqueeze(0),
+         "sc_sampler_head_mass": sampler_head_mass.unsqueeze(0),
+         "sc_train_head_mass": train_head_mass.unsqueeze(0),
++        "sc_tail_ratio": tail_ratio.unsqueeze(0),
+     }
+ 
+ 
+@@ -261,6 +642,11 @@ def score_centering_ppo_loss(
+     dp_group=None,
+     student_logits: torch.Tensor = None,
+     data_format: str = "thd",
++    process_group=None,
++    vocab_size: Optional[int] = None,
++    sampling_support: bool = False,
++    cp_split: Optional[str] = None,
++    chunk_elems: int = TOPK_LOG_PROB_CHUNK_ELEMS,
+ ):
+     """Actor loss function used both for the logits processor and the final policy loss.
+     - student_logits is not None, compute the centering term in the logits processor.
+@@ -269,22 +655,37 @@ def score_centering_ppo_loss(
+     Args:
+         config: Actor configuration.
+         model_output: Model output, including log_probs and sc_correction.
+-        data: Micro input batch, contains the nested rollout top-k head.
++        data: Micro input batch, carries the sampler heads (see ``score_centering_logits_processor``).
+         dp_group: Data parallel group for ``ppo_loss``.
+-        student_logits: (1, nnz/sp, V).
++        student_logits: (1, nnz/sp, V); set only on the logits-processor call.
+         data_format: "thd" or "bshd". Only "thd" is supported.
++        process_group: Tensor-parallel vocabulary group, or None.
++        vocab_size: Real vocabulary size excluding padded entries; defaults to the sharded size.
++        sampling_support: True for exact support mode, False for the top-k head model.
++        cp_split: "thd"/"bshd" to slice sampler heads to this context-parallel rank, or None.
++        chunk_elems: fp32 workspace budget per normalizer chunk, in elements. Default: 64M (256 MiB).
+ 
+     Returns:
+         student_logits is not None: dict from ``score_centering_logits_processor``.
+         student_logits is None: the (loss, metrics) tuple from ``ppo_loss``.
+     """
+     if student_logits is not None:
+-        return score_centering_logits_processor(student_logits, data, config, data_format)
++        return score_centering_logits_processor(
++            student_logits,
++            data,
++            config,
++            data_format,
++            process_group,
++            vocab_size,
++            sampling_support,
++            cp_split,
++            chunk_elems,
++        )
+     rollout_correction = config.policy_loss.get("rollout_correction", None) or {}
+     if rollout_correction.get("score_centering", False) and "sc_correction" not in model_output:
+         # an entrypoint that never sets the micro-batch flag would otherwise train plain bypass PG
+         raise RuntimeError(
+-            "score centering is enabled but the logits processor did not run: the trainer must set the "
+-            "score_centering micro-batch flag (supported by the v1 trainer only)."
++            "score centering is enabled but the logits processor did not run: the trainer must set "
++            "the score_centering micro-batch flag (upstream v1 does this; PSRL's trainer sets it too)."
+         )
+     return ppo_loss(config, model_output, data, dp_group)
 diff --git a/verl/utils/checkpoint/megatron_checkpoint_manager.py b/verl/utils/checkpoint/megatron_checkpoint_manager.py
-index 1f13ab04..91e02660 100644
+index 3c7d487a..40a74679 100644
 --- a/verl/utils/checkpoint/megatron_checkpoint_manager.py
 +++ b/verl/utils/checkpoint/megatron_checkpoint_manager.py
-@@ -175,6 +175,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -173,6 +173,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
          bridge=None,
          provider=None,
          peft_cls=None,
@@ -464,8 +1385,8 @@ index 1f13ab04..91e02660 100644
          **kwargs,
      ):
          super().__init__(
-@@ -201,8 +202,12 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-         self.vanilla_bridge = self.provider is None
+@@ -198,8 +199,12 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         self.provider = provider
          self.peft_cls = peft_cls
          self.use_megatron_fsdp = use_megatron_fsdp
 +        self.use_per_rank_checkpoint = use_per_rank_checkpoint and not self.use_megatron_fsdp
@@ -477,7 +1398,7 @@ index 1f13ab04..91e02660 100644
          # ``use_dist_checkpointing`` selects Megatron shards for the ``model``
          # slot; HF weights always go through ``bridge`` when requested by
          # ``save_contents`` / ``load_contents``.
-@@ -498,6 +503,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -495,6 +500,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
          transformer_config_rel = _rel(get_transformer_config_checkpoint_path(local_path))
  
          contents: dict[str, dict] = {}
@@ -486,7 +1407,7 @@ index 1f13ab04..91e02660 100644
  
          if self.should_save_hf_model:
              model_entry: dict = {
-@@ -524,33 +531,33 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -521,33 +528,33 @@ class MegatronCheckpointManager(BaseCheckpointManager):
          if self.should_save_dist_ckpt_model:
              contents["model"] = {
                  "path": model_dist_rel,
@@ -526,7 +1447,7 @@ index 1f13ab04..91e02660 100644
                  "key": "rng_state",
              }
              contents["transformer_config"] = {
-@@ -844,11 +851,22 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -836,11 +843,22 @@ class MegatronCheckpointManager(BaseCheckpointManager):
              raise KeyError
          tensor_parallel.get_cuda_rng_tracker().set_states(rng_states["rng_tracker_states"])
  
@@ -550,7 +1471,7 @@ index 1f13ab04..91e02660 100644
              metadata = load_content_metadata(checkpoint_dir=ckpt_dir)
          if metadata is None:
              if self.use_distributed_optimizer:
-@@ -857,6 +875,22 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -849,6 +867,22 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                  metadata = self._build_sharded_state_dict_metadata()
          return metadata
  
@@ -573,7 +1494,7 @@ index 1f13ab04..91e02660 100644
      def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
          """Load a Megatron checkpoint in the v2 split layout.
  
-@@ -915,10 +949,13 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -907,10 +941,13 @@ class MegatronCheckpointManager(BaseCheckpointManager):
          # ── Load model weights ──────────────────────────────────────────────
          if self.should_load_dist_ckpt_model or (self.should_load_hf_model and self.peft_cls is not None):
              model_sd = self._maybe_filter_peft_state_dict(dict(model_sharded_state_dict))
@@ -590,7 +1511,7 @@ index 1f13ab04..91e02660 100644
              assert "model" in loaded_model or any(
                  f"model{vpp_rank}" in loaded_model for vpp_rank in range(len(self.model))
              ), f"Model state dict not found in {loaded_model.keys()}. Please check the checkpoint file {local_path}."
-@@ -943,10 +980,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -935,10 +972,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
          # ── Load optimizer / LR scheduler ───────────────────────────────────
          if self.should_load_optimizer:
              optim_sd = self._build_optimizer_state_dict(model_sharded_state_dict, metadata, is_loading=True)
@@ -602,7 +1523,7 @@ index 1f13ab04..91e02660 100644
              assert "optimizer" in loaded_optim, (
                  f"Optimizer state dict not found in {loaded_optim.keys()}. "
                  f"Please check the checkpoint file {optim_dist_path}."
-@@ -967,10 +1001,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -959,10 +993,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
          # ── Load RNG states ─────────────────────────────────────────────────
          if self.should_load_extra:
              extra_sd = self._build_extra_state_dict()
@@ -614,7 +1535,7 @@ index 1f13ab04..91e02660 100644
              assert "rng_state" in loaded_extra, (
                  f"RNG state dict not found in {loaded_extra.keys()}. "
                  f"Please check the checkpoint file {extra_dist_path}."
-@@ -1056,29 +1087,50 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -1034,29 +1065,50 @@ class MegatronCheckpointManager(BaseCheckpointManager):
              )
  
      def _save_dist_checkpoint(self, dist_checkpoint_path: str, state_dict: dict):
@@ -679,6 +1600,75 @@ index 1f13ab04..91e02660 100644
 +                torch.distributed.barrier()
  
          return async_save_request
+ 
+diff --git a/verl/utils/config.py b/verl/utils/config.py
+index 03ee6213..8d0ac4c9 100644
+--- a/verl/utils/config.py
++++ b/verl/utils/config.py
+@@ -86,33 +86,43 @@ def _validate_router_replay_config(actor_config: Any, rollout_correction: Any) -
+ 
+ 
+ def _validate_score_centering_config(config: DictConfig) -> None:
+-    algorithm_rc = config.algorithm.get("rollout_correction") or {}
+-    actor_rc = config.actor_rollout_ref.actor.policy_loss.get("rollout_correction") or {}
++    # PSRL mounts its rollout/actor groups under gen_actor_rollout_ref / train_actor_rollout_ref and
++    # runs its own trainer on both FSDP and Megatron, so the upstream v1 + FSDP-only restriction is
++    # enforced only when the stock actor_rollout_ref group is present.
++    actor_cfg = config.get("actor_rollout_ref")
++    algorithm_rc = (config.get("algorithm") or {}).get("rollout_correction") or {}
++    actor_rc = (actor_cfg.actor.policy_loss.get("rollout_correction") or {}) if actor_cfg is not None else {}
+     if not (algorithm_rc.get("score_centering", False) or actor_rc.get("score_centering", False)):
+         return
+-    if not (algorithm_rc.get("score_centering", False) and actor_rc.get("score_centering", False)):
+-        raise ValueError(
+-            "score centering must be enabled on both algorithm.rollout_correction and "
+-            "actor_rollout_ref.actor.policy_loss.rollout_correction."
+-        )
+     from verl.trainer.config.algorithm import RolloutCorrectionConfig
+ 
+-    # the actor-side mirror is a plain mapping, so run the dataclass checks on it here
+-    RolloutCorrectionConfig(**actor_rc)
+-    for key in ("bypass_mode", "loss_type", "rollout_is", "rollout_is_threshold"):
+-        if actor_rc.get(key) != algorithm_rc.get(key):
++    # The algorithm-level rollout_correction must itself satisfy the score-centering contract
++    # (bypass_mode=True, loss_type="reinforce", rollout_is None/"token", no batch normalize). It may
++    # be a plain mapping with no actor mirror, so validate it directly rather than only via the actor.
++    RolloutCorrectionConfig(**algorithm_rc)
++    if actor_cfg is not None:
++        if not (algorithm_rc.get("score_centering", False) and actor_rc.get("score_centering", False)):
+             raise ValueError(
+-                f"score centering requires actor_rollout_ref.actor.policy_loss.rollout_correction.{key} to match "
+-                f"algorithm.rollout_correction.{key}."
++                "score centering must be enabled on both algorithm.rollout_correction and "
++                "actor_rollout_ref.actor.policy_loss.rollout_correction."
+             )
+-    if not config.trainer.get("use_v1", True):
+-        raise ValueError("score centering requires the v1 trainer (trainer.use_v1=True).")
+-    if config.actor_rollout_ref.actor.get("strategy") not in ("fsdp", "fsdp2"):
+-        raise ValueError("score centering requires actor_rollout_ref.actor.strategy=fsdp or fsdp2.")
+-    if config.actor_rollout_ref.rollout.get("name") != "vllm":
+-        raise ValueError("score centering requires actor_rollout_ref.rollout.name=vllm.")
+-    if not config.actor_rollout_ref.rollout.get("topk_log_probs", 0):
+-        raise ValueError("score centering requires actor_rollout_ref.rollout.topk_log_probs > 0.")
++        # the actor-side mirror is a plain mapping, so run the dataclass checks on it here
++        RolloutCorrectionConfig(**actor_rc)
++        for key in ("bypass_mode", "loss_type", "rollout_is", "rollout_is_threshold"):
++            if actor_rc.get(key) != algorithm_rc.get(key):
++                raise ValueError(
++                    f"score centering requires actor_rollout_ref.actor.policy_loss.rollout_correction.{key} to match "
++                    f"algorithm.rollout_correction.{key}."
++                )
++        strategy = actor_cfg.actor.get("strategy")
++        if strategy is not None and strategy not in ("fsdp", "fsdp2", "megatron"):
++            raise ValueError("score centering requires actor strategy fsdp, fsdp2 or megatron.")
++        if strategy in ("fsdp", "fsdp2") and not config.trainer.get("use_v1", True):
++            raise ValueError("score centering requires the v1 trainer (trainer.use_v1=True) for FSDP.")
++        if actor_cfg.rollout.get("name") != "vllm":
++            raise ValueError("score centering requires actor_rollout_ref.rollout.name=vllm.")
++        if not actor_cfg.rollout.get("topk_log_probs", 0):
++            raise ValueError("score centering requires actor_rollout_ref.rollout.topk_log_probs > 0.")
+     if (config.get("distillation") or {}).get("enabled", False):
+         raise ValueError("score centering cannot be combined with distillation.")
  
 diff --git a/verl/utils/dataset/rl_dataset.py b/verl/utils/dataset/rl_dataset.py
 index aad0655b..4b9fbb10 100644
@@ -861,10 +1851,10 @@ index 65f528bb..2ce27eb2 100644
          processor = None
          # TODO(haibin.lin): try-catch should be removed after adding transformer version req to setup.py to avoid
 diff --git a/verl/workers/config/actor.py b/verl/workers/config/actor.py
-index 5ca39ca5..a33aac6b 100644
+index 731b26c2..9e781f41 100644
 --- a/verl/workers/config/actor.py
 +++ b/verl/workers/config/actor.py
-@@ -215,6 +215,7 @@ class ActorConfig(BaseConfig):
+@@ -214,6 +214,7 @@ class ActorConfig(BaseConfig):
              "seq-mean-token-sum",
              "seq-mean-token-mean",
              "seq-mean-token-sum-norm",
@@ -873,10 +1863,10 @@ index 5ca39ca5..a33aac6b 100644
          if self.loss_agg_mode not in valid_loss_agg_modes:
              raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
 diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
-index 63783752..bcb90b5c 100644
+index 59ea7ca6..e41eb431 100644
 --- a/verl/workers/config/engine.py
 +++ b/verl/workers/config/engine.py
-@@ -110,6 +110,7 @@ class EngineConfig(BaseConfig):
+@@ -110,10 +110,16 @@ class EngineConfig(BaseConfig):
      use_remove_padding: bool = True
  
      seed: int = 42
@@ -884,7 +1874,16 @@ index 63783752..bcb90b5c 100644
  
      full_determinism: bool = False
      router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
-@@ -198,6 +199,7 @@ class McoreEngineConfig(EngineConfig):
+ 
++    # Score-centering head computation: fp32 workspace budget per chunk, in elements. The row count
++    # is derived from the local vocabulary size, so one value works for any vocab. Applies to FSDP
++    # and Megatron.
++    score_centering_chunk_elems: int = 64 * 1024 * 1024
++
+     def __post_init__(self):
+         pass
+         # TODO: turn on this check after we reorg config
+@@ -197,6 +203,7 @@ class McoreEngineConfig(EngineConfig):
      pad_to_length: bool = False
      pad_to_length_bucket: int = 512
      use_dist_checkpointing: bool = False
@@ -892,8 +1891,46 @@ index 63783752..bcb90b5c 100644
      dist_checkpointing_path: Optional[str] = None
      dist_checkpointing_prefix: str = ""
      dist_ckpt_optim_fully_reshardable: bool = False
+diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
+index 6428bf72..cb56b707 100644
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -224,6 +224,10 @@ class RolloutConfig(BaseConfig):
+     # Sampler top-k log-probs per generated token for score centering; 0 disables.
+     topk_log_probs: int = 0
+ 
++    # Sampler support replay for score centering: the captured head is the sampler's complete
++    # truncated support (top_p<1 / top_k>0), scored exactly with no tail model.
++    sampler_support: bool = False
++
+     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
+ 
+     trace: TraceConfig = field(default_factory=TraceConfig)
+@@ -352,15 +356,15 @@ class RolloutConfig(BaseConfig):
+         if self.topk_log_probs:
+             if self.name != "vllm":
+                 raise ValueError("rollout.topk_log_probs is supported by the vLLM rollout only.")
+-            if (
+-                not self.calculate_log_probs
+-                or self.top_p != 1.0
+-                or self.top_k != -1
+-                or self.logprobs_mode != "processed_logprobs"
+-            ):
++            if not self.calculate_log_probs or self.logprobs_mode != "processed_logprobs":
+                 raise ValueError(
+-                    "rollout.topk_log_probs needs calculate_log_probs=True, top_p=1.0, top_k=-1 and "
++                    "rollout.topk_log_probs needs calculate_log_probs=True and "
+                     "logprobs_mode='processed_logprobs' so the returned head is the sampling distribution."
+                 )
++            if not self.sampler_support and (self.top_p != 1.0 or self.top_k != -1):
++                raise ValueError(
++                    "rollout.topk_log_probs needs top_p=1.0 and top_k=-1; set sampler_support=True "
++                    "for truncated sampling (the captured head is then the complete support)."
++                )
+             vllm_kwargs = self.engine_kwargs.setdefault("vllm", {})
+             vllm_kwargs["max_logprobs"] = max(vllm_kwargs.get("max_logprobs", 0), self.topk_log_probs)
 diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
-index c5cbc35d..7b49e24a 100644
+index 15fae90e..327a6da9 100644
 --- a/verl/workers/engine/fsdp/transformer_impl.py
 +++ b/verl/workers/engine/fsdp/transformer_impl.py
 @@ -29,6 +29,7 @@ from tensordict import TensorDict
@@ -1063,88 +2100,68 @@ index c5cbc35d..7b49e24a 100644
              sync_ctx = (
                  nullcontext()
                  if forward_only
-@@ -1339,6 +1380,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
-         )
+@@ -1342,6 +1383,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
          distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
          distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
-+        extra_processor = getattr(logits_processor_func, "logits_processor", None)
-+        if extra_processor is not None and use_fused_kernels:
-+            raise ValueError("An auxiliary logits processor requires materialized logits.")
-+        if extra_processor is not None and distillation_use_topk:
-+            raise ValueError("Compose auxiliary logits processing explicitly with distillation.")
+         score_centering = tu.get_non_tensor_data(data=micro_batch, key="score_centering", default=False)
++        sampler_support = tu.get_non_tensor_data(data=micro_batch, key="sampler_support", default=False)
  
          if calculate_sum_pi_squared and use_fused_kernels:
              raise NotImplementedError(
-@@ -1409,8 +1455,24 @@ class FSDPEngineWithLMHead(FSDPEngine):
-                         )
+@@ -1418,15 +1460,30 @@ class FSDPEngineWithLMHead(FSDPEngine):
  
                  # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
--                if distillation_use_topk:
+                 if distillation_use_topk or score_centering:
 -                    outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
-+                if distillation_use_topk or extra_processor is not None:
-+                    if extra_processor is None:
-+                        outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
-+                    else:
-+                        row_ids = torch.arange(input_ids.values().shape[0], device=logits_rmpad.device).unsqueeze(0) + 1
-+                        static_pad = self._get_packed_pad_size(row_ids.shape[-1])
-+                        if static_pad:
-+                            row_ids, _ = pad_packed_inputs(row_ids, None, static_pad)
-+                        if self.use_ulysses_sp:
-+                            row_ids, _, _ = ulysses_pad_and_slice_inputs(
-+                                row_ids, None, sp_size=self.ulysses_sequence_parallel_size
-+                            )
-+                        outputs = extra_processor(
-+                            logits=logits_rmpad.unsqueeze(0),
-+                            data=micro_batch,
-+                            row_ids=row_ids - 1,
-+                            process_group=None,
-+                        )
++                    processor_kwargs = {"student_logits": logits_rmpad.unsqueeze(0), "data": micro_batch}
++                    if score_centering:
++                        processor_kwargs["sampling_support"] = sampler_support
++                        processor_kwargs["chunk_elems"] = self.engine_config.score_centering_chunk_elems
++                    outputs = logits_processor_func(**processor_kwargs)
                      cu_seqlens = input_ids.offsets()
-                     for k, v in outputs.items():
-                         v = v.squeeze(0)
-@@ -1423,7 +1485,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
+-                    for k, v in outputs.items():
+-                        v = v.squeeze(0)
+-                        assert v.shape == (logits_rmpad.shape[0],), (
+-                            f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
+-                        )
+-                        v = self._gather_and_unpad_packed(v, output_args["pad_size"])
+-                        model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
++                    if score_centering:
++                        # All score-centering fields are per-token scalars: gather them in one
++                        # collective instead of one all-gather per field.
++                        names = list(outputs.keys())
++                        packed = torch.stack([outputs[name].squeeze(0) for name in names], dim=1)
++                        packed = self._gather_and_unpad_packed(packed, output_args["pad_size"])
++                        for index, name in enumerate(names):
++                            model_output[name] = torch.nested.nested_tensor_from_jagged(
++                                packed[:, index], cu_seqlens
++                            )
++                    else:
++                        for k, v in outputs.items():
++                            v = v.squeeze(0)
++                            assert v.shape == (logits_rmpad.shape[0],), (
++                                f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
++                            )
++                            v = self._gather_and_unpad_packed(v, output_args["pad_size"])
++                            model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+ 
                  if not distillation_only:
                      # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                     inplace_backward = True
--                    if calculate_entropy:
-+                    if calculate_entropy or extra_processor is not None:
-                         inplace_backward = False
-                     log_probs = logprobs_from_logits(
-                         logits=logits_rmpad,
-@@ -1508,8 +1570,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
-                     # (log_probs is also not gathered) and pad_size is only
+@@ -1516,7 +1573,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                      # populated in output_args along the use_remove_padding=True
                      # path of prepare_model_inputs.
--                    if distillation_use_topk:
+                     if distillation_use_topk or score_centering:
 -                        outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
-+                    if distillation_use_topk or extra_processor is not None:
-+                        if extra_processor is None:
-+                            outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
-+                        else:
-+                            outputs = extra_processor(
-+                                logits=logits_rmpad.unsqueeze(0),
-+                                data=micro_batch,
-+                                row_ids=torch.arange(logits_rmpad.shape[0], device=logits_rmpad.device).unsqueeze(0),
-+                                process_group=None,
-+                            )
++                        processor_kwargs = {"student_logits": logits_rmpad.unsqueeze(0), "data": micro_batch}
++                        if score_centering:
++                            processor_kwargs["sampling_support"] = sampler_support
++                            processor_kwargs["chunk_elems"] = self.engine_config.score_centering_chunk_elems
++                        outputs = logits_processor_func(**processor_kwargs)
                          for k, v in outputs.items():
                              v = v.squeeze(0)
                              assert v.shape == (logits_rmpad.shape[0],), (
-@@ -1519,7 +1589,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
- 
-                     log_probs = None
-                     if not distillation_only:
--                        log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
-+                        log_probs = logprobs_from_logits(
-+                            logits=logits_rmpad,
-+                            labels=input_ids_rmpad_rolled,
-+                            inplace_backward=extra_processor is None and not calculate_entropy,
-+                        )
- 
-                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
-                     if not distillation_only:
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index 01499e86..73d472fe 100644
+index b75c00c9..d75d146b 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
 @@ -15,6 +15,7 @@
@@ -1162,8 +2179,8 @@ index 01499e86..73d472fe 100644
 +from tqdm import tqdm
  
  import verl.utils.torch_functional as verl_F
- from verl.models.mcore import get_mcore_weight_converter
-@@ -83,6 +85,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
+ from verl.trainer.config import CheckpointConfig
+@@ -82,6 +84,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
  from ..utils import detach_tree, postprocess_batch_func, prepare_micro_batches
  from .utils import set_random_seed
  
@@ -1177,7 +2194,7 @@ index 01499e86..73d472fe 100644
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
  
-@@ -496,20 +505,21 @@ class MegatronEngine(BaseEngine):
+@@ -449,15 +458,21 @@ class MegatronEngine(BaseEngine):
          self.tf_config = updated_tf_config
          print(f"module: {len(module)}")
  
@@ -1186,19 +2203,15 @@ index 01499e86..73d472fe 100644
 -                module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
 -            )
 -        else:
--            if self.vanilla_bridge:
--                self.bridge.load_weights(module, self.model_config.local_path)
--            else:
--                allowed_mismatched_params = []
--                if self.is_value_model:
--                    allowed_mismatched_params = ["output_layer.weight"]
--                self.bridge.load_hf_weights(
--                    module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
+-            allowed_mismatched_params = ["output_layer.weight"] if self.is_value_model else []
+-            self.bridge.load_hf_weights(
+-                module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
+-            )
 +        if self.engine_config.load_weight:
 +            if self.engine_config.use_dist_checkpointing:
 +                load_mcore_dist_weights(
 +                    module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
-                 )
++                )
 +            else:
 +                if self.vanilla_bridge:
 +                    self.bridge.load_weights(module, self.model_config.local_path)
@@ -1212,7 +2225,7 @@ index 01499e86..73d472fe 100644
  
          if torch.distributed.get_rank() == 0:
              print_model_size(module[0])
-@@ -576,85 +586,90 @@ class MegatronEngine(BaseEngine):
+@@ -524,85 +539,90 @@ class MegatronEngine(BaseEngine):
      def initialize(self):
          self._hf_export_tasks = None
          self._build_tf_config()
@@ -1369,7 +2382,7 @@ index 01499e86..73d472fe 100644
  
      def train_mode(self, **kwargs):
          """
-@@ -960,17 +975,43 @@ class MegatronEngine(BaseEngine):
+@@ -908,17 +928,43 @@ class MegatronEngine(BaseEngine):
          # batch should be a list of batches inside micro-batches
          batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
  
@@ -1422,70 +2435,82 @@ index 01499e86..73d472fe 100644
  
          if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
              # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
-@@ -1201,6 +1242,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1143,6 +1189,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
          logits_processor_func: Callable,
          batch: TensorDict,
          data_format: str,
-+        auxiliary_row_ids=None,
++        score_centering: bool = False,
++        sampler_support: bool = False,
      ):
          assert logits.shape[:2] == label.shape[:2]
          # avoid non-positive temperature such as padding
-@@ -1235,8 +1277,20 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1177,8 +1225,28 @@ class MegatronEngineWithLMHead(MegatronEngine):
          # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
          if distillation_use_topk:
              ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
-+        extra_processor = getattr(logits_processor_func, "logits_processor", None)
-+        if extra_processor is not None:
++        if score_centering:
++            # The trainer logits are vocab-sharded under TP, so the head log-probs are gathered with
++            # the tensor-parallel group and normalized over the full (unpadded) vocabulary.
 +            ret.update(
-+                extra_processor(
-+                    logits=logits_bak,
++                logits_processor_func(
++                    student_logits=logits_bak,
 +                    data=batch,
-+                    row_ids=auxiliary_row_ids - 1,
++                    data_format=data_format,
 +                    process_group=mpu.get_tensor_model_parallel_group(),
++                    vocab_size=getattr(self.model_config.hf_config, "vocab_size", None),
++                    sampling_support=sampler_support,
++                    # Static CP splits the full-sequence sampler heads to this rank's rows (as
++                    # distillation does for its teacher tensors); CP=1 keeps the flat path.
++                    cp_split=data_format if mpu.get_context_parallel_world_size() > 1 else None,
++                    chunk_elems=self.engine_config.score_centering_chunk_elems,
 +                )
 +            )
          if not distillation_only:
 -            ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
-+            # Cross entropy mutates its saved logits during backward.
-+            label_logits = logits_bak.clone() if extra_processor is not None else logits_bak
++            # Cross entropy mutates its saved logits during backward, and the score centering term
++            # reuses `logits_bak` in its own backward, so isolate the cross-entropy copy.
++            label_logits = logits_bak.clone() if score_centering else logits_bak
 +            ret["log_probs"] = vocab_parallel_log_probs_from_logits(label_logits, label)
  
          return ret
  
-@@ -1258,6 +1312,14 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1200,6 +1268,22 @@ class MegatronEngineWithLMHead(MegatronEngine):
          calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
          distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
          distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
-+        extra_processor = getattr(logits_processor_func, "logits_processor", None)
-+        if extra_processor is not None and use_fused_kernels:
-+            raise ValueError("An auxiliary logits processor requires materialized logits.")
-+        if extra_processor is not None and distillation_use_topk:
-+            raise ValueError("Compose auxiliary logits processing explicitly with distillation.")
-+        if extra_processor is not None and self.model_config.mtp.enable and self.model_config.mtp.enable_train:
-+            raise ValueError("Auxiliary logits processors require an explicit MTP target alignment.")
++        score_centering = tu.get_non_tensor_data(batch, key="score_centering", default=False)
++        sampler_support = tu.get_non_tensor_data(batch, key="sampler_support", default=False)
++        if score_centering and use_fused_kernels:
++            raise ValueError("score_centering requires materialized logits.")
++        if score_centering and distillation_use_topk:
++            raise ValueError("score_centering cannot be combined with top-K distillation.")
++        if score_centering and self.model_config.mtp.enable and self.model_config.mtp.enable_train:
++            raise ValueError("score_centering with MTP training needs an explicit target alignment.")
++        if score_centering and self.engine_config.dynamic_context_parallel:
++            # Dynamic CP changes the row assignment per micro-batch, so a static head slice cannot
++            # align with it (the same reason distillation rejects dynamic CP).
++            raise NotImplementedError(
++                "score centering does not support dynamic context parallel; use static context "
++                "parallel or context_parallel_size=1."
++            )
 +
          pad_to_length_bucket = (
              self.engine_config.pad_to_length_bucket
              if self.engine_config.pad_to_length and self.engine_config.use_remove_padding
-@@ -1384,6 +1446,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
-                 "response_attention_mask": response_attention_mask,
-             }
+@@ -1315,6 +1399,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 logits_processor_func=logits_processor_func,
+                 batch=batch,
+                 data_format=data_format,
++                score_centering=score_centering,
++                sampler_support=sampler_support,
+             )
  
-+            if extra_processor is not None:
-+                # The model forward applies the same CP, FP8 and bucket padding as the labels.
-+                markers = torch.arange(input_ids.values().shape[0], device=input_ids.device) + 1
-+                logits_processor_args["auxiliary_row_ids"] = torch.nested.nested_tensor_from_jagged(
-+                    markers, input_ids.offsets()
-+                )
-+
-             mtp_loss_normalization_factor = None
-             if (
-                 self.model_config.mtp.enable
+             response_attention_mask = None
 diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
-index b55d4ce6..aa1efea6 100644
+index aa8f31c1..726bd57e 100644
 --- a/verl/workers/engine_workers.py
 +++ b/verl/workers/engine_workers.py
-@@ -86,8 +86,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
+@@ -87,8 +87,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
  
          from verl.workers.engine import BaseEngine, EngineRegistry
  
@@ -1494,7 +2519,7 @@ index b55d4ce6..aa1efea6 100644
          set_numa_affinity()
  
          self.config = config
-@@ -257,6 +255,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
+@@ -258,6 +256,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
          epochs = tu.pop(data, key="epochs", default=1)
          seed = tu.pop(data, key="seed", default=42)
          dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
@@ -1502,7 +2527,7 @@ index b55d4ce6..aa1efea6 100644
  
          assert mini_batch_size is not None or num_mini_batch is not None
  
-@@ -305,7 +304,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
+@@ -306,7 +305,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                  tu.assign_non_tensor(
                      mini_batch_td,
                      global_token_num=NonTensorData(global_token_num),
@@ -1511,7 +2536,7 @@ index b55d4ce6..aa1efea6 100644
                      disable_auto_offload=True,
                  )
                  # Name the mini-batch in the trace so each iteration of this otherwise identical
-@@ -538,6 +537,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -539,6 +538,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
      @register(dispatch_mode=Dispatch.ONE_TO_ALL)
      def init_model(self):
          model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
@@ -1520,10 +2545,19 @@ index b55d4ce6..aa1efea6 100644
          # 1. build reference model
          if "ref" in self.role:
 diff --git a/verl/workers/utils/losses.py b/verl/workers/utils/losses.py
-index ebaa4e4d..64fc8171 100644
+index 94684c05..defcd242 100644
 --- a/verl/workers/utils/losses.py
 +++ b/verl/workers/utils/losses.py
-@@ -83,6 +83,24 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+@@ -62,7 +62,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+         entropy = no_padding_2_padding(entropy, data)
+     sc_outputs = {
+         key: no_padding_2_padding(model_output[key], data)
+-        for key in ("sc_correction", "sc_sampler_head_mass", "sc_train_head_mass")
++        for key in ("sc_correction", "sc_sampler_head_mass", "sc_train_head_mass", "sc_tail_ratio")
+         if key in model_output
+     }
+ 
+@@ -88,6 +88,24 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
      metrics = {}
  
      # select fields and convert to padded tensor
@@ -1548,12 +2582,24 @@ index ebaa4e4d..64fc8171 100644
      fields = ["response_mask", "old_log_probs", "advantages"]
      if "rollout_is_weights" in data:
          fields.append("rollout_is_weights")
-@@ -98,8 +116,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+@@ -103,8 +121,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
  
      loss_agg_mode = config.loss_agg_mode
  
 -    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 -
      policy_loss_fn = get_policy_loss_fn(loss_mode)
+     policy_loss_kwargs = {"sc_correction": sc_outputs["sc_correction"]} if sc_outputs else {}
      pg_loss, pg_metrics = policy_loss_fn(
-         old_log_prob=old_log_prob,
+@@ -125,7 +141,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+     metrics.update(pg_metrics)
+     metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
+     if sc_outputs:
+-        for key in ("sc_sampler_head_mass", "sc_train_head_mass"):
++        for key in ("sc_correction", "sc_sampler_head_mass", "sc_train_head_mass", "sc_tail_ratio"):
+             value = masked_mean(sc_outputs[key], response_mask)
+             metrics[f"actor/{key}"] = Metric(value=value, aggregation=AggregationType.MEAN)
+     policy_loss = pg_loss
+-- 
+2.43.0
+

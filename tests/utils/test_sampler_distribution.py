@@ -2,7 +2,7 @@ import base64
 
 import numpy as np
 import pytest
-from psrl.utils.sampler_distribution import SamplerDistribution, configure_capture
+from psrl.utils.sampler_distribution import SamplerCapture, SamplerDistribution, configure_capture
 from psrl.utils.tito.training_data import build_training_data
 
 
@@ -15,22 +15,29 @@ def wire(ids, probabilities, complete=False):
     }
 
 
-def test_sparse_layout_has_no_prompt_or_environment_entries():
+def test_compact_layout_has_no_prompt_or_environment_entries():
     head = SamplerDistribution.from_wire(wire([2, 8], [0.4, 0.3]), [[np.log(0.4), 2]])
     support = SamplerDistribution.from_wire(wire([3], [1], True), [[0, 3]])
     merged = SamplerDistribution.concatenate([head, SamplerDistribution.empty(2), support])
-    merged.validate_capture("topk", 2, [1, 0, 0, 1])
-    fields = merged.as_tensor_fields(prompt_length=3)
-    assert fields["sampler_offsets"].tolist() == [0, 0, 0, 2, 2, 2, 3, 3]
-    assert fields["sampler_token_ids"].tolist() == [2, 8, 3]
-    assert fields["sampler_complete"].tolist() == [False, False, False, False, False, True, False]
+    merged.validate_capture(SamplerCapture("topk", 2), [1, 0, 0, 1])
+    assert merged.offsets.tolist() == [0, 2, 2, 2, 3]
+    assert merged.token_ids.tolist() == [2, 8, 3]
+    assert merged.complete.tolist() == [False, False, False, True]
     assert merged.prefix(3).token_ids.tolist() == [2, 8]
 
 
 def test_support_budget_never_silently_truncates():
     head = SamplerDistribution.from_wire(wire([2], [0.999999]), [[np.log(0.999999), 2]])
     with pytest.raises(ValueError, match="capture budget"):
-        head.validate_capture("support", 128, [1])
+        head.validate_capture(SamplerCapture("support", 128), [1])
+
+
+def test_capture_width_matches_mode_and_budget():
+    assert SamplerCapture("disabled", 128).width == 0
+    assert SamplerCapture("topk", 128).width == 128
+    assert SamplerCapture("support", 128).width == 129
+    assert not SamplerCapture().enabled
+    assert SamplerCapture("topk", 4).enabled
 
 
 @pytest.mark.parametrize(
@@ -71,8 +78,8 @@ def test_missing_capture_is_not_silently_disabled():
 
 def test_capture_does_not_duplicate_head_in_agent_response():
     body = {"top_p": 0.9, "temperature": 0.7}
-    configure_capture(body, "support", 128)
+    configure_capture(body, SamplerCapture("support", 128))
     assert body["top_logprobs"] == 0
     assert body["sampler_top_logprobs"] == 129
     with pytest.raises(ValueError, match="Truncated sampling"):
-        configure_capture(body, "topk", 128)
+        configure_capture(body, SamplerCapture("topk", 128))

@@ -16,7 +16,7 @@ from psrl.utils.common.http_utils import (
     request_raw,
 )
 from psrl.utils.rollout.turn_output_writer import TurnOutputWriter
-from psrl.utils.sampler_distribution import capture_width, configure_capture
+from psrl.utils.sampler_distribution import SamplerCapture, configure_capture
 from psrl.workers.gen.harness.protocol import (
     anthropic_error_body,
     anthropic_error_response,
@@ -101,8 +101,7 @@ class SessionRouter:
         client_concurrency: int = 1024,
         trajectory_id_strategy: str = "manual",
         turn_output_writer: TurnOutputWriter | None = None,
-        sampler_distribution: str = "disabled",
-        sampler_max_tokens: int = 128,
+        sampler_capture: SamplerCapture | None = None,
     ):
         trajectory_id_strategy = trajectory_id_strategy.lower()
         if trajectory_id_strategy not in TRAJECTORY_ID_STRATEGIES:
@@ -114,9 +113,9 @@ class SessionRouter:
         self.client_concurrency = client_concurrency
         self.trajectory_id_strategy = trajectory_id_strategy
         self.turn_output_writer = turn_output_writer
-        capture_width(sampler_distribution, sampler_max_tokens)
-        self.sampler_distribution = sampler_distribution
-        self.sampler_max_tokens = sampler_max_tokens
+        # Resolve eagerly so a bad mode or budget fails at construction, not on the first request.
+        self.sampler_capture = sampler_capture or SamplerCapture()
+        _ = self.sampler_capture.width
         self.states: dict[str, SessionState] = {}
         self.states_lock = asyncio.Lock()
         self.setup_routes()
@@ -285,12 +284,17 @@ class SessionRouter:
         stream = body.get("stream") is True
         body["stream"] = False
         state = await self._ensure_state(sid)
-        mode = "disabled" if state.headers.get("x-is-validate") == "true" else self.sampler_distribution
-        if mode != "disabled" and protocol != "chat":
-            return JSONResponse(status_code=400, content={"error": "Sampler capture requires the chat protocol."})
-        if protocol == "chat":
+        # Validation runs never capture, so they use a disabled capture regardless of config.
+        capture = SamplerCapture() if state.headers.get("x-is-validate") == "true" else self.sampler_capture
+        if capture.enabled:
             try:
-                configure_capture(body, mode, self.sampler_max_tokens)
+                # Chat and Responses carry OpenAI-style logprobs fields. Anthropic Messages lowers to
+                # the canonical chat IR inside SMG and only carries sampler_top_logprobs.
+                configure_capture(
+                    body,
+                    capture,
+                    set_response_fields=protocol in ("chat", "responses"),
+                )
             except (ValueError, TypeError) as error:
                 return JSONResponse(status_code=400, content={"error": str(error)})
         content = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()

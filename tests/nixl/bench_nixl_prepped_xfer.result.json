@@ -6,83 +6,84 @@
     "POSIX",
     "UCX"
   ],
-  "slice_bytes": 16384,
+  "slice_bytes": 65536,
   "prep": [
     {
       "label": "prep_xfer_dlist",
       "count": 1024,
-      "median_ms": 0.015543773770332336,
-      "p90_ms": 0.027388334274291992,
-      "per_desc_us": 0.015179466572590172
+      "median_ms": 0.00652950257062912,
+      "p90_ms": 0.00835023820400238,
+      "per_desc_us": 0.00637646735413
     },
     {
       "label": "prep_xfer_dlist",
       "count": 4096,
-      "median_ms": 0.06342772394418716,
-      "p90_ms": 0.07347948849201202,
-      "per_desc_us": 0.01548528416606132
+      "median_ms": 0.018749386072158813,
+      "p90_ms": 0.02436898648738861,
+      "per_desc_us": 0.004577486834023148
     },
     {
       "label": "prep_xfer_dlist",
       "count": 16384,
-      "median_ms": 0.2278890460729599,
-      "p90_ms": 0.24183467030525208,
-      "per_desc_us": 0.013909243534726556
+      "median_ms": 0.0771423801779747,
+      "p90_ms": 0.08528120815753937,
+      "per_desc_us": 0.004708397227659589
     }
   ],
   "submit_prepped": [
     {
       "label": "make_prepped_xfer",
       "count": 1024,
-      "median_ms": 0.04078075289726257,
-      "p90_ms": 0.05688890814781189,
-      "per_desc_us": 0.03982495400123298
+      "median_ms": 0.004509463906288147,
+      "p90_ms": 0.0067390501499176025,
+      "per_desc_us": 0.0044037733459845185
     },
     {
       "label": "make_prepped_xfer",
       "count": 4096,
-      "median_ms": 0.16702059656381607,
-      "p90_ms": 0.2258550375699997,
-      "per_desc_us": 0.04077651283296291
+      "median_ms": 0.005574896931648254,
+      "p90_ms": 0.007526949048042297,
+      "per_desc_us": 0.001361058821203187
     },
     {
       "label": "make_prepped_xfer",
       "count": 16384,
-      "median_ms": 0.6606187671422958,
-      "p90_ms": 0.7217340171337128,
-      "per_desc_us": 0.04032096967421239
+      "median_ms": 0.013998709619045258,
+      "p90_ms": 0.051137059926986694,
+      "per_desc_us": 0.0008544134288968053
     }
   ],
   "submit_initialize": [
     {
       "label": "initialize_xfer",
       "count": 1024,
-      "median_ms": 0.007504597306251526,
-      "p90_ms": 0.007972121238708496,
-      "per_desc_us": 0.007328708306886256
+      "median_ms": 0.02705492079257965,
+      "p90_ms": 0.037748366594314575,
+      "per_desc_us": 0.026420821086503565
     },
     {
       "label": "initialize_xfer",
       "count": 4096,
-      "median_ms": 0.024840235710144043,
-      "p90_ms": 0.025177374482154846,
-      "per_desc_us": 0.0060645106714218855
+      "median_ms": 0.09635742753744125,
+      "p90_ms": 0.10313838720321655,
+      "per_desc_us": 0.02352476258238312
     },
     {
       "label": "initialize_xfer",
       "count": 16384,
-      "median_ms": 0.2822047099471092,
-      "p90_ms": 0.2988148480653763,
-      "per_desc_us": 0.01722440856610774
+      "median_ms": 0.39898231625556946,
+      "p90_ms": 0.7471349090337753,
+      "per_desc_us": 0.024351948013645597
     }
   ],
   "strided": {
     "count": 16384,
     "xferdlist_accepts_nx5": false,
     "xferdlist_error": "descs must be a Nx3 numpy array",
-    "prep_accepts_nx5": false,
-    "strided_error": "TypeError",
-    "verdict": "installed NIXL lacks the Nx5 overload; strided plans need a build from third_party/nixl (nixl_bindings.cpp:148 to_stride_dlist)"
+    "prep_accepts_nx5": true,
+    "compression_ratio": 16384,
+    "strided_prep_ms": 0.0019101426005363464,
+    "strided_submit_ms": 0.001214444637298584
   },
   "reorder": {
     "identity": "ok",

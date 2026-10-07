@@ -22,6 +22,15 @@ Run::
     python tests/nixl/bench_nixl_prepped_xfer.py
     python tests/nixl/bench_nixl_prepped_xfer.py --counts 128,1024 --json out.json
 
+**Budget at least 60s per agent on a shared container host.** ``nixl_agent()`` spends
+that time inside ``uct_tcp_query_devices``, which calls ``ucs_netif_is_active()`` --
+and therefore ``getifaddrs()`` -- once per network interface. On a Docker host with
+~460 interfaces (hundreds of ``br-*`` bridges and ``veth*`` pairs from other
+containers) ``getifaddrs()`` costs ~69ms, so enumeration alone is ~32s per agent and
+this benchmark needs two. ``UCX_TLS``/``UCX_NET_DEVICES`` do not help because
+enumeration precedes filtering. It looks exactly like a hang; it is not. Verify with
+``ls /sys/class/net | wc -l`` before concluding NIXL is broken.
+
 Findings on H20 / NIXL 1.5.0 built from ``third_party/nixl`` with UCX
 (see ``bench_nixl_prepped_xfer.result.json``):
 

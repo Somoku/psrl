@@ -23,7 +23,13 @@ import torch
 nixlBind = pytest.importorskip("nixl._bindings", reason="NIXL not installed")
 _api = pytest.importorskip("nixl._api", reason="NIXL not installed")
 
-AGENT_SETUP_BUDGET_S = 180.0
+#: Agent construction is dominated by UCX's per-interface `getifaddrs()` sweep, which
+#: on this ~460-interface host has been measured anywhere from 60s to over 300s
+#: depending on how many other processes are sweeping concurrently. The budget is a
+#: guard against waiting indefinitely, not a performance assertion: exceeding it skips
+#: with the interface count in the message, so the cause is never mistaken for a NIXL
+#: fault. Override with PSRL_NIXL_AGENT_BUDGET_S when running on a quiet node.
+AGENT_SETUP_BUDGET_S = float(os.environ.get("PSRL_NIXL_AGENT_BUDGET_S", "900"))
 
 
 @pytest.fixture(scope="session")
@@ -119,9 +125,7 @@ def registered_buffer(agent_pair):
         reg_list = nixlBind.nixlRegDList(nixlBind.VRAM_SEG, descs)
         handles = [agent.register_memory(reg_list) for agent in (local, peer)]
         created.append((handles, buffer))
-        # Re-publish so each side can address the other's new region.
-        local.add_remote_agent(peer.get_agent_metadata())
-        peer.add_remote_agent(local.get_agent_metadata())
+        _refresh_peer_metadata(local, peer)
         return buffer
 
     yield make
@@ -130,6 +134,23 @@ def registered_buffer(agent_pair):
         for agent, handle in zip((local, peer), handles):
             with contextlib.suppress(Exception):
                 agent.deregister_memory(handle)
+
+
+def _refresh_peer_metadata(local, peer) -> None:
+    """Re-publish both agents' metadata so newly registered regions are addressable.
+
+    `loadRemoteMD` returns NIXL_ERR_NOT_ALLOWED once a peer is already known, so the
+    peer must be invalidated before the fresh blob is loaded. Skipping the invalidate
+    works for the first few buffers and then starts failing, which looks like a
+    descriptor fault rather than a metadata-lifecycle one.
+    """
+    for agent, remote_name, remote_agent in (
+        (local, "pytest-peer", peer),
+        (peer, "pytest-local", local),
+    ):
+        with contextlib.suppress(Exception):
+            agent.remove_remote_agent(remote_name)
+        agent.add_remote_agent(remote_agent.get_agent_metadata())
 
 
 def xfer_descs(agent, buffer: torch.Tensor, slices: list[tuple[int, int]]):

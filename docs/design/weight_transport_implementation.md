@@ -860,9 +860,19 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 实现期逐项打勾。**判据栏必须可执行**，不接受「已实现」这种描述。
 
 ### 阶段 A
-- [x] **A1 descriptor 正确性已验证**（`test_descriptor_correctness_gpu.py`）：
-      真实 RDMA loopback 下 prepped 路径逐字节正确，含 rotated / subset 索引；
-      subset 提交不越界写。**代码改造（热路径替换 `initialize_xfer`）仍待做**
+- [x] **A1 已落地并验证**：`psrl/utils/nixl/prepped_xfer.py` 的 `PreppedXferCache`
+      接入 `_initialize_merged_xfer`，热路径 `initialize_xfer` 调用数 **== 0**（真实 agent 实测）；
+      逐字节正确（含 rotated / subset / 重注册）；**2048 descriptor 下提交快 >2×**，
+      且优势随 descriptor 数增长。`test_prepped_xfer_cache.py` 29 passed +
+      `test_prepped_hotpath_gpu.py` 7 passed。
+
+      **实现中发现三处会让收益归零的陷阱**（都已修并有回归测试）：
+      1. `prep_xfer_dlist` 的 `mem_type` 要字符串，merged 路径给的是 `nixl_mem_t` 枚举 →
+         裸 `KeyError`，被 fallback 吞掉只留一条 warning
+      2. **每次提交重建索引数组是 O(n)**（0.085μs/desc），比 `initialize_xfer` 还慢 5 倍 →
+         必须缓存索引数组
+      3. **`tuple(wanted)` 做缓存 key 也是 O(n)**（0.027μs/desc）→ 需要 identity 快路径
+      最终 4096 descriptor 下 cache 开销从 0.110ms 降到 0.006ms（18×）
 - [x] **A2 strided 等价性已验证**：strided 与逐条 Nx3 **逐字节一致**，
       含 gapped stride 不写入间隙。**代码改造（删 pinned 中转）仍待做**
 - [x] **A3** 「第二个 post 早于第一个 wait 返回」已有断言 — `test_post_wait_split.py` 15 passed

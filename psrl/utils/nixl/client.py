@@ -18,6 +18,7 @@ from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.meta_buffer import MetaBuffer
+from psrl.utils.nixl.prepped_xfer import PreppedXferCache
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
@@ -171,6 +172,10 @@ class NIXLStorageClient:
 
         # Registry for all local registrations (desc_bytes -> desc object)
         self._registered_descs: dict[bytes, Any] = {}
+
+        # Prepped dlists for the hot path (item A1). Holds raw addresses, so it must be
+        # cleared whenever registered memory changes -- see deregister_all_local_tensors.
+        self._prepped_cache: PreppedXferCache | None = PreppedXferCache(self.agent, self.client_name)
 
         # mem_type -> [(base_addr, nbytes, device_id, mem_type)] tuples for storage registration
         self._mtype_to_reg_region_lists: dict[str, list[tuple[int, int, int, str]]] = {}
@@ -835,6 +840,13 @@ class NIXLStorageClient:
     def deregister_local_tensors(self):
         """Deregister all local tensors"""
         assert self.local_client_info is not None, "Local client info not registered."
+        # Prepped dlists embed the addresses they were built from, so they must go before
+        # the memory they point at. Submitting a stale handle after deregistration would
+        # read freed pages -- the same hazard registration_epoch guards remotely
+        # (design 3.7.3.0a), except here it is entirely local and preventable.
+        prepped_cache = getattr(self, "_prepped_cache", None)
+        if prepped_cache is not None:
+            prepped_cache.clear()
         # Deregister all registered regions.
         self._deregister_all_descs()
         if not self.enable_tms_for_temp_buffers:
@@ -1504,7 +1516,49 @@ class NIXLStorageClient:
         return posted
 
     def _initialize_merged_xfer(self, op_type, local_meta, remote_meta, target_agent, tag, target_client):
-        """Build the merged descriptor lists and create one NIXL transfer handle."""
+        """Create one NIXL transfer handle for a merged descriptor group.
+
+        Prefers the prepped path, which ships only an index array per submission rather
+        than re-serialising the descriptor list: measured 6-28x cheaper, widening with
+        descriptor count (`tests/nixl/bench_nixl_prepped_xfer.result.json`). Falls back
+        to `initialize_xfer` when prepping is unavailable, so a NIXL build without the
+        ndarray overload still works -- at the old cost.
+        """
+        notif = make_xfer_tag(tag, self.client_name, target_client, f"merged_xfer_for_{tag}")
+        descriptor_count = len(local_meta["descs"])
+
+        # getattr, not direct access: the cache is created in __init__, but clients are
+        # also built via __new__ in tests and in the deprecated workers, and a missing
+        # attribute should degrade to the old path rather than raise.
+        if getattr(self, "_prepped_cache", None) is not None:
+            try:
+                start_time = time.time()
+                handle = self._prepped_cache.make_xfer(
+                    op_type,
+                    target_agent,
+                    local_meta["mem_type"],
+                    local_meta["descs"],
+                    remote_meta["mem_type"],
+                    remote_meta["descs"],
+                    notif,
+                )
+                psrl_logger.debug(
+                    f"{self.client_name} composed prepped {op_type} transfer to {target_client} "
+                    f"for tag {tag} with {descriptor_count} descriptors, "
+                    f"time: {time.time() - start_time}s"
+                )
+                return handle
+            except Exception as e:
+                # Disable rather than retry: if prepping cannot work here it will fail
+                # for every subsequent group too, and silently paying the cost twice per
+                # round would be worse than paying the old cost once.
+                psrl_logger.warning(
+                    f"{self.client_name}: prepped submission unavailable ({type(e).__name__}: {e}); "
+                    f"falling back to initialize_xfer for the rest of this client"
+                )
+                self._prepped_cache.clear()
+                self._prepped_cache = None
+
         try:
             merged_local_desc = nixlBind.nixlXferDList(local_meta["mem_type"], local_meta["descs"])
             merged_remote_desc = nixlBind.nixlXferDList(remote_meta["mem_type"], remote_meta["descs"])
@@ -1514,7 +1568,7 @@ class NIXLStorageClient:
                 merged_local_desc,
                 merged_remote_desc,
                 target_agent,
-                make_xfer_tag(tag, self.client_name, target_client, f"merged_xfer_for_{tag}"),
+                notif,
             )
             psrl_logger.debug(
                 f"{self.client_name} created client {op_type} transfer to {target_client} "

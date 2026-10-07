@@ -137,7 +137,23 @@ class Transport:
         """Send one request on its own connection and return its reply."""
         budget = self.timeout_s if timeout_s is None else timeout_s
         async with self._slots:
-            reader, writer = await self._acquire()
+            # Acquiring is inside the try: opening a fresh connection can fail the
+            # same ways a live one can (the socket path is gone, the host refused
+            # it), and a caller does not care which side of that line the failure
+            # was on. Left outside, a bare OSError -- a FileNotFoundError for a
+            # missing unix socket, say -- reached the caller unconverted, naming
+            # neither the service nor the method that was ever reached for.
+            try:
+                reader, writer = await asyncio.wait_for(self._acquire(), timeout=budget)
+            except asyncio.TimeoutError as exc:
+                raise SandboxTransportError(
+                    f"The sandbox service at {self.endpoint!r} did not accept a connection "
+                    f"for {method!r} within {budget:g}s."
+                ) from exc
+            except (ConnectionError, OSError) as exc:
+                raise SandboxTransportError(
+                    f"The sandbox service at {self.endpoint!r} could not be reached for {method!r}: {exc}"
+                ) from exc
             try:
                 result = await asyncio.wait_for(self._roundtrip(reader, writer, method, payload), timeout=budget)
             except asyncio.TimeoutError as exc:

@@ -162,3 +162,47 @@ def test_nothing_in_the_tree_imports_the_removed_copy() -> None:
         "These files still reference the removed psrl.pysandbox copy; they should "
         "import `sandboxd`:\n  " + "\n  ".join(sorted(offenders))
     )
+
+
+def test_transport_wraps_connection_errors_as_sandboxtransporterror() -> None:
+    """Transport.call() must never let a bare OSError escape to callers.
+
+    Regression test for a bug where _acquire() was called outside the try block
+    in call(), so an OSError raised while opening a new connection (the canonical
+    case is FileNotFoundError for a missing unix socket) would surface as a raw
+    Python exception rather than a SandboxTransportError.
+
+    That manifested as opaque 'Container error: [Errno 2] No such file or
+    directory' messages in the grader log — no path, no endpoint, no method name
+    — making the failure look like a container problem rather than a connectivity
+    problem, and hiding which service was unreachable.
+    """
+    import asyncio
+    import sys
+
+    sys.path.insert(0, str(SDK.parent))
+    from sandboxd.client import Transport
+    from sandboxd.errors import SandboxTransportError
+
+    async def check(endpoint: str) -> None:
+        t = Transport(endpoint, timeout_s=2, pool_size=2)
+        try:
+            await t.call("fleet", {})
+            raise AssertionError(f"call to {endpoint!r} should have failed but succeeded")
+        except SandboxTransportError as e:
+            # The endpoint address must appear in the message so the caller
+            # can tell which service was unreachable without reading the code.
+            assert endpoint in str(e), (
+                f"SandboxTransportError {str(e)!r} does not name the endpoint "
+                f"{endpoint!r}; without it the error is undiagnosable."
+            )
+        except OSError as raw:
+            raise AssertionError(
+                f"Transport.call() let a raw {type(raw).__name__} escape to the "
+                "caller instead of wrapping it in SandboxTransportError. The caller "
+                "cannot tell which service was unreachable or which method was "
+                "being invoked."
+            ) from raw
+
+    asyncio.run(check("unix:///run/psrl-test-does-not-exist.sock"))
+    asyncio.run(check("127.0.0.1:19999"))

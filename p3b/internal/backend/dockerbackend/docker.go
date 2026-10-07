@@ -12,12 +12,15 @@
 package dockerbackend
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -451,6 +454,146 @@ func (b *Backend) Snapshot(ctx context.Context, handle backend.Handle, kind stri
 		return "", fmt.Errorf("docker commit: %w", err)
 	}
 	return committed.ID, nil
+}
+
+// ReadFile fetches one file from a sandbox via the Engine's archive endpoint.
+//
+// The shell-based approach (base64 | base64 -d) puts the entire file content
+// on the command line, which fails with ENOMEM / "argument list too long" for
+// files larger than ~96 KiB. The archive endpoint streams a tar containing the
+// file without any shell involvement, so it works for arbitrarily large files.
+func (b *Backend) ReadFile(ctx context.Context, handle backend.Handle, path string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	raw, err := b.callRaw(ctx, http.MethodGet,
+		"/containers/"+handle.SandboxID+"/archive?path="+urlEncodePath(path), nil)
+	if err != nil {
+		return nil, fmt.Errorf("docker archive get %q: %w", path, err)
+	}
+	return extractTarSingle(raw)
+}
+
+// WriteFile uploads one file into a sandbox via the Engine's archive endpoint.
+//
+// Using PUT /containers/{id}/archive avoids the shell-argument-list limit that
+// breaks the old printf-base64 approach for files larger than ~96 KiB (e.g.
+// a large model patch). The data travels as a tar stream in the request body.
+func (b *Backend) WriteFile(ctx context.Context, handle backend.Handle, path string, data []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	tarBytes, err := singleFileTar(path, data)
+	if err != nil {
+		return fmt.Errorf("docker archive put %q: build tar: %w", path, err)
+	}
+	dir := parentDir(path)
+	// Ensure the directory exists first so the archive upload lands cleanly.
+	mkdirCmd := "mkdir -p " + shellescape(dir)
+	code, out, execErr := b.execOneShot(ctx, handle, mkdirCmd, "", nil)
+	if execErr != nil {
+		return fmt.Errorf("docker archive put %q: mkdir: %w", path, execErr)
+	}
+	if code != 0 {
+		return fmt.Errorf("docker archive put %q: mkdir exited %d: %s", path, code, out)
+	}
+	if err := b.putArchive(ctx, handle.SandboxID, dir, tarBytes); err != nil {
+		return fmt.Errorf("docker archive put %q: %w", path, err)
+	}
+	return nil
+}
+
+// putArchive calls PUT /containers/{id}/archive with a tar body.
+func (b *Backend) putArchive(ctx context.Context, containerID, dir string, tarData []byte) error {
+	url := "http://docker/" + b.cfg.APIVersion + "/containers/" + containerID + "/archive?path=" + urlEncodePath(dir)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(tarData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw := new(bytes.Buffer)
+	_, _ = raw.ReadFrom(resp.Body)
+	if resp.StatusCode >= 400 {
+		return &apiError{status: resp.StatusCode, body: strings.TrimSpace(raw.String())}
+	}
+	return nil
+}
+
+// singleFileTar creates an in-memory tar archive containing one file.
+// The entry name is the base name; the caller controls where it is written via
+// the archive upload path parameter.
+func singleFileTar(filePath string, data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	name := path.Base(filePath)
+	if err := tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     name,
+		Size:     int64(len(data)),
+		Mode:     0o644,
+	}); err != nil {
+		return nil, err
+	}
+	if _, err := tw.Write(data); err != nil {
+		return nil, err
+	}
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// extractTarSingle reads the single file from a tar that the archive endpoint
+// returns for a non-directory path.
+func extractTarSingle(tarData []byte) ([]byte, error) {
+	tr := tar.NewReader(bytes.NewReader(tarData))
+	_, err := tr.Next()
+	if err != nil {
+		return nil, fmt.Errorf("archive entry: %w", err)
+	}
+	return io.ReadAll(tr)
+}
+
+// urlEncodePath percent-encodes a filesystem path for use in a query string.
+// Only the characters that would break a URL need encoding; / is left intact
+// because Docker parses it as a path component, not as a delimiter.
+func urlEncodePath(p string) string {
+	// net/url.PathEscape encodes / as %2F, which Docker does not accept in the
+	// path query parameter. Replace it back after encoding.
+	return strings.ReplaceAll(pathEscape(p), "%2F", "/")
+}
+
+// pathEscape is net/url.PathEscape without the special treatment of /.
+func pathEscape(s string) string {
+	var buf strings.Builder
+	const safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:@!$&'()*+,;=/"
+	for _, b := range []byte(s) {
+		if strings.ContainsRune(safe, rune(b)) {
+			buf.WriteByte(b)
+		} else {
+			fmt.Fprintf(&buf, "%%%02X", b)
+		}
+	}
+	return buf.String()
+}
+
+// parentDir returns the directory component of a path, or "/" when there is
+// none.
+func parentDir(p string) string {
+	d := path.Dir(p)
+	if d == "" || d == "." {
+		return "/"
+	}
+	return d
+}
+
+// shellescape wraps a string in single quotes, escaping any embedded single
+// quotes. This is sufficient for mkdir paths that may contain spaces.
+func shellescape(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // DeleteSnapshot removes a committed image.

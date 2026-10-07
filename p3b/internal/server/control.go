@@ -58,6 +58,10 @@ type Control struct {
 	// fleet that is genuinely full behind a slow create.
 	placementAttempts int
 	acquireTimeout    time.Duration
+	// admitPollInterval is how often a queued request re-tries its class. Short
+	// against a sandbox lifetime, so a freed share is picked up promptly, and long
+	// enough that a queue of waiters is not a spin on the ledger's lock.
+	admitPollInterval time.Duration
 
 	mu       sync.Mutex
 	sandbox  map[string]sandboxRecord
@@ -81,6 +85,9 @@ type ControlConfig struct {
 	Nodes             NodeClient
 	PlacementAttempts int
 	AcquireTimeout    time.Duration
+	// AdmitPollInterval overrides how often a request queued on a full class
+	// re-tries. Zero takes the default.
+	AdmitPollInterval time.Duration
 }
 
 // NewControl returns the cluster-level server.
@@ -94,6 +101,9 @@ func NewControl(cfg ControlConfig) (*Control, error) {
 	if cfg.AcquireTimeout <= 0 {
 		cfg.AcquireTimeout = 30 * time.Minute
 	}
+	if cfg.AdmitPollInterval <= 0 {
+		cfg.AdmitPollInterval = 250 * time.Millisecond
+	}
 	return &Control{
 		registry:          cfg.Registry,
 		ledger:            cfg.Ledger,
@@ -102,6 +112,7 @@ func NewControl(cfg ControlConfig) (*Control, error) {
 		nodes:             cfg.Nodes,
 		placementAttempts: cfg.PlacementAttempts,
 		acquireTimeout:    cfg.AcquireTimeout,
+		admitPollInterval: cfg.AdmitPollInterval,
 		sandbox:           map[string]sandboxRecord{},
 	}, nil
 }
@@ -122,17 +133,8 @@ func (c *Control) Create(ctx context.Context, req *v1.CreateRequest) (*v1.Create
 	owner := c.ownerFor(req.GetCallbackTarget())
 	grantID := fmt.Sprintf("grant-%d", time.Now().UnixNano())
 	amount := quotaAmount(spec)
-	admitted, err := c.ledger.Acquire(grantID, spec.ResourceClass, owner, amount)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	if !admitted {
-		// The class is at its share. This clears as sandboxes are released, so the
-		// caller is told to wait rather than that its spec is impossible.
-		c.ledger.Enqueue(spec.ResourceClass, amount)
-		c.ledger.Cancel(spec.ResourceClass, amount)
-		return nil, status.Errorf(codes.ResourceExhausted,
-			"the %q class is at its fleet share; this clears as sandboxes are released", spec.ResourceClass)
+	if err := c.admit(ctx, grantID, spec.ResourceClass, owner, amount); err != nil {
+		return nil, err
 	}
 
 	created, err := c.place(ctx, selected, spec, req.GetCallbackTarget(), owner)
@@ -145,6 +147,66 @@ func (c *Control) Create(ctx context.Context, req *v1.CreateRequest) (*v1.Create
 		grantID: grantID, reservationID: created.reservationID, class: spec.ResourceClass,
 	})
 	return createdToProto(created.created), nil
+}
+
+// admit charges one request against its class, waiting for room when the class
+// is momentarily full.
+//
+// A class at its share is a queue, not a verdict: the share clears as sandboxes
+// are released, and the request is for capacity that will exist rather than for a
+// capability that never will. Returning ResourceExhausted immediately made the
+// caller's retry the queue, and a caller that treats the refusal as terminal --
+// a grader step, which cannot be retried without redoing the rollout -- loses the
+// episode to a wait it was never offered. The wait is bounded by AcquireTimeout,
+// which is derived from the episode deadline for exactly this purpose: a queue
+// longer than an episode is a fault rather than contention.
+//
+// The demand is enqueued for the whole wait, which is what reserves the class's
+// guarantee against borrowers while it waits. It is withdrawn on every exit path,
+// so a caller that gave up does not leave the class reserving room for a request
+// that no longer exists.
+func (c *Control) admit(ctx context.Context, grantID, class, owner string, amount quota.Amount) error {
+	admitted, err := c.ledger.Acquire(grantID, class, owner, amount)
+	if err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	if admitted {
+		return nil
+	}
+
+	c.ledger.Enqueue(class, amount)
+	defer c.ledger.Cancel(class, amount)
+
+	// Polled rather than signalled: a release happens on another caller's
+	// goroutine and the ledger publishes no readiness channel, so the choice is
+	// between a poll here and a condition variable threaded through every release
+	// path. The interval is short against a sandbox lifetime and the waiters are
+	// few, so the poll costs a lock acquisition per class per interval.
+	ticker := time.NewTicker(c.admitPollInterval)
+	defer ticker.Stop()
+	deadline := time.Now().Add(c.acquireTimeout)
+
+	for {
+		select {
+		case <-ctx.Done():
+			// The caller's own deadline fired. Its error is the honest one: nothing
+			// about the fleet is known to be wrong.
+			return status.FromContextError(ctx.Err()).Err()
+		case <-ticker.C:
+			admitted, err := c.ledger.Acquire(grantID, class, owner, amount)
+			if err != nil {
+				return status.Error(codes.Internal, err.Error())
+			}
+			if admitted {
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return status.Errorf(codes.ResourceExhausted,
+					"the %q class did not come free within %s; this clears as sandboxes are released",
+					class, c.acquireTimeout)
+			}
+		}
+	}
 }
 
 type placed struct {

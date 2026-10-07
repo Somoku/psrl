@@ -5,8 +5,8 @@
   "timing": { "episode_deadline_s": 1800, "node_ttl_s": 120, "rpc_timeout_s": 60 },
   "fleet": { "memory_mb": 1920000, "cpu_millis": 360000, "disk_mb": 8000000 },
   "classes": {
-    "rollout": { "guaranteed_share": 0.7 },
-    "grader": { "guaranteed_share": 0.2 }
+    "rollout": { "guaranteed_share": 0.45 },
+    "grader": { "guaranteed_share": 0.45 }
   },
   "backends": [
     { "type": "docker", "mode": "direct", "socket": "/var/run/docker.sock", "api_version": "v1.40" }

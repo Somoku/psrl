@@ -202,13 +202,23 @@ class Capabilities:
 
 @dataclass(frozen=True)
 class AgentEndpoint:
-    """Where the SDK reaches the agent inside a sandbox.
+    """Where the SDK reaches a sandbox's data plane.
 
     Returned with the handle, so command traffic needs no further round trip
     through the control plane.
+
+    Two shapes, because two kinds of backend exist. A provider sandbox runs its
+    own agent and reports it in `address`. A bare container runs none, so the
+    node that owns its daemon drives it instead and reports itself in
+    `data_plane`. Either way the call leaves the control plane out of the path;
+    what differs is only which host answers it.
     """
 
     address: str = ""
+    # The owning node's own plane, for a sandbox with no in-sandbox agent. Kept
+    # apart from `address` because they are not interchangeable: one speaks the
+    # backend's agent protocol, the other speaks this service's node protocol.
+    data_plane: str = ""
     headers: Mapping[str, str] = field(default_factory=dict)
     callback_host_alias: str | None = None
     callback_port: int | None = None

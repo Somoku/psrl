@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	v1 "psrl.dev/sandboxd/api/v1"
+	"psrl.dev/sandboxd/internal/backend"
 	"psrl.dev/sandboxd/internal/placement"
 )
 
@@ -239,6 +241,12 @@ func (n *NodeListener) exec(ctx context.Context, raw json.RawMessage) (any, erro
 	return map[string]any{"exit_code": code, "stdout": output, "stderr": "", "truncated": false}, nil
 }
 
+// readBytes fetches one file out of a sandbox.
+//
+// The archive path is preferred where the backend offers it. The shell fallback
+// puts the whole file on a command line, and Linux caps a single argument at
+// 128 KiB (MAX_ARG_STRLEN), so a large file fails there with "argument list too
+// long" however much memory the node has.
 func (n *NodeListener) readBytes(ctx context.Context, raw json.RawMessage) (any, error) {
 	var payload struct {
 		handlePayload
@@ -247,7 +255,17 @@ func (n *NodeListener) readBytes(ctx context.Context, raw json.RawMessage) (any,
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, err
 	}
-	code, output, err := n.node.Exec(ctx, payload.handle(), fmt.Sprintf("base64 %q", payload.Path), "", nil)
+	handle := payload.handle()
+	if hosted, hosts := n.node.hosted(handle.Backend); hosts {
+		if files, ok := hosted.(backend.FileHandler); ok {
+			data, err := files.ReadFile(ctx, handle, payload.Path)
+			if err != nil {
+				return nil, status.Errorf(codes.NotFound, "reading %q: %v", payload.Path, err)
+			}
+			return map[string]any{"data": base64.StdEncoding.EncodeToString(data)}, nil
+		}
+	}
+	code, output, err := n.node.Exec(ctx, handle, fmt.Sprintf("base64 %q", payload.Path), "", nil)
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -257,6 +275,11 @@ func (n *NodeListener) readBytes(ctx context.Context, raw json.RawMessage) (any,
 	return map[string]any{"data": compactBase64(output)}, nil
 }
 
+// writeBytes puts one file into a sandbox.
+//
+// Same reason as readBytes for preferring the archive path: the shell fallback
+// cannot carry a file past the kernel's single-argument limit, and a model patch
+// routinely exceeds it.
 func (n *NodeListener) writeBytes(ctx context.Context, raw json.RawMessage) (any, error) {
 	var payload struct {
 		handlePayload
@@ -266,9 +289,22 @@ func (n *NodeListener) writeBytes(ctx context.Context, raw json.RawMessage) (any
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, err
 	}
+	handle := payload.handle()
+	if hosted, hosts := n.node.hosted(handle.Backend); hosts {
+		if files, ok := hosted.(backend.FileHandler); ok {
+			decoded, err := base64.StdEncoding.DecodeString(payload.Data)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "writing %q: %v", payload.Path, err)
+			}
+			if err := files.WriteFile(ctx, handle, payload.Path, decoded); err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "writing %q: %v", payload.Path, err)
+			}
+			return map[string]any{}, nil
+		}
+	}
 	command := fmt.Sprintf("mkdir -p \"$(dirname %q)\" && printf %%s %q | base64 -d > %q",
 		payload.Path, payload.Data, payload.Path)
-	code, output, err := n.node.Exec(ctx, payload.handle(), command, "", nil)
+	code, output, err := n.node.Exec(ctx, handle, command, "", nil)
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}

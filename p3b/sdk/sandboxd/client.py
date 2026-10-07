@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from collections import deque
 from collections.abc import Mapping, Sequence
 from types import TracebackType
 from typing import Any
@@ -50,64 +51,120 @@ from sandboxd.types import (
 
 DEFAULT_ENDPOINT = "unix:///run/sandboxd.sock"
 
-# A control call asks a question or moves a reservation, so a healthy one answers
-# in milliseconds and one that has not answered in a minute is a fault. A command
-# carries its own budget instead, because its duration is the work itself.
-DEFAULT_CONTROL_TIMEOUT_S = 60.0
+# A control call asks a question or moves a reservation. Most answer in
+# milliseconds, but a create can legitimately take minutes: it may pull a cold
+# image, and it may try several nodes before one admits. The budget covers that
+# worst case rather than the median, because the failure mode of a budget set to
+# the median is a timeout reported as a service fault on a service that was
+# working.
+DEFAULT_CONTROL_TIMEOUT_S = 300.0
+
+# How many connections one client keeps to one endpoint. The wire protocol
+# matches replies to requests by order, so a connection serves one call at a
+# time and concurrency is the pool's width. Sized for the concurrent episodes one
+# worker runs; a burst wider than this waits for a connection rather than opening
+# an unbounded number of sockets.
+DEFAULT_POOL_SIZE = 32
 
 
 class Transport:
-    """One connection to the service, speaking length-prefixed JSON.
+    """A pool of connections to one service endpoint, speaking length-prefixed JSON.
 
     JSON rather than protobuf on the Python side: the SDK's job is to serialize
-    and forward, the control path is two calls per episode, and a generated stub
-    would make the SDK's install depend on a protobuf runtime for no measurable
-    gain. The wire shape is still the one the proto defines.
+    and forward, and a generated stub would make the SDK's install depend on a
+    protobuf runtime for no measurable gain. The wire shape is still the one the
+    proto defines.
+
+    A pool rather than one connection, because the wire protocol has no request
+    ids: a reply is matched to a request by arrival order, so two callers sharing
+    a connection would have to take turns. That used to be a lock around every
+    call, which made the whole SDK serial -- one slow create (a cold image pull
+    is minutes) held every other caller behind it until they hit their own
+    deadline. Giving each in-flight call its own connection removes the queue
+    without adding request ids to the protocol.
+
+    Connections are reused rather than opened per call, so a steady workload pays
+    the handshake once per pooled connection rather than once per command.
     """
 
-    def __init__(self, endpoint: str, *, timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S) -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S,
+        pool_size: int = DEFAULT_POOL_SIZE,
+    ) -> None:
         self.endpoint = endpoint
         self.timeout_s = timeout_s
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._lock = asyncio.Lock()
+        if pool_size < 1:
+            raise ValueError(f"A transport pool needs at least one connection, got {pool_size}.")
+        # Idle connections, available for reuse. A call takes one, uses it
+        # exclusively, and returns it; the pool is a free-list, never a set of
+        # shared connections.
+        self._idle: deque[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = deque()
+        # Bounds concurrent connections. A burst wider than the pool waits here
+        # rather than opening an unbounded number of sockets against the service.
+        self._slots = asyncio.Semaphore(pool_size)
+        self._closed = False
 
-    async def _connect(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        if self._reader is not None and self._writer is not None and not self._writer.is_closing():
-            return self._reader, self._writer
+    async def _open(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         if self.endpoint.startswith("unix://"):
             path = self.endpoint[len("unix://") :]
-            self._reader, self._writer = await asyncio.open_unix_connection(path)
-        else:
-            parsed = urlsplit(self.endpoint if "://" in self.endpoint else f"//{self.endpoint}")
-            if parsed.hostname is None or parsed.port is None:
-                raise SandboxTransportError(f"A service endpoint must be unix:// or host:port, got {self.endpoint!r}.")
-            self._reader, self._writer = await asyncio.open_connection(parsed.hostname, parsed.port)
-        return self._reader, self._writer
+            return await asyncio.open_unix_connection(path)
+        parsed = urlsplit(self.endpoint if "://" in self.endpoint else f"//{self.endpoint}")
+        if parsed.hostname is None or parsed.port is None:
+            raise SandboxTransportError(f"A service endpoint must be unix:// or host:port, got {self.endpoint!r}.")
+        return await asyncio.open_connection(parsed.hostname, parsed.port)
+
+    async def _acquire(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Take an idle connection, or open one when the pool has a free slot."""
+        while self._idle:
+            reader, writer = self._idle.popleft()
+            if not writer.is_closing():
+                return reader, writer
+            # The peer closed it while it sat idle. Drop it and look further.
+            writer.close()
+        return await self._open()
+
+    def _release(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Return a healthy connection to the pool."""
+        if self._closed or writer.is_closing():
+            writer.close()
+            return
+        self._idle.append((reader, writer))
 
     async def call(self, method: str, payload: Mapping[str, Any], *, timeout_s: float | None = None) -> dict[str, Any]:
-        """Send one request and return its reply.
-
-        Serialized on one connection, because the control path is low rate and a
-        connection per call would cost more than it saves.
-        """
+        """Send one request on its own connection and return its reply."""
         budget = self.timeout_s if timeout_s is None else timeout_s
-        async with self._lock:
+        async with self._slots:
+            reader, writer = await self._acquire()
             try:
-                return await asyncio.wait_for(self._roundtrip(method, payload), timeout=budget)
+                result = await asyncio.wait_for(self._roundtrip(reader, writer, method, payload), timeout=budget)
             except asyncio.TimeoutError as exc:
-                # The service may still be acting on it, so the connection is
-                # dropped rather than reused with an unread reply in the pipe.
-                await self.close()
+                # The service may still be acting on it, so this connection is
+                # dropped rather than pooled with an unread reply in the pipe.
+                writer.close()
                 raise SandboxTransportError(
                     f"The sandbox service did not answer {method!r} within {budget:g}s."
                 ) from exc
-            except (ConnectionError, OSError) as exc:
-                await self.close()
+            except (ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
+                writer.close()
                 raise SandboxTransportError(f"The sandbox service connection failed during {method!r}: {exc}") from exc
+            except SandboxError:
+                # A typed service error leaves the connection clean: the reply was
+                # read in full, so the connection is still reusable.
+                self._release(reader, writer)
+                raise
+            self._release(reader, writer)
+            return result
 
-    async def _roundtrip(self, method: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-        reader, writer = await self._connect()
+    async def _roundtrip(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        method: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
         request = json.dumps({"method": method, "payload": dict(payload)}).encode()
         writer.write(len(request).to_bytes(4, "big") + request)
         await writer.drain()
@@ -119,16 +176,16 @@ class Transport:
         return reply.get("result") or {}
 
     async def close(self) -> None:
-        """Drop the connection."""
-        writer, self._writer, self._reader = self._writer, None, None
-        if writer is None:
-            return
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except (ConnectionError, OSError):
-            # The peer is already gone, which is the state close wanted.
-            pass
+        """Drop every pooled connection."""
+        self._closed = True
+        idle, self._idle = self._idle, deque()
+        for _, writer in idle:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                # The peer is already gone, which is the state close wanted.
+                pass
 
 
 def _error_for(code: str, message: str) -> SandboxError:
@@ -260,6 +317,50 @@ class Sandbox:
         await self.release()
 
 
+def node_plane_agent_factory(
+    *,
+    timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S,
+    pool_size: int = DEFAULT_POOL_SIZE,
+):
+    """Return a factory that reaches each sandbox's owning node directly.
+
+    This is what keeps command and file traffic off the control plane for a
+    backend whose sandboxes run no agent of their own. A bare container is that
+    case: there is no process inside it listening for commands, so something has
+    to drive the runtime on its behalf, and the node that owns the daemon is the
+    nearest thing that can. Routing those calls through the control plane instead
+    costs a second hop and a second serialization on every command, which an
+    episode pays dozens of times for no decision.
+
+    The node plane speaks the same length-prefixed JSON as the control plane and
+    already implements exec, read_bytes, and write_bytes, so the dial target is
+    the only difference. One pool per node address, shared by every sandbox on
+    that node: a burst on one node is a burst of calls to one host, and a pool per
+    sandbox would spend a handshake on each.
+
+    A sandbox whose create reply names no data-plane address falls back to the
+    control plane by returning None, which is also what a provider backend's own
+    agent protocol would do if this factory were replaced.
+    """
+    pools: dict[str, Transport] = {}
+
+    def factory(agent: AgentEndpoint):
+        address = getattr(agent, "data_plane", "") or ""
+        if not address:
+            return None
+        pool = pools.get(address)
+        if pool is None:
+            pool = Transport(address, timeout_s=timeout_s, pool_size=pool_size)
+            pools[address] = pool
+
+        async def run(method: str, payload: Mapping[str, Any], *, timeout_s: float | None = None) -> dict[str, Any]:
+            return await pool.call(method, payload, timeout_s=timeout_s)
+
+        return run
+
+    return factory
+
+
 class SandboxClient:
     """A connection to one sandbox service."""
 
@@ -268,14 +369,20 @@ class SandboxClient:
         endpoint: str = DEFAULT_ENDPOINT,
         *,
         control_timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S,
+        pool_size: int = DEFAULT_POOL_SIZE,
         agent_factory: Any = None,
     ) -> None:
-        self._transport = Transport(endpoint, timeout_s=control_timeout_s)
-        # Returns a runner for a sandbox that has its own agent, or None when it
-        # has none and the owning node proxies instead. Injected so a test can
-        # drive the data plane, and so a deployment whose agents speak another
-        # protocol can supply its own.
-        self._agent_factory = agent_factory or (lambda _agent: None)
+        self._transport = Transport(endpoint, timeout_s=control_timeout_s, pool_size=pool_size)
+        # Returns a runner for a sandbox whose data plane is reachable directly,
+        # or None to fall back to the control plane. The default reaches the
+        # owning node's own plane, which is what keeps commands off the control
+        # plane for a backend whose sandboxes run no agent of their own.
+        #
+        # Injected so a test can drive the data plane, and so a deployment whose
+        # agents speak another protocol (execd, say) can supply its own.
+        self._agent_factory = agent_factory or node_plane_agent_factory(
+            timeout_s=control_timeout_s, pool_size=pool_size
+        )
 
     async def create(self, spec: SandboxSpec) -> Sandbox:
         """Provision one sandbox.
@@ -390,6 +497,7 @@ class SandboxClient:
             ),
             AgentEndpoint(
                 address=agent.get("address", ""),
+                data_plane=agent.get("data_plane", ""),
                 headers=agent.get("headers") or {},
                 callback_host_alias=agent.get("callback_host_alias"),
                 callback_port=agent.get("callback_port"),

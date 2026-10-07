@@ -32,6 +32,12 @@ type JSONListener struct {
 	node    *Node
 	log     *slog.Logger
 
+	// dataPlane resolves a node id to the address the SDK can reach that node's
+	// own plane on, so a sandbox with no in-sandbox agent still gets a data-plane
+	// address and its commands stay off the control plane. Nil in a combined
+	// deployment, where the SDK already shares a socket with the node.
+	dataPlane func(nodeID string) string
+
 	mu       sync.Mutex
 	listener net.Listener
 	closed   bool
@@ -46,6 +52,13 @@ func NewJSONListener(control *Control, node *Node, log *slog.Logger) *JSONListen
 		log = slog.Default()
 	}
 	return &JSONListener{control: control, node: node, log: log}
+}
+
+// WithDataPlane supplies the node-id-to-address lookup a fleet deployment needs,
+// so a create reply can tell the SDK which node to send commands to.
+func (j *JSONListener) WithDataPlane(resolve func(nodeID string) string) *JSONListener {
+	j.dataPlane = resolve
+	return j
 }
 
 // Serve accepts connections until the listener is closed.
@@ -279,7 +292,7 @@ func (j *JSONListener) create(ctx context.Context, raw json.RawMessage) (any, er
 	if err != nil {
 		return nil, err
 	}
-	return createdJSON(created), nil
+	return j.createdJSON(created), nil
 }
 
 func (j *JSONListener) createGroup(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -300,11 +313,31 @@ func (j *JSONListener) createGroup(ctx context.Context, raw json.RawMessage) (an
 	}
 	members := make([]any, 0, len(group.GetMembers()))
 	for _, member := range group.GetMembers() {
-		members = append(members, createdJSON(member))
+		members = append(members, j.createdJSON(member))
 	}
 	return map[string]any{"members": members}, nil
 }
 
+// createdJSON renders a create reply, resolving the data-plane address this
+// deployment's topology implies.
+func (j *JSONListener) createdJSON(created *v1.CreateResponse) map[string]any {
+	out := createdJSON(created)
+	// A sandbox with no agent of its own is driven by the node that owns it, so
+	// the node's address is what the SDK needs to keep its commands off the
+	// control plane. Resolved here rather than carried up from the backend,
+	// because the address belongs to this deployment's topology and the backend
+	// only knows that it has no agent to report.
+	if j.dataPlane != nil && created.GetAgent().GetAddress() == "" {
+		if agent, ok := out["agent"].(map[string]any); ok {
+			agent["data_plane"] = j.dataPlane(created.GetHandle().GetNodeId())
+		}
+	}
+	return out
+}
+
+// createdJSON renders a create reply with no topology applied. The node plane
+// uses this for its own replies, where the caller is the control plane rather
+// than the SDK and no data-plane address is wanted.
 func createdJSON(created *v1.CreateResponse) map[string]any {
 	features := make([]string, 0, len(created.GetCapabilities().GetFeatures()))
 	for _, feature := range created.GetCapabilities().GetFeatures() {
@@ -327,6 +360,7 @@ func createdJSON(created *v1.CreateResponse) map[string]any {
 		},
 		"agent": map[string]any{
 			"address":             created.GetAgent().GetAddress(),
+			"data_plane":          "",
 			"headers":             created.GetAgent().GetHeaders(),
 			"callback_host_alias": created.GetAgent().GetCallbackHostAlias(),
 			"callback_port":       created.GetAgent().GetCallbackPort(),

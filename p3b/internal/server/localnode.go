@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 
 	v1 "psrl.dev/sandboxd/api/v1"
@@ -78,7 +79,20 @@ func (l *LocalNodeClient) ExecOn(ctx context.Context, handle backend.Handle, com
 }
 
 // ReadBytesOn reads a file from a sandbox the node holds.
+//
+// Uses the Engine archive API when the backend implements FileHandler, which
+// avoids the ARG_MAX limit that breaks shell-based base64 for files over ~96 KiB.
 func (l *LocalNodeClient) ReadBytesOn(ctx context.Context, handle backend.Handle, path string) (string, error) {
+	if b, ok := l.node.hosted(handle.Backend); ok {
+		if fh, ok := b.(backend.FileHandler); ok {
+			data, err := fh.ReadFile(ctx, handle, path)
+			if err != nil {
+				return "", fmt.Errorf("reading %q: %w", path, err)
+			}
+			return base64.StdEncoding.EncodeToString(data), nil
+		}
+	}
+	// Fallback for backends that don't implement FileHandler.
 	code, output, err := l.node.Exec(ctx, handle, fmt.Sprintf("base64 %q", path), "", nil)
 	if err != nil {
 		return "", err
@@ -90,7 +104,20 @@ func (l *LocalNodeClient) ReadBytesOn(ctx context.Context, handle backend.Handle
 }
 
 // WriteBytesOn writes a file into a sandbox the node holds.
+//
+// Uses the Engine archive API when the backend implements FileHandler, which
+// avoids the ARG_MAX limit that breaks shell-based base64 for files over ~96 KiB.
 func (l *LocalNodeClient) WriteBytesOn(ctx context.Context, handle backend.Handle, path, data string) error {
+	if b, ok := l.node.hosted(handle.Backend); ok {
+		if fh, ok := b.(backend.FileHandler); ok {
+			decoded, err := base64.StdEncoding.DecodeString(data)
+			if err != nil {
+				return fmt.Errorf("writing %q: decode: %w", path, err)
+			}
+			return fh.WriteFile(ctx, handle, path, decoded)
+		}
+	}
+	// Fallback for backends that don't implement FileHandler.
 	command := fmt.Sprintf("mkdir -p \"$(dirname %q)\" && printf %%s %q | base64 -d > %q", path, data, path)
 	code, output, err := l.node.Exec(ctx, handle, command, "", nil)
 	if err != nil {

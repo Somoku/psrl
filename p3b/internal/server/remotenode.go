@@ -227,6 +227,24 @@ func (f *FleetNodeClient) node(nodeID string) (*RemoteNodeClient, error) {
 	return n, nil
 }
 
+// DataPlaneFor returns the address a caller can reach one node's own plane on,
+// or an empty string for a node this control plane does not hold.
+//
+// The SDK needs it because a bare container runs no agent of its own: something
+// has to drive the runtime for it, and the node that owns the daemon is the
+// nearest thing that can. Handing the caller that address is what keeps command
+// and file traffic off the control plane, which would otherwise add a hop and a
+// serialization to every command in an episode.
+func (f *FleetNodeClient) DataPlaneFor(nodeID string) string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	n, ok := f.nodes[nodeID]
+	if !ok {
+		return ""
+	}
+	return n.address
+}
+
 // Admit asks the named node to accept one sandbox request.
 func (f *FleetNodeClient) Admit(ctx context.Context, nodeID string, spec backend.Spec) (string, []int32, string, error) {
 	n, err := f.node(nodeID)

@@ -1,5 +1,9 @@
-# compiled binaries and test binaries
-sandboxd
+# Compiled binaries and test binaries.
+#
+# The build output is anchored to bin/ rather than written as a bare
+# "sandboxd": a bare pattern matches at any depth, and it silently excluded the
+# whole SDK package at sdk/sandboxd/, so a fresh clone had no SDK to install.
+bin/
 *.test
 
 # go workspace artifacts

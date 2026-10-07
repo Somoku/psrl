@@ -429,8 +429,11 @@ func runControl(ctx context.Context, cfg Config, spans timing.Contract, log *slo
 	}
 	log.Info("sandboxd control plane listening", "address", cfg.Listen, "fleet_nodes", len(cfg.FleetNodes))
 	// nil node: a control-only process forwards exec via FleetNodeClient, not a
-	// local node. JSONListener.exec routes through control.nodes.ExecOn.
-	return server.NewJSONListener(control, nil, log).Serve(ctx, listener)
+	// local node. The data-plane resolver lets a create reply name the node a
+	// caller should send commands to, so they skip this process entirely.
+	return server.NewJSONListener(control, nil, log).
+		WithDataPlane(fleetClient.DataPlaneFor).
+		Serve(ctx, listener)
 }
 
 // runCombined is the original single-process shape: control and node in one

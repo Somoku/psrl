@@ -11,20 +11,37 @@ Design and rationale: [sandbox_service](../../docs/design/sandbox_service.md).
 | `${REPO}` | this repository's root |
 | `${SOCK}` | where the SDK reaches the service, default `/run/sandboxd.sock` |
 
-## Quickstart
+## Install
 
-Build the service and run it against the local Docker daemon:
+Two artifacts, installed separately because they are deployed to different
+places: the service runs on every sandbox node, the SDK wherever a caller runs.
 
 ```bash
-cd ${REPO}/sandboxd
-go build -o /usr/local/bin/sandboxd ./cmd/sandboxd
-sandboxd -config ${REPO}/sandboxd/example.json
+cd ${REPO}/p3b
+make install          # builds and installs ${PREFIX}/bin/sandboxd, PREFIX=/usr/local
+make sdk-install      # pip install -e sdk, the surface a caller imports
 ```
+
+`PREFIX`, `DESTDIR`, `GO`, and `PIP` are overridable. `make help` lists every
+target.
+
+## Quickstart
+
+Validate a configuration before serving it. The exit code is the whole answer,
+which is what a deployment pipeline reads:
+
+```bash
+make preflight                        # validates example.json, reaches each backend
+sandboxd -config ${REPO}/p3b/example.json
+```
+
+A preflight failure names what it could not reach. `docker daemon at
+/var/run/docker.sock is not answering` means the daemon, not the service.
 
 Then, from Python:
 
 ```python
-from psrl.pysandbox import Resources, SandboxClient, SandboxSpec, Source
+from sandboxd import Resources, SandboxClient, SandboxSpec, Source
 
 async with SandboxClient("unix:///run/sandboxd.sock") as client:
     async with await client.create(
@@ -71,7 +88,7 @@ derived is not a knob.
     "prepare": { "guaranteed_share": 0.1 }
   },
   "backends": [
-    { "type": "docker", "mode": "psrl", "socket": "/var/run/docker.sock", "api_version": "v1.40" }
+    { "type": "docker", "mode": "direct", "socket": "/var/run/docker.sock", "api_version": "v1.40" }
   ],
   "default_backend": "docker"
 }
@@ -87,13 +104,50 @@ derived is not a knob.
 | `node.local_*_ceiling` | `0` (off) | measured pressure above which the node refuses regardless of its envelope |
 | `classes.*.guaranteed_share` | — | must sum below one, or a guarantee is unsatisfiable |
 | `classes.*.max_share` | unset | a ceiling, even on an idle fleet |
-| `backends[].mode` | `psrl` | `psrl`: this service places. `provider`: the backend's own scheduler does |
+| `backends[].mode` | `direct` | `direct`: this service places and drives the runtime. `provider`: the backend’s own scheduler does |
 
 Override a derived span only when a deployment genuinely needs a different one.
 The orderings are still asserted against it:
 
 ```json
 "timing": { "episode_deadline_s": 1800, "overrides": { "reap_window_s": 600 } }
+```
+
+## One control plane over several nodes
+
+The quickstart runs both planes in one process, which serves one machine. A
+fleet splits them: one control process, and one node process per machine.
+
+| Field | Role `control` | Role `node` |
+|---|---|---|
+| `role` | `"control"` | `"node"` |
+| `listen` | where the SDK connects, `host:port` so every worker can reach it | unused |
+| `node_listen` | unused | where the control plane reaches this node |
+| `fleet_nodes` | every node, as `node_id` and `address` | unused |
+| `node` | unused | this machine's envelope |
+| `fleet` | the whole fleet's ceiling | unused |
+| `backends` | declared, for capability routing | declared, and driven |
+
+Both roles declare `backends` and `classes`, and the two declarations have to
+agree: the control plane routes a spec by capability, and the node it picks is
+the one that actually creates. A class named in a spec must exist in both.
+
+Start the nodes first, then the control plane; a control process whose nodes are
+absent starts, but places nothing until they report.
+
+```bash
+# on each node
+sandboxd -config node.json
+# on the control host
+sandboxd -config control.json
+```
+
+Then point the rollout at `host:port` rather than at a socket. Confirm the fleet
+is whole before a run — a control plane reports every node it has heard from,
+and the count is the answer:
+
+```python
+print(await client.fleet())
 ```
 
 ## Scheduling modes
@@ -104,25 +158,60 @@ ablation hold everything else fixed.
 
 | Mode | Who picks the node | When to use it |
 |---|---|---|
-| `psrl` | this service, with in-flight reservation and image locality | the backend's own scheduler adds nothing |
+| `direct` | this service, with in-flight reservation and image locality | the backend’s own scheduler adds nothing |
 | `provider` | the backend's control plane | the backend has a real scheduler whose decisions would be lost |
 
 ## Tests
 
 ```bash
-cd ${REPO}/sandboxd
-go test ./internal/...                 # unit, no daemon needed
-go test -race ./internal/...           # the concurrency invariants
-go test ./internal/backend/dockerbackend/ ./internal/server/   # needs a docker socket
+cd ${REPO}/p3b
+make test             # unit, no daemon needed
+make test-race        # the concurrency invariants
+make bench            # the create path and the port allocator
+make test-rollout     # end-to-end, needs a Docker daemon (build tag)
 ```
 
-The Python SDK's live suite needs a built binary:
+The SDK's live suite drives the real SDK against a real service and a real
+daemon, so it needs a built binary:
 
 ```bash
-SANDBOXD_BINARY=/usr/local/bin/sandboxd pytest ${REPO}/tests/sandbox/test_pysandbox_live.py
+SANDBOXD_BINARY=${PREFIX}/bin/sandboxd pytest ${REPO}/tests/sandbox/test_sdk_live.py
 ```
 
-Both live suites skip themselves where no Docker socket is present.
+Every live suite skips itself where no Docker socket is present, so the default
+run works on a machine that has none.
+
+## Using it from PSRL
+
+PSRL reaches the service through the `p3b` backend, which is a client and
+nothing more: placement, admission, and reclamation stay here. Two steps.
+
+1. Start a service where the sandboxes should run. One combined process per
+   node is the simplest shape; a fleet runs one control plane over several node
+   processes instead. `listen` is what the worker reaches.
+2. Point the rollout at it, in
+   `psrl/trainer/config/rollout/psrl_rollout.yaml`:
+
+```yaml
+sandbox:
+  default_backend: p3b          # was: docker
+  backends:
+    p3b:
+      endpoint: unix:///run/sandboxd.sock
+      resource_class: rollout   # must name a class this service declares
+```
+
+The `resource_class` has to exist in this service's own `classes` block, or
+every create is refused for a class it was never given a share of.
+
+Choose `p3b` over the in-process `docker` backend when more than one worker
+shares a fleet: the service holds one quota ledger across every node and
+backend it drives, so a class guarantee bounds the whole run rather than each
+worker's own node. A single-worker deployment gains nothing from the hop.
+
+The service must be listening before a worker starts. The backend connects on
+its first create, and a missing socket is a startup error rather than something
+it retries.
 
 ## Gotchas
 

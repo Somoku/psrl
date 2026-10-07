@@ -199,6 +199,20 @@ type NodeScheduled interface {
 	RegisterBinding(ctx context.Context, nodeID string, sandboxID string) error
 }
 
+// FileHandler is implemented by a backend that supports efficient direct file
+// transfer to and from a sandbox.
+//
+// A backend that implements this avoids the shell-based printf/base64 approach
+// that fails with ENOMEM for files larger than ~96 KiB (Linux ARG_MAX). The
+// docker backend implements this via the Engine API archive endpoint.
+//
+// When a backend does not implement FileHandler, the node falls back to the
+// shell-based approach.
+type FileHandler interface {
+	ReadFile(ctx context.Context, handle Handle, path string) ([]byte, error)
+	WriteFile(ctx context.Context, handle Handle, path string, data []byte) error
+}
+
 // Stateful is implemented by a backend that can pause, resume, or snapshot.
 type Stateful interface {
 	Pause(ctx context.Context, handle Handle, mode string) error

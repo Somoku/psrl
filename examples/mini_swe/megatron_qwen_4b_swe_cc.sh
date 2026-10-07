@@ -175,7 +175,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.total_nnodes=${NNODES} \
-    psrl.deployment.sandbox_placement.enabled=true \
+    psrl.deployment.sandbox_placement.enabled=false \
     psrl.nixl.server_port=23456 \
     psrl.rollout_gateway.trajectory_id_strategy=auto \
     psrl.rollout_gateway.tito_debug=false \
@@ -183,7 +183,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     \
     gen_actor_rollout_ref.rollout.agent.default_agent_loop=mini_swe_claude_code \
     gen_actor_rollout_ref.rollout.agent.traj_reward_mode=traj \
-    gen_actor_rollout_ref.rollout.agent.sandbox.default_backend=docker \
+    gen_actor_rollout_ref.rollout.agent.sandbox.default_backend=p3b \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \

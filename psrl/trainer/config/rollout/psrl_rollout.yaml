@@ -234,8 +234,14 @@ agent:
       p3b:
         _target_: psrl.sandbox.backends.P3bBackend
 
-        # Where the SDK reaches the service. A service per node uses the default
-        # unix socket; one shared control plane is reached by host:port.
+        # Where the SDK reaches the service. A service per node uses this unix
+        # socket; one shared control plane over several nodes is reached by
+        # host:port instead, and that is the deployment which makes this backend
+        # worth the hop — every worker charges one ledger and placement compares
+        # every node rather than each worker seeing only its own.
+        #
+        # Override per deployment rather than editing this default:
+        #   actor_rollout_ref.rollout.sandbox.backends.p3b.endpoint=<host>:9000
         endpoint: unix:///run/sandboxd.sock
 
         # The class a sandbox is charged to when its spec names none. The
@@ -245,7 +251,12 @@ agent:
 
         # Bounds a control call — a create, a release, a report. Never a command:
         # a command carries its own budget, because its duration is the work.
-        control_timeout_s: 60
+        #
+        # Covers a create's worst case rather than its median. A create may pull a
+        # cold image and may try several nodes before one admits, so a budget set
+        # to the median turns a slow-but-healthy create into a reported service
+        # fault.
+        control_timeout_s: 300
 
       docker:
         _target_: psrl.sandbox.backends.DockerBackend

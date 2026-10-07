@@ -127,7 +127,7 @@ sandbox_placement:
 
   # The backend the fleet runs, which is also the placement filter and the name a task asks
   # for. It has to be a name the nodes advertise.
-  backend_name: docker
+  backend_name: p3b
 
   # A node that has missed this long is drained rather than trusted.
   node_ttl_s: 120.0

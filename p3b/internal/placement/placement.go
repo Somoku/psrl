@@ -198,7 +198,14 @@ type Service struct {
 	// pending is what this replica has promised since the last fleet view. It is
 	// per node, and it is cleared for a node as soon as a fresher view arrives,
 	// because by then the node's own accounting includes the grant.
-	pending  map[string]Headroom
+	pending map[string]Headroom
+	// promised counts those same promises as sandboxes rather than as resources,
+	// because the balance tie-break ranks on a count and a node's reported count
+	// is a poll interval stale. Resources alone do not cover it: a burst of small
+	// sandboxes moves utilisation by less than one bucket, so without this every
+	// member of the burst sees an identical score and the id tie-break sends all
+	// of them to the same node. Maintained wherever pending is.
+	promised map[string]int
 	viewedAt map[string]time.Time
 	reserved map[string]*reservation
 	now      func() time.Time
@@ -235,6 +242,7 @@ func New(cfg Config, monitor Monitor) (*Service, error) {
 		cfg:      cfg,
 		monitor:  monitor,
 		pending:  map[string]Headroom{},
+		promised: map[string]int{},
 		viewedAt: map[string]time.Time{},
 		reserved: map[string]*reservation{},
 		matched:  map[string]string{},
@@ -302,6 +310,7 @@ func (s *Service) Choose(req Request) (Decision, error) {
 	// Charge the promise now, so the next caller in this same burst sees the room
 	// go even though the node cannot report it until the grant lands.
 	s.pending[chosen.NodeID] = s.pending[chosen.NodeID].Add(req.Footprint)
+	s.promised[chosen.NodeID]++
 	s.decisions++
 	s.noteLocality(chosen, req)
 	return Decision{NodeID: chosen.NodeID, Backend: matched[chosen.NodeID], ReservationID: id}, nil
@@ -322,6 +331,7 @@ func (s *Service) refreshPendingLocked(view *NodeView) {
 	if last, seen := s.viewedAt[view.NodeID]; !seen || view.SeenAt.After(last) {
 		s.viewedAt[view.NodeID] = view.SeenAt
 		delete(s.pending, view.NodeID)
+		delete(s.promised, view.NodeID)
 	}
 }
 
@@ -454,7 +464,10 @@ func (s *Service) best(fleet []NodeView, candidates []int, req Request) int {
 			index:    index,
 			bucket:   int(utilisation * float64(s.cfg.BalanceBuckets)),
 			locality: localityScore(view, req),
-			load:     view.LiveSandboxes,
+			// Reported count plus this replica's own un-reported promises. The
+			// reported half is a poll interval stale, so on its own it makes every
+			// member of one burst look equally loaded.
+			load: view.LiveSandboxes + s.promised[view.NodeID],
 		})
 	}
 	s.scores = scores
@@ -535,7 +548,22 @@ func (s *Service) retire(id string) {
 		return
 	}
 	delete(s.reserved, id)
+	s.dropPromiseLocked(r)
+}
+
+// dropPromiseLocked returns one reservation's promise to the node it was charged
+// against.
+//
+// The count is floored rather than allowed to go negative: a fresher view clears
+// the whole promise for a node, so a reservation retired after that view arrives
+// has already been accounted for and has nothing left to return.
+func (s *Service) dropPromiseLocked(r *reservation) {
 	s.pending[r.nodeID] = s.pending[r.nodeID].Sub(r.amount)
+	if remaining := s.promised[r.nodeID] - 1; remaining > 0 {
+		s.promised[r.nodeID] = remaining
+	} else {
+		delete(s.promised, r.nodeID)
+	}
 }
 
 // Sweep drops reservations whose owner stopped renewing, returning their ids.
@@ -556,7 +584,7 @@ func (s *Service) sweepLocked(now time.Time) []string {
 	for _, id := range expired {
 		r := s.reserved[id]
 		delete(s.reserved, id)
-		s.pending[r.nodeID] = s.pending[r.nodeID].Sub(r.amount)
+		s.dropPromiseLocked(r)
 	}
 	s.swept += int64(len(expired))
 	return expired

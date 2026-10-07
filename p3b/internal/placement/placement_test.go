@@ -237,6 +237,76 @@ func TestABurstDoesNotHerdOntoOneNode(t *testing.T) {
 	}
 }
 
+func TestABurstOfSmallSandboxesDoesNotHerdOntoOneNode(t *testing.T) {
+	// The same property as above, at the ratio a deployment actually has. The
+	// test above gives each sandbox a tenth of its node, so every create moves
+	// utilisation by a whole balance bucket and the bucket alone spreads the
+	// burst. A real rollout sandbox is a fraction of a percent of its node:
+	// utilisation does not move a bucket, locality is equal, and the reported
+	// sandbox count is a poll interval stale, so ranking fell through to the
+	// node-id tie-break and the whole burst landed on the lowest id.
+	//
+	// Measured on a two-node fleet before the fix: 6 of 6 on node-250.
+	monitor := &fakeMonitor{nodes: []NodeView{
+		node("node-250", 960_000), node("node-97", 960_000),
+	}}
+	service := mustService(t, monitor)
+
+	counts := map[string]int{}
+	for i := 0; i < 6; i++ {
+		decision, err := service.Choose(request(256))
+		if err != nil {
+			t.Fatalf("choose %d: %v", i, err)
+		}
+		counts[decision.NodeID]++
+	}
+
+	for id, n := range counts {
+		if n != 3 {
+			t.Fatalf("node %q took %d of 6; a burst of small sandboxes must spread "+
+				"even though no single one moves a balance bucket: %v", id, n, counts)
+		}
+	}
+}
+
+func TestARetiredReservationStopsCountingAgainstItsNode(t *testing.T) {
+	// The count half of the overlay has to come back off, or a node accumulates
+	// phantom load across a run and placement stops choosing it. Resources alone
+	// would not catch this: they are returned by a separate line.
+	monitor := &fakeMonitor{nodes: []NodeView{
+		node("node-a", 960_000), node("node-b", 960_000),
+	}}
+	service := mustService(t, monitor)
+
+	// Fill one node's count, then give all of it back.
+	var held []string
+	for i := 0; i < 4; i++ {
+		decision, err := service.Choose(request(256))
+		if err != nil {
+			t.Fatalf("choose %d: %v", i, err)
+		}
+		held = append(held, decision.ReservationID)
+	}
+	for _, id := range held {
+		service.Release(id)
+	}
+
+	// With every promise returned, the next pair must spread again rather than
+	// both going to whichever node the retirements left looking emptier.
+	counts := map[string]int{}
+	for i := 0; i < 2; i++ {
+		decision, err := service.Choose(request(256))
+		if err != nil {
+			t.Fatalf("choose after release %d: %v", i, err)
+		}
+		counts[decision.NodeID]++
+	}
+	if len(counts) != 2 {
+		t.Fatalf("after releasing every reservation the fleet is even again, so two "+
+			"creates must land on two nodes: %v", counts)
+	}
+}
+
 func TestAFreshViewClearsTheInFlightOverlay(t *testing.T) {
 	// Once the node reports, its own accounting includes the grant, so keeping the
 	// promise charged as well would double-count it.

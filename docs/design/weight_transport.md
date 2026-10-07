@@ -1893,9 +1893,15 @@ _finish_gateway_sync: actual_versions = await gather(*pull_futures)
   plan 里的下标就是 prepped dlist 的下标。
 - **strided 描述符**（**需 NIXL ≥ 1.5.0**，§3.6.3）：用 Nx5
   `(addr, len, dev_id, stride, count)` 原生表达非连续 shard，
-  删掉 `max_pinned_temp_memory_slots` 整套 pinned 中转 + 槽位等待逻辑
+  删掉 `max_pinned_temp_memory_slots` 整套中转 + 槽位等待逻辑
   （`client_read` 里 `_pinned_slot_running_read_xfer` 的串行等待是真实的流水阻塞点）。
-  **这条直接服务约束 (b)**：pinned 中转槽本身就是一份额外的 CPU 权重存储。
+
+  **一处事实更正**：初稿称这些槽位是「额外的 CPU 权重存储」，
+  读代码后发现**不是**——`client.py:541` 分配在 `device=self.device`，
+  即 GPU 上（变量名 `pinned_memory` 是误导）。所以它服务的是约束 (b) 的
+  **GPU** 那一半，不是 CPU 那一半。
+  **收益因此要重新表述**：省下的是 `slots × 最大非连续 shard` 的 GPU 显存
+  与槽位串行等待，而不是 CPU 内存。槽位等待才是主要收益。
 - **round-based 双 buffer**：chunk 默认 512MB，深度 2 流水。需要被重叠的是**三类**工作，
   不只是量化：
   - trainer 侧的 cast / scale 转码（cast 路径）
@@ -4120,7 +4126,7 @@ train step v 完成
 | **0** | **NIXL 新 API 的 micro-benchmark + 升级到 1.5.0** | **已完成**（`tests/nixl/bench_nixl_prepped_xfer.py`）。确认收益成立（5~30×）但有两个前提，见 §3.6.3。**`scripts/install_nixl.sh:81` 的 `-b v1.2.0` 必须升到 v1.5.0**，否则 Nx5 strided 不可用 | 已做 |
 | 1 | `prep_xfer_dlist` / `make_prepped_xfer` 替代 per-key `initialize_xfer` | **实测 5~30× 加速且随 descriptor 数放大**（16384 条下 0.014ms vs 0.424ms）。**索引必须用 int32 ndarray**，传 Python list 会慢 15× 并抵消全部收益（§3.6.3） | 是 |
 | 2 | colocate 走 CUDA IPC + stage 边界 offload（`discard(("kv_cache",))`） | 切换成本从「全量 PCIe 往返 + 重握手」降到「权重 D2H/H2D + KV cache 重分配」，**且 colocate 路径完全不碰 NIXL 注册**（§3.7.3），省掉大 MoE 下 14 万次 `register_memory` | 是 |
-| 3 | Nx5 strided 描述符 | 删掉 pinned 中转（本身是一份额外 CPU 权重存储）与槽位串行等待 | 是 |
+| 3 | Nx5 strided 描述符 | 删掉非连续 shard 的中转缓冲（**GPU 上，不是 CPU**——见 §3.6 的更正）与槽位串行等待。**槽位串行等待是主要收益**，显存次之 | 是 |
 | 4 | 源头 FP8 wire | 传输字节减半，消掉 train/gen 双缓冲，且量化产物天然就是发布缓冲 | 是 |
 | 5 | round-based 三类重叠（cast / RDMA / 落地格式化）**+ slot 的 ack bitmap** | **§3.5.5 完成后 RDMA（92ms H20）是主导项**，三类重叠让 fmt（18.5ms）与 cast（9.8ms）完全隐藏（§3.6.0 cost model）。§3.5.5 之前 fmt 主导，overlap 本身没有意义——**两者必须按序**。**ack bitmap 是正确性而非优化**：`2×chunk` 循环复用下不守 slot 会让慢读者拿到被覆盖的字节；期待集合由 plan 派生、ack 捎带在已有完成通知里，零额外显存、零额外往返（§3.4.2 末段） | 是 |
 | **5b** | **`merge_and_finish_cached_xfer` 拆 post / wait，完成检测改 `get_new_notifs`** | **第 5 项的前置**：现有实现提交后立刻进 1ms 轮询循环（`client.py:1519-1544`），**双 buffer 流水在实现层无处落脚**（§3.6.4）。拆 post/wait 是必需，换 notif 把 chunk 下界从 256MB 降到 RTT 级 | **是**，但 5 依赖它 |

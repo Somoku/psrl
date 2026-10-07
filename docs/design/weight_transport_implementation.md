@@ -873,8 +873,18 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
          必须缓存索引数组
       3. **`tuple(wanted)` 做缓存 key 也是 O(n)**（0.027μs/desc）→ 需要 identity 快路径
       最终 4096 descriptor 下 cache 开销从 0.110ms 降到 0.006ms（18×）
-- [x] **A2 strided 等价性已验证**：strided 与逐条 Nx3 **逐字节一致**，
-      含 gapped stride 不写入间隙。**代码改造（删 pinned 中转）仍待做**
+- [x] **A2 已落地并验证**：`psrl/utils/nixl/strided_desc.py` 的 `describe_shard`
+      判定哪些非连续 shard 可免中转拷贝。strided 与逐条 Nx3 **逐字节一致**。
+      `test_strided_desc.py` 35 passed。
+
+      **一处事实更正**：初稿称中转槽是「额外 CPU 权重存储」，
+      读 `client.py:541` 后发现分配在 `device=self.device` 即 **GPU** 上
+      （变量名 `pinned_memory` 误导）。主要收益是**消除槽位串行等待**，显存次之。
+
+      **三处测试前提被实现推翻**（实现是对的，测试错了）：3-D 张量切中间维
+      **是** strided 可表达的（尾部维连续，逐字节验证通过）；
+      `torch.flip` 产生拷贝而非负 stride 视图；
+      PyTorch 的 `as_strided` 根本拒绝负 stride，该分支只能直接测谓词
 - [x] **A3** 「第二个 post 早于第一个 wait 返回」已有断言 — `test_post_wait_split.py` 15 passed
 - [x] **A4** 140k tag 构造 20ms（预算 40ms）；单射性含 `(1,2)`vs`(12,)`、None vs ""
       — `tests/nixl/test_xfer_tag.py` 9 passed
@@ -902,9 +912,25 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 测试用 `importorskip` 跳过而非失败，以免掩盖真实回归。
 
 ### 阶段 B
-- [ ] B1 11GB 单 key 跨 chunk 且 group 全齐才可见；半个 group 报错
-- [ ] B2 wire buffer == `2×chunk` 且不随 W 增长；慢读者超时返回 `CHUNK_STALE` 不停流水；端到端 ≈ `max(T_rdma, T_fmt)`
+- [x] **B1 已落地并验证**：`psrl/utils/nixl/chunking.py` 分离 chunk 与 commit group。
+      11GB 单 key 切 22 个 chunk 且偏移正确；**group 全齐才可见，半个 group 抛错并点名缺哪些 chunk**；
+      **chunk 大小改变不影响 group 成员**（4 种 chunk size 验证）。`test_chunking.py` 22 passed
+- [x] **B2 已落地并验证**：`psrl/utils/nixl/slot_ack.py` 的 `SlotAckTable`。
+      **2 个 slot 服务 16 个 reader**（不随 W 增长);slot 耗尽时**抛错而非覆盖**,
+      错误点名在等哪个 reader;**`forget_reader` 让死掉的 reader 自动收敛**——
+      这正是选 bitmap 而非计数器的理由(计数器会永久泄漏)。`test_slot_ack.py` 20 passed
 - [ ] B3 chunk 按 cost model 计算；轮级 RPC == 0
+
+### 阶段 C
+- [x] **C1 已落地并验证**：`psrl/utils/nixl/moe_grouping.py`。
+      **真实 checkpoint 实测**：Qwen3-30B-A3B 18867 → 579 key（32.6×），
+      48 层 × 3 投影 = 144 个 expert group，expert 数与 config 一致，
+      **无 key 丢失**（覆盖集 ⊎ 透传集 == 全集）；dense 模型零改动。
+      **关键正确性**：expert id 必须**数值排序而非字典序**——
+      字典序会把 expert 10 排在 2 前面,静默置换所有 expert。
+      `test_moe_grouping.py` 26 passed
+- [ ] C2 稳态 rollout→PS RPC == 0；控制面消息非平方增长
+- [ ] C3 发布时刻紧跟 param all-gather，不与 backward NCCL 重叠
 
 ### 阶段 C
 - [ ] C1 key 数 14 万→数百；`client_info` 56MB→数百 KB；MoE 两维 shard 跑通

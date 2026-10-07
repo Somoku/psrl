@@ -94,7 +94,8 @@ meson setup build \
     -Dbuild_docs=false \
     -Ducx_path=$UCX_PREFIX \
     -Dinstall_headers=true \
-    -Ddisable_gds_backend=false
+    -Ddisable_gds_backend=false \
+    -Dbuild_nixl_ep=true
 cd build
 ninja -j $MAX_JOBS
 ninja install -j $MAX_JOBS

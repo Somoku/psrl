@@ -1707,14 +1707,14 @@ chunk_min = 由完成检测粒度定，不是由控制面开销定（§3.6.4）�
 所以这个比值由 **cost model 预先给出，不需要首次同步时实测**：
 
 ```
-T_fmt(N_keys, M_v)  =  N_keys × 60μs  +  2·M_v / 4800 GB/s       [ms]
+T_fmt(N_keys, M_v)  =  N_keys × 12.5μs  +  2·M_v / 4800 GB/s     [ms]
 T_rdma(M_v, chunk)  =  M_v / BW_NIC_node  +  ⌈M_v/chunk⌉ × 2μs   [ms]
   BW_NIC_node = NIC_count × NIC_line_Gbps × 0.85 / 8              [GB/s]
   (H20 8×200GbE 节点: 170 GB/s)
 
 T_fmt / T_rdma 的决定因素：
-  - 未做 MoE 分组时(14k keys): 846ms / 92ms ≈ 9.2  → fmt 主导
-  - 完成 MoE 分组后(200 keys): 18.5ms / 92ms ≈ 0.2 → rdma 主导
+  - 未做 MoE 分组时(K2 70k keys): 885ms / 92ms ≈ 9.6  → fmt 主导
+  - 完成 MoE 分组后(K2 183 keys):  8.8ms / 92ms ≈ 0.1 → rdma 主导
 ```
 
 **结论：完成 §3.5.5（MoE 分组）之后，T_fmt/T_rdma < 1，fmt 不再是主导项。**
@@ -1884,35 +1884,64 @@ _finish_gateway_sync: actual_versions = await gather(*pull_futures)
 |---|---|---|
 | **每节点 RDMA**（15.6GB / NIC_BW） | **92ms**（8×200GbE×85%=170GB/s）| **92ms**（不变） |
 | **trainer 侧 cast**（BF16→FP8，Roofline） | **9.8ms**（HBM 4800GB/s，内存带宽限制） | **9.8ms**（不变） |
-| **rollout 侧落地格式化**（`post_load_weights`） | **846ms**（14k key × 60μs/key + 6.5ms BW） | **18.5ms**（200 key × 60μs/key + 6.5ms BW） |
+| **rollout 侧落地格式化**（`post_load_weights`） | **885ms**（K2 70,272 key × 12.5μs + 6.5ms BW） | **8.8ms**（183 key × 12.5μs + 6.5ms BW） |
 
 **T_fmt 模型**（基于 kernel launch 分析，miles Kimi-K2 实测值 884ms 拟合验证）：
 
 ```
 T_fmt(N_keys, M_v)  =  N_keys × T_py_overhead  +  2·M_v / BW_HBM
-  T_py_overhead ≈ 60μs/key（Python dispatch + dtype check + reshape，从 K2 884ms 拟合）
+  T_py_overhead ≈ 12.5μs/key（Python dispatch + dtype check + reshape）
   BW term: 2 × 15.6GB / 4800GB/s ≈ 6.5ms（可忽略）
 
-未分组: 14000 × 60μs + 6.5ms ≈ 846ms  ≈ 实测 884ms  ✓
-已分组:   200 × 60μs + 6.5ms ≈ 18.5ms  （60× 加速）
+拟合依据（注意 N_keys 取 §3.5.5 的架构推导值，不是估计值）:
+  Kimi-K2 HF 展开 = 384 experts × 61 层 × 3 投影 = 70,272 key（§3.5.5 的表）
+  70272 × 12.5μs + 6.5ms ≈ 885ms  ≈ miles 实测 884ms  ✓
+
+**一处已修正的拟合错误**：本节初稿按 `14000 key × 60μs` 拟合，
+而 §3.5.5 自己算出的是 **70,272**（fp8 配 scale 则 140,544）。
+14000 这个数没有推导来源，是 140k 的十分之一——转写时掉了一个数量级。
+按正确 key 数重新拟合得 **12.5μs/key**，这个值对「Python 调度 + dtype 检查 + reshape」
+也更合理（60μs/key 偏高一个数量级）。
+**结论方向不变**（见下），但公式的绝对预测值此前偏大约 5 倍。
 ```
 
-BW 项（6.5ms）相对 launch 项可忽略，说明 `post_load_weights` 是 **launch-dominated**，
-不是内存带宽受限——这是 format 优化（MoE 分组、减少 key 数）有效的根本原因。
+BW 项（6.5ms）相对 launch 项可忽略**仅在 key 数较大时成立**：
+200 key × 12.5μs = 2.5ms 已小于 BW 项的 6.5ms，
+所以**分组后 T_fmt 由带宽项主导，分组前由 launch 项主导**——
+这是两个不同的 regime，不能用一句「launch-dominated」概括。
+format 优化（MoE 分组、减少 key 数）有效的根本原因是分组前处在 launch regime。
 
-**两阶段结论：**
+**实测校准（本机 `/jizhicfs/johnnyslin/models`）**：
+
+| 模型 | HF key 数 | expert key 占比 | 分组后 | 压缩比 |
+|---|---|---|---|---|
+| Qwen2.5-0.5B（dense） | 290 | 0% | 290 | 1× |
+| Moonlight-16B-A3B | 5,344 | 94.9% | — | — |
+| **Qwen3-30B-A3B** | **18,867** | **97.7%** | **579** | **32.6×** |
+
+**所以「14 万 → 数百」的说法要收紧为「压缩比 30~400×，随 expert 数而变」**：
+Qwen3-30B-A3B（128 experts）实测 32.6×，Kimi-K2（384 experts）理论 70272/183 ≈ 384×。
+回归测试见 `tests/nixl/test_cost_model.py`。
+
+**两阶段结论**（按修正后的 `T_py=12.5μs` 与实测 key 数重算）：
 
 | 阶段 | 主导项 | 正确目标 |
 |---|---|---|
-| **§3.5.5 完成前**（14k keys，§3.6.0 原来的情形） | fmt 846ms >> rdma 92ms（9×） | **优先做 §3.5.5（MoE 分组），这才是瓶颈** |
-| **§3.5.5 完成后**（200 keys） | rdma 92ms >> fmt 18.5ms（5×） | **优先做 §3.6（overlap）打满 NIC 带宽** |
+| **§3.5.5 完成前** | K2 70k key：fmt **885ms** >> rdma 92ms（9.6×）；Qwen3-30B 18.9k key：fmt **242ms** >> rdma 92ms（2.6×） | **优先做 §3.5.5（MoE 分组），这才是瓶颈** |
+| **§3.5.5 完成后** | K2 183 key：rdma 92ms >> fmt **8.8ms**（10×）；Qwen3-30B 579 key：rdma 92ms >> fmt **13.7ms**（6.7×） | **优先做 §3.6（overlap）打满 NIC 带宽** |
 
 > **「格式化是主导项」只在 §3.5.5 完成之前成立。完成之后，RDMA 是主导项，
 > 「打满带宽、充分 overlap」才是正确目标。**
 >
 > 两者必须按序：先做 §3.5.5，再做 §3.6。
-> 先做 §3.6 而没有 §3.5.5，overlap 做完端到端仍被 846ms 格式化主导，
-> 浪费实现工作量。
+> 先做 §3.6 而没有 §3.5.5，overlap 做完端到端仍被格式化主导，浪费实现工作量。
+
+**一处边界条件**：节点数极多时这个结论会翻转回来。
+`T_rdma ∝ M_v` 随节点数线性下降，而分组后的 `T_fmt` 只有 BW 项随 `M_v` 下降、
+launch 项（`N_keys × 12.5μs`）是常数。128 节点 + K2 分组后：
+`T_rdma = 23ms` vs `T_fmt = 8.9ms`，仍是 rdma 主导；
+但若 key 数更多或节点数再翻倍，交叉点会出现。
+**判据写成「比较两者」而不是「假定 rdma 主导」**，验证项 2 已据此表述。
 
 **cast 资源分析：**
 BF16→FP8 Roofline 为 1596 GB/s（HBM 4800GB/s / 3.008 字节/元素），
@@ -2071,11 +2100,12 @@ NIC_Gbps    : 单端口线速 [Gbps]     (200G RoCE 常见配置)
 NIC_eff     : RDMA 效率             (大包 0.85，推荐值来自 Kalia OSDI'16 Fig.5)
 BW_NIC      = NIC_count × NIC_Gbps × NIC_eff / 8   [GB/s]
 
-── T_fmt 模型（launch-dominated，拟合自 miles Kimi-K2 884ms 实测值）─────
-T_fmt(N_keys, M_v)  =  N_keys × 60μs  +  2·M_v / BW_HBM
-  注：BW 项通常 < 10ms（可忽略）；主导项是 Python dispatch 开销
-  拟合依据：14000 keys × 60μs ≈ 840ms ≈ 实测 884ms ✓
-  MoE 分组后 (§3.5.5)：N_keys 从 14000 降到 ~200，T_fmt ≈ 18.5ms
+── T_fmt 模型（拟合自 miles Kimi-K2 884ms 实测值）─────────────────────
+T_fmt(N_keys, M_v)  =  N_keys × 12.5μs  +  2·M_v / BW_HBM
+  拟合依据：K2 HF 展开 = 384 experts × 61 层 × 3 投影 = 70,272 key（§3.5.5）
+            70272 × 12.5μs + 6.5ms ≈ 885ms ≈ 实测 884ms ✓
+  **两个 regime**：key 数大时 launch 项主导；分组后（数百 key）BW 项主导
+  MoE 分组后 (§3.5.5)：K2 → 183 key，Qwen3-30B 实测 18867 → 579 key
 
 ── T_rdma 模型（LogGP，大块消息 L/g 项可忽略）─────────────────────────
 T_rdma(M_v, chunk)  =  M_v / BW_NIC  +  ⌈M_v/chunk⌉ × 2μs
@@ -2103,7 +2133,7 @@ T_cast(M_v, dtype)  =  M_v × bytes_per_src / BW_HBM
   chunk_max = M_v / N_min
 
 H20 / 32 节点 / 1T MoE（§3.5.5 完成后）：
-  T_fmt = 18.5ms, T_rdma = 92ms → ratio = 0.20 < 1 → rdma 主导
+  T_fmt = 8.8ms（K2 183 key）, T_rdma = 92ms → ratio = 0.10 < 1 → rdma 主导
   N_min = ceil(max(0.20, 1) × 2) = 2 → chunk_max ≈ 7.8GB
   建议: 512MB（给出 30 轮，充足余量；chunk 下界见 §3.6.4）
 
@@ -2117,15 +2147,15 @@ num_threads = min(NIC_count, cpu_cores // 8)
 
 | 节点 | BW_NIC | T_rdma(15.6GB) | T_fmt_grouped | W_init | num_threads |
 |---|---|---|---|---|---|
-| H20 8×200G RoCE | 170 GB/s | 92ms | 18.5ms | 8 | 8 |
-| H100 8×400G IB (NDR) | 340 GB/s | 46ms | 18.5ms | 8 | 8 |
-| A100 8×200G IB (HDR) | 170 GB/s | 92ms | 19ms | 8 | 8 |
-| H800 8×400G IB (NDR) | 340 GB/s | 46ms | 18.5ms | 8 | 8 |
+| H20 8×200G RoCE | 170 GB/s | 92ms | 8.8ms | 8 | 8 |
+| H100 8×400G IB (NDR) | 340 GB/s | 46ms | 8.8ms | 8 | 8 |
+| A100 8×200G IB (HDR) | 170 GB/s | 92ms | 9.3ms | 8 | 8 |
+| H800 8×400G IB (NDR) | 340 GB/s | 46ms | 8.8ms | 8 | 8 |
 
 注：T_fmt_grouped ≈ 不变（launch 时间与 GPU 型号弱相关，差异 < 2ms）。
 
 **此模型替代文档中所有「应实测」标注**，除了以下两个量需要首轮真实测量后更新：
-1. `T_py_overhead`（60μs/key）在不同 vLLM 版本 / Python 版本下可能变化，
+1. `T_py_overhead`（12.5μs/key）在不同 vLLM 版本 / Python 版本下可能变化，
    首轮实测后按实际值修正 `T_fmt` 公式；
 2. `T_rdma_p99`（W 的反馈调整输入），可用 §3.2b 的完成通知捎带，
    无需额外测量基础设施。

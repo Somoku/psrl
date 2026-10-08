@@ -117,9 +117,16 @@ def fill_by_global_coord(
     else:
         modulus = exact_int_limit(tensor.dtype)
 
-    indices = torch.arange(global_offset, global_offset + numel, dtype=torch.int64)
+    indices = torch.arange(
+        global_offset, global_offset + numel, dtype=torch.int64, device=tensor.device
+    )
     values = encode_coord(indices, tensor.dtype, modulus=modulus)
-    tensor.view(-1).copy_(values.to(tensor.dtype))
+    # `no_grad` + `.data`: the e2e harness fills real model parameters, which are leaf
+    # Variables requiring grad, and autograd rejects an in-place write through a view of
+    # one. This mirrors how the production sync hooks write into parameters
+    # (ParamSyncPlan wraps every action in torch.no_grad()).
+    with torch.no_grad():
+        tensor.data.view(-1).copy_(values.to(tensor.dtype))
     return tensor
 
 

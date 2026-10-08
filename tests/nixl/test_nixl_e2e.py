@@ -3,6 +3,17 @@ import math
 import os
 import time
 
+# Must precede anything that reaches megatron.bridge. That chain pulls in modelopt ->
+# tilelang, which loads its own `libcudart_stub.so` into the process; a later
+# `flashinfer.comm` import then resolves cudaDeviceReset against the stub and dies with
+# "undefined symbol". vLLM's FusedMoE -> all2all_utils -> nixl_ep path imports
+# flashinfer, so the whole harness fails at import time unless the real CUDA runtime is
+# bound first. Importing it here is the fix; order, not presence, is what matters.
+try:
+    import flashinfer.comm  # noqa: F401
+except Exception:  # pragma: no cover - flashinfer is optional for CPU-only runs
+    pass
+
 import hydra
 import ray
 import torch
@@ -29,10 +40,28 @@ from psrl.workers.ps import (
     PSWorkerGroup,
 )
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from tests.nixl.coord_judge import (
-    assert_state_dict_matches_coord,
-    fill_state_dict_by_coord,
-)
+try:
+    from tests.nixl.coord_judge import (
+        assert_state_dict_matches_coord,
+        fill_state_dict_by_coord,
+    )
+except ModuleNotFoundError:
+    # Loaded by file path rather than by package name. Run as a script
+    # (`python tests/nixl/test_nixl_e2e.py`), sys.path[0] is this file's own directory,
+    # so `tests` resolves to whatever else is on the path -- adding the repo root does
+    # not help, because the shadowing entry comes first. Loading the sibling module
+    # directly sidesteps package resolution entirely and works under pytest too, since
+    # the try branch wins there.
+    import importlib.util
+    from pathlib import Path
+
+    _spec = importlib.util.spec_from_file_location(
+        "psrl_e2e_coord_judge", Path(__file__).resolve().parent / "coord_judge.py"
+    )
+    _coord_judge = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_coord_judge)
+    assert_state_dict_matches_coord = _coord_judge.assert_state_dict_matches_coord
+    fill_state_dict_by_coord = _coord_judge.fill_state_dict_by_coord
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -777,6 +806,19 @@ def test_nixl_e2e(cfg: DictConfig):
     ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
 
     # Create per-node PortScanner actors (required by NIXLStorageClient).
+    # The comment above predates the call: every NIXLStorageClient resolves
+    # `get_port_scanner(host_ip)` during construction, so without this the first client
+    # dies with "Failed to look up actor with name 'psrl_port_scanner_<ip>'". Only alive
+    # nodes are passed -- a dead entry would pin a detached actor to a node that cannot
+    # run it, and the lookup would hang rather than fail.
+    from psrl.utils.nixl.port_scanner import create_port_scanners
+
+    alive_ip_to_node_id = {
+        node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes() if node["Alive"]
+    }
+    port_scanner_handles = create_port_scanners(alive_ip_to_node_id)
+    print(f"[PASS] created {len(port_scanner_handles)} PortScanner actors")
+
     assert listen_ip in ip_to_node_id, f"listen_ip is absent from Ray nodes: {listen_ip!r}."
     server = MetaServerActor.options(
         scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=ip_to_node_id[listen_ip], soft=False)

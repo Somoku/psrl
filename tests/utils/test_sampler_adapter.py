@@ -86,7 +86,9 @@ def test_compact_support_ships_lengths_flat_ids_and_flat_log_probs():
     }
     lengths = out["rollout_topk_lengths"]
     assert lengths.shape == (2 + 3,)
-    assert lengths[1:].tolist() == [3, 0, 2]  # start at prompt_length-1
+    # One length per sequence row: the leading prompt row and the trailing final-position row are
+    # zero, and the response rows start at prompt_length-1.
+    assert lengths.tolist() == [0, 3, 0, 2, 0]
     assert out["rollout_support_ids"].tolist() == [10, 11, 12, 20, 21]
     # Log-probs are flat (only the realized support), not a dense [T, width] array.
     assert out["rollout_support_log_probs"].shape == (5,)

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from examples.mini_swe.runner import _build_model_config
 from psrl.utils.rollout.vision_utils import normalize_messages
+from psrl.utils.sampler_distribution import SamplerCapture
 from psrl.workers.agent_loop.loops import session_agent_loop as module
 from psrl.workers.agent_loop.loops.session_agent_loop import SessionAgentLoop
 
@@ -24,6 +25,8 @@ def _bare_loop(trajectory_id_strategy: str = "manual") -> SessionAgentLoop:
     loop.model_config = SimpleNamespace(path="model")
     loop.rollout_config = {}
     loop._capture_sessions = set()
+    # The base constructor normally sets this from the rollout config, so a __new__-built loop must too.
+    loop.sampler_capture = SamplerCapture()
 
     return loop
 

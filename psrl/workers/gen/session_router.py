@@ -286,17 +286,16 @@ class SessionRouter:
         state = await self._ensure_state(sid)
         # Validation runs never capture, so they use a disabled capture regardless of config.
         capture = SamplerCapture() if state.headers.get("x-is-validate") == "true" else self.sampler_capture
-        if capture.enabled:
-            try:
-                # Chat and Responses carry OpenAI-style logprobs fields. Anthropic Messages lowers to
-                # the canonical chat IR inside SMG and only carries sampler_top_logprobs.
-                configure_capture(
-                    body,
-                    capture,
-                    set_response_fields=protocol in ("chat", "responses"),
-                )
-            except (ValueError, TypeError) as error:
-                return JSONResponse(status_code=400, content={"error": str(error)})
+        try:
+            # Always apply the capture contract: a disabled capture still sets the OpenAI logprob
+            # fields TITO needs, while Anthropic Messages only carries sampler_top_logprobs.
+            configure_capture(
+                body,
+                capture,
+                set_response_fields=protocol in ("chat", "responses"),
+            )
+        except (ValueError, TypeError) as error:
+            return JSONResponse(status_code=400, content={"error": str(error)})
         content = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
         return content, stream
 

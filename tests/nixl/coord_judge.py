@@ -125,8 +125,16 @@ def fill_by_global_coord(
     # Variables requiring grad, and autograd rejects an in-place write through a view of
     # one. This mirrors how the production sync hooks write into parameters
     # (ParamSyncPlan wraps every action in torch.no_grad()).
+    #
+    # The fill must stay in place and must not assume contiguity. The converters hand
+    # back strided views of a fused buffer (QKV slices, MoE expert slices), for which
+    # `.view(-1)` raises "spans across two contiguous subspaces"; `.reshape(-1)` would
+    # silently return a *copy* for those, so the fill would land nowhere. Writing
+    # through a same-shape view of the value buffer keeps the write in place for both
+    # contiguous and strided targets.
     with torch.no_grad():
-        tensor.data.view(-1).copy_(values.to(tensor.dtype))
+        target = tensor.data
+        target.copy_(values.to(tensor.dtype).view(target.shape))
     return tensor
 
 

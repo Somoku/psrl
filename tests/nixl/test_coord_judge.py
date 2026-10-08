@@ -231,3 +231,40 @@ class TestToleranceMode:
         displaced = torch.roll(tensor, 1)
         with pytest.raises(AssertionError):
             assert_matches_global_coord(displaced, key="w", rtol=1e-2)
+
+
+class TestStridedAndGradTargets:
+    """Fill must work on what the converters actually hand over, not just plain tensors.
+
+    Both cases below came out of the 5-node e2e run; the unit tests had only ever
+    exercised freshly-allocated contiguous tensors, so neither was visible before.
+    """
+
+    def test_fill_writes_through_a_leaf_parameter(self):
+        """Model parameters are leaf Variables requiring grad.
+
+        An in-place write through a view of one is rejected by autograd, which is why
+        the fill goes through `.data` inside `no_grad` -- the same thing ParamSyncPlan
+        does in production.
+        """
+        param = torch.nn.Parameter(torch.zeros(32, 8))
+        fill_by_global_coord(param, 0, strict=False)
+        assert_matches_global_coord(param, 0, key="param", strict=False)
+
+    def test_fill_is_in_place_on_a_strided_view(self):
+        """QKV and MoE slices are strided views of a fused buffer, not contiguous.
+
+        `.view(-1)` raises on these, and `.reshape(-1)` would silently produce a copy --
+        the fill would then land nowhere and the judge would compare against zeros. The
+        assertions check both that the base buffer changed and that nothing outside the
+        view did.
+        """
+        base = torch.nn.Parameter(torch.zeros(4, 96, 16))
+        view = base.data.narrow(1, 0, 64)
+        assert not view.is_contiguous(), "test needs a non-contiguous target"
+
+        fill_by_global_coord(view, 7, strict=False)
+        assert_matches_global_coord(view, 7, key="strided", strict=False)
+
+        assert base.data.narrow(1, 0, 64).ne(0).any(), "fill did not reach the base buffer"
+        assert base.data.narrow(1, 64, 32).eq(0).all(), "fill spilled outside the view"

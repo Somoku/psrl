@@ -29,6 +29,10 @@ from psrl.workers.ps import (
     PSWorkerGroup,
 )
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from tests.nixl.coord_judge import (
+    assert_state_dict_matches_coord,
+    fill_state_dict_by_coord,
+)
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -105,16 +109,27 @@ def validate_parallel_config(cfg: DictConfig) -> None:
         )
 
 
-def assert_state_dict_all_ones(state_dict: dict[str, torch.Tensor], actor_label: str) -> None:
+def assert_state_dict_matches_coords(
+    state_dict: dict[str, torch.Tensor],
+    offsets: dict[str, int],
+    actor_label: str,
+) -> None:
+    """Judge a pulled state dict against the coordinate function it was filled with.
+
+    Replaces the previous all-ones judge (item T1). Filling with 1.0 detects "no data
+    arrived" and nothing else: a transposed tensor of ones is still ones, any slice of
+    ones is ones, and ones cast to fp8 is still 1.0. Layout errors, shard misplacement,
+    precision-conversion errors and MoE expert mix-ups -- the four things this design's
+    format conversions can get wrong -- are all invisible to it.
+
+    `assert_state_dict_matches_coord` reports the first offending global coordinate,
+    which localises the fault to a dimension rather than just flagging the key.
+    """
     assert state_dict, f"{actor_label} state_dict is empty."
-    for key, tensor in state_dict.items():
-        expected = torch.ones_like(tensor)
-        if not torch.allclose(tensor, expected, atol=1e-6):
-            max_abs_diff = (tensor - expected).abs().max().item()
-            raise AssertionError(
-                f"{actor_label} parameter {key!r} is not all ones. "
-                f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, max_abs_diff={max_abs_diff}."
-            )
+    try:
+        assert_state_dict_matches_coord(state_dict, offsets)
+    except AssertionError as exc:
+        raise AssertionError(f"{actor_label}: {exc}") from exc
 
 
 def make_dual_print(log_path, prefix=None):
@@ -403,9 +418,12 @@ class TrainClientActor:
             conversion_result = convert_megatron_inplace(parameter_mapping, self.model)
             state_dict = conversion_result.state_dict
             sharding = conversion_result.sharding_dict
-        for tensor in state_dict.values():
-            if torch.is_tensor(tensor) and tensor.is_floating_point():
-                tensor.data.fill_(1)
+        # Fill with a function of each element's global coordinate rather than with 1.0
+        # (item T1). The all-ones fill cannot distinguish a correct transfer from a
+        # transposed, misplaced, or wrongly-cast one -- see assert_state_dict_matches_coords.
+        # The offsets are keyed by state-dict key and must reach the gen side verbatim,
+        # which is why they are returned rather than recomputed there.
+        self.coord_offsets = fill_state_dict_by_coord(state_dict, strict=False)
         # self.print(f"state_dict keys: {state_dict.keys()}")
         self.state_dict = state_dict
         self.sharding = sharding
@@ -458,6 +476,15 @@ class TrainClientActor:
                 )
         ray.get(futures)
         # self.client.merge_and_finish_cached_xfer()
+
+    def get_coord_offsets(self):
+        """The per-key global coordinate offsets this rank filled with.
+
+        The gen side needs exactly these to judge what it pulled: recomputing them
+        there would re-derive the same numbers from the same key ordering and so would
+        not catch a key-set mismatch between the two sides.
+        """
+        return self.coord_offsets
 
     def shutdown(self):
         self.client.shutdown()
@@ -880,13 +907,16 @@ def test_nixl_e2e(cfg: DictConfig):
     end_time = time.time()
     print(f"[PASS] gen pull from all ps done. time: {end_time - start_time}s")
 
-    # Fetch and verify gen client state_dicts
-    print("[CHECK] Verifying GenClientActor state_dicts are all ones...")
+    # Fetch and verify gen client state_dicts against the coordinate function.
+    print("[CHECK] Verifying GenClientActor state_dicts encode their global coordinates...")
+    # Every train rank fills the same canonical key space, so any rank's offsets serve
+    # as the reference; rank 0 is used for definiteness.
+    coord_offsets = ray.get(train_actors[0].get_coord_offsets.remote())
     gen_state_dicts = ray.get([g.get_state_dict.remote() for g in gen_actors])
     for gen_idx, state_dict in enumerate(gen_state_dicts):
-        assert_state_dict_all_ones(state_dict, f"Gen client {gen_idx}")
-        print(f"[PASS] Gen client {gen_idx} is all ones.")
-    print("[PASS] All GenClientActor parameters are all ones.")
+        assert_state_dict_matches_coords(state_dict, coord_offsets, f"Gen client {gen_idx}")
+        print(f"[PASS] Gen client {gen_idx} matches its global coordinates.")
+    print("[PASS] All GenClientActor parameters match the coordinate function.")
 
     # Shutdown all actors and Ray
     for t in train_actors:

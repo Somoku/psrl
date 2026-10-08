@@ -1,0 +1,76 @@
+# @package _global_
+#
+# 5-node / 40-GPU variant of nixl_e2e.yaml.
+#
+# The default config asks for num_train=64 + num_gen=32, which needs 12 nodes: the
+# harness assigns train nodes from the front of the (IP-sorted) Ray node list and gen
+# nodes from the back, and asserts each side has enough -- so train_nnodes + gen_nnodes
+# must not exceed the cluster, or the two ranges overlap and GPUs are double-booked.
+#
+# Here: train 24 GPU (3 nodes) + gen 16 GPU (2 nodes) = 5 nodes exactly.
+#
+# Parallelism is chosen so every divisibility assertion in validate_parallel_config
+# passes and both sides exercise a non-trivial mesh:
+#   train  TP=4 x PP=2 = 8  -> 24 % 8 == 0, DP = 3
+#   gen    TP=2 x PP=1 = 2  -> 16 % 2 == 0, DP = 8
+# That also makes train TP=4 vs gen TP=2 a genuine mismatch, so the finest-mesh
+# reconciliation (lcm = 4) is on the critical path rather than being bypassed by
+# equal meshes -- verification item 19 at the real-handshake level.
+defaults:
+  - _self_
+
+test:
+  num_train: 24
+  num_gen: 16
+  train_engine_type: megatron  # fsdp, fsdp_hybrid, megatron
+
+  # HSDP: only used when train_engine_type=fsdp_hybrid. 24 % (2*4) == 0.
+  fsdp_hybrid:
+    ddp_size: 2
+    fsdp_size: 4
+
+  megatron:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    virtual_pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+
+  gen:
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    # Left at 1 so the harness derives DP from num_gen / (TP*PP) = 8 rather than
+    # asserting against a hand-written value.
+    data_parallel_size: 1
+
+model:
+  # Qwen3-8B rather than the default Qwen2.5-Math-7B: it is GQA (32 heads / 8 kv heads),
+  # which is the layout that exposed the ConcatenatedQKVSync cat-dimension bug. A model
+  # whose heads and kv-heads are equal would not exercise that path.
+  path: ${oc.env:PSRL_WORKSPACE}/models/Qwen3-8B
+  trust_remote_code: false
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
+
+logging:
+  path: ${oc.env:PSRL_WORKSPACE}/psrl/unit_tests/nixl/log_5node
+  level: INFO
+
+network:
+  listen_ip: ${oc.env:LOCAL_IP}
+  listen_port: 23459
+  torch_port_train: 29502
+  torch_port_gen: 29503
+  backend: nccl
+
+nixl:
+  server_mode: meta_server
+  server_ip: ${network.listen_ip}
+  server_port: ${network.listen_port}
+  max_pinned_temp_memory_slots: 4
+  enable_tms_for_temp_buffers: False
+
+ps:
+  mode: nixl_cpu

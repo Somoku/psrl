@@ -12,6 +12,15 @@
 # Idempotent: exits early if gdaki.cuh is already present under a 1.22+ UCX.
 set -euo pipefail
 
+# This cluster reaches the public internet only through an HTTP proxy. Interactive
+# shells get it from the profile, but a non-interactive `ssh host cmd` does not, so
+# both yum (DOCA repo) and git (UCX clone) fail with "all mirrors were tried" /
+# connection timeouts unless it is set here explicitly.
+PROXY=${PSRL_HTTP_PROXY:-http://star-proxy.oa.com:3128}
+export http_proxy="${http_proxy:-$PROXY}"
+export https_proxy="${https_proxy:-$PROXY}"
+export no_proxy="${no_proxy:-localhost,127.0.0.1,::1}"
+
 LOG=/tmp/provision_nixl_ep.log
 exec > >(tee -a "$LOG") 2>&1
 echo "=== provision start $(date -Is) on $(hostname) ==="

@@ -282,6 +282,48 @@ class NIXLStorageClient:
             return descs.trim()
         return descs
 
+    def _align_desc_counts(self, local_desc, remote_desc):
+        """Split whichever side has one descriptor so both sides have the same count.
+
+        NIXL pairs transfer descriptors element-wise, so a strided shard -- which
+        expands to one descriptor per row (item A2) -- cannot be paired against a single
+        contiguous descriptor on the other side. The transfer is rejected with
+        NIXL_ERR_INVALID_PARAM rather than being split automatically.
+
+        The contiguous side is cut into the same number of equal, consecutive pieces.
+        That is exactly the layout the strided rows land in, because the rows carry
+        equal `row_bytes` and the receiver's buffer is dense: row i of the source
+        corresponds to bytes [i*row_bytes, (i+1)*row_bytes) of the destination.
+
+        Returns the pair unchanged when the counts already agree, so the contiguous
+        path keeps its single-descriptor fast case.
+        """
+        n_local, n_remote = local_desc.descCount(), remote_desc.descCount()
+        if n_local == n_remote:
+            return local_desc, remote_desc
+
+        if n_local == 1:
+            single, count, other = local_desc, n_remote, "local"
+        elif n_remote == 1:
+            single, count, other = remote_desc, n_local, "remote"
+        else:
+            raise RuntimeError(
+                f"{self.client_name}: cannot pair {n_local} local descriptors with "
+                f"{n_remote} remote ones; neither side is a single contiguous descriptor"
+            )
+
+        addr, length, dev_id = single[0]
+        if length % count != 0:
+            raise RuntimeError(
+                f"{self.client_name}: contiguous {other} descriptor of {length} bytes does "
+                f"not divide into {count} equal rows, so it cannot be paired with a "
+                "strided descriptor"
+            )
+        row = length // count
+        rows = [(addr + i * row, row, dev_id) for i in range(count)]
+        split = nixlBind.nixlXferDList(single.getType(), rows)
+        return (split, remote_desc) if n_local == 1 else (local_desc, split)
+
     def _ensure_xfer_descs(self, descs):
         """Normalize reg/xfer descriptors to xfer list."""
         if isinstance(descs, nixlBind.nixlRegDList):
@@ -1270,6 +1312,7 @@ class NIXLStorageClient:
             )
             local_desc = self._deserialize_to_xfer_descs(local_desc_bytes)
             remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
+            local_desc, remote_desc = self._align_desc_counts(local_desc, remote_desc)
             # NOTE(claude): Continue after caching so every shard is processed before return.
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("READ", local_desc, remote_desc, target_agent, tag, target_client))
@@ -1455,6 +1498,7 @@ class NIXLStorageClient:
             )
             local_desc = self._deserialize_to_xfer_descs(local_desc_bytes)
             remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
+            local_desc, remote_desc = self._align_desc_counts(local_desc, remote_desc)
             # NOTE(claude): Use continue (not return) here so all shards are processed before returning.
             # Returning inside the loop would silently skip all remaining shards for this key.
             if merge_and_cache_xfer and is_contiguous:

@@ -19,6 +19,7 @@ from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, lo
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.prepped_xfer import PreppedXferCache
+from psrl.utils.nixl.strided_desc import StridedLayout, describe_shard
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
@@ -183,6 +184,9 @@ class NIXLStorageClient:
 
         # Mapping from (key, shard_idx) to registered desc slice info
         self.contig_desc_slice_map: dict[tuple[str, tuple[int, ...]], tuple[int, int, int, str]] = {}
+        # Shards that are non-contiguous but regularly strided (item A2): addressed
+        # in place via an Nx5 descriptor instead of being staged through a copy.
+        self.strided_desc_slice_map: dict[tuple[str, tuple[int, ...]], tuple[StridedLayout, str]] = {}
         self.temp_desc_slice_map: dict[tuple[str, tuple[int, ...]], tuple[int, int, int, str]] = {}
 
         # Optimization: merge multiple contiguous transfers into one
@@ -215,6 +219,7 @@ class NIXLStorageClient:
         self._pinned_memory = None
         self._temp_pinned_idx_mapping = {}
         self.temp_desc_slice_map = {}
+        self.strided_desc_slice_map = {}
 
     def _get_local_original_tensor(self, key: str, shard_idx: tuple[int, ...]) -> torch.Tensor | None:
         """Get original tensor mapping for non-contiguous shard"""
@@ -343,6 +348,30 @@ class NIXLStorageClient:
 
     # NOTE(lhy): High level registration amortizes the expensive low level NIXL API
     # while preserving complete tensor coverage.
+    def _serialize_strided_descs(self, tensor_infos, shard_pos_cache) -> int:
+        """Serialize strided shards into `desc_bytes_list`, returning how many were written.
+
+        A strided shard is written as the Nx3 rows it expands to, not as one Nx5 row:
+        `nixlXferDList` accepts only Nx3 in every NIXL version, and Nx5 is reachable
+        solely through `prep_xfer_dlist` (design 3.6.3). The win is still real -- no
+        staging buffer is allocated and no copy-back happens -- and the prepped hot path
+        (item A1) collapses these rows into a single strided descriptor when it preps the
+        dlist.
+        """
+        written = 0
+        for (key, shard_idx), (layout, mem_type) in self.strided_desc_slice_map.items():
+            rows = layout.to_nx3_rows()
+            xfer_descs = self.agent.get_xfer_descs(rows, mem_type=mem_type)
+            assert xfer_descs.descCount() == len(rows), (
+                f"{self.client_name}: get_xfer_descs returned {xfer_descs.descCount()} descs "
+                f"for {len(rows)} strided rows of {key} shard {shard_idx}."
+            )
+            desc_bytes = self.agent.get_serialized_descs(xfer_descs)
+            local_pos = shard_pos_cache[key][shard_idx]
+            tensor_infos[key].desc_bytes_list[local_pos] = desc_bytes
+            written += 1
+        return written
+
     def _ensure_all_tensor_registered_low_level(self):
         """Check if all tensors are registered."""
         for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
@@ -409,6 +438,16 @@ class NIXLStorageClient:
             if not _is_covered(slice_addr, slice_len):
                 raise RuntimeError(
                     f"{self.client_name}: tensor {key} shard {shard_idx} is a temp tensor but not registered"
+                )
+
+        # A strided shard is registered through its own storage, so the whole span --
+        # gaps included -- has to fall inside one region. Checking only the first row
+        # would pass for a shard whose last row runs past the end.
+        for (key, shard_idx), (layout, _mem_type) in self.strided_desc_slice_map.items():
+            if not _is_covered(layout.address, layout.span_bytes):
+                raise RuntimeError(
+                    f"{self.client_name}: tensor {key} shard {shard_idx} is a strided tensor "
+                    "but its span is not covered by a registered region"
                 )
 
     def register_local_tensors(
@@ -490,6 +529,9 @@ class NIXLStorageClient:
                     self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
                     local_pos = reregister_shard_pos_cache[key][shard_idx]
                     self.local_client_info.tensor_infos[key].temp_desc_bytes_list[local_pos] = desc_bytes
+            self._serialize_strided_descs(
+                self.local_client_info.tensor_infos, reregister_shard_pos_cache
+            )
             self._all_temp_mappings[self.client_name] = self._temp_desc_bytes_mapping
             return
 
@@ -654,6 +696,27 @@ class NIXLStorageClient:
                                 device_id,
                                 mem_type,
                             )
+                        elif (strided_layout := describe_shard(local_sharded_tensor)) is not None:
+                            # Non-contiguous but regularly strided (implementation item A2).
+                            # An Nx5 descriptor addresses the shard where it already lives, so
+                            # there is no staging copy to allocate, no slot to wait for, and
+                            # nothing to copy back after a pull. The shard's own storage is
+                            # registered instead.
+                            storage_key = self._record_region_registration(local_sharded_tensor)
+                            assert (
+                                strided_layout.address >= storage_key[0]
+                                and strided_layout.address + strided_layout.span_bytes
+                                <= storage_key[0] + storage_key[1]
+                            ), (
+                                f"{self.client_name}: key {key} shard {shard_indices[local_pos]} is strided, "
+                                f"but its span {strided_layout.address} through "
+                                f"{strided_layout.address + strided_layout.span_bytes} escapes the registered "
+                                f"region {storage_key[0]} through {storage_key[0] + storage_key[1]}."
+                            )
+                            self.strided_desc_slice_map[(key, shard_indices[local_pos])] = (
+                                strided_layout,
+                                storage_key[3],
+                            )
                         else:
                             if self.max_pinned_temp_memory_slots is None:
                                 # Non-contiguous shard: create temporary contiguous memory
@@ -807,6 +870,13 @@ class NIXLStorageClient:
                         local_pos = shard_pos_cache[key][shard_idx]
                         tensor_infos[key].temp_desc_bytes_list[local_pos] = desc_bytes
 
+                n_strided = self._serialize_strided_descs(tensor_infos, shard_pos_cache)
+                if n_strided:
+                    psrl_logger.info(
+                        f"{self.client_name}: {n_strided} strided shard(s) registered in place "
+                        f"(no staging copy)"
+                    )
+
                 psrl_logger.info(
                     f"{self.client_name}: [timing] register_local_tensors batch xfer_descs done in "
                     f"{time.time() - _t_xfer_descs:.3f}s"
@@ -863,6 +933,7 @@ class NIXLStorageClient:
             self._reg_regions = set()
             self._mtype_to_reg_region_lists = {}
             self.contig_desc_slice_map = {}
+            self.strided_desc_slice_map = {}
 
         psrl_logger.debug(f"{self.client_name} deregistered all local tensors.")
 

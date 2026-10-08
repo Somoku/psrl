@@ -46,6 +46,18 @@ class StridedLayout:
         return self.row_bytes * self.row_count
 
     @property
+    def span_bytes(self) -> int:
+        """Bytes from the first address to the end of the last row, gaps included.
+
+        Distinct from `total_bytes`, which counts only the payload. The span is what a
+        containment check against a registered region needs: the gaps sit inside the
+        region too, and the final row must end before the region does.
+        """
+        if self.row_count == 0:
+            return 0
+        return (self.row_count - 1) * self.stride_bytes + self.row_bytes
+
+    @property
     def is_contiguous(self) -> bool:
         """A stride equal to the block size means the view has no gaps after all."""
         return self.stride_bytes == self.row_bytes

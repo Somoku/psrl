@@ -291,3 +291,43 @@ class TestLayoutArithmetic:
             (0x1100, 64, 0),
             (0x1200, 64, 0),
         ]
+
+
+class TestSpanBytes:
+    """`span_bytes` is what a containment check against a registered region needs.
+
+    Distinct from `total_bytes`: the payload excludes the gaps, but the gaps sit inside
+    the registered region too. Checking only the payload would accept a shard whose
+    final row runs past the end of its region -- an RDMA read into unregistered memory.
+    """
+
+    def test_span_includes_the_gaps(self):
+        base = torch.zeros(8, 96, 16)
+        layout = describe_shard(base.narrow(1, 0, 64))
+        assert layout is not None
+        assert layout.span_bytes > layout.total_bytes, (
+            "a gapped layout must span more bytes than it carries"
+        )
+
+    def test_span_equals_total_when_contiguous(self):
+        """No gaps means span and payload coincide."""
+        layout = describe_shard(torch.zeros(4, 64))
+        if layout is None:
+            pytest.skip("contiguous tensors need no strided description here")
+        if layout.is_contiguous:
+            assert layout.span_bytes == layout.total_bytes
+
+    def test_span_reaches_the_end_of_the_last_row(self):
+        """The arithmetic must agree with the rows the layout expands to."""
+        base = torch.zeros(8, 96, 16)
+        layout = describe_shard(base.narrow(1, 0, 64))
+        assert layout is not None
+        rows = layout.to_nx3_rows()
+        last_end = rows[-1][0] + rows[-1][1]
+        assert last_end - layout.address == layout.span_bytes
+
+    def test_empty_layout_spans_nothing(self):
+        layout = StridedLayout(
+            address=0, row_bytes=128, device_id=0, stride_bytes=256, row_count=0
+        )
+        assert layout.span_bytes == 0

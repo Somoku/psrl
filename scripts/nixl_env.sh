@@ -23,8 +23,30 @@ _PSRL_NIXL_PLUGINS=/apdcephfs_zwfy10/share_303541817/lhy/nixl_runtime/plugins
 export LD_LIBRARY_PATH="${_PSRL_CONDA_LIB}:${LD_LIBRARY_PATH:-}"
 export NIXL_PLUGIN_DIR="${_PSRL_NIXL_PLUGINS}"
 
-# UCX needs the interface that carries RDMA on this cluster; the default selection
-# picks a management NIC on some nodes and silently falls back to TCP.
-export UCX_NET_DEVICES="${UCX_NET_DEVICES:-bond1}"
+# Device list and RoCE reachability mode, taken from the cluster's own env
+# (/jizhicfs/johnnyslin/env/psrl.sh).
+#
+# Getting this wrong does not fail loudly, it just runs ~24x slower:
+#   * `bond1` alone names an IP bond with no RDMA device behind it, so UCX finds no
+#     verbs transport and silently falls back to tcp. Measured 17.3 s for 4 GiB
+#     (~240 MB/s) on a 200 Gbps fabric.
+#   * Hand-picking the underlying `mlx5_8`/`mlx5_9` is worse: the RDMA path is selected,
+#     QPs connect and GIDs exchange, then the data phase hangs -- each node's bond1 sits
+#     in its own /26 and nothing routes RoCE between them.
+#   * The full list below lets UCX pick a reachable pair itself, and
+#     ROCE_REACHABILITY_MODE=all stops it from writing off peers that are not
+#     subnet-local. Measured 0.70 s for the same 4 GiB (~6.1 GB/s), wait time
+#     17.28 s -> 0.00028 s.
+#
+# `mlx5_bond_N` are the bonded 200 Gbps RoCE devices (GID index 3 is the RoCE v2 entry,
+# matching the cluster's NCCL_IB_GID_INDEX=3); the plain `bondN` entries stay in the
+# list as the fallback UCX uses when no RDMA pair is mutually reachable.
+# Set unconditionally, NOT via ${VAR:-default}. The cluster profile already exports
+# `UCX_NET_DEVICES=bond1`, so a :- default is a no-op and leaves the slow TCP path in
+# place -- which is how an earlier measurement of this came out at 19 s instead of
+# 0.70 s for the same node pair. Override with PSRL_UCX_NET_DEVICES when a specific
+# device list is wanted.
+export UCX_NET_DEVICES="${PSRL_UCX_NET_DEVICES:-bond1,bond2,bond3,bond4,bond5,bond6,bond7,bond8,mlx5_bond_1:1,mlx5_bond_4:1,mlx5_bond_3:1,mlx5_bond_2:1,mlx5_bond_7:1,mlx5_bond_6:1,mlx5_bond_8:1,mlx5_bond_5:1}"
+export UCX_IB_ROCE_REACHABILITY_MODE="${PSRL_UCX_ROCE_REACHABILITY:-all}"
 
 unset _PSRL_CONDA_LIB _PSRL_NIXL_PLUGINS

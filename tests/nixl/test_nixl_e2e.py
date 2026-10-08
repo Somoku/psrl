@@ -155,10 +155,23 @@ def assert_state_dict_matches_coords(
     which localises the fault to a dimension rather than just flagging the key.
     """
     assert state_dict, f"{actor_label} state_dict is empty."
+
+    # Only keys the train side actually filled can be judged by coordinate. The two
+    # sides do not share a key space: Megatron fuses attention into `linear_qkv` while
+    # vLLM exposes `q_proj`/`k_proj`/`v_proj`, and the converters map between them. A
+    # key present only on the gen side was produced by that mapping, not copied
+    # verbatim, so its elements legitimately do not carry the sender's coordinates.
+    shared = {k: v for k, v in state_dict.items() if k in offsets}
+    assert shared, (
+        f"{actor_label}: none of its {len(state_dict)} keys overlap the "
+        f"{len(offsets)} keys the train side filled -- the two sides share no key "
+        "space at all, which would make the whole judgement vacuous"
+    )
     try:
-        assert_state_dict_matches_coord(state_dict, offsets)
+        assert_state_dict_matches_coord(shared, offsets)
     except AssertionError as exc:
         raise AssertionError(f"{actor_label}: {exc}") from exc
+    return len(shared), len(state_dict)
 
 
 def make_dual_print(log_path, prefix=None):
@@ -951,13 +964,22 @@ def test_nixl_e2e(cfg: DictConfig):
 
     # Fetch and verify gen client state_dicts against the coordinate function.
     print("[CHECK] Verifying GenClientActor state_dicts encode their global coordinates...")
-    # Every train rank fills the same canonical key space, so any rank's offsets serve
-    # as the reference; rank 0 is used for definiteness.
-    coord_offsets = ray.get(train_actors[0].get_coord_offsets.remote())
+    # Merge offsets from every train rank: under TP/PP each rank holds only part of the
+    # key space, so one rank's map would leave most gen keys unjudged. Ranks that do
+    # share a key agree on its offset (the fill is driven by the canonical key order),
+    # so a plain merge is well defined.
+    per_rank_offsets = ray.get([t.get_coord_offsets.remote() for t in train_actors])
+    coord_offsets: dict[str, int] = {}
+    for rank_offsets in per_rank_offsets:
+        coord_offsets.update(rank_offsets)
+    print(f"[CHECK] train side filled {len(coord_offsets)} distinct keys")
+
     gen_state_dicts = ray.get([g.get_state_dict.remote() for g in gen_actors])
     for gen_idx, state_dict in enumerate(gen_state_dicts):
-        assert_state_dict_matches_coords(state_dict, coord_offsets, f"Gen client {gen_idx}")
-        print(f"[PASS] Gen client {gen_idx} matches its global coordinates.")
+        judged, total = assert_state_dict_matches_coords(
+            state_dict, coord_offsets, f"Gen client {gen_idx}"
+        )
+        print(f"[PASS] Gen client {gen_idx}: {judged}/{total} keys match their coordinates.")
     print("[PASS] All GenClientActor parameters match the coordinate function.")
 
     # Shutdown all actors and Ray

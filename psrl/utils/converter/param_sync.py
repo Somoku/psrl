@@ -122,7 +122,9 @@ class ConcatenatedQKVSync:
             attn_output_gate=False,
             tp_size=self.tp_size,
         )
-        qkv = torch.cat((q, k, v), dim=0)
+        # GQA models produce mismatched shapes (e.g., q: [8, 512, 4096], k/v: [8, 128, 4096]).
+        # cat(dim=0) only works for MHA; cat(dim=1) concatenates group-local QKV, then flatten.
+        qkv = torch.cat((q, k, v), dim=1).reshape(-1, self.source_param.size(1))
         if self.is_visual_qkv:
             qkv = reshape_visual_block_qkv(qkv, vision_head_size=self.vision_head_size)
         state_dict[self.key].copy_(qkv.to(dtype=state_dict[self.key].dtype))
@@ -133,27 +135,33 @@ class ConcatenatedQKVSync:
     def after_pull(self, state_dict: dict[str, torch.Tensor]) -> None:
         if self.key not in state_dict:
             return
+        import math
         hf_qkv = state_dict[self.key]
-        if hf_qkv.dim() == 4:
-            hf_qkv = hf_qkv.reshape(-1, hf_qkv.shape[-1])
-        elif hf_qkv.dim() == 3:
+        # Flatten visual QKV layouts to 2-D first.
+        if hf_qkv.dim() > 2:
             hf_qkv = hf_qkv.reshape(-1, hf_qkv.shape[-1])
 
-        total_rows = hf_qkv.shape[0]
-        denom = self.num_heads + 2 * self.num_kv_heads
-        if denom == 0 or total_rows % denom != 0:
+        # `before_push` writes via cat(dim=1).reshape: the flat tensor is organised as
+        # nsh groups, each containing (q_len + k_len + v_len) rows, where
+        #   nsh       = gcd(num_heads, num_kv_heads)
+        #   q_len     = head_size * num_heads  // nsh
+        #   k_len     = head_size * num_kv_heads // nsh
+        # Invert that by reshaping to (nsh, q_len+2*k_len, hidden), splitting on dim=1,
+        # concatenating back in Megatron's interleaved order, and copying into source_param.
+        nsh = math.gcd(self.num_heads, self.num_kv_heads)
+        q_len = self.head_size * self.num_heads // nsh
+        k_len = self.head_size * self.num_kv_heads // nsh
+        total_group_rows = q_len + 2 * k_len
+
+        expected_rows = nsh * total_group_rows
+        if hf_qkv.shape[0] != expected_rows:
+            # Size mismatch — cannot safely reconstruct; skip to avoid corruption.
             return
 
-        unit = total_rows // denom
-        q_size = unit * self.num_heads
-        k_size = unit * self.num_kv_heads
-        v_size = unit * self.num_kv_heads
-        q_flat, k_flat, v_flat = hf_qkv.split([q_size, k_size, v_size], dim=0)
-
-        heads_per_group = self.num_heads // self.num_kv_heads
-        num_kv_groups = k_size // self.head_size
-        q_grouped = q_flat.reshape(num_kv_groups, heads_per_group * self.head_size, -1)
-        k_grouped = k_flat.reshape(num_kv_groups, self.head_size, -1)
-        v_grouped = v_flat.reshape(num_kv_groups, self.head_size, -1)
-        megatron_qkv = torch.cat([q_grouped, k_grouped, v_grouped], dim=1)
+        hidden = hf_qkv.shape[1]
+        qkv_3d = hf_qkv.reshape(nsh, total_group_rows, hidden)
+        q_part = qkv_3d[:, :q_len, :]
+        k_part = qkv_3d[:, q_len:q_len + k_len, :]
+        v_part = qkv_3d[:, q_len + k_len:, :]
+        megatron_qkv = torch.cat([q_part, k_part, v_part], dim=1)
         self.source_param.copy_(megatron_qkv.reshape(self.source_param.shape).to(dtype=self.source_param.dtype))

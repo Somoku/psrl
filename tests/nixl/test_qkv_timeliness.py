@@ -63,9 +63,9 @@ def _make_state_dict_entry(
 ) -> torch.Tensor:
     """Produce the tensor `_convert_concatenated_qkv_parameter` puts in the state dict.
 
-    This mirrors the production expression exactly -- ``torch.cat((q, k, v), dim=0)`` on
-    the 3-D views the slicer returns -- so the fixture's target shape is whatever
-    production actually writes, rather than a shape invented here.
+    Mirrors the production expression: the slicer returns 3-D views whose middle dim
+    differs between Q and K/V under GQA, so the concat is group-local (``dim=1``) and the
+    result is flattened to the 2-D ``(rows, hidden)`` form a HF checkpoint stores.
     """
     from psrl.utils.converter.model_mappings import slice_qkv_proj_megatron
 
@@ -77,7 +77,7 @@ def _make_state_dict_entry(
         attn_output_gate=False,
         tp_size=sync.tp_size,
     )
-    return torch.cat((q, k, v), dim=0).clone()
+    return torch.cat((q, k, v), dim=1).reshape(-1, source_param.size(1)).clone()
 
 
 class TestConcatenatedQKVSyncBasics:
@@ -155,14 +155,15 @@ class TestStaleQKVIsDetectable:
     """
 
     @pytest.mark.parametrize("delta", [0.1, 1.0])
-    def test_skipping_before_push_leaves_stale_bytes(self, delta):
+    @pytest.mark.parametrize("heads, kv_heads", [(8, 8), (32, 8)], ids=["mha", "gqa"])
+    def test_skipping_before_push_leaves_stale_bytes(self, delta, heads, kv_heads):
         """After an optimizer step of magnitude `delta`, the stale diff must exceed noise.
 
         The diff being zero would mean either the state dict was a live view (not a
         clone) of source_param, or the before_push refresh is always applied regardless —
         either would break the semantics the test is designed to catch.
         """
-        num_heads, num_kv_heads, head_size, tp_size = 8, 8, 64, 1
+        num_heads, num_kv_heads, head_size, tp_size = heads, kv_heads, 64, 1
         source_param = _make_megatron_qkv(num_heads, num_kv_heads, head_size, tp_size)
         sync = ConcatenatedQKVSync(
             key="qkv",
@@ -190,7 +191,8 @@ class TestStaleQKVIsDetectable:
             "before_push is not refreshing the QKV entry, so staleness would be silent"
         )
 
-    def test_fresh_entry_matches_source_param_after_step(self):
+    @pytest.mark.parametrize("heads, kv_heads", [(8, 8), (32, 8)], ids=["mha", "gqa"])
+    def test_fresh_entry_matches_source_param_after_step(self, heads, kv_heads):
         """The refreshed state dict entry must reflect the post-step source_param content.
 
         This is the positive form of the staleness test: not only must stale != fresh,
@@ -198,7 +200,7 @@ class TestStaleQKVIsDetectable:
         """
         from psrl.utils.converter.model_mappings import slice_qkv_proj_megatron
 
-        num_heads, num_kv_heads, head_size, tp_size = 8, 8, 64, 1
+        num_heads, num_kv_heads, head_size, tp_size = heads, kv_heads, 64, 1
         source_param = _make_megatron_qkv(num_heads, num_kv_heads, head_size, tp_size)
         sync = ConcatenatedQKVSync(
             key="qkv",
@@ -224,7 +226,7 @@ class TestStaleQKVIsDetectable:
             attn_output_gate=False,
             tp_size=tp_size,
         )
-        expected = torch.cat((q, k, v), dim=0)
+        expected = torch.cat((q, k, v), dim=1).reshape(-1, source_param.size(1))
         assert torch.allclose(state_dict["qkv"], expected), (
             "after before_push, state_dict['qkv'] does not match the current source_param; "
             "the refresh is computing from stale data rather than the live parameter"
@@ -234,7 +236,8 @@ class TestStaleQKVIsDetectable:
 class TestAfterPullRestoresSourceParam:
     """after_pull must write the pulled HF QKV back into source_param (Megatron form)."""
 
-    def test_after_pull_updates_source_param(self):
+    @pytest.mark.parametrize("heads, kv_heads", [(8, 8), (32, 8)], ids=["mha", "gqa"])
+    def test_after_pull_updates_source_param(self, heads, kv_heads):
         """A state dict modified by the PS pull must be reflected in source_param.
 
         Driven through `ParamSyncPlan` rather than by calling `after_pull` directly:
@@ -244,7 +247,7 @@ class TestAfterPullRestoresSourceParam:
         """
         from psrl.utils.converter.param_sync import ParamSyncPlan
 
-        num_heads, num_kv_heads, head_size, tp_size = 8, 8, 64, 1
+        num_heads, num_kv_heads, head_size, tp_size = heads, kv_heads, 64, 1
         source_param = _make_megatron_qkv(num_heads, num_kv_heads, head_size, tp_size)
         sync = ConcatenatedQKVSync(
             key="qkv",
@@ -271,7 +274,8 @@ class TestAfterPullRestoresSourceParam:
             "after_pull did not modify source_param; a PS pull of new weights would be lost"
         )
 
-    def test_after_pull_round_trips_through_before_push(self):
+    @pytest.mark.parametrize("heads, kv_heads", [(8, 8), (32, 8)], ids=["mha", "gqa"])
+    def test_after_pull_round_trips_through_before_push(self, heads, kv_heads):
         """push(cat) then pull(un-cat) must return the original Megatron parameter.
 
         This is the real correctness property of the pair: the HF-ordered tensor the
@@ -281,7 +285,7 @@ class TestAfterPullRestoresSourceParam:
         """
         from psrl.utils.converter.param_sync import ParamSyncPlan
 
-        num_heads, num_kv_heads, head_size, tp_size = 8, 8, 64, 1
+        num_heads, num_kv_heads, head_size, tp_size = heads, kv_heads, 64, 1
         source_param = _make_megatron_qkv(num_heads, num_kv_heads, head_size, tp_size)
         sync = ConcatenatedQKVSync(
             key="qkv",

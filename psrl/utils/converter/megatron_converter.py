@@ -283,7 +283,10 @@ class MegatronConverter(BaseConverter):
                 f"Failed to convert concatenated qkv parameter {full_name} into {full_hf_name}: {e}"
             ) from e
 
-        qkv = torch.cat((q, k, v), dim=0)
+        # GQA produces mismatched middle dims (q: [groups, q_len, hidden],
+        # k/v: [groups, kv_len, hidden]), so the concat is group-local (dim=1) and then
+        # flattened. cat(dim=0) happens to work only when num_heads == num_kv_heads.
+        qkv = torch.cat((q, k, v), dim=1).reshape(-1, param.size(1))
         if "visual.blocks" in full_hf_name and "qkv" in full_hf_name:
             qkv = reshape_visual_block_qkv(qkv, vision_head_size=self.model_info.get("vision_head_size"))
         self.sync_plan.add(

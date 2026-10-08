@@ -664,12 +664,18 @@ class NIXLStorageClient:
 
                     # Create meta info for shards
                     is_contiguous = local_sharded_tensor.is_contiguous()
+                    # Computed once here and carried in the metadata: the peer needs to
+                    # know this shard is sendable without staging, and it cannot work
+                    # that out from shape and stride alone without repeating the
+                    # analysis `describe_shard` already did.
+                    strided_layout = None if is_contiguous else describe_shard(local_sharded_tensor)
                     meta_info = NIXLShardMetaInfo(
                         dtype=local_sharded_tensor.dtype,
                         device=local_sharded_tensor.device,
                         shape=local_sharded_tensor.shape,
                         stride=local_sharded_tensor.stride(),
                         is_contiguous=is_contiguous,
+                        is_strided_expressible=strided_layout is not None,
                     )
                     shard_meta_info_list.append(meta_info)
 
@@ -696,7 +702,7 @@ class NIXLStorageClient:
                                 device_id,
                                 mem_type,
                             )
-                        elif (strided_layout := describe_shard(local_sharded_tensor)) is not None:
+                        elif strided_layout is not None:
                             # Non-contiguous but regularly strided (implementation item A2).
                             # An Nx5 descriptor addresses the shard where it already lives, so
                             # there is no staging copy to allocate, no slot to wait for, and

@@ -3,7 +3,7 @@ from collections import OrderedDict
 
 import pytest
 import torch
-from psrl.utils.nixl.nixl_spec import NIXLSharding
+from psrl.utils.nixl.nixl_spec import NIXLShardMetaInfo, NIXLSharding
 
 pytestmark = pytest.mark.cpu_test
 
@@ -217,3 +217,75 @@ class TestNIXLSharding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestShardMetaCanXferTo:
+    """The sendability rule, after strided shards became sendable in place (item A2).
+
+    Before A2 the only way to put a non-contiguous shard on the wire was to stage it
+    into a contiguous copy, so `can_xfer_to` refused any non-contiguous source. A
+    strided-expressible shard is now addressed where it lives, and its descriptor
+    enumerates the same bytes in the same order as that copy would have -- so the
+    receiver cannot tell the difference and the refusal is no longer correct.
+    """
+
+    @staticmethod
+    def _meta(is_contiguous: bool, strided: bool = False, shape=(4, 8), dtype=torch.float32):
+        return NIXLShardMetaInfo(
+            dtype=dtype,
+            device=torch.device("cpu"),
+            shape=torch.Size(shape),
+            stride=(8, 1),
+            is_contiguous=is_contiguous,
+            is_strided_expressible=strided,
+        )
+
+    def test_contiguous_source_is_sendable(self):
+        src = self._meta(is_contiguous=True)
+        assert src.can_xfer_to(self._meta(is_contiguous=True))
+
+    def test_strided_source_is_sendable(self):
+        """The A2 case: non-contiguous but addressable by one Nx5 descriptor."""
+        src = self._meta(is_contiguous=False, strided=True)
+        assert src.can_xfer_to(self._meta(is_contiguous=True)), (
+            "a strided-expressible shard must be sendable; refusing it sends every such "
+            "shard back through staging and discards the benefit of A2"
+        )
+
+    def test_unexpressible_non_contiguous_source_is_refused(self):
+        """Still refused: these genuinely need a staging copy."""
+        src = self._meta(is_contiguous=False, strided=False)
+        assert not src.can_xfer_to(self._meta(is_contiguous=True))
+
+    def test_dtype_mismatch_is_refused_even_when_strided(self):
+        """dtype decides how the receiver reads the bytes, so it must still match."""
+        src = self._meta(is_contiguous=False, strided=True, dtype=torch.float32)
+        dst = self._meta(is_contiguous=True, dtype=torch.bfloat16)
+        assert not src.can_xfer_to(dst)
+
+    def test_shape_mismatch_is_refused_even_when_strided(self):
+        src = self._meta(is_contiguous=False, strided=True, shape=(4, 8))
+        dst = self._meta(is_contiguous=True, shape=(8, 4))
+        assert not src.can_xfer_to(dst)
+
+
+class TestShardMetaSerializationCompatibility:
+    """A peer predating the strided field must still be readable."""
+
+    def test_round_trip_preserves_the_flag(self):
+        meta = NIXLShardMetaInfo(
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            shape=torch.Size((2, 3)),
+            stride=(3, 1),
+            is_contiguous=False,
+            is_strided_expressible=True,
+        )
+        assert NIXLShardMetaInfo.deserialize(meta.serialize()).is_strided_expressible
+
+    def test_legacy_five_element_tuple_defaults_to_not_strided(self):
+        """The safe reading: an older peer claims no strided capability."""
+        legacy = ("torch.float32", "cpu", (2, 3), (3, 1), True)
+        restored = NIXLShardMetaInfo.deserialize(legacy)
+        assert restored.is_strided_expressible is False
+        assert restored.is_contiguous is True

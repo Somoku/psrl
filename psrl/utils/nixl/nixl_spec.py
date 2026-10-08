@@ -420,15 +420,28 @@ class NIXLShardMetaInfo:
     shape: torch.Size
     stride: tuple[int, ...]
     is_contiguous: bool
+    #: Whether a non-contiguous shard can still be addressed in place by one Nx5
+    #: strided descriptor (item A2). Defaults False so metadata produced before this
+    #: field existed -- or by a peer that predates it -- keeps the old, stricter
+    #: behaviour of routing through staging.
+    is_strided_expressible: bool = False
 
     def serialize(self) -> tuple:
         """
         Serialize the shard metadata to a compact primitive tuple.
 
         Returns:
-            tuple: ``(dtype_str, device_str, shape_tuple, stride, is_contiguous)``
+            tuple: ``(dtype_str, device_str, shape_tuple, stride, is_contiguous,
+            is_strided_expressible)``
         """
-        return (str(self.dtype), str(self.device), tuple(self.shape), self.stride, self.is_contiguous)
+        return (
+            str(self.dtype),
+            str(self.device),
+            tuple(self.shape),
+            self.stride,
+            self.is_contiguous,
+            self.is_strided_expressible,
+        )
 
     @staticmethod
     def deserialize(t: tuple) -> "NIXLShardMetaInfo":
@@ -447,12 +460,28 @@ class NIXLShardMetaInfo:
             shape=torch.Size(t[2]),
             stride=t[3],
             is_contiguous=t[4],
+            # Tolerate the 5-element form: a peer on the older layout simply reports no
+            # strided capability, which is the safe reading.
+            is_strided_expressible=t[5] if len(t) > 5 else False,
         )
 
     def can_xfer_to(self, other: "NIXLShardMetaInfo") -> bool:
-        """Check if the shard can be transferred to another shard"""
-        # xfer from non-contiguous shards is not supported
-        return self.is_contiguous and self.dtype == other.dtype and self.shape == other.shape
+        """Whether this shard's bytes can be sent directly to ``other``.
+
+        Contiguity of the *source* is not required when the shard is strided-expressible
+        (implementation item A2): its descriptor enumerates exactly the same bytes in the
+        same order as the contiguous copy it replaces, so the receiver -- which always
+        lands in a contiguous buffer -- sees an identical byte stream. Requiring
+        ``self.is_contiguous`` here predates that path and would send every strided shard
+        back through staging, discarding the benefit.
+
+        What must still match is dtype and shape. Those decide how the receiver
+        interprets the bytes, and a mismatch there is a genuine incompatibility rather
+        than a difference in how the source happens to be laid out.
+        """
+        if self.dtype != other.dtype or self.shape != other.shape:
+            return False
+        return self.is_contiguous or self.is_strided_expressible
 
 
 @dataclass

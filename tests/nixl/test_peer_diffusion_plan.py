@@ -353,22 +353,32 @@ class TestTwoPhaseExecution:
         """A typo must not silently fall through to reading everything."""
         assert 'assert phase in ("all", "upstream", "peer")' in self._harness()
 
-    def test_the_driver_barriers_between_the_phases(self):
-        """`ray.get` on every actor is the barrier; a single call would not be one."""
-        harness = self._harness()
-        upstream_at = harness.index('phase="upstream"')
-        peer_at = harness.index('phase="peer"')
-        between = harness[upstream_at:peer_at]
+    def test_the_driver_barriers_between_every_wave(self):
+        """The barrier is inside the wave loop, so wave i lands before i+1 starts.
 
-        assert "ray.get" in between, (
-            "the peer phase is issued without waiting for every actor's upstream phase, "
-            "so a peer may be read before it has the bytes"
+        Hoisting the `ray.get` out of the loop would still look like a pipeline in a
+        trace while letting a follower read a chunk its designate has not fetched.
+        """
+        harness = self._harness()
+        loop_at = harness.index("for wave in range(num_waves):")
+        body = harness[loop_at : loop_at + 400]
+
+        assert "ray.get" in body, (
+            "the wave loop issues reads without waiting, so a peer may be read before "
+            "its designate has the chunk"
         )
+        assert 'phase=f"wave:{wave}"' in body
 
-    def test_the_peer_phase_targets_rollout_clients(self):
-        """Peer sources are gen clients, so the train-client names would not resolve."""
+    def test_the_wave_loop_covers_every_wave(self):
+        """Taking the max across clients is what keeps the loop uniform."""
         harness = self._harness()
-        assert "g.get_nixl_names.remote() for g in gen_actors" in harness
+        assert "wave_counts = ray.get([g.chunk_wave_count.remote() for g in gen_actors])" in harness
+        assert "num_waves = max(wave_counts)" in harness
+
+    def test_the_waves_can_reach_both_source_kinds(self):
+        """A wave mixes upstream and peer reads, so both name sets must be passed."""
+        harness = self._harness()
+        assert "all_agent_names = source_agent_names + [a for a, _c in gen_names]" in harness
 
     def test_the_ps_path_stays_single_phase(self):
         """Nothing to diffuse there; a second driver round trip would be pure overhead."""

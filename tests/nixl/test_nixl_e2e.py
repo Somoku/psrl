@@ -587,6 +587,12 @@ class GenClientActor:
         self.rank = rank
         self.tp_rank = rank % self.tp_size
         self.instance_world_size = self.tp_size * self.pp_size
+        #: Chunk-wave schedule and chunk->keys map (item D1). Built once and reused
+        #: across waves: the schedule derives from the plan, which does not change
+        #: between waves, and rebuilding per wave would make the pipeline's own cost
+        #: grow with the wave count -- the opposite of the point.
+        self._cached_waves = None
+        self._chunk_keys = None
         assert world_size % (self.tp_size * self.pp_size) == 0, (
             f"TP*PP does not divide world_size. world_size={world_size!r}, product={self.tp_size * self.pp_size!r}."
         )
@@ -735,7 +741,9 @@ class GenClientActor:
         is nothing to diffuse there and a second round trip through the driver would be
         pure overhead.
         """
-        assert phase in ("all", "upstream", "peer"), f"unknown pull phase {phase!r}"
+        assert phase in ("all", "upstream", "peer") or phase.startswith("wave:"), (
+            f"unknown pull phase {phase!r}"
+        )
         wait_operations = []
         total_start_time = time.time()
         agent_of = dict(zip(ps_client_names, ps_agent_names))
@@ -792,28 +800,54 @@ class GenClientActor:
             if not self._shards_fully_covered(key, src, peer_covered)
         ]
 
-        if phase == "upstream":
+        if phase.startswith("wave:"):
+            # D1 chunk pipeline: issue only the reads belonging to one chunk, so a
+            # follower's peer read of chunk i overlaps the designate's work on chunk
+            # i+1. The driver advances the index and barriers between waves, which is
+            # what keeps the per-chunk dependency honest.
+            wave_index = int(phase.split(":", 1)[1])
+            work = self._wave_work(wave_index)
+        elif phase == "upstream":
             work = upstream_without_peer_covered
         elif phase == "peer":
             work = peer_work
         else:
             work = upstream_work
-        deferred_peer_reads = peer_work if phase != "peer" else []
+        deferred_peer_reads = peer_work if phase in ("all", "upstream") else []
 
-        skip = peer_covered if phase == "upstream" else {}
+        # The tag must differ per wave. `wait` keys on (key, tag, op, target), so
+        # reusing one tag across waves makes wave i+1's read collide with wave i's
+        # already-completed handle for the same key and source -- the second wait would
+        # match the wrong transfer.
+        tag = f"gen_pull_{phase}"
+        # In wave mode the plan is already partitioned: `_wave_work` returns exactly the
+        # reads this wave should issue, and a shard appears either as an upstream read or
+        # as a peer read, never both. Applying the whole-model `peer_covered` set on top
+        # of that skipped shards whose peer read lives in a *different* wave -- 266
+        # scheduled reads produced only 101 transfers, and the coordinate judge caught
+        # the resulting gap. The wave partition is the authority; nothing is subtracted
+        # from it.
+        skip_upstream = phase == "upstream"
         for key, source_client in work:
+            # Outside wave mode the two lists overlap by construction (the upstream read
+            # is kept whole so a caller may skip peer reads), so a peer-covered shard
+            # must be excluded from the upstream read -- but never from the peer read
+            # itself, which exists precisely to fetch it.
+            is_peer_read = source_client in self.client.peer_sources_for(key)
             shards_to_transfer = self.client.client_read(
                 agent_of[source_client],
                 source_client,
                 key,
-                "gen_pull",
+                tag,
                 merge_and_cache_xfer=False,
-                skip_shards=skip.get(key),
+                skip_shards=(
+                    peer_covered.get(key) if (skip_upstream and not is_peer_read) else None
+                ),
             )
             if len(shards_to_transfer) > 0:
                 wait_operations.append((key, source_client, shards_to_transfer))
         for key, source_client, shards_to_transfer in wait_operations:
-            self.client.wait(key, "gen_pull", "READ", target_client=source_client)
+            self.client.wait(key, tag, "READ", target_client=source_client)
         self.client.merge_and_finish_cached_xfer()
         total_end_time = time.time()
         # torch.cuda.synchronize()
@@ -822,6 +856,57 @@ class GenClientActor:
             f"({len(work)} scheduled reads, {len(wait_operations)} transfers, "
             f"{len(deferred_peer_reads)} peer reads deferred)"
         )
+
+    def chunk_wave_count(self) -> int:
+        """Number of chunk waves this client's plan implies (item D1).
+
+        The driver takes the max across clients so every client is asked for every wave
+        index; a client with fewer waves returns no work for the surplus ones rather
+        than erroring, which keeps the loop uniform.
+        """
+        self._wave_work(0)  # builds the cache
+        return len(self._cached_waves or [])
+
+    def _wave_work(self, wave_index: int) -> list:
+        """``(key, source)`` pairs belonging to chunk ``wave_index`` (item D1).
+
+        Derived from the chunk plan rather than recomputed here: the plan already
+        decides which shards a chunk carries, and a second definition of that boundary
+        is how the two would drift apart.
+
+        An out-of-range index returns nothing rather than raising, so the driver can
+        advance past the end without knowing the wave count in advance.
+        """
+        from psrl.utils.nixl.chunk_pipeline import schedule_pipelined_reads
+
+        if self._cached_waves is None:
+            chunks, _groups = self.client.pull_chunks()
+            upstream = {
+                key: self.client.upstream_sources_for(key) for key in self.state_dict_keys
+            }
+            peer = {key: self.client.peer_shards_for(key) for key in self.state_dict_keys}
+            self._cached_waves = schedule_pipelined_reads(
+                chunks,
+                {k: v for k, v in upstream.items() if v},
+                {k: v for k, v in peer.items() if v},
+                self.client_name,
+            )
+        if wave_index >= len(self._cached_waves):
+            return []
+        # Take the (key, source) pairs the schedule recorded. Deriving them from chunk
+        # membership instead emitted reads nobody planned and dropped planned ones: a
+        # chunk holds ~100 keys at this model size, so "every key in this chunk" is not
+        # the same set as "the reads placed in this chunk". That mistake produced wrong
+        # weights that the coordinate judge caught -- 100 + 269 reads issued against 653
+        # planned.
+        seen, pairs = set(), []
+        for read in self._cached_waves[wave_index].reads:
+            pair = (read.key, read.source)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            pairs.append(pair)
+        return pairs
 
     def _shards_fully_covered(self, key, source, peer_covered) -> bool:
         """Whether every shard ``source`` would serve is already covered by a peer.
@@ -1160,28 +1245,29 @@ def test_nixl_e2e(cfg: DictConfig):
         # A peer read is only valid once that peer has completed its upstream read, and
         # reading early *succeeds* against an unfilled buffer rather than failing -- so
         # the ordering is a correctness requirement, not a scheduling preference.
-        ray.get(
-            [
-                g.pull_from_ps.remote(source_agent_names, source_client_names, phase="upstream")
-                for g in gen_actors
-            ]
-        )
-        upstream_done = time.time()
-        print(f"[PASS] gen upstream pull done. time: {upstream_done - start_time}s")
-
-        # The peer phase reads from other rollout clients, so the names it needs are
-        # the gen clients', not the train clients'.
+        # Peer reads need the designate's chunk to have landed first, so each wave is
+        # separated by a barrier. Driving the loop here keeps the barrier where it has
+        # to be while letting wave i+1's upstream read overlap wave i's peer read --
+        # which is the whole difference from the two-phase arrangement that measured
+        # slower than not diffusing at all.
         gen_names = ray.get([g.get_nixl_names.remote() for g in gen_actors])
-        peer_agent_names = [agent for agent, _client in gen_names]
-        peer_client_names = [client for _agent, client in gen_names]
-        ray.get(
-            [
-                g.pull_from_ps.remote(peer_agent_names, peer_client_names, phase="peer")
-                for g in gen_actors
-            ]
-        )
+        all_agent_names = source_agent_names + [a for a, _c in gen_names]
+        all_client_names = source_client_names + [c for _a, c in gen_names]
+
+        wave_counts = ray.get([g.chunk_wave_count.remote() for g in gen_actors])
+        num_waves = max(wave_counts) if wave_counts else 0
+        print(f"[PASS] chunk pipeline: {num_waves} waves (max over {len(gen_actors)} clients)")
+
+        for wave in range(num_waves):
+            ray.get(
+                [
+                    g.pull_from_ps.remote(
+                        all_agent_names, all_client_names, phase=f"wave:{wave}"
+                    )
+                    for g in gen_actors
+                ]
+            )
         end_time = time.time()
-        print(f"[PASS] gen peer pull done. time: {end_time - upstream_done}s")
         print(f"[PASS] gen pull from {label} done. time: {end_time - start_time}s")
     else:
         futures = []

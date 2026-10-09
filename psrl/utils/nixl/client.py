@@ -295,6 +295,23 @@ class NIXLStorageClient:
             return []
         return self._comm_plan.get_rollout_pull_plan(self.client_name, key).get(source, [])
 
+    def upstream_sources_for(self, key: str) -> dict[str, list[tuple[int, ...]]]:
+        """``{source: shards}`` this client reads upstream for ``key`` (item D1)."""
+        if self._comm_plan is None:
+            return {}
+        return self._comm_plan.get_rollout_pull_plan(self.client_name, key)
+
+    def pull_chunks(self) -> tuple[list, list]:
+        """This client's chunk plan: ``(chunks, commit_groups)`` (items B1, D1).
+
+        Empty when the planner had no size metadata for this client, which callers must
+        read as "no chunking" rather than "no work" -- the same distinction
+        `iter_planned_pull_work` draws.
+        """
+        if self._comm_plan is None:
+            return [], []
+        return self._comm_plan.get_pull_chunks(self.client_name)
+
     def _get_temp_desc_bytes(self, client_name: str, key: str, shard_idx: tuple[int, ...]) -> bytes | None:
         """Get temporary descriptor for non-contiguous shard"""
         assert client_name in self._all_temp_mappings, f"Client {client_name} not found in temp mappings."

@@ -278,6 +278,23 @@ class NIXLStorageClient:
             return set()
         return set(self._comm_plan.get_peer_pull_plan(self.client_name, key))
 
+    def peer_shards_for(self, key: str) -> dict[str, list[tuple[int, ...]]]:
+        """``{peer: shards}`` this client should take from peers for ``key`` (item D1).
+
+        Shard-level rather than key-level because a key can be partly peer-covered: the
+        client may want several of its shards with a peer holding only some. Dropping
+        the whole key's upstream read in that case loses the remainder silently.
+        """
+        if self._comm_plan is None:
+            return {}
+        return self._comm_plan.get_peer_pull_plan(self.client_name, key)
+
+    def upstream_shards_for(self, key: str, source: str) -> list[tuple[int, ...]]:
+        """Shards ``source`` is planned to serve this client for ``key`` (item D1)."""
+        if self._comm_plan is None:
+            return []
+        return self._comm_plan.get_rollout_pull_plan(self.client_name, key).get(source, [])
+
     def _get_temp_desc_bytes(self, client_name: str, key: str, shard_idx: tuple[int, ...]) -> bytes | None:
         """Get temporary descriptor for non-contiguous shard"""
         assert client_name in self._all_temp_mappings, f"Client {client_name} not found in temp mappings."
@@ -1274,6 +1291,7 @@ class NIXLStorageClient:
         tag: str,
         comm_plan: NIXLCommPlan | None = None,
         merge_and_cache_xfer: bool | None = False,
+        skip_shards: "set[tuple[int, ...]] | None" = None,
     ) -> list[tuple[int, ...]]:
         """Read from another client, supports shard alignment and communication plan.
 
@@ -1290,6 +1308,11 @@ class NIXLStorageClient:
                 internal cache for later bulk submission via
                 ``merge_and_finish_cached_xfer()`` instead of posting the
                 transfer immediately.
+            skip_shards: Shards a same-node peer will supply instead (item D1), so this
+                read must not fetch them over the NIC -- that omission is the traffic
+                reduction. The caller owns this decision because only it knows whether
+                the peer phase will actually run: passing shards that no peer read
+                follows loses those bytes with no error.
         """
         plan = comm_plan or self._comm_plan
         self._ensure_client_info_fetched(target_client)
@@ -1333,6 +1356,10 @@ class NIXLStorageClient:
             for shard_idx in local_info.sharding.shard_indices:
                 if shard_idx in remote_info.sharding.shard_indices:
                     shards_to_transfer.append(shard_idx)
+
+        if skip_shards:
+            # The caller has committed to a peer read covering these (item D1).
+            shards_to_transfer = [s for s in shards_to_transfer if s not in skip_shards]
         for shard_idx in shards_to_transfer:
             assert (
                 shard_idx in local_info.sharding.shard_indices and shard_idx in remote_info.sharding.shard_indices

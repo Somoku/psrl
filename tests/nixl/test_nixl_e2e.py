@@ -670,6 +670,15 @@ class GenClientActor:
     def get_state_dict(self):
         return {k: v.cpu() for k, v in self.state_dict.items()}
 
+    def get_nixl_names(self):
+        """This client's (agent, client) names, for peers reading it (item D1).
+
+        A gen actor is its own NIXL agent, so both names are the same string -- the same
+        shape the train side reports, which is what lets the peer phase reuse the pull
+        path unchanged.
+        """
+        return self.client_name, self.client_name
+
     def protocol(self, model_path):
         self.print("step0: convert_vllm_inplace")
         from transformers import AutoConfig
@@ -714,7 +723,19 @@ class GenClientActor:
         self.client.wait_for_server_temp_mappings()
         self.print("protocol done.")
 
-    def pull_from_ps(self, ps_agent_names, ps_client_names):
+    def pull_from_ps(self, ps_agent_names, ps_client_names, phase="all"):
+        """Pull weights. ``phase`` selects which half of the plan to issue.
+
+        D1's peer reads are only valid once the peer has finished its own upstream read,
+        so the two need a barrier between them. The driver already supplies one -- it
+        `ray.get`s every gen actor -- so running this twice, as ``upstream`` then
+        ``peer``, is sufficient; no new synchronisation primitive is required.
+
+        ``all`` keeps the single-phase behaviour, which is what the PS path wants: there
+        is nothing to diffuse there and a second round trip through the driver would be
+        pure overhead.
+        """
+        assert phase in ("all", "upstream", "peer"), f"unknown pull phase {phase!r}"
         wait_operations = []
         total_start_time = time.time()
         agent_of = dict(zip(ps_client_names, ps_agent_names))
@@ -734,30 +755,52 @@ class GenClientActor:
         else:
             work = [(key, source) for key in self.state_dict_keys for source in ps_client_names]
 
-        # D1: peer reads are planned but not issued here, and the reason is a hard
-        # prerequisite rather than an oversight. A peer only holds the bytes once its
-        # own upstream read has completed, so issuing a peer read early reads an
-        # unfilled buffer -- and *succeeds*, because the registration is valid and the
-        # transfer is well formed. The result is silently wrong weights.
+        # D1: a peer read is only valid once that peer has finished its own upstream
+        # read. Issuing it early does not fail -- the registration is valid and the
+        # transfer is well formed -- it succeeds against an unfilled buffer and yields
+        # silently wrong weights. So the two must be separated by a barrier, which the
+        # driver supplies by `ray.get`-ing every actor between the phases.
         #
-        # Making it safe needs a barrier across rollout actors between the upstream
-        # wave and the peer wave. This harness has no such barrier (the gen actors share
-        # no process group), so peer reads are filtered out and every client reads
-        # upstream. The plan still records them, and the planner tests measure the
-        # reduction they would give; what is missing is the execution-order guarantee.
-        # Partition by whether the plan names the source as a peer for that specific
-        # key. Filtering on `agent_of` first -- the train-client map -- would drop peer
-        # reads before this point and report zero deferrals, which is a count of nothing
-        # rather than evidence that diffusion found no duplication.
-        deferred_peer_reads = [
+        # Partition per key, not against a flat set of peer names: a client can be a
+        # peer for one key and an upstream source for another. Filtering on `agent_of`
+        # first -- the train-client map -- would drop peer reads before this point and
+        # report zero of them, a count of nothing rather than evidence that diffusion
+        # found no duplication.
+        peer_work = [
             (key, src) for key, src in work if src in self.client.peer_sources_for(key)
         ]
-        work = [
+        upstream_work = [
             (key, src)
             for key, src in work
             if src not in self.client.peer_sources_for(key) and src in agent_of
         ]
+        # Shards a peer will supply are not pulled over the NIC at all -- that omission
+        # *is* the traffic claim. Safe only because the peer phase follows the barrier;
+        # in single-phase mode the full upstream list is used instead.
+        #
+        # Exclusion is per *shard*, not per key. A key is only partly peer-covered when
+        # the client wants several of its shards and a peer holds some: excluding the
+        # whole key would drop the upstream read for the rest, losing those bytes with
+        # no error. `client_read` is told exactly which shards to skip.
+        peer_covered: dict[str, set] = {}
+        for key in {k for k, _ in peer_work}:
+            for shard_list in self.client.peer_shards_for(key).values():
+                peer_covered.setdefault(key, set()).update(shard_list)
+        upstream_without_peer_covered = [
+            (key, src)
+            for key, src in upstream_work
+            if not self._shards_fully_covered(key, src, peer_covered)
+        ]
 
+        if phase == "upstream":
+            work = upstream_without_peer_covered
+        elif phase == "peer":
+            work = peer_work
+        else:
+            work = upstream_work
+        deferred_peer_reads = peer_work if phase != "peer" else []
+
+        skip = peer_covered if phase == "upstream" else {}
         for key, source_client in work:
             shards_to_transfer = self.client.client_read(
                 agent_of[source_client],
@@ -765,6 +808,7 @@ class GenClientActor:
                 key,
                 "gen_pull",
                 merge_and_cache_xfer=False,
+                skip_shards=skip.get(key),
             )
             if len(shards_to_transfer) > 0:
                 wait_operations.append((key, source_client, shards_to_transfer))
@@ -778,6 +822,20 @@ class GenClientActor:
             f"({len(work)} scheduled reads, {len(wait_operations)} transfers, "
             f"{len(deferred_peer_reads)} peer reads deferred)"
         )
+
+    def _shards_fully_covered(self, key, source, peer_covered) -> bool:
+        """Whether every shard ``source`` would serve is already covered by a peer.
+
+        Only then is dropping the upstream read safe. Partial coverage keeps the read
+        and excludes just the covered shards, which is why this returns a verdict rather
+        than the caller assuming key-level coverage: a key with several shards can be
+        half-covered, and dropping it whole would lose the remainder silently.
+        """
+        covered = peer_covered.get(key)
+        if not covered:
+            return False
+        planned = self.client.upstream_shards_for(key, source)
+        return bool(planned) and all(shard in covered for shard in planned)
 
     def shutdown(self):
         self.client.shutdown()
@@ -1097,12 +1155,41 @@ def test_nixl_e2e(cfg: DictConfig):
         label = "all ps"
 
     start_time = time.time()
-    futures = []
-    for g in gen_actors:
-        futures.append(g.pull_from_ps.remote(source_agent_names, source_client_names))
-    ray.get(futures)
-    end_time = time.time()
-    print(f"[PASS] gen pull from {label} done. time: {end_time - start_time}s")
+    if direct_supply:
+        # D1: two phases with the driver's own `ray.get` as the barrier between them.
+        # A peer read is only valid once that peer has completed its upstream read, and
+        # reading early *succeeds* against an unfilled buffer rather than failing -- so
+        # the ordering is a correctness requirement, not a scheduling preference.
+        ray.get(
+            [
+                g.pull_from_ps.remote(source_agent_names, source_client_names, phase="upstream")
+                for g in gen_actors
+            ]
+        )
+        upstream_done = time.time()
+        print(f"[PASS] gen upstream pull done. time: {upstream_done - start_time}s")
+
+        # The peer phase reads from other rollout clients, so the names it needs are
+        # the gen clients', not the train clients'.
+        gen_names = ray.get([g.get_nixl_names.remote() for g in gen_actors])
+        peer_agent_names = [agent for agent, _client in gen_names]
+        peer_client_names = [client for _agent, client in gen_names]
+        ray.get(
+            [
+                g.pull_from_ps.remote(peer_agent_names, peer_client_names, phase="peer")
+                for g in gen_actors
+            ]
+        )
+        end_time = time.time()
+        print(f"[PASS] gen peer pull done. time: {end_time - upstream_done}s")
+        print(f"[PASS] gen pull from {label} done. time: {end_time - start_time}s")
+    else:
+        futures = []
+        for g in gen_actors:
+            futures.append(g.pull_from_ps.remote(source_agent_names, source_client_names))
+        ray.get(futures)
+        end_time = time.time()
+        print(f"[PASS] gen pull from {label} done. time: {end_time - start_time}s")
 
     # Fetch and verify gen client state_dicts against the coordinate function.
     print("[CHECK] Verifying GenClientActor state_dicts encode their global coordinates...")

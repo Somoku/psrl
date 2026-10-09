@@ -305,13 +305,14 @@ class TestTheHarnessPartitionsCorrectly:
         start = harness.index("planned = list(self.client.iter_planned_pull_work())")
         body = harness[start : start + 1800]
 
-        defer_at = body.index("deferred_peer_reads = [")
-        narrow_at = body.index("if planned:")
-        assert narrow_at < defer_at
-
         assert "work = list(planned)" in body, (
-            "the work list is narrowed to train clients before peers are split off, so "
-            "the deferral count measures nothing"
+            "the work list is narrowed before peers are split off, so the peer set is "
+            "computed from an already-filtered list"
+        )
+        # The ordering itself: peers are identified before the train-client filter runs.
+        assert body.index("peer_work = [") < body.index("src in agent_of"), (
+            "the train-client filter runs before peers are identified, so peer sources "
+            "-- which are rollout clients -- are gone before they can be counted"
         )
 
     def test_the_peer_check_is_per_key(self):
@@ -325,3 +326,107 @@ class TestTheHarnessPartitionsCorrectly:
             "a cluster-wide peer-name set would misclassify a client that is a peer for "
             "one key and an upstream source for another"
         )
+
+
+class TestTwoPhaseExecution:
+    """The barrier that makes peer reads safe to issue (item D1).
+
+    A peer read against a peer that has not yet completed its own upstream read does not
+    fail -- the registration is valid and the transfer is well formed, so it succeeds
+    against an unfilled buffer. The error surfaces as wrong weights, with nothing to
+    attribute them to. So the ordering is a correctness requirement, and these tests pin
+    the mechanism rather than trusting a comment.
+    """
+
+    @staticmethod
+    def _harness() -> str:
+        from pathlib import Path
+
+        import tests.nixl as tests_pkg
+
+        return (Path(tests_pkg.__file__).parent / "test_nixl_e2e.py").read_text()
+
+    def test_the_pull_takes_a_phase(self):
+        assert 'def pull_from_ps(self, ps_agent_names, ps_client_names, phase="all")' in self._harness()
+
+    def test_an_unknown_phase_is_rejected(self):
+        """A typo must not silently fall through to reading everything."""
+        assert 'assert phase in ("all", "upstream", "peer")' in self._harness()
+
+    def test_the_driver_barriers_between_the_phases(self):
+        """`ray.get` on every actor is the barrier; a single call would not be one."""
+        harness = self._harness()
+        upstream_at = harness.index('phase="upstream"')
+        peer_at = harness.index('phase="peer"')
+        between = harness[upstream_at:peer_at]
+
+        assert "ray.get" in between, (
+            "the peer phase is issued without waiting for every actor's upstream phase, "
+            "so a peer may be read before it has the bytes"
+        )
+
+    def test_the_peer_phase_targets_rollout_clients(self):
+        """Peer sources are gen clients, so the train-client names would not resolve."""
+        harness = self._harness()
+        assert "g.get_nixl_names.remote() for g in gen_actors" in harness
+
+    def test_the_ps_path_stays_single_phase(self):
+        """Nothing to diffuse there; a second driver round trip would be pure overhead."""
+        harness = self._harness()
+        assert "if direct_supply:" in harness
+        single = harness.index("futures.append(g.pull_from_ps.remote(source_agent_names, source_client_names))")
+        assert single > 0
+
+
+class TestUpstreamOmissionIsPerShard:
+    """Dropping a whole key's upstream read would lose partly-covered shards."""
+
+    def test_the_harness_excludes_by_shard_not_by_key(self):
+        from pathlib import Path
+
+        import tests.nixl as tests_pkg
+
+        harness = (Path(tests_pkg.__file__).parent / "test_nixl_e2e.py").read_text()
+        assert "skip_shards=" in harness, (
+            "the upstream read is not told which shards to skip, so coverage is being "
+            "decided at key granularity"
+        )
+        assert "_shards_fully_covered" in harness
+
+    def test_client_read_honours_skip_shards(self):
+        from pathlib import Path
+
+        import psrl.utils.nixl as nixl_pkg
+
+        client = (Path(nixl_pkg.__file__).parent / "client.py").read_text()
+        assert "if skip_shards:" in client
+        assert "s not in skip_shards" in client
+
+    def test_a_partly_covered_key_still_reads_upstream(self):
+        """The property itself: coverage of one shard must not drop the others."""
+        clients = {
+            "train0": _client("train0", NIXLClientType.PUSH_SIDE, "10.0.0.0", 4, [0, 1, 2, 3]),
+        }
+        # Two clients each wanting two shards, overlapping in one.
+        clients["gen0"] = _client("gen0", NIXLClientType.PULL_SIDE, "10.1.0.0", 4, [0, 1])
+        clients["gen1"] = _client("gen1", NIXLClientType.PULL_SIDE, "10.1.0.0", 4, [1, 2])
+        plan = CommunicationPlanner().make_comm_plan(clients)
+
+        for name in ("gen0", "gen1"):
+            for key in KEYS:
+                wanted = set(clients[name].tensor_infos[key].sharding.shard_indices)
+                via_peer = {
+                    shard
+                    for shard_list in plan.get_peer_pull_plan(name, key).values()
+                    for shard in shard_list
+                }
+                upstream = {
+                    shard
+                    for shard_list in plan.get_rollout_pull_plan(name, key).values()
+                    for shard in shard_list
+                }
+                # Whatever the peer does not supply must be reachable upstream.
+                assert (wanted - via_peer) <= upstream, (
+                    f"{name} {key}: {sorted(wanted - via_peer - upstream)} is neither "
+                    "peer-covered nor upstream-readable"
+                )

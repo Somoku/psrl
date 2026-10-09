@@ -185,14 +185,6 @@ def validate_config(
             rollout_config, "engine_kwargs.vllm.speculative_config", default=None
         ):
             raise ValueError("Sampler capture requires a non-speculative rollout sampler.")
-    if capture_mode == "support" and rollout_config.get("sampler_compact_support", False):
-        engine_mount = "megatron" if actor_config.strategy == "megatron" else "fsdp_config"
-        cp_size = OmegaConf.select(actor_config, f"{engine_mount}.context_parallel_size", default=1)
-        if cp_size and int(cp_size) > 1:
-            raise NotImplementedError(
-                "rollout.sampler_compact_support is not supported with context_parallel_size>1; "
-                "disable it or use context_parallel_size=1."
-            )
     # Score centering must be enabled in the actor's *static* policy_loss: the worker selects its
     # loss_fn once in init_model, before this runtime mutation exists on the driver.
     mirror_bypass_config_to_actor(config)

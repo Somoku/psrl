@@ -125,8 +125,8 @@ class RolloutConfig(_VeRLRolloutConfig):
     # row and is expensive over long responses, so normal training skips it. Enable for CI runs.
     sampler_strict_validation: bool = False
     # Support mode only: ship per-row support lengths + flat support ids instead of a dense id head.
-    # Not supported with context_parallel_size>1.
-    sampler_compact_support: bool = False
+    # A smaller transport for a per-micro-batch GPU reconstruction, and now allowed with context parallel.
+    sampler_compact_support: bool = True
 
 
 __all__ = [

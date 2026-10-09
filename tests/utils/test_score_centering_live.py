@@ -2,7 +2,8 @@
 
 Opt-in: set ``PSRL_LIVE_SAMPLER_ENDPOINT`` (SMG base URL) and ``PSRL_LIVE_SAMPLER_MODEL`` (served
 model), then run this file. The server must run vLLM with ``logprobs_mode=processed_logprobs`` and
-``max_logprobs >= PSRL_LIVE_BUDGET + 1`` (SMG raises the limit from ``sampler_top_logprobs``).
+``max_logprobs >= PSRL_LIVE_BUDGET + 1`` (PSRL raises the limit from ``sampler_top_logprobs`` in
+``psrl.workers.gen.vllm_async_server``).
 
 It verifies the exact-support contract PSRL's ``support`` mode relies on, which SGLang needed a
 dedicated API for but vLLM already provides through ``processed_logprobs``:

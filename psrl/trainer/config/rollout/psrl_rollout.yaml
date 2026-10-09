@@ -24,8 +24,9 @@ logprobs_mode: raw_logprobs
 # `sampler_max_tokens` is the per-token budget (32 default, roughly 8 * budget bytes per token).
 sampler_distribution: disabled
 sampler_max_tokens: 32
-# Support mode only: ship per-row lengths + flat support ids instead of a dense id head (needs CP=1).
-sampler_compact_support: false
+# Support mode only: ship per-row lengths + flat support ids instead of a dense id head. Smaller
+# transport for a per-micro-batch GPU reconstruction, and works with context parallel.
+sampler_compact_support: true
 
 # Select the rollout weight loader. Large safetensors models should set `use_shm=True`.
 load_format: dummy

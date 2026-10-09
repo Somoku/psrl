@@ -47,7 +47,7 @@ class SamplerCapture:
 
     mode: str = "disabled"
     budget: int = 32
-    compact_support: bool = False
+    compact_support: bool = True
 
     @property
     def enabled(self) -> bool:
@@ -65,7 +65,7 @@ class SamplerCapture:
         return cls(
             mode=rollout_config.get("sampler_distribution", "disabled"),
             budget=int(rollout_config.get("sampler_max_tokens", 32)),
-            compact_support=bool(rollout_config.get("sampler_compact_support", False)),
+            compact_support=bool(rollout_config.get("sampler_compact_support", True)),
         )
 
 
@@ -201,13 +201,17 @@ class SamplerDistribution:
                 raise ValueError(f"Sampler head and sampled log probability disagree at row {row}.")
 
     @classmethod
-    def from_topk_rows(cls, token_ids, log_probs, sampled: list) -> SamplerDistribution:
+    def from_topk_rows(cls, token_ids, log_probs, sampled: list, *, strict: bool = True) -> SamplerDistribution:
         """
         Build a distribution from a fixed-width head decoded from the /generate response.
 
         Finite entries form the sampler support. An ``-inf`` entry is the completeness sentinel for
         its row and its id is dropped. The /generate endpoint has no environment turns, so every row
         is present and offsets follow the per-row finite counts.
+
+        ``strict`` runs the per-row sampled-token checks, an O(rows) Python pass over every response.
+        Normal training leaves it off and relies on the structural checks plus the engine's
+        fail-closed capture. Enable it for CI-style validation runs.
         """
         ids = np.asarray(token_ids)
         logps = np.asarray(log_probs, dtype=np.float32)
@@ -229,11 +233,12 @@ class SamplerDistribution:
         np.cumsum(counts, out=offsets[1:])
         distribution = cls(
             offsets=offsets,
-            token_ids=ids[finite].astype(np.int32),
-            log_probs=logps[finite].astype(np.float32),
+            token_ids=ids[finite].astype(np.int32, copy=False),
+            log_probs=logps[finite].astype(np.float32, copy=False),
             complete=complete,
         )
-        distribution._validate_sampled(sampled)
+        if strict:
+            distribution._validate_sampled(sampled)
         return distribution
 
     @classmethod

@@ -116,6 +116,7 @@ def build_training_data(
 
     cursor = 0
     total_acc_len = len(accumulated_token_ids)
+    accumulated_arr = np.asarray(accumulated_token_ids)
     for i, record in enumerate(records):
         prompt_len = record["prompt_token_count"]
         raw_lps = record.get("output_logprobs") or []
@@ -148,10 +149,14 @@ def build_training_data(
                 str(env_ids[:5]),
             )
 
-        # Assistant output tokens. `output_logprobs` is the only source of the sampled tokens, so
-        # a turn with accumulated tokens beyond its prompt but no logprobs cannot be reconstructed.
-        output_ids = [int(pair[1]) for pair in raw_lps]
-        output_logprobs = [float(pair[0]) for pair in raw_lps]
+        # Assistant output tokens: `output_logprobs` is the only source of the sampled tokens. The
+        # [logprob, token_id] split and the boundary match are vectorized over the whole turn.
+        if raw_lps:
+            raw = np.asarray(raw_lps, dtype=np.float64)
+            output_logprobs = raw[:, 0].tolist()
+            output_ids = raw[:, 1].astype(np.int64).tolist()
+        else:
+            output_ids, output_logprobs = [], []
         is_last = i == len(records) - 1
         if not output_ids and prompt_len < total_acc_len:
             raise ValueError(f"Missing output_logprobs at TITO turn {i}.")
@@ -159,12 +164,10 @@ def build_training_data(
         # Greedy match the sampled output against the authoritative stream. The divergent suffix is
         # the boundary tokens the template re-renders as the next turn's prefix, so it must be trimmed.
         matched = 0
-        for j, token_id in enumerate(output_ids):
-            position = prompt_len + j
-            if position < total_acc_len and token_id == accumulated_token_ids[position]:
-                matched += 1
-            else:
-                break
+        compare = min(len(output_ids), total_acc_len - prompt_len)
+        if compare > 0:
+            equal = np.asarray(output_ids[:compare]) == accumulated_arr[prompt_len : prompt_len + compare]
+            matched = compare if bool(equal.all()) else int(np.argmin(equal))
         trim_count = len(output_ids) - matched
         allowed = 0 if is_last else max_trim_tokens
         if trim_count > allowed:

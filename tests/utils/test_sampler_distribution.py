@@ -80,6 +80,15 @@ def test_generate_rows_reject_duplicate_and_out_of_range_ids():
         )
 
 
+def test_generate_rows_strict_false_skips_row_level_checks():
+    # The per-row checks are O(rows) Python and run only in strict/CI mode, so a duplicate id that
+    # fails under strict is accepted with strict off (structural row checks still run).
+    distribution = SamplerDistribution.from_topk_rows(
+        [[2, 2]], [[np.log(0.6), np.log(0.4)]], [[np.log(0.6), 2]], strict=False
+    )
+    assert distribution.token_ids.tolist() == [2, 2]
+
+
 def test_generate_rows_reject_empty_width_and_noninteger_ids():
     with pytest.raises(ValueError, match=r"\[R, k\]"):
         SamplerDistribution.from_topk_rows([[]], [[]], [[0.0, 2]])

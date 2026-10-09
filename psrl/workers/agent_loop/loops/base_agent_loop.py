@@ -435,6 +435,7 @@ class AgentLoopBase(ABC):
                 meta_info,
                 list(zip(log_probs, token_ids, strict=True)),
                 self.sampler_capture.width,
+                strict=self.rollout_config.get("sampler_strict_validation", False),
             )
 
         return TokenOutput(
@@ -621,6 +622,7 @@ class AgentLoopBase(ABC):
         meta_info: dict,
         sampled: list[tuple[float, int]],
         expected_width: int,
+        strict: bool = False,
     ) -> "SamplerDistribution":
         """Decode SMG's /generate sampler head into a compact distribution (top-k or support)."""
 
@@ -648,7 +650,7 @@ class AgentLoopBase(ABC):
         # boolean-indexes it (which already copies), so no defensive .copy() is needed.
         ids = np.frombuffer(base64.b64decode(ids_b64), dtype="<i4").reshape(rows, width)
         log_probs = np.frombuffer(base64.b64decode(logps_b64), dtype="<f4").reshape(rows, width)
-        return SamplerDistribution.from_topk_rows(ids, log_probs, sampled)
+        return SamplerDistribution.from_topk_rows(ids, log_probs, sampled, strict=strict)
 
     async def _post_generate(
         self,

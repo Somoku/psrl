@@ -9,6 +9,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+MAX_SAMPLER_CAPTURE_WIDTH = 1 << 20
+
 
 def capture_width(mode: str, max_tokens: int) -> int:
     """
@@ -24,9 +26,14 @@ def capture_width(mode: str, max_tokens: int) -> int:
     is why the gateway's ``rank <= width`` filter, not the request value alone, defines the wire
     width. Kept here so the request, the buffer and the trainer padding share one definition.
     """
-    if mode not in ("disabled", "topk", "support") or not 1 <= max_tokens < 2**31 - 1:
+    if mode not in ("disabled", "topk", "support") or not 1 <= max_tokens:
         raise ValueError("Invalid sampler distribution mode or sampler_max_tokens budget.")
-    return 0 if mode == "disabled" else max_tokens + (mode == "support")
+    width = 0 if mode == "disabled" else max_tokens + (mode == "support")
+    if width > MAX_SAMPLER_CAPTURE_WIDTH:
+        raise ValueError(
+            f"sampler_max_tokens resolves to width {width}, above the protocol limit {MAX_SAMPLER_CAPTURE_WIDTH}."
+        )
+    return width
 
 
 @dataclass(frozen=True)
@@ -165,27 +172,36 @@ class SamplerDistribution:
             raise ValueError("Sampler distribution offsets do not align with sampled tokens.")
         if np.any(ids < 0) or not np.isfinite(log_probs).all() or np.any(log_probs > 1e-6):
             raise ValueError("Sampler distribution contains invalid IDs or log probabilities.")
+        distribution = cls(offsets, ids, log_probs, complete)
         if not strict:
-            return cls(offsets, ids, log_probs, complete)
+            return distribution
+        distribution._validate_sampled(sampled)
+        return distribution
+
+    def _validate_sampled(self, sampled: list) -> None:
+        """
+        Validate row identity, probability mass, and sampled-token agreement.
+        """
+        if len(sampled) != len(self):
+            raise ValueError("Sampler distribution row count does not match sampled tokens.")
         for row, (sample_logprob, sample_id) in enumerate(sampled):
             if not np.isfinite(sample_logprob) or sample_logprob > 1e-6 or sample_id < 0:
                 raise ValueError(f"Invalid sampled token or log probability at row {row}.")
-            start, end = offsets[row : row + 2]
-            row_ids, row_lp = ids[start:end], log_probs[start:end]
+            start, end = self.offsets[row : row + 2]
+            row_ids, row_lp = self.token_ids[start:end], self.log_probs[start:end]
             if len(np.unique(row_ids)) != len(row_ids):
                 raise ValueError(f"Duplicate sampler token IDs at row {row}.")
             mass = np.exp(row_lp.astype(np.float64)).sum()
-            if mass > 1 + 2e-5 or (complete[row] and abs(mass - 1) > 2e-5):
+            if mass > 1 + 2e-5 or (self.complete[row] and abs(mass - 1) > 2e-5):
                 raise ValueError(f"Invalid sampler probability mass {mass!r} at row {row}.")
             selected = row_ids == sample_id
-            if complete[row] and not selected.any():
+            if self.complete[row] and not selected.any():
                 raise ValueError(f"Complete sampler support omits the sampled token at row {row}.")
             if selected.any() and not np.isclose(row_lp[selected][0], sample_logprob, rtol=1e-5, atol=1e-5):
                 raise ValueError(f"Sampler head and sampled log probability disagree at row {row}.")
-        return cls(offsets, ids, log_probs, complete)
 
     @classmethod
-    def from_topk_rows(cls, token_ids, log_probs) -> SamplerDistribution:
+    def from_topk_rows(cls, token_ids, log_probs, sampled: list) -> SamplerDistribution:
         """
         Build a distribution from a fixed-width head decoded from the /generate response.
 
@@ -193,21 +209,32 @@ class SamplerDistribution:
         its row and its id is dropped. The /generate endpoint has no environment turns, so every row
         is present and offsets follow the per-row finite counts.
         """
-        ids = np.asarray(token_ids, dtype=np.int32)
+        ids = np.asarray(token_ids)
         logps = np.asarray(log_probs, dtype=np.float32)
-        if ids.ndim != 2 or ids.shape != logps.shape or ids.shape[0] < 1:
+        if ids.ndim != 2 or ids.shape != logps.shape or ids.shape[0] < 1 or ids.shape[1] < 1:
             raise ValueError(f"topk rows must be a shared [R, k] shape, got {ids.shape} and {logps.shape}.")
+        if not np.issubdtype(ids.dtype, np.integer):
+            raise ValueError("Sampler token IDs must be integers.")
         finite = np.isfinite(logps)
-        complete = (~finite).any(-1)
+        sentinel = np.isneginf(logps)
+        if np.any((~finite) & (~sentinel)):
+            raise ValueError("Sampler rows contain NaN or positive infinity.")
+        if np.any(logps[finite] > 1e-6) or np.any(ids[finite] < 0) or np.any(ids[finite] > np.iinfo(np.int32).max):
+            raise ValueError("Sampler rows contain invalid IDs or log probabilities.")
+        if np.any(np.maximum.accumulate(sentinel, axis=-1) & finite):
+            raise ValueError("Finite sampler entries must precede the support sentinel.")
+        complete = sentinel.any(-1)
         counts = finite.sum(-1)
         offsets = np.zeros(len(ids) + 1, dtype=np.int64)
         np.cumsum(counts, out=offsets[1:])
-        return cls(
+        distribution = cls(
             offsets=offsets,
             token_ids=ids[finite].astype(np.int32),
             log_probs=logps[finite].astype(np.float32),
             complete=complete,
         )
+        distribution._validate_sampled(sampled)
+        return distribution
 
     @classmethod
     def concatenate(cls, segments: list[SamplerDistribution]) -> SamplerDistribution:

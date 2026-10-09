@@ -432,7 +432,9 @@ class AgentLoopBase(ABC):
         sampler_distribution = None
         if capture_mode != "disabled":
             sampler_distribution = self._decode_sampler_head_payload(
-                meta_info, len(token_ids), self.sampler_capture.width
+                meta_info,
+                list(zip(log_probs, token_ids, strict=True)),
+                self.sampler_capture.width,
             )
 
         return TokenOutput(
@@ -615,9 +617,14 @@ class AgentLoopBase(ABC):
         return np.load(io.BytesIO(raw_bytes)).copy()
 
     @staticmethod
-    def _decode_sampler_head_payload(meta_info: dict, rows: int, expected_width: int) -> "SamplerDistribution":
+    def _decode_sampler_head_payload(
+        meta_info: dict,
+        sampled: list[tuple[float, int]],
+        expected_width: int,
+    ) -> "SamplerDistribution":
         """Decode SMG's /generate sampler head into a compact distribution (top-k or support)."""
 
+        rows = len(sampled)
         ids_b64 = meta_info.get("output_topk_token_ids")
         logps_b64 = meta_info.get("output_topk_log_probs")
         shape = meta_info.get("output_topk_shape")
@@ -641,7 +648,7 @@ class AgentLoopBase(ABC):
         # boolean-indexes it (which already copies), so no defensive .copy() is needed.
         ids = np.frombuffer(base64.b64decode(ids_b64), dtype="<i4").reshape(rows, width)
         log_probs = np.frombuffer(base64.b64decode(logps_b64), dtype="<f4").reshape(rows, width)
-        return SamplerDistribution.from_topk_rows(ids, log_probs)
+        return SamplerDistribution.from_topk_rows(ids, log_probs, sampled)
 
     async def _post_generate(
         self,

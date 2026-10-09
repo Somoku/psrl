@@ -2,7 +2,12 @@ import base64
 
 import numpy as np
 import pytest
-from psrl.utils.sampler_distribution import SamplerCapture, SamplerDistribution, configure_capture
+from psrl.utils.sampler_distribution import (
+    MAX_SAMPLER_CAPTURE_WIDTH,
+    SamplerCapture,
+    SamplerDistribution,
+    configure_capture,
+)
 from psrl.utils.tito.training_data import build_training_data
 
 
@@ -38,6 +43,48 @@ def test_capture_width_matches_mode_and_budget():
     assert SamplerCapture("support", 128).width == 129
     assert not SamplerCapture().enabled
     assert SamplerCapture("topk", 4).enabled
+    assert SamplerCapture("topk", MAX_SAMPLER_CAPTURE_WIDTH).width == MAX_SAMPLER_CAPTURE_WIDTH
+    with pytest.raises(ValueError, match="protocol limit"):
+        _ = SamplerCapture("support", MAX_SAMPLER_CAPTURE_WIDTH).width
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf")])
+def test_generate_rows_reject_nonfinite_values_other_than_negative_infinity(invalid):
+    with pytest.raises(ValueError, match="NaN or positive infinity"):
+        SamplerDistribution.from_topk_rows([[2, 3]], [[0.0, invalid]], [[0.0, 2]])
+
+
+def test_generate_support_validates_mass_and_sampled_token():
+    with pytest.raises(ValueError, match="mass"):
+        SamplerDistribution.from_topk_rows(
+            [[2, 3, 0]],
+            [[np.log(0.6), np.log(0.3), -np.inf]],
+            [[np.log(0.6), 2]],
+        )
+    with pytest.raises(ValueError, match="omits"):
+        SamplerDistribution.from_topk_rows(
+            [[2, 3, 0]],
+            [[np.log(0.6), np.log(0.4), -np.inf]],
+            [[0.0, 4]],
+        )
+
+
+def test_generate_rows_reject_duplicate_and_out_of_range_ids():
+    with pytest.raises(ValueError, match="Duplicate"):
+        SamplerDistribution.from_topk_rows([[2, 2]], [[np.log(0.6), np.log(0.4)]], [[np.log(0.6), 2]])
+    with pytest.raises(ValueError, match="invalid IDs"):
+        SamplerDistribution.from_topk_rows(
+            [[2, np.iinfo(np.int32).max + 1]],
+            [[np.log(0.6), np.log(0.4)]],
+            [[np.log(0.6), 2]],
+        )
+
+
+def test_generate_rows_reject_empty_width_and_noninteger_ids():
+    with pytest.raises(ValueError, match=r"\[R, k\]"):
+        SamplerDistribution.from_topk_rows([[]], [[]], [[0.0, 2]])
+    with pytest.raises(ValueError, match="must be integers"):
+        SamplerDistribution.from_topk_rows([[2.0, 3.0]], [[np.log(0.6), np.log(0.4)]], [[np.log(0.6), 2]])
 
 
 @pytest.mark.parametrize(

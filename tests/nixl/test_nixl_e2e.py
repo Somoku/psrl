@@ -730,7 +730,7 @@ class GenClientActor:
         # nothing would look like a fast success.
         planned = list(self.client.iter_planned_pull_work())
         if planned:
-            work = [(key, source) for key, source in planned if source in agent_of]
+            work = list(planned)
         else:
             work = [(key, source) for key in self.state_dict_keys for source in ps_client_names]
 
@@ -745,13 +745,18 @@ class GenClientActor:
         # no process group), so peer reads are filtered out and every client reads
         # upstream. The plan still records them, and the planner tests measure the
         # reduction they would give; what is missing is the execution-order guarantee.
-        peer_names = {
-            peer
-            for key in self.state_dict_keys
-            for peer in self.client.peer_sources_for(key)
-        }
-        deferred_peer_reads = [(key, src) for key, src in work if src in peer_names]
-        work = [(key, src) for key, src in work if src not in peer_names]
+        # Partition by whether the plan names the source as a peer for that specific
+        # key. Filtering on `agent_of` first -- the train-client map -- would drop peer
+        # reads before this point and report zero deferrals, which is a count of nothing
+        # rather than evidence that diffusion found no duplication.
+        deferred_peer_reads = [
+            (key, src) for key, src in work if src in self.client.peer_sources_for(key)
+        ]
+        work = [
+            (key, src)
+            for key, src in work
+            if src not in self.client.peer_sources_for(key) and src in agent_of
+        ]
 
         for key, source_client in work:
             shards_to_transfer = self.client.client_read(

@@ -281,3 +281,47 @@ class TestSerialization:
         restored = NIXLCommPlan.deserialize(plan.serialize())
 
         assert restored.peer_pull_plan == plan.peer_pull_plan
+
+
+class TestTheHarnessPartitionsCorrectly:
+    """A measurement bug this file exists to prevent recurring.
+
+    The harness first filtered its work list to sources present in the train-client map,
+    then split off the peer reads. Peer sources are rollout clients, so they were already
+    gone -- and the run reported "0 peer reads deferred", which was a count of nothing
+    rather than evidence that diffusion had found no duplication. The planner was working
+    the whole time.
+
+    The lesson generalises: a zero in a diagnostic is only meaningful if the thing being
+    counted could have been non-zero at that point.
+    """
+
+    def test_peers_are_split_off_before_the_train_map_filter(self):
+        from pathlib import Path
+
+        import tests.nixl as tests_pkg
+
+        harness = (Path(tests_pkg.__file__).parent / "test_nixl_e2e.py").read_text()
+        start = harness.index("planned = list(self.client.iter_planned_pull_work())")
+        body = harness[start : start + 1800]
+
+        defer_at = body.index("deferred_peer_reads = [")
+        narrow_at = body.index("if planned:")
+        assert narrow_at < defer_at
+
+        assert "work = list(planned)" in body, (
+            "the work list is narrowed to train clients before peers are split off, so "
+            "the deferral count measures nothing"
+        )
+
+    def test_the_peer_check_is_per_key(self):
+        """A client can be a peer for one key and an upstream source for another."""
+        from pathlib import Path
+
+        import tests.nixl as tests_pkg
+
+        harness = (Path(tests_pkg.__file__).parent / "test_nixl_e2e.py").read_text()
+        assert "self.client.peer_sources_for(key)" in harness, (
+            "a cluster-wide peer-name set would misclassify a client that is a peer for "
+            "one key and an upstream source for another"
+        )

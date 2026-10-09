@@ -286,7 +286,8 @@ class NIXLMetaServer:
 
         Only the initiating side needs the remote descriptors, so the rules are:
           - PUSH_SIDE needs: all PS_FOR_PUSH (train pushes to PS)
-          - PULL_SIDE needs: all PS_FOR_PULL (gen pulls from PS)
+          - PULL_SIDE needs: all PS_FOR_PULL (gen pulls from PS), or all PUSH_SIDE when
+            no PS exists (trainer direct supply, item D3)
           - PS clients do not initiate transfers and need no remote infos beyond their own,
             unless broadcast_init is enabled. In that case PS workers write to each other
             and therefore need every other PS worker's descriptors.
@@ -302,6 +303,18 @@ class NIXLMetaServer:
             NIXLClientType.PUSH_SIDE: NIXLClientType.PS_FOR_PUSH,
             NIXLClientType.PULL_SIDE: NIXLClientType.PS_FOR_PULL,
         }
+        # D3: with no PS registered, a rollout reads the train clients, so those are the
+        # descriptors it needs. Deciding by what is registered -- rather than by a mode
+        # flag -- keeps this in step with the planner, which dispatches the same way.
+        # Without it a direct-supply rollout is handed no remote descriptors at all and
+        # its first read fails with "target client not found in client infos", which
+        # reads as a handshake bug rather than a filter that was never updated.
+        has_ps_for_pull = any(
+            info.type is NIXLClientType.PS_FOR_PULL for info in self.client_infos.values()
+        )
+        if not has_ps_for_pull:
+            type_needs[NIXLClientType.PULL_SIDE] = NIXLClientType.PUSH_SIDE
+
         needed_types: set[NIXLClientType] = {dst for src, dst in type_needs.items() if src in my_types}
 
         for client_name, client_info in self.client_infos.items():

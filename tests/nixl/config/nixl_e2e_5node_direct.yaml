@@ -1,0 +1,69 @@
+# @package _global_
+#
+# 5-node direct-supply variant: rollouts read the train clients and no PS exists
+# (implementation items T2 and D3).
+#
+# Identical to nixl_e2e_5node.yaml except for `direct_supply`, which is the point --
+# the two runs differ in exactly one thing, so a difference in the result is
+# attributable. Train 24 GPU (3 nodes, TP=4 x PP=2) + gen 16 GPU (2 nodes, TP=2).
+#
+# The PS nodes the other config allocates are simply not created here, so this run
+# uses 5 nodes for compute where the PS variant used 5 plus PS actors colocated on the
+# gen nodes.
+defaults:
+  - _self_
+
+test:
+  num_train: 24
+  num_gen: 16
+  train_engine_type: megatron
+
+  # No PS workers, no push step: the rollout reads the trainer directly.
+  direct_supply: true
+
+  fsdp_hybrid:
+    ddp_size: 2
+    fsdp_size: 4
+
+  megatron:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    virtual_pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+
+  gen:
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
+
+model:
+  # Qwen3-8B: GQA (32 heads / 8 kv heads), the layout that exposed the
+  # ConcatenatedQKVSync cat-dimension bug.
+  path: ${oc.env:PSRL_WORKSPACE}/models/Qwen3-8B
+  trust_remote_code: false
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
+
+logging:
+  path: ${oc.env:PSRL_WORKSPACE}/psrl/unit_tests/nixl/log_5node_direct
+  level: INFO
+
+network:
+  listen_ip: ${oc.env:LOCAL_IP}
+  listen_port: 23461
+  torch_port_train: 29504
+  torch_port_gen: 29505
+  backend: nccl
+
+nixl:
+  server_mode: meta_server
+  server_ip: ${network.listen_ip}
+  server_port: ${network.listen_port}
+  max_pinned_temp_memory_slots: 4
+  enable_tms_for_temp_buffers: False
+
+ps:
+  mode: nixl_cpu

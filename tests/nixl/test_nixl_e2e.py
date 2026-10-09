@@ -72,6 +72,10 @@ from verl.workers.engine.megatron.utils import set_random_seed
 
 NUM_GPU_PER_NODE = 8
 
+#: Repository root, shipped to Ray actors so they import this tree rather than the
+#: checkout the cluster environment puts on the default path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def _fully_shard_transformer(model, mesh) -> None:
     """Apply FSDP2 ``fully_shard`` bottom-up, mirroring verl's wrap policy.
@@ -528,6 +532,15 @@ class TrainClientActor:
         """
         return self.coord_offsets
 
+    def get_nixl_names(self):
+        """This rank's (agent, client) names, for rollouts reading it directly (T2).
+
+        A train actor is its own NIXL agent, so both names are the same string. The gen
+        side's pull takes an (agent, client) pair either way, which is why direct supply
+        needs no second read path -- only a different pair.
+        """
+        return self.client_name, self.client_name
+
     def shutdown(self):
         self.client.shutdown()
         dist.destroy_process_group()
@@ -768,7 +781,19 @@ def test_nixl_e2e(cfg: DictConfig):
     os.makedirs(log_dir, exist_ok=True)
     ray.init(
         ignore_reinit_error=True,
-        runtime_env={"env_vars": {"PSRL_LOGGING_PATH": log_dir}},
+        runtime_env={
+            "env_vars": {
+                "PSRL_LOGGING_PATH": log_dir,
+                # Ray worker processes resolve `psrl` through the cluster's shared
+                # environment, which points at a *different* checkout
+                # (.../psrl_main/psrl). Without this the driver runs this tree while
+                # every actor runs that one, so the harness silently measures code the
+                # working tree does not contain -- a passing run that proves nothing
+                # about the change under test. Prepending the repo root makes the
+                # actors import what the driver does.
+                "PYTHONPATH": f"{_REPO_ROOT}:{os.environ.get('PYTHONPATH', '')}".rstrip(":"),
+            }
+        },
     )
     listen_ip = cfg.network.listen_ip
     print(f"meta server listen_ip: {listen_ip}")
@@ -780,8 +805,12 @@ def test_nixl_e2e(cfg: DictConfig):
     num_train = cfg.test.num_train
     # Number of gen GPUs
     num_gen = cfg.test.num_gen
+    # T2 / D3: with direct supply the rollout reads the train clients and no PS exists.
+    # Defaulting to False keeps every existing config on the PS path, so the two can be
+    # compared on the same cluster rather than one replacing the other untested.
+    direct_supply = bool(cfg.test.get("direct_supply", False))
     # Number of PS Nodes (align with the number of nodes used for gen)
-    num_ps = math.ceil(num_gen / NUM_GPU_PER_NODE)
+    num_ps = 0 if direct_supply else math.ceil(num_gen / NUM_GPU_PER_NODE)
     ray_nodes = ray.nodes()
     ray_nodes_sorted = sorted(ray_nodes, key=lambda n: n["NodeManagerAddress"])
     # Use the first num_train / NUM_GPU_PER_NODE nodes for train
@@ -841,21 +870,34 @@ def test_nixl_e2e(cfg: DictConfig):
     print(f"[PASS] server init done. time: {end_time - start_time}s")
 
     start_time = time.time()
-    ps_wg = create_ps_worker_group(train_engine_type, num_ps, psrl_config, cfg.model)
-    ray.get(ps_wg.execute_all_async("init_model"))
-    ray.get(ps_wg.execute_all_async("init_nixl_client"))
-    ps_agent_names = ray.get(ps_wg.execute_all_async("get_nixl_agent_name"))
-    ps_for_push_names = ray.get(ps_wg.execute_all_async("get_nixl_train_storage_client_name"))
-    ps_for_pull_names = ray.get(ps_wg.execute_all_async("get_nixl_gen_storage_client_name"))
-    print(f"ps_for_push_names: {ps_for_push_names}")
-    print(f"ps_for_pull_names: {ps_for_pull_names}")
-    ps_for_push_worker_handles = {}
-    for ps_for_push_name in ps_for_push_names:
-        ps_for_push_worker_handles[ps_for_push_name] = ps_wg.distinguish_worker_by_method(
-            lambda worker, name=ps_for_push_name: ray.get(worker.get_nixl_train_storage_client_name.remote()) == name
-        )
-    end_time = time.time()
-    print(f"[PASS] ps init done. time: {end_time - start_time}s")
+    if direct_supply:
+        # T2 / D3: no PS at all. The rollout reads the train clients, so there is no
+        # intermediate copy to create, register, or wait for. Keeping this as a branch
+        # rather than a separate harness is what makes the two arrangements comparable:
+        # everything after this point is identical except which names the pull targets.
+        ps_wg = None
+        ps_agent_names = []
+        ps_for_push_names = []
+        ps_for_pull_names = []
+        ps_for_push_worker_handles = {}
+        print("[PASS] direct supply: no PS workers created")
+    else:
+        ps_wg = create_ps_worker_group(train_engine_type, num_ps, psrl_config, cfg.model)
+        ray.get(ps_wg.execute_all_async("init_model"))
+        ray.get(ps_wg.execute_all_async("init_nixl_client"))
+        ps_agent_names = ray.get(ps_wg.execute_all_async("get_nixl_agent_name"))
+        ps_for_push_names = ray.get(ps_wg.execute_all_async("get_nixl_train_storage_client_name"))
+        ps_for_pull_names = ray.get(ps_wg.execute_all_async("get_nixl_gen_storage_client_name"))
+        print(f"ps_for_push_names: {ps_for_push_names}")
+        print(f"ps_for_pull_names: {ps_for_pull_names}")
+        ps_for_push_worker_handles = {}
+        for ps_for_push_name in ps_for_push_names:
+            ps_for_push_worker_handles[ps_for_push_name] = ps_wg.distinguish_worker_by_method(
+                lambda worker, name=ps_for_push_name: ray.get(worker.get_nixl_train_storage_client_name.remote())
+                == name
+            )
+        end_time = time.time()
+        print(f"[PASS] ps init done. time: {end_time - start_time}s")
 
     start_time = time.time()
     # Prepare configuration for train actors
@@ -922,7 +964,8 @@ def test_nixl_e2e(cfg: DictConfig):
         futures.append(t.protocol.remote(cfg.model.path))
     for g in gen_actors:
         futures.append(g.protocol.remote(cfg.model.path))
-    futures.extend(ps_wg.execute_all_async("nixl_protocol"))
+    if ps_wg is not None:
+        futures.extend(ps_wg.execute_all_async("nixl_protocol"))
     ray.get(futures)
     end_time = time.time()
     print(f"[PASS] protocol done. time: {end_time - start_time}s")
@@ -937,14 +980,17 @@ def test_nixl_e2e(cfg: DictConfig):
     print(f"[PASS] Warm-up done. time: {end_time - start_time}s")
     """
 
-    # Each train client pushes to each PS worker
-    start_time = time.time()
-    futures = []
-    for t in train_actors:
-        futures.append(t.push_to_ps.remote(ps_agent_names, ps_for_push_names))
-    ray.get(futures)
-    end_time = time.time()
-    print(f"[PASS] train push to all ps done. time: {end_time - start_time}s")
+    # Each train client pushes to each PS worker. Under direct supply there is no
+    # push at all -- that the step disappears rather than becoming a no-op is the
+    # point of D3: the intermediate copy is gone, not merely skipped.
+    if not direct_supply:
+        start_time = time.time()
+        futures = []
+        for t in train_actors:
+            futures.append(t.push_to_ps.remote(ps_agent_names, ps_for_push_names))
+        ray.get(futures)
+        end_time = time.time()
+        print(f"[PASS] train push to all ps done. time: {end_time - start_time}s")
 
     # Each gen client pulls from each PS worker
     """
@@ -954,13 +1000,25 @@ def test_nixl_e2e(cfg: DictConfig):
         end_time = time.time()
         print(f"[PASS] gen {gen_idx} pull from all ps done. time: {end_time - start_time}s")
     """
+    if direct_supply:
+        # The pull takes an (agent, client) pair either way, so direct supply needs a
+        # different pair rather than a different read path.
+        train_names = ray.get([t.get_nixl_names.remote() for t in train_actors])
+        source_agent_names = [agent for agent, _client in train_names]
+        source_client_names = [client for _agent, client in train_names]
+        label = "train clients"
+    else:
+        source_agent_names = ps_agent_names
+        source_client_names = ps_for_pull_names
+        label = "all ps"
+
     start_time = time.time()
     futures = []
     for g in gen_actors:
-        futures.append(g.pull_from_ps.remote(ps_agent_names, ps_for_pull_names))
+        futures.append(g.pull_from_ps.remote(source_agent_names, source_client_names))
     ray.get(futures)
     end_time = time.time()
-    print(f"[PASS] gen pull from all ps done. time: {end_time - start_time}s")
+    print(f"[PASS] gen pull from {label} done. time: {end_time - start_time}s")
 
     # Fetch and verify gen client state_dicts against the coordinate function.
     print("[CHECK] Verifying GenClientActor state_dicts encode their global coordinates...")
@@ -987,7 +1045,8 @@ def test_nixl_e2e(cfg: DictConfig):
         ray.get(t.shutdown.remote())
     for g in gen_actors:
         ray.get(g.shutdown.remote())
-    ray.get(ps_wg.execute_all_async("shutdown"))
+    if ps_wg is not None:
+        ray.get(ps_wg.execute_all_async("shutdown"))
     ray.get(server.shutdown.remote())
     ray.shutdown()
 

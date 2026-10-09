@@ -1,0 +1,147 @@
+"""Control-plane round trips per weight sync (implementation item C2).
+
+C2's criterion is that a steady-state sync costs zero rollout -> PS round trips. That is
+not a property you can establish by reading the code -- the calls are spread across the
+pull path, the shared-pull lock, and the version read -- so it has to be counted, and
+the counter has to be trustworthy enough that a regression shows up as a failure rather
+than as a slow cluster.
+"""
+
+from __future__ import annotations
+
+import threading
+
+import pytest
+
+from psrl.workers.ps.control_plane_meter import ControlPlaneMeter
+
+pytestmark = pytest.mark.cpu_test
+
+
+class TestCounting:
+    def test_calls_are_counted_by_name(self):
+        meter = ControlPlaneMeter()
+        with meter.measuring():
+            meter.record("get_version")
+            meter.record("get_version")
+            meter.record("pull")
+
+        assert meter.breakdown() == {"get_version": 2, "pull": 1}
+        assert meter.total == 3
+
+    def test_calls_outside_the_window_are_not_counted(self):
+        """Handshake and retry traffic must not be charged to a steady-state sync."""
+        meter = ControlPlaneMeter()
+        meter.record("handshake")
+
+        with meter.measuring():
+            meter.record("steady_state")
+
+        assert meter.breakdown() == {"steady_state": 1}
+
+    def test_each_window_starts_from_zero(self):
+        meter = ControlPlaneMeter()
+        with meter.measuring():
+            meter.record("first_sync")
+        with meter.measuring():
+            meter.record("second_sync")
+
+        assert meter.breakdown() == {"second_sync": 1}
+
+    def test_windows_do_not_nest(self):
+        """Nesting would attribute an inner sync's calls to the outer one."""
+        meter = ControlPlaneMeter()
+        with meter.measuring():
+            with pytest.raises(RuntimeError, match="does not nest"):
+                with meter.measuring():
+                    pass
+
+    def test_the_window_closes_even_when_the_body_raises(self):
+        meter = ControlPlaneMeter()
+        with pytest.raises(ValueError):
+            with meter.measuring():
+                raise ValueError("sync failed")
+
+        meter.record("after")
+        assert meter.total == 0, "the meter stayed armed after an exception"
+
+
+class TestBudgetAssertion:
+    def test_a_free_sync_passes(self):
+        meter = ControlPlaneMeter()
+        with meter.measuring():
+            pass
+        meter.assert_steady_state_is_free()
+
+    def test_a_round_trip_is_reported_with_its_name(self):
+        """After a regression the useful question is which call came back."""
+        meter = ControlPlaneMeter()
+        with meter.measuring():
+            meter.record("get_rollout_instance_model_version")
+
+        with pytest.raises(AssertionError, match="get_rollout_instance_model_version"):
+            meter.assert_steady_state_is_free()
+
+    def test_a_budget_above_zero_is_respected(self):
+        meter = ControlPlaneMeter()
+        with meter.measuring():
+            meter.record("lock")
+            meter.record("unlock")
+
+        meter.assert_steady_state_is_free(allowed=2)
+        with pytest.raises(AssertionError):
+            meter.assert_steady_state_is_free(allowed=1)
+
+
+class TestThreadSafety:
+    def test_concurrent_records_are_not_lost(self):
+        """An undercount would make the criterion look satisfied when it is not."""
+        meter = ControlPlaneMeter()
+        per_thread = 500
+
+        def hammer():
+            for _ in range(per_thread):
+                meter.record("call")
+
+        with meter.measuring():
+            threads = [threading.Thread(target=hammer) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        assert meter.total == 8 * per_thread
+
+
+class TestVersionReadIsEliminated:
+    """The measure C2 ranks highest: remove the call, not just speed it up."""
+
+    def test_pull_returns_the_version_it_assigned(self):
+        """Source-level check: the PS call must hand back the version.
+
+        A round trip can only be removed if the caller can get the number another way,
+        and the only honest source is the call that just set it.
+        """
+        from pathlib import Path
+
+        import psrl.workers.ps as ps_pkg
+
+        source = (Path(ps_pkg.__file__).parent / "ps_manager.py").read_text()
+        marker = "def pull_model_state_dict_nixl("
+        start = source.index(marker)
+        body = source[start : start + 2000]
+        assert "return self.model_store.version_tag" in body, (
+            "pull_model_state_dict_nixl no longer returns the version, so the caller "
+            "must read it back with a second round trip"
+        )
+
+    def test_caller_prefers_the_reported_version(self):
+        from pathlib import Path
+
+        import psrl.workers.gen as gen_pkg
+
+        source = (Path(gen_pkg.__file__).parent / "vllm_async_server.py").read_text()
+        assert "curr_model_version = self._last_pulled_model_version" in source
+        assert "self._last_pulled_model_version = None" in source, (
+            "a version left over from the previous sync would be recorded as this one's"
+        )

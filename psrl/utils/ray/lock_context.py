@@ -346,7 +346,13 @@ class _AsyncSharedPullModelContext:
 
     async def __aenter__(self):
         """Enter the context, acquiring shared lock."""
+        from psrl.workers.ps.control_plane_meter import GLOBAL_CONTROL_PLANE_METER
+
         while True:
+            # Counted per attempt, not per acquisition: this polls, so a contended sync
+            # costs more round trips than an uncontended one, and averaging that away
+            # would hide the cost the C2 criterion is about.
+            GLOBAL_CONTROL_PLANE_METER.record("try_acquire_shared_pull_lock")
             can_acquire = await self.ps_manager._try_acquire_shared_pull_lock.remote()
             if can_acquire:
                 return self
@@ -354,5 +360,8 @@ class _AsyncSharedPullModelContext:
 
     async def __aexit__(self, exc_type, exc, exc_tb):
         """Exit the context, releasing shared lock."""
+        from psrl.workers.ps.control_plane_meter import GLOBAL_CONTROL_PLANE_METER
+
+        GLOBAL_CONTROL_PLANE_METER.record("release_shared_pull_lock")
         await self.ps_manager._release_shared_pull_lock.remote()
         return False

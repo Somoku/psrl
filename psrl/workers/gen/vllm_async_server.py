@@ -61,6 +61,7 @@ from psrl.workers.gen.smg_adapter import build_worker_registration_payload, cfg_
 from psrl.workers.gen.stats_collector import DPLBStatCollector
 from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT
 from psrl.workers.gen.zmq_queue import ZMQPushQueue
+from psrl.workers.ps.control_plane_meter import GLOBAL_CONTROL_PLANE_METER
 
 if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
     get_encoding()
@@ -128,6 +129,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # NIXL cache
         self._cached_ps_nixl_agent_names = None
         self._cached_ps_nixl_gen_storage_client_names = None
+        #: Version reported by the most recent pull, or None if that pull reported none
+        #: (item C2). Cleared before every pull: a value left over from the previous
+        #: sync would be recorded as this sync's version, which is worse than the round
+        #: trip it saves because nothing downstream could detect it.
+        self._last_pulled_model_version: int | None = None
 
         # Gateway HTTP client (connection pooled)
         self._gateway_client: aiohttp.ClientSession | None = None
@@ -1030,9 +1036,17 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
                 await self.pull_model()
 
-        curr_model_version = await self.gen_interface.ps_manager_handle.get_rollout_instance_model_version.remote(
-            (self.base_worker_id, data_parallel_rank)
-        )
+        # C2: `pull_model` reports the version it landed on, so the steady-state path
+        # makes no round trip here. The read remains for the modes that do not report
+        # one, rather than being assumed unreachable.
+        curr_model_version = self._last_pulled_model_version
+        if curr_model_version is None:
+            GLOBAL_CONTROL_PLANE_METER.record("get_rollout_instance_model_version")
+            curr_model_version = (
+                await self.gen_interface.ps_manager_handle.get_rollout_instance_model_version.remote(
+                    (self.base_worker_id, data_parallel_rank)
+                )
+            )
         assert curr_model_version >= ps_version, (
             f"Pulled model version is stale: current={curr_model_version}, required={ps_version}."
         )
@@ -1062,6 +1076,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         return version
 
     async def pull_model(self):
+        # C2: clear before the pull, not after. A version left over from the previous
+        # sync would be silently attributed to this one.
+        self._last_pulled_model_version = None
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             await self.ray_pull_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
@@ -1081,8 +1098,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         )
         ps_manager_handle = self.gen_interface.ps_manager_handle
         if self._cached_ps_nixl_agent_names is None:
+            GLOBAL_CONTROL_PLANE_METER.record("get_ps_nixl_agent_names")
             self._cached_ps_nixl_agent_names = await ps_manager_handle.get_ps_nixl_agent_names.remote()
         if self._cached_ps_nixl_gen_storage_client_names is None:
+            GLOBAL_CONTROL_PLANE_METER.record("get_ps_nixl_gen_storage_client_names")
             self._cached_ps_nixl_gen_storage_client_names = (
                 await ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote()
             )
@@ -1096,9 +1115,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             )
         data_parallel_ranks = range(self.get_instance_num())
         pulled_instance_ids = [(self.base_worker_id, data_parallel_rank) for data_parallel_rank in data_parallel_ranks]
-        await ps_manager_handle.pull_model_state_dict_nixl.remote(
+        GLOBAL_CONTROL_PLANE_METER.record("pull_model_state_dict_nixl")
+        # C2: the call returns the version it just assigned, so the caller no longer
+        # needs a second round trip to read it back.
+        self._last_pulled_model_version = await ps_manager_handle.pull_model_state_dict_nixl.remote(
             pulled_instance_ids
-        )  # This only updates the model version
+        )
         psrl_logger.info("NIXL pull model done.")
 
     async def ray_pull_model(self) -> None:

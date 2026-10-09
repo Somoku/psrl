@@ -1266,11 +1266,18 @@ class PSManager(RequestStatusTracker):
         return self.model_store.model_state_dict_ref
 
     @_state_locked
-    def pull_model_state_dict_nixl(self, rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId]):
+    def pull_model_state_dict_nixl(
+        self, rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId]
+    ) -> int:
         """
         Pull the latest model state dict from PS via NIXL. Only used in 'nixl_cpu' or 'nixl_gpu' mode.
         This only updates the version tag of the model state dict pulled from the PS.
         The actual model state dict is stored in the PS worker group.
+
+        Returns the version the instances were advanced to (item C2). The caller needs
+        that number and used to fetch it with a second round trip, even though this call
+        has just assigned it -- the read could only ever return what was set here, or
+        something newer, which would make the caller record a version it did not pull.
         """
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", (
             "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
@@ -1287,3 +1294,4 @@ class PSManager(RequestStatusTracker):
             event_type=EventType.PULL,
         )
         self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_ids)
+        return self.model_store.version_tag

@@ -41,7 +41,7 @@ class StepBoundary:
     step: int | None = None
     version: int | None = None
 
-    def ordered_before(self, other: "StepBoundary") -> bool:
+    def ordered_before(self, other: StepBoundary) -> bool:
         return self.ended_at < other.ended_at
 
 

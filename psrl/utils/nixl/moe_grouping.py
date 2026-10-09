@@ -68,7 +68,7 @@ class ExpertGroup:
     def num_experts(self) -> int:
         return len(self.expert_ids)
 
-    def shard_mesh(self, inner_mesh: "OrderedDict[int, int] | None" = None) -> "OrderedDict[int, int]":
+    def shard_mesh(self, inner_mesh: OrderedDict[int, int] | None = None) -> OrderedDict[int, int]:
         """Shard mesh for the grouped key: expert axis first, then any inner sharding.
 
         ``inner_mesh`` is the per-expert tensor's existing mesh -- ETP sharding within an
@@ -206,7 +206,7 @@ def grouping_report(keys: list[str]) -> dict[str, int | float]:
     }
 
 
-def _inner_mesh_of(sharding: NIXLSharding) -> "OrderedDict[int, int]":
+def _inner_mesh_of(sharding: NIXLSharding) -> OrderedDict[int, int]:
     return OrderedDict(sharding.shard_mesh)
 
 
@@ -305,8 +305,15 @@ def group_expert_tensors(
         reference_dims = list(reference.keys())
         keep_positions = [reference_dims.index(dim) for dim in kept_dims]
 
-        def _full_index(expert_id: int, inner_index: tuple[int, ...]) -> tuple[int, ...]:
-            return (expert_id, *(inner_index[position] for position in keep_positions))
+        # `keep_positions` is bound as a default rather than captured: it is redefined on
+        # every group, and a late-binding closure would silently index later groups with
+        # an earlier group's layout.
+        def _full_index(
+            expert_id: int,
+            inner_index: tuple[int, ...],
+            positions: tuple[int, ...] = tuple(keep_positions),
+        ) -> tuple[int, ...]:
+            return (expert_id, *(inner_index[position] for position in positions))
 
         shards: list[torch.Tensor] = []
         indices: list[tuple[int, ...]] = []

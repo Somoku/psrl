@@ -7,8 +7,6 @@ from collections import OrderedDict
 import torch
 from torch.nn import Parameter
 
-from psrl.utils.nixl.moe_grouping import group_expert_tensors, grouping_report
-
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
     is_q_weight,
@@ -17,6 +15,7 @@ from psrl.utils.converter.model_mappings import (
     reshape_q_to_5d,
     reshape_qkv_to_3d,
 )
+from psrl.utils.nixl.moe_grouping import group_expert_tensors, grouping_report
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 psrl_logger = logging.getLogger(__file__)

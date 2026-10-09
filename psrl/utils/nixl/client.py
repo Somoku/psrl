@@ -19,8 +19,6 @@ from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, lo
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.moe_grouping import GroupedShards, entry_is_empty, local_shards_of
-from psrl.utils.nixl.prepped_xfer import PreppedXferCache
-from psrl.utils.nixl.strided_desc import StridedLayout, describe_shard
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
@@ -29,6 +27,8 @@ from psrl.utils.nixl.nixl_spec import (
     NIXLShardMetaInfo,
     NIXLTensorInfo,
 )
+from psrl.utils.nixl.prepped_xfer import PreppedXferCache
+from psrl.utils.nixl.strided_desc import StridedLayout, describe_shard
 
 if TYPE_CHECKING:
     from torch_memory_saver import torch_memory_saver
@@ -1270,7 +1270,16 @@ class NIXLStorageClient:
         """
         plan = comm_plan or self._comm_plan
         self._ensure_client_info_fetched(target_client)
-        remote_info = self._all_client_infos[target_client].get_tensor_info(key)
+        # A source legitimately may not hold this key: under direct supply (item D3) the
+        # sources are train ranks, and pipeline parallelism gives each rank only its own
+        # stage's keys. Reading `remote_info` before consulting the plan raised KeyError
+        # for every key the rank does not have. Against a PS this never arose -- every PS
+        # worker holds every key -- so the ordering looked safe while it was merely
+        # untested.
+        remote_client_info = self._all_client_infos[target_client]
+        if key not in remote_client_info.tensor_infos:
+            return []
+        remote_info = remote_client_info.get_tensor_info(key)
         local_info = self.local_client_info.get_tensor_info(key)
         shards_to_transfer = []
         if plan and self.client_type == NIXLClientType.PULL_SIDE:
@@ -1442,7 +1451,14 @@ class NIXLStorageClient:
         """
         plan = (comm_plan or self._comm_plan) if use_comm_plan else None
         self._ensure_client_info_fetched(target_client)
-        remote_info = self._all_client_infos[target_client].get_tensor_info(key)
+        # Symmetric with `client_read`: a target that does not hold the key has nothing
+        # to receive. Unreachable today, since every push target is a PS worker holding
+        # every key -- but leaving the two paths asymmetric is how the read side came to
+        # have this bug in the first place.
+        remote_client_info = self._all_client_infos[target_client]
+        if key not in remote_client_info.tensor_infos:
+            return []
+        remote_info = remote_client_info.get_tensor_info(key)
         local_info = self.local_client_info.get_tensor_info(key)
         shards_to_transfer = []
         if plan and self.client_type == NIXLClientType.PUSH_SIDE:

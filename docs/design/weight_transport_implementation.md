@@ -967,14 +967,53 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       shard wait 完成后才发布），缺的只是**可观测性**——而那正是判据要求验证的东西。
 
 ### 阶段 D（不可分割）
-- [ ] D1 trainer 出口 == `M`；每节点入口 == `M_v`；AGST 亚线性；无链式 peer
-- [ ] D2 四条断言各有违反测试；actor/critic role 隔离
-- [ ] D3 无 PS worker 进程；CPU 权重 == 0；换大一倍模型 cast 显存不变
+
+> **当前状态**：D1/D2/D5/D6/D7/D8 的**逻辑层已落地并单测通过**，D3 完成了 planner 一半。
+> 尚未执行任何删除 —— `PSStorageWorker` 仍在，链路仍走 PS。
+> 这是刻意的顺序：先让直供的 plan 跑通，删除才有可对照的基准。
+
+- [x] **D1 已落地（模块）**：`psrl/utils/nixl/source_resolution.py`。
+      trainer 出口 == 节点数（4 节点 × 8 reader 实测为 4 次而非 32 次）；
+      出口随「每节点 reader 数」增长保持不变；无链式结构（逐轮断言源不是二手 holder）；
+      扩散轮数对数级（16 reader ≤ 6 轮）。`test_source_resolution.py` 22 passed
+
+      **一个实现期发现的真实 bug**：W 个 trainer 名额若按 reader 列表顺序发放，
+      4 个名额会全落在 node0，trainer 服务 16 次而非 4 次 —— 正是本项要消除的 `N×M`。
+      名额必须**按节点**发放：拿到一份的节点能用 NVLink 扩散，没拿到的节点下一轮还得回 trainer。
+      **判据写成「数 trainer 出口次数」而非「断言发生了扩散」，才看得见这个差别。**
+- [x] **D2 已落地（模块）**：`psrl/workers/ps/holder_index.py`。
+      `(role, version, chunk)` 三元键；actor 的 v3 与 critic 的 v3 互不覆盖；
+      pull 准入四类拒绝（非 holder / 版本不符 / 二手 holder / 角色未发布）；
+      在飞读者为 per-chunk 整数，释放前断言归零且**报错点名是哪些 chunk**。
+      `test_holder_index.py` 21 passed
+- [ ] **D3 部分落地**：planner 已支持「集群内无 PS 时 rollout 直接从 train client 读」
+      （`test_direct_supply_plan.py` 8 passed），PS 存在时路径完全不变。
+      **仍待做**：删除 `PSStorageWorker` / `create_ps_worker_group` / push 路径 /
+      `ps_mode` 枚举，以及 `ParamSyncPlan` 的 push 成对语义改造。
+      判据（无 PS 进程、CPU 权重 == 0、cast 显存上界 `2×chunk`）需删除后实测。
 - [ ] D4 首次切回读盘、稳态切回从 CPU reload 且版本 == eval 前版本
-- [ ] D5 偏移与 group 边界对齐；确定性；peer 命中率提升
-- [ ] D6 降级后 replica 仍在 SMG 可用集合；请求粒度版本记账一致
-- [ ] D7 单 rank 故障 rollout 无感知；整组故障保持版本继续生成
-- [ ] D8 纯 FSDP2 返回 `CHUNK_UNAVAILABLE`、HSDP 走 DP 接管
+- [x] **D5 已落地**：`psrl/utils/nixl/chunk_offset.py`。
+      偏移**向下**吸附到 commit group 边界（逐 instance 验证每个 group 在读序中连续），
+      向下而非就近是为了保持对 instance 序号单调，index 据此无通信预测 holder；
+      **收益实测**：4 instance 各读 2 个 chunk 后，错开覆盖 8 个 chunk、不错开只覆盖 2 个。
+      `R <= W` 时不启用。`test_chunk_offset.py` 19 passed
+- [x] **D6 已落地**：`pull_model_for_sync` 的版本 assert 已删除 ——
+      它会经 `_finish_gateway_sync` 的 except 走到 `fail_sync` + `/workers/pause`，
+      **把「落后一个版本」变成「摘除该 replica」**，与判据正好相反。
+      发布时机从「pull 前乐观预发」改为「pull 落地后按实际版本发布」，
+      消除了「SMG 记 v+1 而实例持 v」的窗口。
+      连带改动：原先「仅在实际版本与目标不符时才发布」依赖预发存在，
+      去掉预发后达标的 replica 将永不发布，故改为无条件发布。
+      `test_degraded_sync.py` 8 passed + 5 节点 e2e exit=0
+- [x] **D7 已落地（模块）**：`psrl/workers/ps/chunk_availability.py`。
+      单 rank 故障由同 DP 组接管且 rollout 无感知；整组故障返回显式
+      `CHUNK_UNAVAILABLE`（非超时）；trainer 全体重启清空 holder 但保留版本号。
+      故障检测搭在已有错误路径上（`client_read` 失败时上报 holder 身份），不加心跳。
+- [x] **D8 已落地（模块）**：副本数由 `NIXLSharding` 运行时推导。
+      **决定性的一对测试**：同一个单 rank 故障，HSDP（`{0:8}`/16 rank → 2 副本）走 DP 接管，
+      纯 FSDP2（`{0:16}`/16 rank → 1 副本）返回 `CHUNK_UNAVAILABLE`。
+      mesh 声明的分片数超过 world size 时**报错而非返回 0 副本**（后者会让所有 chunk 静默不可用）。
+      `test_chunk_availability.py` 21 passed
 
 ### 阶段 E
 - [ ] E1 关掉版本级等待后能观测到 FSDP2 bf16 同精度的权重破坏

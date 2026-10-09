@@ -7,8 +7,9 @@ PUSH_SIDE to PS and PULL_SIDE from PS communication plans.
 """
 
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from psrl.utils.nixl.chunking import CommitGroup, plan_chunks
 from psrl.utils.nixl.global_vars import GLOBAL_TOPOLOGY
 from psrl.utils.nixl.nixl_spec import NIXLClientInfo, NIXLClientType
 
@@ -28,6 +29,19 @@ class NIXLCommPlan:
     # PUSH_SIDE <- PS read plan
     # {pull_client: {key: {ps_client: [shard_indices]}}
     train_pull_from_ps_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]]
+
+    # Per-pull-client chunk plan (implementation item B1).
+    # {pull_client: (chunks, commit_groups)}
+    #
+    # `chunk` and `commit_group` are deliberately separate concepts (design 3.6.1): a
+    # chunk is a fixed byte budget and may split one key, while a commit group is what
+    # the engine loader requires atomically and may span several chunks. They are
+    # many-to-many, so collapsing them into one unit makes either the pipeline or
+    # version visibility wrong.
+    #
+    # Empty when no size information was available at planning time; consumers must
+    # treat an absent entry as "no chunking", not as an error.
+    pull_chunk_plan: dict[str, tuple[list, list]] = field(default_factory=dict)
 
     def serialize(self):
         """Serialize communication plan"""
@@ -66,6 +80,15 @@ class NIXLCommPlan:
                 result[pull_client] = key_plans[key][ps_client]
         return result
 
+    def get_pull_chunks(self, pull_client: str) -> tuple[list, list]:
+        """Chunks and commit groups this pull client should transfer, in order.
+
+        Returns empty lists when the client has no chunk plan -- the planner had no size
+        metadata for it. Callers fall back to per-key transfers, which is the behaviour
+        that predates B1.
+        """
+        return self.pull_chunk_plan.get(pull_client, ([], []))
+
     def get_train_ps_read_plan(self, ps_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
         """Get read plan for specific PS client and key (sending to PUSH_SIDE)"""
         result = {}
@@ -78,10 +101,17 @@ class NIXLCommPlan:
 class CommunicationPlanner:
     """Intelligent communication planning with load balancing"""
 
-    def __init__(self, restrict_client_group_comm: bool = False):
+    #: Default chunk budget. 512MB is the design's recommendation for a 170 GB/s node
+    #: (3.5.6): large enough that `check_xfer_state` polling is a small fraction of the
+    #: per-chunk transfer time, small enough to leave the pipeline several rounds.
+    #: B3 replaces this constant with the cost model.
+    DEFAULT_CHUNK_BYTES = 512 * 1024 * 1024
+
+    def __init__(self, restrict_client_group_comm: bool = False, chunk_bytes: int | None = None):
         """Initialize the communication planner"""
         # NOTE(lhy): Restrict communication to matching client groups when enabled.
         self.restrict_client_group_comm = restrict_client_group_comm
+        self.chunk_bytes = chunk_bytes or self.DEFAULT_CHUNK_BYTES
 
     def make_comm_plan(self, clients: dict[str, NIXLClientInfo]) -> NIXLCommPlan:
         """
@@ -156,11 +186,76 @@ class CommunicationPlanner:
                 clients, rollout_pull_client_groups, ps_for_rollout_pull_client_groups, rollout_pull_from_ps_plan
             )
 
+        # B1: chunk plan for the rollout pull side, where the pipeline and the wire
+        # buffer live. The push side writes whole shards into PS buffers and has no
+        # chunk pipeline, so planning chunks for it would be dead metadata.
+        pull_chunk_plan = self._build_pull_chunk_plan(
+            clients, rollout_pull_from_ps_plan, self.chunk_bytes
+        )
+
         return NIXLCommPlan(
             push_to_ps_plan=push_to_ps_plan,
             rollout_pull_from_ps_plan=rollout_pull_from_ps_plan,
             train_pull_from_ps_plan=train_pull_from_ps_plan,
+            pull_chunk_plan=pull_chunk_plan,
         )
+
+    def _build_pull_chunk_plan(
+        self,
+        clients: dict[str, NIXLClientInfo],
+        pull_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]],
+        chunk_bytes: int,
+    ) -> dict[str, tuple[list, list]]:
+        """Derive each pull client's chunk plan from what it is scheduled to read.
+
+        One commit group per key: that is the granularity the engine loader requires
+        atomically (weight and its scale, a fused QKV). Chunks are then cut across those
+        groups by byte budget, so a key larger than the budget spans several chunks and
+        several small keys share one -- the many-to-many relationship B1 exists to
+        express.
+
+        Sizes come from the *reader's* own metadata rather than the sender's: that is
+        what the reader will actually land, and it is the side whose buffer the chunk
+        budget is protecting. A key the reader has no metadata for is skipped rather
+        than guessed at, since a wrong size silently mis-cuts every later chunk.
+        """
+        chunk_plan: dict[str, tuple[list, list]] = {}
+
+        for pull_client, key_plans in pull_plan.items():
+            info = clients.get(pull_client)
+            if info is None:
+                continue
+
+            groups: list[CommitGroup] = []
+            shard_bytes: dict[tuple[str, tuple[int, ...]], int] = {}
+
+            for key in sorted(key_plans):
+                tensor_info = info.tensor_infos.get(key)
+                if tensor_info is None:
+                    continue
+                shard_positions = {s: i for i, s in enumerate(tensor_info.sharding.shard_indices)}
+
+                shards: list[tuple[str, tuple[int, ...]]] = []
+                for shard_indices in key_plans[key].values():
+                    for shard_idx in shard_indices:
+                        local_pos = shard_positions.get(shard_idx)
+                        if local_pos is None:
+                            continue
+                        ref = (key, shard_idx)
+                        if ref in shard_bytes:
+                            continue
+                        shard_bytes[ref] = tensor_info.get_shard_size_bytes(local_pos)
+                        shards.append(ref)
+
+                if shards:
+                    groups.append(CommitGroup(name=key, shards=tuple(shards)))
+
+            if not groups:
+                continue
+            chunks, resolved = plan_chunks(groups, shard_bytes, chunk_bytes=chunk_bytes)
+            chunk_plan[pull_client] = (chunks, resolved)
+
+        return chunk_plan
 
     def _make_push_to_ps_plan(
         self,

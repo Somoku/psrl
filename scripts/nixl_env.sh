@@ -17,6 +17,20 @@
 # byte-identical libraries -- a version skew between nodes in an RDMA path is the kind
 # of fault that shows up as a wrong-bytes transfer rather than a clean error.
 
+# Activate the cluster's canonical environment first. Every node must agree on the
+# interpreter: Ray refuses to join a cluster whose head runs a different Python
+# ("Version mismatch: ... Python: 3.12.13 / 3.12.2"), and an interactive shell picks up
+# a different conda than a non-interactive `ssh host cmd` does. Sourcing one shared file
+# on every node is what makes that impossible to get wrong.
+#
+# It also exports the proxy the cluster needs for outbound HTTP; callers that talk gRPC
+# (Ray) must `unset http_proxy https_proxy` afterwards, as the file's own comment says.
+_PSRL_CLUSTER_ENV=/apdcephfs_zwfy10_303541817/share_303541817/ls/env/psrl.sh
+if [ -f "${_PSRL_CLUSTER_ENV}" ]; then
+    # shellcheck disable=SC1090
+    source "${_PSRL_CLUSTER_ENV}" > /dev/null 2>&1
+fi
+
 _PSRL_CONDA_LIB=/apdcephfs_zwfy10/share_303541817/lhy/anaconda3/lib
 _PSRL_NIXL_PLUGINS=/apdcephfs_zwfy10/share_303541817/lhy/nixl_runtime/plugins
 
@@ -49,4 +63,4 @@ export NIXL_PLUGIN_DIR="${_PSRL_NIXL_PLUGINS}"
 export UCX_NET_DEVICES="${PSRL_UCX_NET_DEVICES:-bond1,bond2,bond3,bond4,bond5,bond6,bond7,bond8,mlx5_bond_1:1,mlx5_bond_4:1,mlx5_bond_3:1,mlx5_bond_2:1,mlx5_bond_7:1,mlx5_bond_6:1,mlx5_bond_8:1,mlx5_bond_5:1}"
 export UCX_IB_ROCE_REACHABILITY_MODE="${PSRL_UCX_ROCE_REACHABILITY:-all}"
 
-unset _PSRL_CONDA_LIB _PSRL_NIXL_PLUGINS
+unset _PSRL_CONDA_LIB _PSRL_NIXL_PLUGINS _PSRL_CLUSTER_ENV

@@ -61,6 +61,22 @@ class NIXLCommPlan:
         """Get read plan for specific PULL_SIDE client and key"""
         return self.rollout_pull_from_ps_plan.get(pull_client, {}).get(key, {})
 
+    def iter_rollout_pull_work(self, pull_client: str):
+        """Yield ``(key, source_client)`` pairs this client is actually scheduled to read.
+
+        The plan already records which source serves each key, so a caller can iterate
+        the work instead of probing every (key, source) combination and discarding the
+        empty ones (item D1).
+
+        That distinction is cosmetic against a PS -- a handful of PS workers each hold
+        every key -- and decisive under direct supply, where the sources are train ranks.
+        Measured on the 5-node config: 399 keys x 24 train ranks is 9,576 probes, against
+        the 399 reads the plan actually calls for.
+        """
+        for key, per_source in self.rollout_pull_from_ps_plan.get(pull_client, {}).items():
+            for source_client in per_source:
+                yield key, source_client
+
     def get_train_pull_plan(self, pull_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
         """Get read plan for specific PUSH_SIDE client and key"""
         return self.train_pull_from_ps_plan.get(pull_client, {}).get(key, {})

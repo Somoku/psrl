@@ -255,6 +255,17 @@ class NIXLStorageClient:
         """Get temporary tensor mapping for non-contiguous shard"""
         return self._temp_tensor_mapping.get((key, shard_idx))
 
+    def iter_planned_pull_work(self):
+        """``(key, source_client)`` pairs this client is scheduled to read (item D1).
+
+        Empty when no plan has been received, which the caller must treat as "fall back
+        to probing" rather than "nothing to do" -- the two are indistinguishable from
+        the return value alone, and reading nothing would look like a very fast success.
+        """
+        if self._comm_plan is None:
+            return iter(())
+        return self._comm_plan.iter_rollout_pull_work(self.client_name)
+
     def _get_temp_desc_bytes(self, client_name: str, key: str, shard_idx: tuple[int, ...]) -> bytes | None:
         """Get temporary descriptor for non-contiguous shard"""
         assert client_name in self._all_temp_mappings, f"Client {client_name} not found in temp mappings."

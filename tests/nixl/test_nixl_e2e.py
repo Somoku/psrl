@@ -717,24 +717,42 @@ class GenClientActor:
     def pull_from_ps(self, ps_agent_names, ps_client_names):
         wait_operations = []
         total_start_time = time.time()
-        for key in self.state_dict_keys:
-            for ps_agent_name, ps_client_name in zip(ps_agent_names, ps_client_names):
-                # self.print(f"pull {key} from {ps_client_name}")
-                shards_to_transfer = self.client.client_read(
-                    ps_agent_name,
-                    ps_client_name,
-                    key,
-                    "gen_pull",
-                    merge_and_cache_xfer=False,
-                )
-                if len(shards_to_transfer) > 0:
-                    wait_operations.append((key, ps_client_name, shards_to_transfer))
-        for key, ps_client_name, shards_to_transfer in wait_operations:
-            self.client.wait(key, "gen_pull", "READ", target_client=ps_client_name)
+        agent_of = dict(zip(ps_client_names, ps_agent_names))
+
+        # D1: iterate the work the plan assigns rather than probing every
+        # (key, source) pair. Against a PS the two are nearly the same -- a couple of
+        # workers, each holding every key. Under direct supply the sources are train
+        # ranks and pipeline parallelism gives each one a slice of the key space, so
+        # probing costs 399 x 24 = 9,576 calls to schedule 399 reads.
+        #
+        # Falling back to the probe when the plan has no entry keeps this honest: an
+        # empty plan means the planner did not cover this client, and silently reading
+        # nothing would look like a fast success.
+        planned = list(self.client.iter_planned_pull_work())
+        if planned:
+            work = [(key, source) for key, source in planned if source in agent_of]
+        else:
+            work = [(key, source) for key in self.state_dict_keys for source in ps_client_names]
+
+        for key, source_client in work:
+            shards_to_transfer = self.client.client_read(
+                agent_of[source_client],
+                source_client,
+                key,
+                "gen_pull",
+                merge_and_cache_xfer=False,
+            )
+            if len(shards_to_transfer) > 0:
+                wait_operations.append((key, source_client, shards_to_transfer))
+        for key, source_client, shards_to_transfer in wait_operations:
+            self.client.wait(key, "gen_pull", "READ", target_client=source_client)
         self.client.merge_and_finish_cached_xfer()
         total_end_time = time.time()
         # torch.cuda.synchronize()
-        self.print(f"Total pull from ps done: {total_end_time - total_start_time}s")
+        self.print(
+            f"Total pull from ps done: {total_end_time - total_start_time}s "
+            f"({len(work)} scheduled reads, {len(wait_operations)} transfers)"
+        )
 
     def shutdown(self):
         self.client.shutdown()
@@ -775,6 +793,45 @@ def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_config)
     return ps_wg
 
 
+def _assert_actors_run_this_tree() -> None:
+    """Fail loudly if Ray actors import a different checkout than the driver.
+
+    The cluster environment puts another `psrl` on the path, so without the PYTHONPATH
+    override the actors silently run that one while the driver runs this one -- and the
+    run *passes*, proving nothing about the code under test. A one-line check here is
+    worth far more than the minutes it costs, because the failure it catches is
+    invisible in the result.
+
+    Checked on every node, not just one: a partial PYTHONPATH would be the same bug with
+    a smaller blast radius.
+    """
+
+    @ray.remote(num_cpus=0)
+    def _where() -> str:
+        import psrl.utils.nixl.client as module
+
+        return module.__file__
+
+    nodes = [node for node in ray.nodes() if node["Alive"]]
+    seen = ray.get(
+        [
+            _where.options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node["NodeID"], soft=False)
+            ).remote()
+            for node in nodes
+        ]
+    )
+    expected = os.path.join(_REPO_ROOT, "psrl", "utils", "nixl", "client.py")
+    wrong = sorted({path for path in seen if path != expected})
+    assert not wrong, (
+        f"Ray actors import a different checkout than the driver.\n"
+        f"  expected: {expected}\n"
+        f"  actors:   {wrong}\n"
+        "The run would pass while measuring code this tree does not contain."
+    )
+    print(f"[PASS] all {len(seen)} nodes import this tree: {expected}")
+
+
 @hydra.main(config_path="config", config_name="nixl_e2e", version_base=None)
 def test_nixl_e2e(cfg: DictConfig):
     validate_parallel_config(cfg)
@@ -796,6 +853,7 @@ def test_nixl_e2e(cfg: DictConfig):
             }
         },
     )
+    _assert_actors_run_this_tree()
     listen_ip = cfg.network.listen_ip
     print(f"meta server listen_ip: {listen_ip}")
     server_name = NIXL_META_SERVER_NAME

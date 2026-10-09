@@ -68,10 +68,11 @@ class _Server:
     minutes on this host and would prove nothing extra about a filter.
     """
 
-    def __init__(self, clients: dict[str, NIXLClientType], broadcast_init=False):
+    def __init__(self, clients: dict[str, NIXLClientType], broadcast_init=False, comm_plan=None):
         self.client_infos = {name: _info(name, t) for name, t in clients.items()}
         self.connected_clients = {f"agent_{name}": [name] for name in clients}
         self._broadcast_init_enabled = broadcast_init
+        self.comm_plan = comm_plan
 
     relevant_for = NIXLMetaServer._get_relevant_client_names_for_agent
 
@@ -160,3 +161,50 @@ class TestDispatchFollowsRegistration:
             "a PS that only accepts pushes cannot serve the rollout, so the rollout "
             "still needs the train descriptors"
         )
+
+
+class TestPeerDescriptorsAreIncluded:
+    """D1: a peer read needs that peer's descriptors, and a peer is PULL_SIDE.
+
+    None of the type rules grant a PULL_SIDE client another PULL_SIDE client, so without
+    this the peer read fails the same way the direct-supply read did -- "target client
+    not found in client infos".
+    """
+
+    class _Plan:
+        def __init__(self, peer_pull_plan):
+            self.peer_pull_plan = peer_pull_plan
+
+    def test_a_named_peer_is_included(self):
+        clients = {**DIRECT, "gen1": NIXLClientType.PULL_SIDE}
+        plan = self._Plan({"gen1": {"w": {"gen0": [(0,)]}}})
+        server = _Server(clients, comm_plan=plan)
+
+        assert "gen0" in server.relevant_for("agent_gen1")
+
+    def test_unnamed_rollouts_are_not_included(self):
+        """Scoped to the plan: otherwise every rollout carries every other rollout."""
+        clients = {
+            **DIRECT,
+            "gen1": NIXLClientType.PULL_SIDE,
+            "gen2": NIXLClientType.PULL_SIDE,
+        }
+        plan = self._Plan({"gen1": {"w": {"gen0": [(0,)]}}})
+        server = _Server(clients, comm_plan=plan)
+
+        assert "gen2" not in server.relevant_for("agent_gen1")
+
+    def test_no_plan_means_no_extra_fan_out(self):
+        """Before a plan exists there are no peers to name."""
+        clients = {**DIRECT, "gen1": NIXLClientType.PULL_SIDE}
+        server = _Server(clients, comm_plan=None)
+
+        assert "gen0" not in server.relevant_for("agent_gen1")
+
+    def test_a_designate_does_not_gain_its_followers(self):
+        """Diffusion is one-directional: the designate reads upstream only."""
+        clients = {**DIRECT, "gen1": NIXLClientType.PULL_SIDE}
+        plan = self._Plan({"gen1": {"w": {"gen0": [(0,)]}}})
+        server = _Server(clients, comm_plan=plan)
+
+        assert "gen1" not in server.relevant_for("agent_gen0")

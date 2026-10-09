@@ -321,6 +321,16 @@ class NIXLMetaServer:
             if client_info.type in needed_types:
                 relevant.add(client_name)
 
+        # D1: a rollout that reads from a same-node peer needs that peer's descriptors,
+        # and a peer is a PULL_SIDE client -- a type the rules above never grant. Scoped
+        # to the peers the plan actually names, and only once a plan exists, so the
+        # fan-out grows by the handful of clients sharing a node rather than by every
+        # rollout in the cluster.
+        if self.comm_plan is not None:
+            for client_name in my_clients:
+                for per_peer in self.comm_plan.peer_pull_plan.get(client_name, {}).values():
+                    relevant.update(per_peer)
+
         # Broadcast initialization uses direct PS writes, so include every PS
         # descriptor in the existing info exchange.
         if self._broadcast_init_enabled:

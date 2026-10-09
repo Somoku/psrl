@@ -979,7 +979,34 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 > 单测与 driver 进程内的字节级测量（18867→579、interning 体积、跨节点带宽）不受影响。
 > 验证方法与复现见 memory 的 `psrl-ray-actors-import-other-checkout`。
 
-- [x] **D1 已落地（模块）**：`psrl/utils/nixl/source_resolution.py`。
+- [ ] **D1 接线部分完成，性能判据未达成**。已完成：plan 侧的 peer 扩散
+      （`_make_peer_diffusion_plan`）、peer descriptor 扇出、拉取按 plan 迭代。
+      5 节点实测 **9,576 次探测 → 653 次读且全部产生传输**。
+
+      **但探测次数从来不是瓶颈**：实测 plan 版 2.93s vs 探测版 2.59s vs PS 路径 1.14s。
+      废弃的探测很便宜（`client_read` 遇空 shard 列表提前返回），时间在传输本身。
+      直供的传输粒度结构性更差：24 个 train rank 在 TP=4×PP=2 下把 key 空间切碎
+      （653 次读对应 399 个 key，每 key 约 1.6 个源），而 2 个 PS worker 各持完整 shard。
+
+      **peer 扩散的收益已在 plan 层量化**：gen TP=2、每节点 8 个 client 时
+      `tp_rank = rank % 2` 让 4 个 client 需要**逐字节相同**的 shard，
+      上游读从每节点 8 次降为 2 次，且**不随每节点 client 数增长**。
+      `test_peer_diffusion_plan.py` 13 passed（含无链式、同节点、确定性、
+      「跳过 peer 读仍然正确」四条）。
+
+      **一个必须先解决的前置条件（设计文档未提）**：peer 读需要
+      **rollout actor 之间的屏障**。peer 只有在它自己的上游读完成后才持有这些字节，
+      提前读会**成功**——注册有效、传输格式正确——读到的是未填充的缓冲区，
+      结果是静默错误的权重。当前 harness 的 gen actor 之间没有 process group，
+      因此 peer 读被**显式推迟**而非执行，上游读保持完整。
+
+      由此定下一条设计约束：**上游读绝不按 peer plan 裁剪**。
+      裁剪会让两条路径互相依赖——没有屏障的调用方必须跳过 peer 读，
+      而裁剪过的上游读就会静默丢掉那些 shard。
+      代价对比很清楚：都发是一次重复读（扩散本想省掉的），
+      裁剪是错误权重且无报错。
+
+- [x] **D1 选源模块已落地**：`psrl/utils/nixl/source_resolution.py`。
       trainer 出口 == 节点数（4 节点 × 8 reader 实测为 4 次而非 32 次）；
       出口随「每节点 reader 数」增长保持不变；无链式结构（逐轮断言源不是二手 holder）；
       扩散轮数对数级（16 reader ≤ 6 轮）。`test_source_resolution.py` 22 passed

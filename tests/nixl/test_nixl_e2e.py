@@ -734,6 +734,25 @@ class GenClientActor:
         else:
             work = [(key, source) for key in self.state_dict_keys for source in ps_client_names]
 
+        # D1: peer reads are planned but not issued here, and the reason is a hard
+        # prerequisite rather than an oversight. A peer only holds the bytes once its
+        # own upstream read has completed, so issuing a peer read early reads an
+        # unfilled buffer -- and *succeeds*, because the registration is valid and the
+        # transfer is well formed. The result is silently wrong weights.
+        #
+        # Making it safe needs a barrier across rollout actors between the upstream
+        # wave and the peer wave. This harness has no such barrier (the gen actors share
+        # no process group), so peer reads are filtered out and every client reads
+        # upstream. The plan still records them, and the planner tests measure the
+        # reduction they would give; what is missing is the execution-order guarantee.
+        peer_names = {
+            peer
+            for key in self.state_dict_keys
+            for peer in self.client.peer_sources_for(key)
+        }
+        deferred_peer_reads = [(key, src) for key, src in work if src in peer_names]
+        work = [(key, src) for key, src in work if src not in peer_names]
+
         for key, source_client in work:
             shards_to_transfer = self.client.client_read(
                 agent_of[source_client],
@@ -751,7 +770,8 @@ class GenClientActor:
         # torch.cuda.synchronize()
         self.print(
             f"Total pull from ps done: {total_end_time - total_start_time}s "
-            f"({len(work)} scheduled reads, {len(wait_operations)} transfers)"
+            f"({len(work)} scheduled reads, {len(wait_operations)} transfers, "
+            f"{len(deferred_peer_reads)} peer reads deferred)"
         )
 
     def shutdown(self):

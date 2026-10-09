@@ -44,6 +44,20 @@ class NIXLCommPlan:
     # treat an absent entry as "no chunking", not as an error.
     pull_chunk_plan: dict[str, tuple[list, list]] = field(default_factory=dict)
 
+    # Reads redirected to a same-node peer (implementation item D1).
+    # {pull_client: {key: {peer_client: [shard_indices]}}}
+    #
+    # Only the *redirected* reads appear. A client absent here reads upstream exactly as
+    # `rollout_pull_from_ps_plan` says, so this is additive: a consumer that ignores it
+    # still transfers the right bytes, just more of them.
+    #
+    # The peer is always same-node and always the client that read upstream, never one
+    # that was itself redirected -- so there are no chains to unwind, and the depth is
+    # one by construction rather than by convention.
+    peer_pull_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]] = field(
+        default_factory=dict
+    )
+
     def serialize(self):
         """Serialize communication plan"""
         return pickle.dumps(self)
@@ -61,6 +75,10 @@ class NIXLCommPlan:
         """Get read plan for specific PULL_SIDE client and key"""
         return self.rollout_pull_from_ps_plan.get(pull_client, {}).get(key, {})
 
+    def get_peer_pull_plan(self, pull_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
+        """Shards of ``key`` this client should take from a same-node peer (item D1)."""
+        return self.peer_pull_plan.get(pull_client, {}).get(key, {})
+
     def iter_rollout_pull_work(self, pull_client: str):
         """Yield ``(key, source_client)`` pairs this client is actually scheduled to read.
 
@@ -72,10 +90,25 @@ class NIXLCommPlan:
         every key -- and decisive under direct supply, where the sources are train ranks.
         Measured on the 5-node config: 399 keys x 24 train ranks is 9,576 probes, against
         the 399 reads the plan actually calls for.
+
+        Upstream reads come first, then peer reads. The order is what makes a single pass
+        correct: a peer only has the bytes once it has read them itself, so issuing the
+        peer reads first would read a buffer that is still empty -- and silently, since
+        the registration is valid and the transfer succeeds.
+
+        Upstream reads are yielded in full, never trimmed by what the peer plan covers.
+        A caller that cannot guarantee the peers have already read -- which needs a
+        barrier across rollout actors -- must be able to skip the peer reads and still be
+        correct. Trimming would turn them into a required step and lose those shards
+        silently. `peer_sources_for` lets a caller tell the two apart.
         """
         for key, per_source in self.rollout_pull_from_ps_plan.get(pull_client, {}).items():
             for source_client in per_source:
                 yield key, source_client
+
+        for key, per_peer in self.peer_pull_plan.get(pull_client, {}).items():
+            for peer_client in per_peer:
+                yield key, peer_client
 
     def get_train_pull_plan(self, pull_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
         """Get read plan for specific PUSH_SIDE client and key"""
@@ -217,6 +250,11 @@ class CommunicationPlanner:
                 clients, rollout_pull_client_groups, push_client_groups, rollout_pull_from_ps_plan
             )
 
+        # D1: collapse duplicate reads of the same bytes into one upstream read plus
+        # same-node peer reads. Done after the plan is built, because it rewrites which
+        # source serves whom rather than which shards anyone needs.
+        peer_pull_plan = self._make_peer_diffusion_plan(clients, rollout_pull_from_ps_plan)
+
         # B1: chunk plan for the rollout pull side, where the pipeline and the wire
         # buffer live. The push side writes whole shards into PS buffers and has no
         # chunk pipeline, so planning chunks for it would be dead metadata.
@@ -229,7 +267,70 @@ class CommunicationPlanner:
             rollout_pull_from_ps_plan=rollout_pull_from_ps_plan,
             train_pull_from_ps_plan=train_pull_from_ps_plan,
             pull_chunk_plan=pull_chunk_plan,
+            peer_pull_plan=peer_pull_plan,
         )
+
+    def _make_peer_diffusion_plan(
+        self,
+        clients: dict[str, NIXLClientInfo],
+        pull_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]],
+    ) -> dict[str, dict[str, dict[str, list[tuple[int, ...]]]]]:
+        """Designate one reader per node for each shard, and route the rest to it (D1).
+
+        Parallelism makes rollout clients on a node want byte-identical shards: with
+        gen TP=2 and 8 clients per node, ``tp_rank = rank % 2`` gives four clients the
+        same tp_rank and therefore the same bytes. Every one of them reading upstream is
+        the ``N x M`` duplication this item exists to remove -- one reads upstream and
+        the others take it over NVLink.
+
+        Returns only the *redirected* reads, keyed by the client that should now read
+        from a peer. A client absent from the result reads upstream unchanged, so the
+        structure is additive and a consumer that ignores it still behaves correctly.
+
+        Two rules the correctness rests on:
+
+        * **Same node only.** A cross-node peer read costs the same NIC as reading
+          upstream, so it buys nothing in the currency that is scarce (design 3.5.2's
+          phase one).
+        * **Single hop.** The designated reader is always the one that read upstream,
+          never one that was itself redirected, so no chain forms. Picking the
+          lowest-named wanter deterministically is what guarantees this: the designated
+          reader is never in the redirected set.
+        """
+        node_of = {name: info.node_ip for name, info in clients.items()}
+
+        # (node, key, shard) -> clients on that node wanting exactly those bytes.
+        wanted: dict[tuple[str, str, tuple[int, ...]], list[str]] = {}
+        # (client, key, shard) -> the upstream source the plan chose, for the designate.
+        upstream_of: dict[tuple[str, str, tuple[int, ...]], str] = {}
+
+        for pull_client, key_plans in pull_plan.items():
+            node = node_of.get(pull_client)
+            if node is None:
+                continue
+            for key, per_source in key_plans.items():
+                for source, shard_indices in per_source.items():
+                    for shard_idx in shard_indices:
+                        wanted.setdefault((node, key, shard_idx), []).append(pull_client)
+                        upstream_of[(pull_client, key, shard_idx)] = source
+
+        peer_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]] = {}
+        for (_node, key, shard_idx), wanters in wanted.items():
+            if len(wanters) < 2:
+                continue
+            # Deterministic so the index can predict holders without communicating, and
+            # so the designate is stable across replans.
+            designate, *followers = sorted(wanters)
+            for follower in followers:
+                peer_plan.setdefault(follower, {}).setdefault(key, {}).setdefault(
+                    designate, []
+                ).append(shard_idx)
+
+        for key_plans in peer_plan.values():
+            for per_source in key_plans.values():
+                for shard_list in per_source.values():
+                    shard_list.sort()
+        return peer_plan
 
     def _build_pull_chunk_plan(
         self,

@@ -266,6 +266,18 @@ class NIXLStorageClient:
             return iter(())
         return self._comm_plan.iter_rollout_pull_work(self.client_name)
 
+    def peer_sources_for(self, key: str) -> set[str]:
+        """Same-node peers this client is planned to read ``key`` from (item D1).
+
+        Exposed so a caller can tell a peer read from an upstream one. That distinction
+        is not cosmetic: a peer read is only valid after the peer's own upstream read has
+        completed, and issuing it early *succeeds* against an unfilled buffer rather than
+        failing. A caller without a cross-actor barrier must defer these.
+        """
+        if self._comm_plan is None:
+            return set()
+        return set(self._comm_plan.get_peer_pull_plan(self.client_name, key))
+
     def _get_temp_desc_bytes(self, client_name: str, key: str, shard_idx: tuple[int, ...]) -> bytes | None:
         """Get temporary descriptor for non-contiguous shard"""
         assert client_name in self._all_temp_mappings, f"Client {client_name} not found in temp mappings."
@@ -1295,8 +1307,23 @@ class NIXLStorageClient:
         shards_to_transfer = []
         if plan and self.client_type == NIXLClientType.PULL_SIDE:
             pull_plan = plan.get_rollout_pull_plan(self.client_name, key)
+            # D1: a peer read's source is another rollout client, which never appears in
+            # the upstream plan, so the peer plan is consulted only when the upstream one
+            # does not name this target.
+            #
+            # The upstream read is deliberately *not* trimmed by what the peer plan
+            # covers. Trimming would make the two paths mutually dependent: a caller
+            # that defers peer reads -- which it must, absent a barrier guaranteeing the
+            # peer has already read the bytes -- would silently lose exactly those
+            # shards. Leaving the upstream read whole means peer reads are an
+            # optimisation a caller may skip, never a step it must take to be correct.
+            # The cost of issuing both is a duplicate read, which is what diffusion was
+            # meant to avoid; the cost of trimming is wrong weights with no error.
+            peer_plan = plan.get_peer_pull_plan(self.client_name, key)
             if target_client in pull_plan:
                 shards_to_transfer = pull_plan[target_client]
+            elif target_client in peer_plan:
+                shards_to_transfer = peer_plan[target_client]
         elif plan and self.client_type == NIXLClientType.PUSH_SIDE:
             push_plan = plan.get_train_pull_plan(self.client_name, key)
             if target_client in push_plan:

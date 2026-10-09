@@ -188,6 +188,18 @@ class CommunicationPlanner:
             self._make_pull_from_ps_plan(
                 clients, rollout_pull_client_groups, ps_for_rollout_pull_client_groups, rollout_pull_from_ps_plan
             )
+        elif rollout_pull_client_groups and push_client_groups:
+            # D3: trainer direct supply. With no PS in the cluster the rollout reads
+            # from the train clients themselves, which is the same planner with a
+            # different source set rather than a second code path -- the thing being
+            # removed is the intermediate copy, not the planning.
+            #
+            # Dispatching on "is there a PS" rather than on a mode flag keeps the two
+            # arrangements from drifting: a cluster either has PS clients registered or
+            # it does not, and that fact is already in `clients`.
+            self._make_pull_from_ps_plan(
+                clients, rollout_pull_client_groups, push_client_groups, rollout_pull_from_ps_plan
+            )
 
         # B1: chunk plan for the rollout pull side, where the pipeline and the wire
         # buffer live. The push side writes whole shards into PS buffers and has no

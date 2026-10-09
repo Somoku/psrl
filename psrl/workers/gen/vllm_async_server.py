@@ -1064,9 +1064,17 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                     (self.base_worker_id, data_parallel_rank)
                 )
             )
-        assert curr_model_version >= ps_version, (
-            f"Pulled model version is stale: current={curr_model_version}, required={ps_version}."
-        )
+        # D6: falling short of the target is a degradation, not a failure. Raising here
+        # reached `_finish_gateway_sync`'s except branch, which calls `fail_sync` and
+        # pauses the instance -- so the replica went *unavailable*, the opposite of
+        # "keep the current version and keep generating". The caller is told the real
+        # version instead and decides; D7's whole-DP-group failure lands here, so
+        # leaving the assert would make that path quarantine replicas on its first run.
+        if curr_model_version < ps_version:
+            psrl_logger.warning(
+                f"Pull did not reach the target version: have {curr_model_version}, "
+                f"wanted {ps_version}. Continuing to generate at {curr_model_version}."
+            )
         for dp_rank in data_parallel_ranks:
             self.curr_rollout_instance_model_version[dp_rank] = curr_model_version
         self.kv_set_current_version(curr_model_version)

@@ -55,8 +55,17 @@ class SyncAndMigrateMixin:
                 for instance_id in replica_instance_ids:
                     self.set_rollout_instance_model_version(instance_id, actual_version)
                     self.instance_to_version_after_sync[instance_id] = actual_version
-                if actual_version != advertised_version:
-                    actual_updates.extend(build_weight_version_updates(replica_instance_ids, actual_version))
+                # D6: published unconditionally, for the version actually reached. The
+                # earlier form published only on a mismatch because the target had
+                # already been announced optimistically; with that pre-announcement
+                # gone, a replica that hit its target would otherwise never be
+                # published at all.
+                actual_updates.extend(build_weight_version_updates(replica_instance_ids, actual_version))
+                if actual_version < advertised_version:
+                    psrl_logger.warning(
+                        f"Replica {replica_id!r} degraded to version {actual_version} "
+                        f"(target {advertised_version}) and stays in service."
+                    )
             if actual_updates:
                 await self._publish_weight_version_updates(actual_updates)
             await asyncio.gather(
@@ -164,13 +173,19 @@ class SyncAndMigrateMixin:
                     self.server_handles[replica_id].pull_model_for_sync.remote(self.ps_model_version)
                     for replica_id in replica_ids
                 ]
-                updates = build_weight_version_updates(instance_ids, self.ps_model_version)
-                await self._publish_weight_version_updates(updates)
-                for instance_id in instance_ids:
-                    self.instance_to_version_after_sync[instance_id] = self.ps_model_version
+                # D6: the version is published once the pull has landed, not before it.
+                # Announcing the target up front left a window in which SMG recorded
+                # v+1 while the instance still held v, so requests arriving in that
+                # window were accounted against weights they were not generated with --
+                # a staleness ledger that disagrees with reality and that nothing
+                # downstream can detect. `_finish_gateway_sync` publishes the version
+                # each replica actually reached.
+                #
+                # Routing resumes here regardless: the instance is serving its current
+                # weights, which is exactly what the ledger still says it has.
                 await self._set_routing_loop_running(True)
                 psrl_logger.info(
-                    f"Published model version and resumed routing: version={self.ps_model_version}, "
+                    f"Resumed routing while the pull completes: target={self.ps_model_version}, "
                     f"replicas={replica_ids!r}."
                 )
             except Exception:

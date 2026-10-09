@@ -11,6 +11,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.converter.param_sync import ParamSyncPlan
 from psrl.utils.logger import DualOutputHandler
+from psrl.workers.train.step_boundary import StepBoundaryRecorder
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -51,6 +52,8 @@ class PSRL_BaseTrainWorker:
         self.nixl_wait_thread_lock = threading.Lock()
         self.nixl_wait_completed = threading.Event()
         self.nixl_wait_exception: BaseException | None = None
+        #: Train-step boundaries and the versions published at them (item C3).
+        self.step_boundaries = StepBoundaryRecorder()
 
         self.log_prefix = f"BaseTrainWorker_R{self.rank}"
         psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
@@ -224,6 +227,11 @@ class PSRL_BaseTrainWorker:
                 psrl_logger.debug("Barrier done, now pushing model tag to the PS on the representative rank...")
                 if self.worker_rank == 0:
                     ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version))
+                    # C3: the publication point, recorded where it happens. The weights
+                    # are in place (the optimizer step returned before push_model was
+                    # called) and the NIC has just gone idle (every shard was waited on
+                    # above), which is the moment the design asks publication to land on.
+                    self.step_boundaries.on_train_step_end(version=next_ps_model_version)
                 self.nixl_storage_client.clear_intermediate_cached_data()
                 psrl_logger.debug(
                     f"All NIXL push operations completed. Model version={next_ps_model_version} was pushed to the PS."

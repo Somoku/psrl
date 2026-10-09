@@ -465,6 +465,9 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 ps_manager_handle.push_model_state_dict_cpu_ref_list.remote(next_version, [object_ref])
             else:
                 raise NotImplementedError(f"ray_push_model does not support ps_mode='{self.psrl_config.ps_mode}'.")
+            # C3: record the publication point on this path too, so the boundary trace
+            # does not depend on which ps_mode is configured.
+            self.step_boundaries.on_train_step_end(version=next_version)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     @gpu_memory_logger_decorator(log_only_rank_0=False)

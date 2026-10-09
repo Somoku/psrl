@@ -915,27 +915,56 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 - [x] **B1 已落地并验证**：`psrl/utils/nixl/chunking.py` 分离 chunk 与 commit group。
       11GB 单 key 切 22 个 chunk 且偏移正确；**group 全齐才可见，半个 group 抛错并点名缺哪些 chunk**；
       **chunk 大小改变不影响 group 成员**（4 种 chunk size 验证）。`test_chunking.py` 22 passed
-- [x] **B2 已落地并验证**：`psrl/utils/nixl/slot_ack.py` 的 `SlotAckTable`。
+- [ ] **B2 接线推迟到阶段 D**（模块已完成，见下）。
+      `slot_ack.py` 保护的是「`2×chunk` 循环复用时下一轮 cast 覆盖慢读者正在读的字节」，
+      而 **cast 产物作为发布缓冲是阶段 D（trainer 直供）才引入的东西**：
+      当前链路里 rollout 从 PS 的 pinned 缓冲读，不存在循环复用的 wire buffer
+      （grep `wire_buffer` 与 cast 路径在 `psrl/` 零命中，仅 `chunk_size.py` 的参数名）。
+      依赖图写的「B2 依赖 A3」在模块层面成立，但**实际的 wire buffer 由 D 创建**，
+      所以 B2 应与 D6/D7/D8 同批，而不是现在接到一个不存在的调用点上。
+- [x] **B2 模块已完成并验证**：`psrl/utils/nixl/slot_ack.py` 的 `SlotAckTable`。
       **2 个 slot 服务 16 个 reader**（不随 W 增长);slot 耗尽时**抛错而非覆盖**,
       错误点名在等哪个 reader;**`forget_reader` 让死掉的 reader 自动收敛**——
       这正是选 bitmap 而非计数器的理由(计数器会永久泄漏)。`test_slot_ack.py` 20 passed
 - [ ] B3 chunk 按 cost model 计算；轮级 RPC == 0
 
 ### 阶段 C
-- [x] **C1 已落地并验证**：`psrl/utils/nixl/moe_grouping.py`。
-      **真实 checkpoint 实测**：Qwen3-30B-A3B 18867 → 579 key（32.6×），
-      48 层 × 3 投影 = 144 个 expert group，expert 数与 config 一致，
-      **无 key 丢失**（覆盖集 ⊎ 透传集 == 全集）；dense 模型零改动。
+- [x] **C1 已落地并验证**：`psrl/utils/nixl/moe_grouping.py` + `BaseConverter.maybe_group_experts`。
+      **真实 checkpoint 端到端实测**（经 HF converter）：Qwen3-30B-A3B 18867 → 579 key（32.6×），
+      144 个 expert group，每个 key 128 shard、`shard_mesh {0: 128}`；
+      `client_info` pickle **3.475MB → 0.324MB（10.7×）**；dense 模型零改动（Qwen3-1.7B 311 key，无分组）。
       **关键正确性**：expert id 必须**数值排序而非字典序**——
       字典序会把 expert 10 排在 2 前面,静默置换所有 expert。
-      `test_moe_grouping.py` 26 passed
-- [ ] C2 稳态 rollout→PS RPC == 0；控制面消息非平方增长
-- [ ] C3 发布时刻紧跟 param all-gather，不与 backward NCCL 重叠
+      5 节点 e2e 通过（16 个 gen client 全部 399/399 坐标匹配）。
+      `test_moe_grouping.py` 42 + `test_shard_meta_interning.py` 12 + `test_moe_grouping_gpu.py` 9 passed
 
-### 阶段 C
-- [ ] C1 key 数 14 万→数百；`client_info` 56MB→数百 KB；MoE 两维 shard 跑通
+      **三处设计文档未写明、由实测确定的事实**：
+      1. **两侧 expert 存储结构不同**：vLLM 的 `w13_weight` 是一个 fused 3-D 张量
+         （expert 轴是真实张量维度），而 Megatron/TE 每个 expert 是独立的 `torch.empty`
+         （TE `grouped_linear.py` 按 GEMM 注册 `weight{i}`），彼此不共享 storage。
+         所以一个 grouped key 在一侧是 1 个张量、在另一侧是 N 个——`GroupedShards` 即为此而设。
+         强行 stack 成单张量会在每次同步复制整个 MoE，**比分组省下的元数据还大**。
+      2. **10.7× 中只有 2.5× 来自分组本身**，其余来自 **shard metadata 的 interning**：
+         128 个 expert 的 metadata 对象「相等但非同一」，而 pickle 按 identity 记忆化
+         （实测 7473 B vs 488 B）。不做 interning 会把 key 数的收益大半吐回去。
+      3. **§3.5.5(b) 的 strided 16384:1 压缩只适用于 vLLM 侧**。
+         实测真实尺寸（768×2048）下 Megatron 相邻 expert 分配**不是均匀跨步**，
+         单条 strided descriptor 覆盖不了，所以训练侧的 per-expert descriptor 不可约。
+         分组后随 expert 数增长的是 **descriptor 而非 metadata**，
+         判据应是「远低于线性」而不是「常数」。
 - [ ] C2 稳态 rollout→PS RPC == 0；控制面消息非平方增长
-- [ ] C3 发布时刻紧跟 param all-gather，不与 backward NCCL 重叠
+- [x] **C3 已落地并验证**：`psrl/workers/train/step_boundary.py` 的 `StepBoundaryRecorder`，
+      NIXL 与 Ray 两条发布路径都记录。`test_step_boundary.py` 13 passed。
+
+      **一处设计文档的事实更正**：本文原方案要求把发布挂到 Megatron-Bridge 的
+      `on_train_step_end`。该回调确实存在且时机正确（`train.py` 中在 `wrapped_train_step`
+      之后触发），但**在 PSRL 中永远不会触发**——它属于 Bridge 自己的 `pretrain`/`train`
+      循环，而 PSRL 只用 Bridge 做**模型转换**（`megatron_converter` 的 `AutoBridge`），
+      RL 的 optimizer step 走 verl 的 `train_mini_batch`；全仓库没有任何 `pretrain()` 调用。
+      挂上去会**正常导入、正常运行、永不触发**，失败形态是发布 trace 恒为空。
+      因此边界定义在 PSRL 实际运行的循环上。设计想要的时序其实**已经结构性成立**
+      （`update_actor` 在 optimizer step 返回后立刻调 `push_model`，NIXL 路径又在所有
+      shard wait 完成后才发布），缺的只是**可观测性**——而那正是判据要求验证的东西。
 
 ### 阶段 D（不可分割）
 - [ ] D1 trainer 出口 == `M`；每节点入口 == `M_v`；AGST 亚线性；无链式 peer

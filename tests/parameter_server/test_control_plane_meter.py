@@ -12,7 +12,6 @@ from __future__ import annotations
 import threading
 
 import pytest
-
 from psrl.workers.ps.control_plane_meter import ControlPlaneMeter
 
 pytestmark = pytest.mark.cpu_test
@@ -135,13 +134,158 @@ class TestVersionReadIsEliminated:
             "must read it back with a second round trip"
         )
 
-    def test_caller_prefers_the_reported_version(self):
+    def test_caller_prefers_the_committed_version(self):
+        """The sync must read the version from the commit, not fetch it again."""
         from pathlib import Path
 
         import psrl.workers.gen as gen_pkg
 
         source = (Path(gen_pkg.__file__).parent / "vllm_async_server.py").read_text()
-        assert "curr_model_version = self._last_pulled_model_version" in source
+        assert "lock.committed_version" in source, (
+            "the sync no longer takes its version from the commit that rides on the "
+            "lock release, so it must be fetching it with a round trip"
+        )
         assert "self._last_pulled_model_version = None" in source, (
             "a version left over from the previous sync would be recorded as this one's"
         )
+
+
+class TestCommitRidesOnTheLockRelease:
+    """C2's second elimination: the commit and the release are one round trip.
+
+    They are the two halves of "this pull finished" and always happen together, so
+    charging two round trips for them is exactly the redundancy C2 targets.
+    """
+
+    class _FakeRemote:
+        """Stands in for a Ray actor method: `.remote()` returns an awaitable."""
+
+        def __init__(self, owner, name):
+            self._owner = owner
+            self._name = name
+
+        def remote(self, *args, **kwargs):
+            self._owner.calls.append(self._name)
+            result = self._owner.results.get(self._name)
+
+            async def _awaitable():
+                return result
+
+            return _awaitable()
+
+    class FakePSManager:
+        """Records which actor methods were called, in order."""
+
+        def __init__(self, acquire_results=None):
+            self.calls: list[str] = []
+            self.results = {
+                "_try_acquire_shared_pull_lock": True,
+                "_release_shared_pull_lock": None,
+                "finish_shared_pull": 7,
+            }
+            self._acquire_results = list(acquire_results or [])
+
+        def __getattr__(self, name):
+            return TestCommitRidesOnTheLockRelease._FakeRemote(self, name)
+
+    @staticmethod
+    async def _run(manager, commit_ids, body=None):
+        from psrl.utils.ray.lock_context import shared_pull_model_context_async
+
+        lock = shared_pull_model_context_async(manager, poll_interval=0, commit_instance_ids=commit_ids)
+        async with lock:
+            if body is not None:
+                body()
+        return lock
+
+    def test_commit_and_release_are_one_round_trip(self):
+        import asyncio
+
+        manager = self.FakePSManager()
+        lock = asyncio.run(self._run(manager, [(0, 0)]))
+
+        assert manager.calls == ["_try_acquire_shared_pull_lock", "finish_shared_pull"]
+        assert "_release_shared_pull_lock" not in manager.calls
+        assert lock.committed_version == 7
+
+    def test_without_commit_ids_the_exit_only_releases(self):
+        """A caller that already committed must not commit twice."""
+        import asyncio
+
+        manager = self.FakePSManager()
+        asyncio.run(self._run(manager, None))
+
+        assert manager.calls == ["_try_acquire_shared_pull_lock", "_release_shared_pull_lock"]
+
+    def test_a_failed_transfer_does_not_commit_its_version(self):
+        """Committing after a failed pull would record weights never landed."""
+        import asyncio
+
+        manager = self.FakePSManager()
+
+        def explode():
+            raise RuntimeError("transfer failed")
+
+        with pytest.raises(RuntimeError, match="transfer failed"):
+            asyncio.run(self._run(manager, [(0, 0)], body=explode))
+
+        assert "finish_shared_pull" not in manager.calls, "a failed pull committed its version"
+        assert "_release_shared_pull_lock" in manager.calls, "the lock was not released"
+
+
+class TestFinishSharedPullOrdering:
+    """Commit before release, and release even if the commit fails."""
+
+    class _Manager:
+        """Minimal stand-in exercising PSManager.finish_shared_pull's real body."""
+
+        def __init__(self, commit_raises=False):
+            self._shared_pull_count = 1
+            self.order: list[str] = []
+            self._commit_raises = commit_raises
+
+        def pull_model_state_dict_nixl(self, rollout_instance_ids):
+            self.order.append("commit")
+            if self._commit_raises:
+                raise RuntimeError("commit failed")
+            return 11
+
+        def _release_shared_pull_lock(self):
+            self.order.append("release")
+            self._shared_pull_count -= 1
+
+        finish_shared_pull = None  # bound below
+
+    @classmethod
+    def _bind(cls):
+        from psrl.workers.ps.ps_manager import PSManager
+
+        cls._Manager.finish_shared_pull = PSManager.finish_shared_pull
+        return cls._Manager
+
+    def test_version_is_committed_before_the_lock_is_released(self):
+        """Releasing first lets a push advance the version mid-commit.
+
+        The instance would then be recorded at a version newer than the bytes it pulled
+        -- a staleness ledger that disagrees with what was generated.
+        """
+        manager = self._bind()()
+        version = manager.finish_shared_pull([(0, 0)])
+
+        assert manager.order == ["commit", "release"]
+        assert version == 11
+
+    def test_the_lock_is_released_even_when_the_commit_raises(self):
+        """A lock never released stalls every later pull."""
+        manager = self._bind()(commit_raises=True)
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            manager.finish_shared_pull([(0, 0)])
+
+        assert manager.order == ["commit", "release"]
+        assert manager._shared_pull_count == 0
+
+    def test_no_instances_means_release_only(self):
+        manager = self._bind()()
+        assert manager.finish_shared_pull(None) is None
+        assert manager.order == ["release"]

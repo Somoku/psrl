@@ -98,12 +98,15 @@ def exclusive_push_model_context_async(ps_manager, poll_interval=0.01):
     return _AsyncExclusivePushModelContext(ps_manager, poll_interval)
 
 
-def shared_pull_model_context_async(ps_manager, poll_interval=0.01):
+def shared_pull_model_context_async(ps_manager, poll_interval=0.01, commit_instance_ids=None):
     """
     An async context manager that ensures shared access during model pull.
     Allows multiple pull operations to run concurrently, but blocks if a push is in progress.
+
+    Pass ``commit_instance_ids`` to commit those instances' version as part of releasing
+    the lock, which costs one round trip rather than two (item C2).
     """
-    return _AsyncSharedPullModelContext(ps_manager, poll_interval)
+    return _AsyncSharedPullModelContext(ps_manager, poll_interval, commit_instance_ids)
 
 
 class RayLock:
@@ -333,16 +336,23 @@ class _AsyncSharedPullModelContext:
     Allows multiple pull operations to run concurrently, but blocks if a push is in progress.
     """
 
-    def __init__(self, ps_manager, poll_interval=0.01):
+    def __init__(self, ps_manager, poll_interval=0.01, commit_instance_ids=None):
         """
         Initialize the async shared pull model context.
 
         Args:
             ps_manager: The PSManager instance
             poll_interval: The interval (in seconds) between polling checks. Default is 0.01 seconds.
+            commit_instance_ids: Rollout instances whose version should be committed as
+                part of releasing the lock (item C2). When given, the exit path makes one
+                round trip instead of two; the committed version is then available as
+                `committed_version`. When None the exit only releases, which is what a
+                caller that has already committed needs.
         """
         self.ps_manager = ps_manager
         self.poll_interval = poll_interval
+        self.commit_instance_ids = commit_instance_ids
+        self.committed_version = None
 
     async def __aenter__(self):
         """Enter the context, acquiring shared lock."""
@@ -359,8 +369,18 @@ class _AsyncSharedPullModelContext:
             await asyncio.sleep(self.poll_interval)
 
     async def __aexit__(self, exc_type, exc, exc_tb):
-        """Exit the context, releasing shared lock."""
+        """Exit the context, releasing the shared lock and optionally committing."""
         from psrl.workers.ps.control_plane_meter import GLOBAL_CONTROL_PLANE_METER
+
+        if self.commit_instance_ids is not None and exc_type is None:
+            # One round trip for commit + release (C2). Skipped when the body raised:
+            # the transfer did not complete, so committing its version would record
+            # weights the instance never landed.
+            GLOBAL_CONTROL_PLANE_METER.record("finish_shared_pull")
+            self.committed_version = await self.ps_manager.finish_shared_pull.remote(
+                self.commit_instance_ids
+            )
+            return False
 
         GLOBAL_CONTROL_PLANE_METER.record("release_shared_pull_lock")
         await self.ps_manager._release_shared_pull_lock.remote()

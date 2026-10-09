@@ -134,6 +134,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         #: sync would be recorded as this sync's version, which is worse than the round
         #: trip it saves because nothing downstream could detect it.
         self._last_pulled_model_version: int | None = None
+        #: Set while a pull runs under the shared-pull lock, so the version commit can
+        #: ride on the lock release instead of costing its own round trip (item C2).
+        self._pull_commit_deferred: bool = False
+        self._pull_commit_instance_ids = None
 
         # Gateway HTTP client (connection pooled)
         self._gateway_client: aiohttp.ClientSession | None = None
@@ -1032,14 +1036,27 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             self.kv_set_current_version(curr_model_version)
             return curr_model_version
 
-        async with shared_pull_model_context_async(self.gen_interface.ps_manager_handle):
-            with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
-                await self.pull_model()
+        # C2: the pull defers its version commit so it can ride on the lock release.
+        # `_pull_commit_instance_ids` is set by `pull_model` and consumed here.
+        self._pull_commit_deferred = True
+        self._pull_commit_instance_ids = None
+        try:
+            lock = shared_pull_model_context_async(self.gen_interface.ps_manager_handle)
+            async with lock:
+                with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
+                    await self.pull_model()
+                lock.commit_instance_ids = self._pull_commit_instance_ids
+        finally:
+            self._pull_commit_deferred = False
 
-        # C2: `pull_model` reports the version it landed on, so the steady-state path
-        # makes no round trip here. The read remains for the modes that do not report
-        # one, rather than being assumed unreachable.
-        curr_model_version = self._last_pulled_model_version
+        # The commit reports the version it assigned, so the steady-state path makes no
+        # round trip here. The read remains for the modes that commit no version, rather
+        # than being assumed unreachable.
+        curr_model_version = (
+            lock.committed_version
+            if lock.committed_version is not None
+            else self._last_pulled_model_version
+        )
         if curr_model_version is None:
             GLOBAL_CONTROL_PLANE_METER.record("get_rollout_instance_model_version")
             curr_model_version = (
@@ -1113,14 +1130,19 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                     self._cached_ps_nixl_gen_storage_client_names,
                 ),
             )
+        # C2: the version commit is not made here. It rides on the shared-pull lock
+        # release (`finish_shared_pull`), which has to happen anyway -- so the commit
+        # costs no round trip of its own. `_pull_commit_instance_ids` tells the lock
+        # context which instances to commit; a caller holding no lock commits directly.
         data_parallel_ranks = range(self.get_instance_num())
         pulled_instance_ids = [(self.base_worker_id, data_parallel_rank) for data_parallel_rank in data_parallel_ranks]
-        GLOBAL_CONTROL_PLANE_METER.record("pull_model_state_dict_nixl")
-        # C2: the call returns the version it just assigned, so the caller no longer
-        # needs a second round trip to read it back.
-        self._last_pulled_model_version = await ps_manager_handle.pull_model_state_dict_nixl.remote(
-            pulled_instance_ids
-        )
+        if self._pull_commit_deferred:
+            self._pull_commit_instance_ids = pulled_instance_ids
+        else:
+            GLOBAL_CONTROL_PLANE_METER.record("pull_model_state_dict_nixl")
+            self._last_pulled_model_version = await ps_manager_handle.pull_model_state_dict_nixl.remote(
+                pulled_instance_ids
+            )
         psrl_logger.info("NIXL pull model done.")
 
     async def ray_pull_model(self) -> None:

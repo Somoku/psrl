@@ -1123,6 +1123,34 @@ class PSManager(RequestStatusTracker):
         assert self._shared_pull_count > 0, "Shared pull lock count is already 0"
         self._shared_pull_count -= 1
 
+    def finish_shared_pull(
+        self,
+        rollout_instance_ids: "RolloutInstanceId | list[RolloutInstanceId] | None" = None,
+    ) -> int | None:
+        """Commit a pull's version and release its shared lock in one round trip (C2).
+
+        These are the two halves of "this pull finished" and always happen together, so
+        charging two round trips for them is the cost C2 exists to remove.
+
+        Order matters and is not interchangeable: the version is committed *before* the
+        lock is released. Releasing first would open a window where a push can take the
+        exclusive lock and advance the version, after which this commit would record the
+        newer version against an instance that pulled the older bytes -- a staleness
+        ledger that disagrees with what was actually generated, which nothing downstream
+        can detect.
+
+        The release still happens if the commit raises, since a lock that is never
+        released stalls every later pull, which is a worse failure than a lost version
+        update that the next sync re-derives.
+        """
+        version: int | None = None
+        try:
+            if rollout_instance_ids is not None:
+                version = self.pull_model_state_dict_nixl(rollout_instance_ids)
+        finally:
+            self._release_shared_pull_lock()
+        return version
+
     @_state_locked
     def init_model_version_for_resume(self, version: int):
         """

@@ -968,9 +968,16 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 
 ### 阶段 D（不可分割）
 
-> **当前状态**：D1/D2/D5/D6/D7/D8 的**逻辑层已落地并单测通过**，D3 完成了 planner 一半。
-> 尚未执行任何删除 —— `PSStorageWorker` 仍在，链路仍走 PS。
-> 这是刻意的顺序：先让直供的 plan 跑通，删除才有可对照的基准。
+> **当前状态**：D1/D2/D5/D6/D7/D8 的**逻辑层已落地并单测通过**；
+> **直供链路已在 5 节点集群端到端跑通**（无任何 PS 进程，16 个 gen client 全部 399/399）。
+> 代码层面的删除（`PSStorageWorker` 等）尚未执行 —— 先让直供跑通，删除才有可对照的基准。
+>
+> **一条必须先说的事实**：在 `6314bde` 之前，所有多节点 e2e 的 **Ray actor 导入的是
+> `psrl_main` 这个另一个 checkout，而非本工作树**。driver 跑本树、actor 跑那棵树，
+> 于是测试测的是工作树里并不存在的代码 —— 而且**会通过**。
+> 此前为 C1/C2/C3/D6 声称的集群验证因此作废，已全部重跑；
+> 单测与 driver 进程内的字节级测量（18867→579、interning 体积、跨节点带宽）不受影响。
+> 验证方法与复现见 memory 的 `psrl-ray-actors-import-other-checkout`。
 
 - [x] **D1 已落地（模块）**：`psrl/utils/nixl/source_resolution.py`。
       trainer 出口 == 节点数（4 节点 × 8 reader 实测为 4 次而非 32 次）；
@@ -986,11 +993,33 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       pull 准入四类拒绝（非 holder / 版本不符 / 二手 holder / 角色未发布）；
       在飞读者为 per-chunk 整数，释放前断言归零且**报错点名是哪些 chunk**。
       `test_holder_index.py` 21 passed
-- [ ] **D3 部分落地**：planner 已支持「集群内无 PS 时 rollout 直接从 train client 读」
-      （`test_direct_supply_plan.py` 8 passed），PS 存在时路径完全不变。
+- [ ] **D3 部分落地：直供链路已端到端打通，删除未做**。
+      5 节点实测（`nixl_e2e_5node_direct.yaml`，与 PS 版仅差一行配置）：
+      **exit=0，16 个 gen client 全部 399/399，运行中零 `PSStorageWorker` 进程**，
+      gen 从 train client 直接拉取。PS 路径同时复测通过（exit=0，16/16，pull 1.14s）。
+
+      **跑通过程中暴露的两个真实阻塞点**（planner 改动本身覆盖不到）：
+      1. **meta server 不给 rollout 任何 descriptor**。
+         `_get_relevant_client_names_for_agent` 只会把 `PS_FOR_PULL` 发给 `PULL_SIDE`，
+         无 PS 时该集合为空，首次读直接报
+         `target client not found in client infos`——看起来像握手 bug，
+         实际是过滤器没跟上。现改为**按注册情况判断**，与 planner 的分派方式一致。
+         测试同时校验 PS 路径的扇出**没有变宽**，否则「永远加上 train client」
+         也能让直供用例通过。
+      2. **`client_read` 在查 plan 之前就解引用对端的 tensor info**。
+         PP 下每个 train rank 只持有本 stage 的 key，向 rank 0 要 rank 12 的 key
+         会抛裸 `KeyError`——读起来像权重丢失，实则是正常的 PP 分片。
+         对 PS 从不触发（每个 PS worker 持有全部 key），所以这个顺序一直是
+         **碰巧安全**而非设计安全。`client_write` 同步加了同样的保护。
+
+      **性能现状要如实说**：直供 pull 2.59s vs PS 路径 1.14s。
+      这是预期之内且尚未处理的——当前每个 rollout 都去读**每一个** train rank，
+      正是 D1 的选源要消除的 `N×M`。接线 D1 是下一步。
+
       **仍待做**：删除 `PSStorageWorker` / `create_ps_worker_group` / push 路径 /
-      `ps_mode` 枚举，以及 `ParamSyncPlan` 的 push 成对语义改造。
-      判据（无 PS 进程、CPU 权重 == 0、cast 显存上界 `2×chunk`）需删除后实测。
+      `ps_mode` 枚举，以及 `ParamSyncPlan` 的 push 成对语义改造；
+      接线 D1 选源以消除 `N×M`。
+      判据（CPU 权重 == 0、cast 显存上界 `2×chunk`）需删除后实测。
 - [ ] D4 首次切回读盘、稳态切回从 CPU reload 且版本 == eval 前版本
 - [x] **D5 已落地**：`psrl/utils/nixl/chunk_offset.py`。
       偏移**向下**吸附到 commit group 边界（逐 instance 验证每个 group 在读序中连续），

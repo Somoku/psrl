@@ -1,9 +1,13 @@
+import logging
 import math
+import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 
 import torch
 from torch.nn import Parameter
+
+from psrl.utils.nixl.moe_grouping import group_expert_tensors, grouping_report
 
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
@@ -14,6 +18,9 @@ from psrl.utils.converter.model_mappings import (
     reshape_qkv_to_3d,
 )
 from psrl.utils.nixl.nixl_spec import NIXLSharding
+
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 class BaseConverter(ABC):
@@ -29,6 +36,37 @@ class BaseConverter(ABC):
                 model_info is populated lazily by the subclass during conversion.
         """
         self.model_info = parameter_mapping.get_model_info() if parameter_mapping is not None else {}
+
+    def maybe_group_experts(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        sharding_dict: dict[str, NIXLSharding],
+    ) -> tuple[dict, dict[str, NIXLSharding]]:
+        """Collapse per-expert keys into grouped keys (implementation item C1).
+
+        Applied here rather than in each converter because all four produce the same
+        canonical per-expert namespace: whatever a backend calls its expert weights, by
+        this point they are ``...experts.<id>.<projection>``. Grouping at the point they
+        converge keeps one rule instead of four.
+
+        A no-op for dense models and whenever ``num_experts`` is absent, so a config that
+        never mentions experts is unaffected rather than needing a flag.
+        """
+        num_experts = self.model_info.get("num_experts")
+        if not isinstance(num_experts, int) or isinstance(num_experts, bool) or num_experts <= 0:
+            return state_dict, sharding_dict
+
+        grouping = group_expert_tensors(state_dict, sharding_dict, num_experts=num_experts)
+        if grouping.groups:
+            report = grouping_report(list(state_dict))
+            psrl_logger.info(
+                "[moe grouping] %d keys -> %d (%.1fx) across %d expert groups",
+                report["keys_before"],
+                report["keys_after"],
+                report["reduction"],
+                report["expert_groups"],
+            )
+        return grouping.state_dict, grouping.sharding_dict
 
     def maybe_reshape_qkv_to_3d(
         self,

@@ -176,7 +176,7 @@ class MegatronConverter(BaseConverter):
                 self.sync_plan.add(DTypeCastSync(key=key, source_param=tensor))
                 converted_state_dict[key] = tensor.float()
 
-        return converted_state_dict, sharding_dict
+        return self.maybe_group_experts(converted_state_dict, sharding_dict)
 
     def convert_parameter(self, full_name: str, param: Parameter, mapping: MegatronParamMapping) -> dict:
         """

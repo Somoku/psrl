@@ -56,7 +56,7 @@ class HFConverter(BaseConverter):
             for new_param_name, (new_param, new_sharding) in converted_params.items():
                 converted_state_dict[new_param_name] = new_param
                 sharding_dict[new_param_name] = new_sharding
-        return converted_state_dict, sharding_dict
+        return self.maybe_group_experts(converted_state_dict, sharding_dict)
 
 
 def maybe_convert_to_smaller_parts(model_info, param_name, param):

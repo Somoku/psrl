@@ -280,7 +280,7 @@ class FSDPConverter(BaseConverter):
             for converted_name, (converted_param, converted_sharding) in converted_params.items():
                 converted_state_dict[converted_name] = converted_param
                 sharding_dict[converted_name] = converted_sharding
-        return converted_state_dict, sharding_dict
+        return self.maybe_group_experts(converted_state_dict, sharding_dict)
 
     def get_sharding_for_param(self, param_name: str, param: DTensor) -> NIXLSharding:
         """

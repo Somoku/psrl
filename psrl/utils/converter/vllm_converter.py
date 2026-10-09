@@ -199,7 +199,7 @@ class VllmConverter(BaseConverter):
                     converted_state_dict[converted.name] = converted_param
                     sharding_dict[converted.name] = sharding
 
-        return converted_state_dict, sharding_dict
+        return self.maybe_group_experts(converted_state_dict, sharding_dict)
 
     def convert_state_and_sharding_dict(self, model) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
         """
@@ -273,7 +273,7 @@ class VllmConverter(BaseConverter):
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding_for_param
 
-        return converted_state_dict, sharding_dict
+        return self.maybe_group_experts(converted_state_dict, sharding_dict)
 
     def convert_parameter(
         self,

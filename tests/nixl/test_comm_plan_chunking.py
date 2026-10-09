@@ -187,3 +187,49 @@ class TestPlanSurvivesSerialization:
         assert len(after_chunks) == len(before_chunks)
         assert [g.name for g in after_groups] == [g.name for g in before_groups]
         assert [g.chunk_indices for g in after_groups] == [g.chunk_indices for g in before_groups]
+
+
+class TestChunkSizeComesFromTheCostModel:
+    """B3: the budget is computed per client, not a constant.
+
+    The judgement the design asks for is that *doubling the model changes the chunk
+    byte size*, not merely the chunk count -- a fixed budget would keep bytes constant
+    and only add rounds.
+    """
+
+    @staticmethod
+    def _default_plan(keys_to_shape):
+        """No explicit chunk_bytes, so the cost model decides."""
+        return CommunicationPlanner().make_comm_plan(_clients(keys_to_shape))
+
+    def test_default_planner_produces_a_chunk_plan(self):
+        chunks, groups = self._default_plan({"a": (2048, 2048)}).get_pull_chunks("pull0")
+        assert chunks and groups
+
+    def test_chunk_size_responds_to_payload_size(self):
+        """A much larger payload must not be cut with the same byte budget."""
+        small = self._default_plan({"a": (512, 512)}).get_pull_chunks("pull0")[0]
+        large = self._default_plan(
+            {f"k{i}": (4096, 4096) for i in range(8)}
+        ).get_pull_chunks("pull0")[0]
+
+        small_budget = max(c.nbytes for c in small)
+        large_budget = max(c.nbytes for c in large)
+        assert large_budget != small_budget, (
+            "chunk byte size did not change with payload size, so the budget is still "
+            f"effectively a constant ({small_budget} bytes in both cases)"
+        )
+
+    def test_explicit_budget_still_wins(self):
+        """Pinning the budget must override the cost model: the sweep needs that."""
+        budget = 2 * MB
+        plan = _plan({"a": (2048, 2048)}, chunk_bytes=budget)
+        chunks, _groups = plan.get_pull_chunks("pull0")
+        assert all(c.nbytes <= budget for c in chunks)
+        assert max(c.nbytes for c in chunks) == budget
+
+    def test_cost_model_budget_is_positive_and_bounded_by_payload(self):
+        keys = {"a": (1024, 1024)}
+        chunks, _groups = self._default_plan(keys).get_pull_chunks("pull0")
+        total = sum(c.nbytes for c in chunks)
+        assert all(0 < c.nbytes <= total for c in chunks)

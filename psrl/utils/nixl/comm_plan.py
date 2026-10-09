@@ -9,6 +9,7 @@ PUSH_SIDE to PS and PULL_SIDE from PS communication plans.
 import pickle
 from dataclasses import dataclass, field
 
+from psrl.utils.nixl.chunk_size import choose_chunk_bytes
 from psrl.utils.nixl.chunking import CommitGroup, plan_chunks
 from psrl.utils.nixl.global_vars import GLOBAL_TOPOLOGY
 from psrl.utils.nixl.nixl_spec import NIXLClientInfo, NIXLClientType
@@ -111,7 +112,9 @@ class CommunicationPlanner:
         """Initialize the communication planner"""
         # NOTE(lhy): Restrict communication to matching client groups when enabled.
         self.restrict_client_group_comm = restrict_client_group_comm
-        self.chunk_bytes = chunk_bytes or self.DEFAULT_CHUNK_BYTES
+        # None means "ask the cost model per client" (B3). A value pins every client
+        # to that budget, which is what the chunk-size sweep needs.
+        self.chunk_bytes = chunk_bytes
 
     def make_comm_plan(self, clients: dict[str, NIXLClientInfo]) -> NIXLCommPlan:
         """
@@ -204,7 +207,7 @@ class CommunicationPlanner:
         self,
         clients: dict[str, NIXLClientInfo],
         pull_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]],
-        chunk_bytes: int,
+        chunk_bytes: int | None,
     ) -> dict[str, tuple[list, list]]:
         """Derive each pull client's chunk plan from what it is scheduled to read.
 
@@ -252,7 +255,24 @@ class CommunicationPlanner:
 
             if not groups:
                 continue
-            chunks, resolved = plan_chunks(groups, shard_bytes, chunk_bytes=chunk_bytes)
+
+            # B3: size the chunk from this client's actual payload rather than a
+            # constant. The cost model balances two opposing pressures -- enough rounds
+            # that format cost hides behind RDMA, chunks large enough that completion
+            # polling is not most of the per-chunk time -- and both depend on how many
+            # bytes and keys this particular reader has. A fixed budget is wrong in both
+            # directions as the model or the parallelism changes.
+            #
+            # An explicit chunk_bytes still wins: tests and the chunk-size sweep
+            # (verification item 15b) need to pin it.
+            effective = chunk_bytes
+            if effective is None:
+                total_bytes = sum(shard_bytes.values())
+                effective = choose_chunk_bytes(
+                    model_bytes=total_bytes, n_grouped_keys=len(groups)
+                ).chunk_bytes
+
+            chunks, resolved = plan_chunks(groups, shard_bytes, chunk_bytes=effective)
             chunk_plan[pull_client] = (chunks, resolved)
 
         return chunk_plan

@@ -353,27 +353,28 @@ class TestTwoPhaseExecution:
         """A typo must not silently fall through to reading everything."""
         assert 'assert phase in ("all", "upstream", "peer")' in self._harness()
 
-    def test_the_driver_barriers_between_every_wave(self):
-        """The barrier is inside the wave loop, so wave i lands before i+1 starts.
+    def test_the_driver_barriers_between_the_phases(self):
+        """`ray.get` on every actor between the phases is what makes peer reads safe."""
+        harness = self._harness()
+        upstream_at = harness.index('phase="upstream"')
+        peer_at = harness.index('phase="peer"')
+        between = harness[upstream_at:peer_at]
 
-        Hoisting the `ray.get` out of the loop would still look like a pipeline in a
-        trace while letting a follower read a chunk its designate has not fetched.
+        assert "ray.get" in between, (
+            "the peer phase is issued without waiting for every actor's upstream phase, "
+            "so a peer may be read before it has the bytes"
+        )
+
+    def test_the_harness_records_why_it_is_not_pipelined(self):
+        """The gap is a design one, so it has to be stated where the choice is made.
+
+        A shared wave counter cannot express the dependency: each client's wave list
+        comes from its own plan, so a designate can run out of upstream work while
+        followers still peer-read chunks it was meant to be filling. Three cluster runs
+        failed exactly that way.
         """
         harness = self._harness()
-        loop_at = harness.index("for wave in range(num_waves):")
-        body = harness[loop_at : loop_at + 400]
-
-        assert "ray.get" in body, (
-            "the wave loop issues reads without waiting, so a peer may be read before "
-            "its designate has the chunk"
-        )
-        assert 'phase=f"wave:{wave}"' in body
-
-    def test_the_wave_loop_covers_every_wave(self):
-        """Taking the max across clients is what keeps the loop uniform."""
-        harness = self._harness()
-        assert "wave_counts = ray.get([g.chunk_wave_count.remote() for g in gen_actors])" in harness
-        assert "num_waves = max(wave_counts)" in harness
+        assert "per-chunk completion signalling between rollout actors" in harness
 
     def test_the_waves_can_reach_both_source_kinds(self):
         """A wave mixes upstream and peer reads, so both name sets must be passed."""

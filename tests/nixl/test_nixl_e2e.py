@@ -1254,20 +1254,40 @@ def test_nixl_e2e(cfg: DictConfig):
         all_agent_names = source_agent_names + [a for a, _c in gen_names]
         all_client_names = source_client_names + [c for _a, c in gen_names]
 
-        wave_counts = ray.get([g.chunk_wave_count.remote() for g in gen_actors])
-        num_waves = max(wave_counts) if wave_counts else 0
-        print(f"[PASS] chunk pipeline: {num_waves} waves (max over {len(gen_actors)} clients)")
-
-        for wave in range(num_waves):
-            ray.get(
-                [
-                    g.pull_from_ps.remote(
-                        all_agent_names, all_client_names, phase=f"wave:{wave}"
-                    )
-                    for g in gen_actors
-                ]
-            )
+        # The chunk pipeline is scheduled (`chunk_pipeline.py`, 18 unit tests) but not
+        # driven from here, and the reason is a gap the schedule cannot close on its own.
+        #
+        # A single shared wave counter does not express the dependency. Each client's
+        # wave list is derived from *its own* plan, so a designate that owns fewer chunks
+        # than a follower expects runs out of upstream work while followers are still
+        # peer-reading chunks it was supposed to be filling -- the counter advances for
+        # everyone regardless. Three cluster runs failed on this, each time with the
+        # coordinate judge catching bytes that a peer read before its designate had
+        # them: the ordering looks right per client and is wrong globally.
+        #
+        # Closing it needs the designate's progress to gate the follower's wave, not a
+        # shared index -- i.e. per-chunk completion signalling between rollout actors,
+        # which is `GroupCompletionTracker` plus a notification channel these actors do
+        # not have. That is the next piece of work, not something to approximate here.
+        #
+        # So the harness runs the two-phase arrangement, which is correct and measured:
+        # 16/16 clients at 399/399, slower than no diffusion but not wrong.
+        ray.get(
+            [
+                g.pull_from_ps.remote(source_agent_names, source_client_names, phase="upstream")
+                for g in gen_actors
+            ]
+        )
+        upstream_done = time.time()
+        print(f"[PASS] gen upstream pull done. time: {upstream_done - start_time}s")
+        ray.get(
+            [
+                g.pull_from_ps.remote(all_agent_names, all_client_names, phase="peer")
+                for g in gen_actors
+            ]
+        )
         end_time = time.time()
+        print(f"[PASS] gen peer pull done. time: {end_time - upstream_done}s")
         print(f"[PASS] gen pull from {label} done. time: {end_time - start_time}s")
     else:
         futures = []

@@ -19,12 +19,19 @@ from pathlib import Path
 
 import pytest
 
+import torch
+
 from psrl.utils.nixl.moe_grouping import (
+    GroupedShards,
+    entry_is_empty,
     group_expert_keys,
+    group_expert_tensors,
     grouped_key_count,
     grouping_report,
+    local_shards_of,
     parse_expert_key,
 )
+from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 pytestmark = pytest.mark.cpu_test
 
@@ -249,3 +256,180 @@ class TestMetadataImpact:
 
         assert report["keys_before"] == 61 * 384 * 3 + 61
         assert report["reduction"] > 100
+
+
+class TestGroupedTensors:
+    """Grouping actual tensors, not just key names.
+
+    The two sides are structurally different and this is where that shows up: vLLM holds
+    one fused 3-D `w13_weight`, while Megatron/TE registers each expert as its own
+    `torch.empty`. A grouped key therefore cannot assume a single storage.
+    """
+
+    @staticmethod
+    def _per_expert(num_experts: int, rows: int = 4, cols: int = 6, shard_mesh=None):
+        """A state dict in the per-expert form, one separate tensor per expert."""
+        state, sharding = {}, {}
+        for expert in range(num_experts):
+            key = f"model.layers.0.mlp.experts.{expert}.gate_proj.weight"
+            # Distinct values per expert, so a permutation is detectable.
+            state[key] = torch.full((rows, cols), float(expert))
+            sharding[key] = (
+                NIXLSharding.default()
+                if shard_mesh is None
+                else NIXLSharding(shard_mesh=shard_mesh, shard_indices=[(0,)])
+            )
+        return state, sharding
+
+    def test_grouping_collapses_the_keys(self):
+        state, sharding = self._per_expert(8)
+        result = group_expert_tensors(state, sharding, num_experts=8)
+
+        assert list(result.state_dict) == ["model.layers.0.mlp.experts.gate_proj.weight"]
+
+    def test_expert_axis_is_the_global_count(self):
+        state, sharding = self._per_expert(8)
+        result = group_expert_tensors(state, sharding, num_experts=8)
+        grouped = result.sharding_dict["model.layers.0.mlp.experts.gate_proj.weight"]
+
+        assert grouped.shard_mesh == OrderedDict([(0, 8)])
+        assert grouped.shard_indices == [(i,) for i in range(8)]
+
+    def test_shard_order_follows_expert_id(self):
+        """The shard index decides which expert the bytes belong to.
+
+        Each expert is filled with its own id, so a permutation shows up as a value
+        mismatch rather than needing a shape check to catch it.
+        """
+        state, sharding = self._per_expert(16)
+        result = group_expert_tensors(state, sharding, num_experts=16)
+        entry = result.state_dict["model.layers.0.mlp.experts.gate_proj.weight"]
+
+        for position, shard in enumerate(entry.shards):
+            assert shard[0, 0].item() == float(position), (
+                f"shard at position {position} holds expert {shard[0, 0].item()}"
+            )
+
+    def test_shards_are_views_not_copies(self):
+        """Stacking the experts would copy the whole MoE on every sync."""
+        state, sharding = self._per_expert(4)
+        result = group_expert_tensors(state, sharding, num_experts=4)
+        entry = result.state_dict["model.layers.0.mlp.experts.gate_proj.weight"]
+
+        for expert in range(4):
+            source = state[f"model.layers.0.mlp.experts.{expert}.gate_proj.weight"]
+            assert entry.shards[expert].data_ptr() == source.data_ptr()
+
+    def test_source_map_round_trips_every_expert(self):
+        state, sharding = self._per_expert(8)
+        result = group_expert_tensors(state, sharding, num_experts=8)
+
+        assert len(result.source_map) == 8
+        for expert in range(8):
+            key = f"model.layers.0.mlp.experts.{expert}.gate_proj.weight"
+            grouped_key, shard_index = result.source_map[key]
+            assert grouped_key == "model.layers.0.mlp.experts.gate_proj.weight"
+            assert shard_index == (expert,)
+
+    def test_non_expert_keys_pass_through_untouched(self):
+        state, sharding = self._per_expert(4)
+        state["model.norm.weight"] = torch.ones(8)
+        sharding["model.norm.weight"] = NIXLSharding.default()
+
+        result = group_expert_tensors(state, sharding, num_experts=4)
+
+        assert result.state_dict["model.norm.weight"] is state["model.norm.weight"]
+
+    def test_dense_model_is_a_no_op(self):
+        state = {"model.norm.weight": torch.ones(4)}
+        sharding = {"model.norm.weight": NIXLSharding.default()}
+
+        result = group_expert_tensors(state, sharding, num_experts=4)
+
+        assert result.state_dict == state
+        assert result.groups == ()
+
+    def test_expert_parallel_rank_still_declares_the_global_mesh(self):
+        """A rank holding 4 of 128 experts must not declare a 4-wide expert axis.
+
+        Each rank would otherwise publish a different mesh for the same key, and the
+        server's lcm reconciliation would then produce a finest mesh no rank can satisfy.
+        """
+        state, sharding = {}, {}
+        for expert in (64, 65, 66, 67):  # this rank's slice under EP
+            key = f"model.layers.0.mlp.experts.{expert}.gate_proj.weight"
+            state[key] = torch.zeros(4, 6)
+            sharding[key] = NIXLSharding.default()
+
+        result = group_expert_tensors(state, sharding, num_experts=128)
+        grouped = result.sharding_dict["model.layers.0.mlp.experts.gate_proj.weight"]
+
+        assert grouped.shard_mesh == OrderedDict([(0, 128)]), "the axis is the global count"
+        assert grouped.shard_indices == [(64,), (65,), (66,), (67,)]
+
+    def test_expert_id_beyond_the_model_is_rejected(self):
+        state, sharding = self._per_expert(4)
+        with pytest.raises(ValueError, match="outside a model of 2 experts"):
+            group_expert_tensors(state, sharding, num_experts=2)
+
+    def test_mismatched_inner_sharding_is_rejected(self):
+        """Experts of one projection differ only in expert; anything else is a bug."""
+        state, sharding = self._per_expert(2)
+        keys = sorted(state)
+        sharding[keys[1]] = NIXLSharding(
+            shard_mesh=OrderedDict([(0, 2)]), shard_indices=[(0,)]
+        )
+
+        with pytest.raises(ValueError, match="sharded identically"):
+            group_expert_tensors(state, sharding, num_experts=2)
+
+    def test_inner_sharding_shifts_to_dimension_one(self):
+        """ETP != 1: the expert axis is prepended, so inner dims move right by one."""
+        state, sharding = self._per_expert(4, rows=4, shard_mesh=OrderedDict([(0, 2)]))
+        result = group_expert_tensors(state, sharding, num_experts=4)
+        grouped = result.sharding_dict["model.layers.0.mlp.experts.gate_proj.weight"]
+
+        assert grouped.shard_mesh == OrderedDict([(0, 4), (1, 2)])
+
+    def test_grouped_shards_rejects_mismatched_pairing(self):
+        with pytest.raises(ValueError, match="paired positionally"):
+            GroupedShards(shards=(torch.ones(2),), shard_indices=((0,), (1,)))
+
+
+class TestLocalShardsOf:
+    """One accessor for both forms, so registration need not branch."""
+
+    def test_plain_tensor_is_sliced_by_its_sharding(self):
+        tensor = torch.arange(8).reshape(4, 2)
+        sharding = NIXLSharding(shard_mesh=OrderedDict([(0, 2)]), shard_indices=[(0,), (1,)])
+
+        shards = local_shards_of(tensor, sharding)
+
+        assert len(shards) == 2
+        assert torch.equal(shards[0], tensor[:2])
+
+    def test_grouped_entry_returns_its_shards_in_order(self):
+        shards = tuple(torch.full((2, 2), float(i)) for i in range(3))
+        entry = GroupedShards(shards=shards, shard_indices=((0,), (1,), (2,)))
+        sharding = NIXLSharding(
+            shard_mesh=OrderedDict([(0, 3)]), shard_indices=[(0,), (1,), (2,)]
+        )
+
+        assert local_shards_of(entry, sharding) == list(shards)
+
+    def test_disagreeing_shard_count_is_rejected(self):
+        entry = GroupedShards(shards=(torch.ones(2),), shard_indices=((0,),))
+        sharding = NIXLSharding(shard_mesh=OrderedDict([(0, 2)]), shard_indices=[(0,), (1,)])
+
+        with pytest.raises(ValueError, match="paired positionally"):
+            local_shards_of(entry, sharding)
+
+    def test_emptiness_needs_every_shard_to_be_empty(self):
+        """A rank legitimately holds a subset under EP; one empty expert is not enough."""
+        real = torch.ones(2, 2)
+        meta = torch.empty(2, 2, device="meta")
+
+        assert entry_is_empty(GroupedShards((meta, meta), ((0,), (1,))))
+        assert not entry_is_empty(GroupedShards((meta, real), ((0,), (1,))))
+        assert not entry_is_empty(real)
+        assert entry_is_empty(meta)

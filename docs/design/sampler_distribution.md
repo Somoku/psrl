@@ -5,6 +5,9 @@ sparse trainer log-probs, then feeds the score-centering correction into the act
 veRL's `score_centering_ppo_loss`. Both the top-k head model (`top_p=1`) and the exact top-p support
 model (`top_p<1`) are supported.
 
+The algorithm, its two head models, the end-to-end workflow and the performance profile are described
+in [score_centering.md](score_centering.md). This page covers the capture wire contract.
+
 ## Capture
 
 Use a session agent that sends chat completions through SessionRouter and TITO.
@@ -15,7 +18,7 @@ gen_actor_rollout_ref:
   rollout:
     sampler_distribution: auto   # disabled | topk | support | auto
     sampler_max_tokens: 128      # topk head size, or the support budget
-    sampler_compact_support: false
+    sampler_compact_support: true
     sampler_strict_validation: false
     logprobs_mode: processed_logprobs
     temperature: 1.0
@@ -89,9 +92,9 @@ excluded by a head mask. Three producers match the trainable paths:
 - `to_dense_support`: right-pads each row to `sampler_max_tokens + 1` for the complete support.
 - `to_compact_support` (`rollout.sampler_compact_support`): ships per-row lengths plus the flat
   support ids and log-probs (instead of the dense `[T, K]` heads), and the trainer reconstructs both
-  dense arrays on device. It is a host/TransferQueue-memory win: GPU memory is unchanged, since the
-  trainer still materializes the dense heads for the loss. Not supported with
-  `context_parallel_size>1`.
+  dense arrays on device. It is the default and works under context parallelism. It is a
+  host/TransferQueue-memory win: GPU memory is unchanged, since the trainer still materializes the
+  dense heads for the loss.
 
 The engine consumes the head through veRL's `score_centering_ppo_loss` on FSDP, or the Megatron
 `_lm_head_logits_processor` branch that normalizes with the tensor-parallel group. FSDP gathers the

@@ -94,6 +94,14 @@ The ordered work breakdown for the refactor, with an exit criterion, a rollback
 note, and a decision trace for every step.
 :::
 
+:::{grid-item-card} {octicon}`sparkles;1.5em` Score Centering
+:link: score_centering
+:link-type: doc
+
+The training-inference mismatch correction for bypass REINFORCE: the estimator,
+the two head models, the workflow, and the performance profile.
+:::
+
 ::::
 
 ---
@@ -119,4 +127,8 @@ sandbox_backend_integration
 sandbox_agentenv
 sandbox_opensandbox
 sandbox_snapshot_store
+score_centering
+score_centering_zh
+sampler_distribution
+session-mean-token-mean
 ```

@@ -897,9 +897,9 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | B2 | ✅ | ⏳ 随 D 的 wire buffer |
 > | C1 / C3 | ✅ | ✅ |
 > | C2 | ✅ | ⏳ 弹性期两项随 E3 |
-> | D1 / D2 / D5 / D6 / D7 / D8 | ✅ | ✅（**D1 性能判据未达成**，根因已修） |
+> | D1 / D2 / D5 / D6 / D7 / D8 | ✅ | ✅ **D1 性能判据已达成**（关扩散走 staging，0.66–0.90s vs PS 1.14s） |
 > | **D4** | ✅ | ✅ **连续两轮 eval，8/8 拉到新版本** |
-> | D3 / T2 | ✅ 生产侧 `nixl_direct` + `ps_mode` 判定集中化 | ⏳ 删除 PS 本体（需先在生产路径实跑直供） |
+> | D3 / T2 | ✅ 生产侧 `nixl_direct` + `ps_mode` 判定集中化 | ⏳ 删除 PS 本体（前置已满足：功能完整、已稳定验证、性能优于 PS） |
 > | E1 | ✅ | ⏳ 待 FSDP2 bf16 同精度配置 |
 > | E2 | ✅ | ✅ |
 > | E3 | ✅ | ⏳ 待握手改事件驱动 |

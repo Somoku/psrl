@@ -1,8 +1,8 @@
 # PSRL 权重传输与 PS 架构设计
 
-> 状态：设计（未落地）。本文取代 `fp8_rollout_bf16_train.md`。
+> 状态：设计（未落地）。FP8 精度组合的增量架构见 `fp8_weight_transport.md`。
 > 约束（用户给定，本文据此收敛）：
-> **(a) 不做自动模型接入**，沿用现有显式 layout plan。
+> **(a) 不做自动模型接入**，沿用现有显式 layout plan（该决定已重开，见 §8）。
 > **(b) 不引入额外的 GPU 权重存储，也不引入额外的 CPU 权重存储**，一律从 trainer 或 rollout
 > GPU 上**已经存在**的权重取数。
 > **(c) TMS 仅在必不可少或能极大简化实现时使用。**
@@ -3184,6 +3184,11 @@ FP8-native train（第二行）是唯一两列都是 `0.5×M` 的配置——
 
 ### 3.8 FP8：贯穿全链路的 wire 格式
 
+> 本节给出 wire 形态与精度矩阵。**两种目标组合（rollout FP8 + train FP8、
+> rollout FP8 + train BF16）的完整架构在 `fp8_weight_transport.md`**：
+> scale 作为一等 plan 公民的可组合性证明、量化结构从 rollout 读取而非手写白名单、
+> cast 产物在 pull 语义下的生命周期、colocate 零拷贝形态、以及落地/验证清单。
+
 **依赖边界先说清楚：本节所有原语都在 PSRL 已有依赖里，不 import SkyRL / miles。**
 
 | 需要的能力 | 来源 | 符号 |
@@ -4631,12 +4636,21 @@ colocate 需要：同一组 GPU 上先跑 train client、再跑 gen client，
 
 ---
 
-## 8. 暂不纳入：自动模型接入
+## 8. 自动模型接入：本期沿用手写，但该决定已在 FP8 文档中重开
 
-按约束 (a)，本设计沿用现有显式 layout plan（`weight_layouts.py` + `model_mappings.py` +
+按约束 (a)，**本期**沿用现有显式 layout plan（`weight_layouts.py` + `model_mappings.py` +
 `weight_layout_transforms.py`），不引入探测式对应关系发现。
 
-保留两点接口余地，使将来接入不需要返工：
+**但这个排除的理由已不成立，重开的论证见 `fp8_weight_transport.md` §9。**
+关键事实是本节初稿没有核实的两条：Megatron 侧**早已是自动的**（`AutoBridge`），
+而 vLLM 侧要的结构已由上游机器可读地声明（`packed_modules_mapping` 覆盖 143 个模型类、
+`get_expert_mapping()` 覆盖 16 个 MoE 类）。所以这是一个**单侧**问题，
+且是「读声明」而非 WeightBridge 式的「探测 `load_weights` 副作用」——
+后者才是本节真正想排除的东西。FP8 另给了一个推力：手写方案下量化会让 per-model
+成本翻倍，而推导方案下 scale 的 layout 是 weight layout 的免费推论。
+
+下面两点接口余地因此从「将来不返工」变成了**增量上线的依据**：
+plan 是数据，所以自动推导可以一个模型一个模型地切，随时回退。
 
 - **canonical 命名空间不变。** PSRL 的 unified HF state dict 正是 WeightBridge 所说的
   「作为桥梁的 checkpoint」，自动化只会替换**映射的来源**，不改变 key/shard 抽象本身。

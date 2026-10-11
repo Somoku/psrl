@@ -805,7 +805,7 @@ which is written by `prepare_swebench.py`.
 | Field | Category | Description |
 |-------|----------|-------------|
 | `rollout.multi_turn.enable` | Required | Must be `True` for mini-SWE-agent |
-| `rollout.multi_turn.max_turns` | Required | Max LLM generation turns per episode; training reads `gen_actor_rollout_ref`, validation reads `train_actor_rollout_ref` |
+| `rollout.multi_turn.max_turns` | Optional | Turns per episode: a positive cap, or `-1`/`null` for unlimited (bounded only by `rollout.agent.trajectory_timeout`). The codex harness takes no turn cap and ignores it. Training reads `gen_actor_rollout_ref`, validation reads `train_actor_rollout_ref` |
 | `sandbox_config.environment.image` | Data-affine | Docker image (overridden per-SWE-problem for SWE-smith path) |
 | `sandbox_config.environment.template` | Data-affine | Provider template/snapshot ID for AgentEnv or CubeSandbox |
 | `sandbox_config.environment.cwd` | Data-affine | Working directory inside container (`/testbed` for SWE-bench images) |

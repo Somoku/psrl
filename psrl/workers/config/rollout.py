@@ -64,6 +64,8 @@ class MultiTurnConfig(_VeRLMultiTurnConfig):
     _mutable_fields = {"max_turns"}
 
     enable: bool = False
+    # Turns per episode: a positive cap, or None/-1 for unlimited (bounded only by
+    # the trajectory time budget). A harness that takes no turn cap ignores it.
     max_turns: int | None = None
     tool_config_path: str | None = None
     function_tool_path: str | None = None

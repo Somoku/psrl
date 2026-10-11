@@ -66,7 +66,9 @@ multi_turn:
   # Enable multi-turn tool interactions and use the compatible rollout backend.
   enable: False
 
-  # null for no limit (default max_length // 3)
+  # Turns per episode. A positive number caps the episode; null or -1 leaves turns
+  # unlimited, so only `rollout.agent.trajectory_timeout` bounds it. The codex
+  # harness takes no turn cap of its own and ignores any value here.
   max_turns: null
 
   # Native `Tool` configuration for stateful lifecycle hooks or custom rewards.

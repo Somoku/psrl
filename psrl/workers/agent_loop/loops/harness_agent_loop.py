@@ -104,6 +104,9 @@ class HarnessAgentLoop(SessionAgentLoop):
         self.harness_config = HarnessConfig.from_value(harness)
         self.compaction_budget: tuple[int, int] | None = None
         self.prompt_too_long_limit: int | None = None
+        # A turn cap the harness ignores is worth saying once per loop, not once per
+        # request, so the warning is emitted on the first request and never again.
+        self._turn_limit_warned = False
         # Set by a task hook when grading never ran, so the completed trajectory is kept
         # and reported as ungraded instead of being discarded or scored as a measured zero.
         self.grader_unavailable = False
@@ -254,7 +257,7 @@ class HarnessAgentLoop(SessionAgentLoop):
             else self.config.gen_actor_rollout_ref.rollout
         )
 
-        self.max_turns = rollout_config.multi_turn.max_turns
+        self.max_turns = self._resolve_turn_limit(rollout_config.multi_turn.max_turns)
         context_window = rollout_config.max_model_len or rollout_token_budget(rollout_config)
         if context_window > self.rollout_budget:
             psrl_logger.warning(
@@ -264,6 +267,27 @@ class HarnessAgentLoop(SessionAgentLoop):
             )
         self.compaction_budget = self.harness_config.compaction.resolve(context_window)
         self.prompt_too_long_limit = self.compaction_budget[1] if self.compaction_budget else None
+
+    def _resolve_turn_limit(self, configured: int | float | None) -> int | None:
+        """Return the turn cap to enforce, or None when turns are unlimited.
+
+        A positive number caps the episode's turns; anything else -- null, -1, or
+        any non-positive value -- means no cap, so the episode is bounded by
+        ``rollout.agent.trajectory_timeout`` alone. A harness that takes no turn
+        cap ignores a positive value too, so a configured one is reported rather
+        than silently doing nothing.
+        """
+        limit = None if configured is None or int(configured) < 1 else int(configured)
+        if limit is not None and not self.harness_config.supports_turn_limit and not self._turn_limit_warned:
+            self._turn_limit_warned = True
+            psrl_logger.warning(
+                "rollout.multi_turn.max_turns=%s is set, but the %r harness takes no turn cap and ignores it, "
+                "so the episode is bounded by rollout.agent.trajectory_timeout instead. Unset it (or set -1) "
+                "to silence this.",
+                limit,
+                self.harness_config.kind,
+            )
+        return limit
 
     async def run(
         self,
@@ -334,7 +358,7 @@ class HarnessAgentLoop(SessionAgentLoop):
                 model=str(self.model_config.path),
                 context_window_tokens=(self.compaction_budget[0] if self.compaction_budget else None),
                 compaction_token_limit=(self.compaction_budget[1] if self.compaction_budget else None),
-                max_turns=int(self.max_turns) if self.max_turns is not None else None,
+                max_turns=self.max_turns,
             )
             prepare_started = time.perf_counter()
             await harness.prepare(harness_runtime)
@@ -678,6 +702,8 @@ class HarnessAgentLoop(SessionAgentLoop):
             return TerminateReason.VERIFIER_ERROR
         if any(len(item["prompt_ids"]) + len(item["response_ids"]) > self.rollout_budget for item in training_data):
             return TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
-        if max(item["num_turns"] for item in training_data) >= self.max_turns:
+        # An unlimited episode has no turn cap to exceed, so it finishes rather than
+        # being reported as exhausted at whatever count it happened to reach.
+        if self.max_turns is not None and max(item["num_turns"] for item in training_data) >= self.max_turns:
             return TerminateReason.MAX_TURNS_EXCEEDED
         return TerminateReason.FINISHED

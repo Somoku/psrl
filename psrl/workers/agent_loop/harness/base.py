@@ -40,6 +40,13 @@ _KIND_DEFAULT_TRAJECTORY_FORMATS: dict[str, str] = {
     "codex": "codex_jsonl",
 }
 
+# Harnesses that take no turn cap of their own. Codex runs an episode from one
+# `exec` process and exposes no `--max-turns`-style flag, so
+# `rollout.multi_turn.max_turns` silently does nothing there; the episode is
+# bounded only by the trajectory time budget. Listed by kind because the cap is
+# a property of the CLI, and a new harness that ignores it belongs here.
+_KINDS_WITHOUT_TURN_LIMIT = frozenset({"codex"})
+
 
 @dataclass(frozen=True)
 class HarnessCompactionConfig:
@@ -126,6 +133,15 @@ class HarnessConfig:
         if self.trajectory_format != "auto":
             return self.trajectory_format
         return _KIND_DEFAULT_TRAJECTORY_FORMATS.get(self.kind, "plain_text")
+
+    @property
+    def supports_turn_limit(self) -> bool:
+        """Return whether this harness enforces `rollout.multi_turn.max_turns`.
+
+        A harness that does not would let a configured cap pass silently, so the
+        agent loop warns when one is set for a kind listed here.
+        """
+        return self.kind not in _KINDS_WITHOUT_TURN_LIMIT
 
     @classmethod
     def from_value(cls, value: HarnessConfig | DictConfig | Mapping[str, Any]) -> HarnessConfig:

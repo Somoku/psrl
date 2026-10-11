@@ -71,6 +71,73 @@ def test_turn_cap_reports_when_the_budget_fits() -> None:
     assert _reason(data) is TerminateReason.MAX_TURNS_EXCEEDED
 
 
+def test_an_unlimited_episode_finishes_instead_of_exceeding_turns() -> None:
+    # With no turn cap the episode is bounded by the trajectory time budget, so a
+    # high turn count is finished, not exhausted.
+    loop = SimpleNamespace(
+        rollout_budget=_BUDGET,
+        max_turns=None,
+        grader_unavailable=False,
+        grader_capacity_timeout=False,
+    )
+    data = [_item(prompt_tokens=1000, response_tokens=1000, num_turns=10_000)]
+
+    assert HarnessAgentLoop.get_harness_terminate_reason(loop, data) is TerminateReason.FINISHED
+
+
+def _limit_loop(kind: str, *, supports_turn_limit: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        harness_config=SimpleNamespace(kind=kind, supports_turn_limit=supports_turn_limit),
+        _turn_limit_warned=False,
+    )
+
+
+@pytest.mark.parametrize("configured", [None, -1, 0, -5])
+def test_a_non_positive_turn_budget_means_unlimited(configured) -> None:
+    loop = _limit_loop("claude_code", supports_turn_limit=True)
+
+    assert HarnessAgentLoop._resolve_turn_limit(loop, configured) is None
+
+
+def test_a_positive_turn_budget_is_a_cap() -> None:
+    loop = _limit_loop("claude_code", supports_turn_limit=True)
+
+    assert HarnessAgentLoop._resolve_turn_limit(loop, 80) == 80
+    # The supported harness does not warn about a cap it honours.
+    assert loop._turn_limit_warned is False
+
+
+def test_a_turn_cap_on_a_harness_that_ignores_it_warns_once(caplog) -> None:
+    import logging
+
+    loop = _limit_loop("codex", supports_turn_limit=False)
+
+    with caplog.at_level(logging.WARNING):
+        assert HarnessAgentLoop._resolve_turn_limit(loop, 80) == 80
+
+    warnings = [r for r in caplog.records if "takes no turn cap" in r.getMessage()]
+    assert len(warnings) == 1, "a cap the harness ignores must be reported"
+    assert loop._turn_limit_warned is True
+
+    # A second request does not repeat the warning.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        HarnessAgentLoop._resolve_turn_limit(loop, 80)
+    assert not [r for r in caplog.records if "takes no turn cap" in r.getMessage()]
+
+
+def test_an_unset_turn_budget_on_a_codex_loop_does_not_warn(caplog) -> None:
+    # Unlimited is the intended default for codex, not a misconfiguration.
+    import logging
+
+    loop = _limit_loop("codex", supports_turn_limit=False)
+
+    with caplog.at_level(logging.WARNING):
+        assert HarnessAgentLoop._resolve_turn_limit(loop, None) is None
+
+    assert not [r for r in caplog.records if "takes no turn cap" in r.getMessage()]
+
+
 def test_any_trajectory_over_budget_marks_the_request_truncated() -> None:
     # A single TITO branch that overflows the budget forces the loop to cut that
     # branch, so the whole request is reported as truncated.

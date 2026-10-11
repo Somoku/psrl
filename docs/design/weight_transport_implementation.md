@@ -1811,6 +1811,12 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       - `await_readers_before_publish` 默认值是 `auto` 而不是 `False`：
         L2 判据要显式**关掉**它来观测破坏，而 `False` 必须能与"由我决定"区分开。
 
+      **多节点回归已过**（run 43）：接线后 0 错误、0 版本违例、6 次 pull 全完成，
+      rollout pull **0.46–0.48 s**（接线前 0.66–0.90 s，PS 1.14 s）。
+      该 run 的 `await_readers_before_publish` 解析为 **False** 且**这是对的** ——
+      日志里 `colocate_validate_and_train=True`，colocate 下 rollout 全程暂停，
+      结构上不存在在飞读者。也就是说真值表在生产配置上确实生效，而非接线失效。
+
       **仍待做**：跑「关掉后观测到权重破坏」的 L2 判据。
       配置已就绪（`psrl.nixl.await_readers_before_publish=false` 可显式关闭），
       但**观测破坏本身尚未实现** —— 需要一次训练中读者恰好落在 optimizer 写窗口内，

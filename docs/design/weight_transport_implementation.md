@@ -1610,8 +1610,17 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       签名兼容、调用顺序、配置合法性、代价模型都属于 CPU 档；
       多节点只留给**跨主机 RDMA 与真实放置**。
 
-      **版本断言的多节点验证目前被环境阻断，证据如下。**
-      run 35/36 都停在 `wait_for_client_shardings`，但**原因不是超时值**：
+      **版本断言已在多节点实跑验证通过**（run 38，`/tmp/prod_direct38.log`）：
+      6 个 client 全部连上、握手 **1 秒**完成、
+      `Binding direct-supply` → `Initial pull` → `step:1`，
+      **0 错误、0 条版本违例**（既无 `torn read` 也无 `stale pull`）。
+      rollout pull **1.25 / 1.56 / 1.69 s**，版本发布 **0.00 s**。
+
+      这意味着：首次 pull 的 announced-vs-observed 检查、
+      以及每次 pull 的撕裂读检查，在真实跨主机 RDMA 下都**不误报**。
+
+      **但在此之前 run 33–37 连续失败，根因不是超时值，值得记下来。**
+      它们都报 `Timeout waiting for agents`，于是看起来像"启动慢"：
 
       | | 等待开始 | 握手完成 |
       |---|---|---|
@@ -1624,16 +1633,27 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       且 `Capturing CUDA graphs (FULL): 100%` 只出现 5 次（成功时 6 次）：
       **有一个 vLLM replica 自始至终没有完成启动**。
 
-      **结论：这不是超时参数能解决的问题，再调大也没用。**
-      把 `handshake_timeout_s` 做成可配置仍然是对的（客户端 1200 s / 服务端 600 s
-      的不一致是真实缺陷，服务端先放弃导致客户端侧什么都没记下来），
-      但它**不是** run 33–36 失败的原因。
+      **真正的根因是 Ray actor 调用串行化造成的死锁。**
+      `PSManager` 是 actor，一旦 `nixl_protocol` 跑起来它就卡在
+      `wait_for_client_shardings`，**此后任何对该 handle 的调用都排在它后面** ——
+      包括 train rank 启动握手前必须读的 `get_ps_model_version`。
+      于是服务端等客户端、客户端等服务端。
 
-      因此**版本断言尚无多节点实跑证据**。已验证的是：
-      CPU 档的顺序与算术不变量（`test_shard_version.py`，27 项）、
-      单节点元数据往返（`test_shard_version_gpu.py`，7 项，1.9 s）——
-      后者覆盖的正是 run 29/30 失败的那条性质。
-      缺的是跨主机 RDMA 下的真实 pull，这需要集群恢复到能稳定起满 6 个 replica。
+      **区分"死锁"与"启动慢"的判据**（两者都报同一句话）：
+      成功的 run 握手只要 **~1 秒**，所以 27 分钟的等待从来不是"超时值太紧"；
+      再看 `Capturing CUDA graphs (FULL): 100%` 已满 6 个而
+      `connect_to_server` 仍为 0 —— 那就是死锁。
+
+      把 `handshake_timeout_s` 做成可配置仍是对的（客户端 1200 s / 服务端 600 s
+      的不一致是真实缺陷：服务端先放弃，客户端侧什么都没记下来），
+      但它**不是** run 33–37 失败的原因，文档不应暗示那是修复。
+
+      顺带还暴露一个我自己引入的缺陷：那次把 11 个 wait 改成
+      `timeout: float | None = None` 时，有 7 处函数体仍在比较 `timeout`，
+      而生产调用全都省略该参数 —— 首次循环即
+      `TypeError: '>' not supported between 'float' and 'NoneType'`。
+      它表现为客户端未连上、**服务端**报 `Timeout waiting for agents`，
+      与上面两种现象完全同形。现已由按**模式**（而非按实例）扫描的测试守住。
 
       **仍待做**：删除 `PSStorageWorker` / `create_ps_worker_group` / push 路径 /
       `ps_mode` 的 PS 取值。

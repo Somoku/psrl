@@ -1782,7 +1782,7 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       `test_chunk_availability.py` 21 passed
 
 ### 阶段 E
-- [ ] **E1 模块已落地并单测通过（13 passed），判据所需的 FSDP2 同精度配置已跑通，接线待做**：
+- [ ] **E1 已接线（22 passed，含真值表），L2 判据待跑**：
       `psrl/workers/ps/version_barrier.py`。
       发布前按预算等待 v 的在飞读者归零；**超限即发布并把 v 标记 INVALID**，
       读者改拉 v+1（更新的权重，算法上是改善）——
@@ -1794,9 +1794,27 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       （FSDP2 + bf16+bf16 + disaggregate，8/8 client × 399/399 keys，拉取 2.91s），
       这正是 `requires_version_barrier` 返回 True 的那一格。
 
-      **仍待做**：接到发布路径，并跑「关掉后观测到权重破坏」的 L2 判据。
-      当前 barrier 无生产输入 —— `HolderIndex.total_in_flight` 只被测试构造，
-      生产的在飞读计数在 `NIXLStorageClient` 的 xfer handle 侧，需要把它接上。
+      **已接线**，三处：
+
+      1. **读者上报**：`PSManager.begin_read` / `end_read` / `abort_reads`，
+         按 `(version, rollout_instance_id)` 计数。按实例而非单纯总数，
+         这样中途死掉的读者不会把计数永久卡在非零 —— `abort_reads` 可整体清掉一个实例。
+      2. **发布前等待**：`push_model_state_dict_nixl` 在建 `ModelStore` 之前
+         drain 上一版本；超限则按设计标记 INVALID 并告警。
+      3. **决策落点**：`validate_config` 解析 `await_readers_before_publish`，
+         因为只有它同时看得到 backend 和两个 dtype —— `PSManager` 只收到 `config.psrl`。
+
+      两个实现上的坑，都记在注释里：
+      - `count_readers` **故意不加锁**：barrier 在紧循环里轮询它，
+        而读者结束读时**要拿**这把锁 —— 加锁会让"正在结束的读者"
+        排在"等它结束的 barrier"后面，互相死等。
+      - `await_readers_before_publish` 默认值是 `auto` 而不是 `False`：
+        L2 判据要显式**关掉**它来观测破坏，而 `False` 必须能与"由我决定"区分开。
+
+      **仍待做**：跑「关掉后观测到权重破坏」的 L2 判据。
+      配置已就绪（`psrl.nixl.await_readers_before_publish=false` 可显式关闭），
+      但**观测破坏本身尚未实现** —— 需要一次训练中读者恰好落在 optimizer 写窗口内，
+      这靠调度而非断言触发，需要一个专门的注入点。
 - [x] **E2 已落地并验证**：`psrl/utils/nixl/staleness.py`，`test_staleness.py` 13 passed。
       两种陈旧的恢复路径**互为无效**，这正是必须分开的理由：
       descriptor 陈旧时换源只是把错地址带到新 peer；版本陈旧时重取 descriptor

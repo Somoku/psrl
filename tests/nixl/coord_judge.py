@@ -181,6 +181,7 @@ def fill_state_dict_by_coord(
     *,
     strict: bool = True,
     base: int = 0,
+    shardings: dict | None = None,
 ) -> dict[str, int]:
     """Fill every tensor in a state dict, giving each key a disjoint coordinate range.
 
@@ -197,10 +198,75 @@ def fill_state_dict_by_coord(
     cursor = base
     for key in sorted(state_dict):
         tensor = state_dict[key]
+        # `cursor` walks the *global* key space, so it stays comparable across ranks --
+        # the assertion is given the same offsets on every rank and checks the whole
+        # logical tensor. `start` is where this rank's shard sits inside that range.
+        #
+        # Without `shardings` this is the unsharded case and `start` is zero. Threading
+        # it here rather than leaving each rank to fill from zero is what makes a
+        # misdelivered shard visible: 8 ranks each filling their own 16 elements from
+        # zero all produce identical bytes, so the check passes whatever the transport
+        # did -- which is exactly the failure the FSDP2 cell reported.
         offsets[key] = cursor
-        fill_by_global_coord(tensor, cursor, strict=strict)
+        start = (
+            shard_global_offset(tensor, shardings.get(key))
+            if shardings and key in shardings
+            else 0
+        )
+        fill_by_global_coord(tensor, cursor + start, strict=strict)
         cursor += tensor.numel()
     return offsets
+
+
+def shard_global_offset(
+    tensor: torch.Tensor,
+    sharding,
+    *,
+    global_shape: tuple[int, ...] | None = None,
+) -> int:
+    """Where this local shard starts in the global tensor's flat element order.
+
+    Filling by coordinate only detects misplacement if each rank writes *its own* range.
+    `fill_state_dict_by_coord` walks the local state dict from zero, so under any sharded
+    backend every rank writes the same values and the check cannot see a shard that went
+    to the wrong place -- which is the one thing it exists to catch. That is not
+    hypothetical: it is what the FSDP2 cell reported as
+
+        q_norm.weight: coordinate mismatch at flat index 16: expected 32.0, got 16.0
+        112 of 128 elements differ
+
+    which is `offset + (i mod local_numel)` -- every one of the 8 ranks having filled its
+    16-element shard with shard 0's coordinates.
+
+    ``sharding`` is a `NIXLSharding`: ``shard_mesh`` gives each dimension's shard count
+    and ``shard_indices`` the coordinates this tensor owns. Only the leading dimension is
+    sliced (row-parallel), which is what the converters produce, so the offset is a
+    multiple of the local row count.
+    """
+    if sharding is None or not sharding.shard_indices:
+        return 0
+
+    mesh = sharding.shard_mesh
+    dims = sorted(mesh)
+    if not dims:
+        return 0
+
+    row_dim = dims[0]
+    local_rows = tensor.shape[row_dim]
+    # Row-major, so everything before the first sliced dimension multiplies by the
+    # trailing extent. For the 1-D and 2-D row-parallel cases the converters emit, this
+    # reduces to (shard row index) x local_rows x trailing_extent.
+    trailing = 1
+    for extent in tensor.shape[row_dim + 1 :]:
+        trailing *= extent
+    leading = 1
+    for extent in tensor.shape[:row_dim]:
+        leading *= extent
+
+    start = 0
+    for index in sharding.shard_indices:
+        start += index[row_dim] * local_rows * trailing
+    return start * leading
 
 
 def assert_state_dict_matches_coord(

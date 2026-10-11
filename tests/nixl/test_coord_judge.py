@@ -314,3 +314,87 @@ class TestVersionShiftMakesASecondRoundMeaningful:
 
         assert offsets["a"] != offsets["b"]
         assert min(offsets.values()) >= 500
+
+
+class TestShardedRanksFillDistinctRanges:
+    """The judge is vacuous under a sharded backend unless each rank fills its own range.
+
+    `fill_state_dict_by_coord` walks the local state dict from zero, so with FSDP2 every
+    one of 8 ranks wrote offsets 0..15 into its 16-element shard of a 128-element
+    parameter. All eight then held *identical bytes*, and the assertion passed whatever
+    the transport did -- while the FSDP2 cell reported
+
+        q_norm.weight: coordinate mismatch at flat index 16: expected 32.0, got 16.0
+
+    which is `offset + (i mod local_numel)`, i.e. the reader correctly seeing shard 0's
+    values in every position.
+    """
+
+    def _sharding(self, rank, count, dim=0):
+        from psrl.utils.nixl.nixl_spec import NIXLSharding
+
+        return NIXLSharding(shard_mesh={dim: count}, shard_indices=[(rank,)])
+
+    def _fill(self, shape, rank, count, dim=0, key="w"):
+        import torch
+
+        from tests.nixl.coord_judge import fill_state_dict_by_coord
+
+        tensor = torch.zeros(shape, dtype=torch.bfloat16)
+        offsets = fill_state_dict_by_coord(
+            {key: tensor},
+            strict=False,
+            shardings={key: self._sharding(rank, count, dim)},
+        )
+        return tensor, offsets[key]
+
+    def test_each_rank_writes_a_different_first_value(self):
+        """Before the fix all eight wrote 0.0, which is what made the check blind."""
+        firsts = [self._fill((16,), rank, 8)[0][0].item() for rank in range(8)]
+
+        assert len(set(firsts)) == 8, f"ranks are not distinguished: {firsts}"
+        assert firsts[0] == 0.0 and firsts[1] == 16.0
+
+    def test_the_offsets_are_shared_so_the_judge_compares_the_whole_tensor(self):
+        """Every rank reports the same per-key base, which is what makes one judge work
+        for all of them: the base indexes the global key space, not the local shard."""
+        bases = {self._fill((16,), rank, 8)[1] for rank in range(8)}
+
+        assert len(bases) == 1, f"ranks disagree on the key's base offset: {bases}"
+
+    def test_a_reassembled_tensor_passes(self):
+        import torch
+
+        from tests.nixl.coord_judge import assert_state_dict_matches_coord
+
+        pieces = [self._fill((16,), rank, 8)[0] for rank in range(8)]
+        _, base = self._fill((16,), 0, 8)
+
+        assert_state_dict_matches_coord({"w": torch.cat(pieces)}, {"w": base})
+
+    def test_a_swapped_pair_of_shards_is_caught(self):
+        """The property the fix exists for. Before it this passed, because swapping two
+        shards that both span offsets 0..15 changes nothing."""
+        import pytest
+        import torch
+
+        from tests.nixl.coord_judge import assert_state_dict_matches_coord
+
+        pieces = [self._fill((16,), rank, 8)[0] for rank in range(8)]
+        _, base = self._fill((16,), 0, 8)
+        swapped = torch.cat([pieces[1], pieces[0]] + pieces[2:])
+
+        with pytest.raises(AssertionError, match="coordinate mismatch"):
+            assert_state_dict_matches_coord({"w": swapped}, {"w": base})
+
+    def test_an_unsharded_fill_is_unchanged(self):
+        """Nothing passes `shardings` in the unsharded path, and it must stay as it was."""
+        import torch
+
+        from tests.nixl.coord_judge import fill_state_dict_by_coord
+
+        tensor = torch.zeros(8, dtype=torch.bfloat16)
+        offsets = fill_state_dict_by_coord({"w": tensor}, strict=False)
+
+        assert offsets == {"w": 0}
+        assert tensor.tolist() == [float(i) for i in range(8)]

@@ -498,7 +498,12 @@ class TrainClientActor:
         # transposed, misplaced, or wrongly-cast one -- see assert_state_dict_matches_coords.
         # The offsets are keyed by state-dict key and must reach the gen side verbatim,
         # which is why they are returned rather than recomputed there.
-        self.coord_offsets = fill_state_dict_by_coord(state_dict, strict=False)
+        # `shardings` is what makes the judgement non-vacuous under a sharded backend:
+        # every rank fills its *own* range of the global coordinate space, so a shard
+        # that arrives in the wrong place no longer looks identical to a correct one.
+        self.coord_offsets = fill_state_dict_by_coord(
+            state_dict, strict=False, shardings=sharding
+        )
         # self.print(f"state_dict keys: {state_dict.keys()}")
         self.state_dict = state_dict
         self.sharding = sharding

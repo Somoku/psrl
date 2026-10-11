@@ -1291,6 +1291,27 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       | 直供 TP=4 / gen_TP=4 | **1.00** | 3,192 |
       | 有 PS | **1.00** | 3,192 |
 
+      **实跑验证 `GEN_TP=4`：公式被证实，但该配置在本集群跑不起来。**
+      run 39 `GEN_TP=4` 确实使 `n_rollout_instances` 从 4 降到 **1**（与预测一致），
+      但 vLLM 启动即失败：
+
+      | | 同节点 KV cache |
+      |---|---|
+      | run 38（`GEN_TP=1`） | **58.85 / 30.18 GiB** |
+      | run 39（`GEN_TP=4`） | 11.48 / **0.29 GiB** |
+
+      `ValueError: To serve at least one request with the model's max seq len (40960),
+      (5.62 GiB KV cache is required)`。
+
+      **原因是放置而非显存总量**：`GEN_TP=1` 时 4 个 rollout 实例各占 1 卡、
+      分散在 4 个节点；`GEN_TP=4` 时单个实例要 4 卡**落在同一个节点**，
+      与同节点其他负载相撞。所以 `GEN_TP` 不只是并发度权衡，
+      它**改变放置拓扑**，需要相应扩节点才能用。
+
+      **结论：公式成立（plan 层已由 CPU 测试钉住），但"匹配 TP"不是现成可用的解法。**
+      要真正达到"不慢于 PS"，仍应走消除 strided 布局那条路 ——
+      它既不增源数、也不牺牲实例数、更不改放置。
+
       **所以 2.93s vs 1.14s 里有一部分不是直供固有的，而是 TP 配置造成的**：
       出脚本用 `TP=4 / GEN_TP=1`，每个 key 要跨 4 个 train rank 拼，
       而 PS worker 一份就是完整 shard。`GEN_TP` 现已可覆盖（默认仍 1），

@@ -63,7 +63,8 @@ MATRIX: tuple[Combination, ...] = (
     ),
     Combination(
         "fsdp2", "bf16", "bf16", "disaggregate", "daily",
-        None, "the cell that makes the version barrier (E1) mandatory",
+        "nixl_e2e_5node_fsdp2.yaml",
+        "the cell that makes the version barrier (E1) mandatory",
     ),
     Combination(
         "megatron", "fp8", "fp8", "colocate", "daily",
@@ -153,3 +154,40 @@ class TestTheTwoDisaggregateConfigsDifferByOneThing:
             f"the two configs differ in {sorted(differing)}; a measured difference "
             f"between them could not be attributed to the supply mode alone"
         )
+
+
+class TestEveryMatrixBackendIsOneTheHarnessAccepts:
+    """The matrix names backends the harness has to build.
+
+    `fsdp2` and `fsdp` were different spellings of the same thing -- the harness's
+    `fsdp` branch calls `fully_shard`, and FSDP1 is rejected outright by config
+    validation -- so the matrix's `fsdp2` cell had no config while the capability
+    existed. A name the harness does not accept fails at startup, deep in a ~30-minute
+    multi-node run, rather than here.
+    """
+
+    def _harness_backends(self) -> set[str]:
+        from pathlib import Path
+        import re
+
+        source = (
+            Path(__file__).resolve().parent / "test_nixl_e2e.py"
+        ).read_text()
+        match = re.search(r"engine_type in \[(.*?)\]", source, re.S)
+
+        assert match, "could not find the harness's accepted engine types"
+        return set(re.findall(r'"([a-z0-9_]+)"', match.group(1)))
+
+    def test_every_named_backend_is_accepted(self):
+        accepted = self._harness_backends()
+        named = {combination.backend for combination in MATRIX}
+
+        assert named <= accepted, (
+            f"the matrix names backends the harness rejects: {sorted(named - accepted)}"
+        )
+
+    def test_the_check_reads_the_real_allowlist(self):
+        """Guard against the regex silently matching nothing and the test passing."""
+        accepted = self._harness_backends()
+
+        assert "megatron" in accepted

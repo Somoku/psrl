@@ -281,7 +281,14 @@ class TrainClientActor:
         fsdp_hybrid_config=None,
         megatron_config=None,
     ):
-        assert engine_type in ["fsdp", "fsdp_hybrid", "megatron"], f"Unsupported engine type: {engine_type!r}."
+        # `fsdp2` is the name the config matrix and `psrl.worker` use; `fsdp` is this
+        # harness's older spelling for the same thing, since the branch below calls
+        # `fully_shard` either way and FSDP1 is rejected outright by config validation
+        # (flat_param cannot give the in-place representation NIXL registration needs).
+        # Accepting both keeps one vocabulary from having to be renamed across the matrix.
+        assert engine_type in ["fsdp", "fsdp2", "fsdp_hybrid", "megatron"], (
+            f"Unsupported engine type: {engine_type!r}."
+        )
         if rank == 0:
             train_master_ip = ray.util.get_node_ip_address()
             ray.get(global_store.set_train_master_ip.remote(train_master_ip))
@@ -321,7 +328,7 @@ class TrainClientActor:
             logging_path=log_dir,
         )
 
-        if engine_type == "fsdp" or engine_type == "fsdp_hybrid":
+        if engine_type in ("fsdp", "fsdp2", "fsdp_hybrid"):
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=self.train_dtype,
@@ -334,7 +341,7 @@ class TrainClientActor:
             # FSDP2 (fully_shard). FSDP1 is rejected by config validation because
             # flat_param cannot guarantee the in-place parameter representation that
             # registering with NIXL requires, so the harness must not build it either.
-            if engine_type == "fsdp":
+            if engine_type in ("fsdp", "fsdp2"):
                 mesh = init_device_mesh("cuda", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
                 _fully_shard_transformer(model, mesh)
                 self.model = model
@@ -364,7 +371,7 @@ class TrainClientActor:
             self.print(f"{k}={os.environ[k]}")
 
     def _get_replica_id(self):
-        if self.engine_type == "fsdp":
+        if self.engine_type in ("fsdp", "fsdp2"):
             return 0
         elif self.engine_type == "fsdp_hybrid":
             return self.rank // self.fsdp_hybrid_config.get("fsdp_size", 4)

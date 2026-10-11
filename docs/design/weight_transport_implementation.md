@@ -1309,8 +1309,26 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       它**改变放置拓扑**，需要相应扩节点才能用。
 
       **结论：公式成立（plan 层已由 CPU 测试钉住），但"匹配 TP"不是现成可用的解法。**
-      要真正达到"不慢于 PS"，仍应走消除 strided 布局那条路 ——
-      它既不增源数、也不牺牲实例数、更不改放置。
+
+      **D1 性能判据已达成** —— 而且是靠**关掉扩散、走 staging**得到的：
+      run 42 用 `peer_diffusion=False` + `shards_must_be_readable=False`：
+
+      | 配置 | rollout pull |
+      |---|---|
+      | 扩散开（run 38） | 1.25 / 1.56 / 1.69 s |
+      | **扩散关 + staging（run 42）** | **0.66 / 0.68 / 0.73 / 0.90 s** |
+      | PS 路径（设计记录） | 1.14 s |
+
+      同配置只差这两个开关，**约 1.9× 提升，且已优于 PS 的 1.14s**。
+      0 错误、0 条版本违例、6 次 pull 全部完成、2 个 step 跑完。
+
+      **这印证了设计里那条判断**：扩散省的是 NIC 字节（跨节点 24.50 GB/s vs
+      同节点 342.95 GB/s），但它逼迫 designate 原地注册、每分片付 4096 个 descriptor
+      （~2.1us 一个），而 descriptor 比字节贵得多。**关掉扩散后 gen 侧可以 staging，
+      一个 descriptor 搬完一个分片。**
+
+      因此直供的推荐配置是 **`peer_diffusion=False` + `shards_must_be_readable=False`**；
+      两者是一对（扩散要求可读），已由 `_validate_nixl_peer_diffusion` 强制。
 
       **所以 2.93s vs 1.14s 里有一部分不是直供固有的，而是 TP 配置造成的**：
       出脚本用 `TP=4 / GEN_TP=1`，每个 key 要跨 4 个 train rank 拼，

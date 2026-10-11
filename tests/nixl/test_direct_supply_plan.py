@@ -269,3 +269,60 @@ class TestTheReadCountAgainstPsIsNowPinned:
             f"contiguous this should drop toward the PS's {with_ps}, and this assertion "
             f"is where that improvement gets recorded"
         )
+
+
+class TestThePairedKnobsAreEnforced:
+    """`peer_diffusion` and `shards_must_be_readable` are one decision, not two.
+
+    A designate serves its followers by being read from, which needs a permanent remote
+    descriptor; a staged shard has none. So diffusion with staging is not a slower
+    configuration, it is a broken one -- and it broke late and far from its cause, as
+    "Remote descriptor must be contiguous for client read" on a follower.
+
+    Both keys were also undeclared in `nixl.yaml`, reaching the client only through
+    `getattr` defaults, which is what made the pairing invisible to a reader.
+    """
+
+    def _config(self, diffusion: bool, readable: bool):
+        from omegaconf import OmegaConf
+
+        return OmegaConf.create(
+            {"psrl": {"nixl": {"peer_diffusion": diffusion, "shards_must_be_readable": readable}}}
+        )
+
+    def test_diffusion_without_readable_shards_is_refused(self):
+        from psrl.utils.config import _validate_nixl_peer_diffusion
+
+        with pytest.raises(AssertionError, match="requires shards_must_be_readable"):
+            _validate_nixl_peer_diffusion(self._config(diffusion=True, readable=False))
+
+    @pytest.mark.parametrize(
+        ("diffusion", "readable"),
+        [(True, True), (False, True), (False, False)],
+    )
+    def test_the_other_three_combinations_are_allowed(self, diffusion, readable):
+        """Staging without diffusion is the whole point of having the knob."""
+        from psrl.utils.config import _validate_nixl_peer_diffusion
+
+        _validate_nixl_peer_diffusion(self._config(diffusion, readable))
+
+    def test_both_keys_are_declared_in_the_config_file(self):
+        """An undeclared key reaches the client as a `getattr` default, so a reader of the
+        YAML cannot see that the two are coupled -- or that they exist at all."""
+        from pathlib import Path
+
+        text = (
+            Path(__file__).resolve().parents[2] / "psrl/trainer/config/psrl/nixl.yaml"
+        ).read_text()
+
+        assert "shards_must_be_readable:" in text
+        assert "peer_diffusion:" in text
+
+    def test_the_validator_runs_for_direct_supply(self):
+        """Direct supply is the mode where diffusion is actually reachable."""
+        from pathlib import Path
+
+        source = (Path(__file__).resolve().parents[2] / "psrl/utils/config.py").read_text()
+        at = source.index('if config.psrl.ps_mode == "nixl_direct":')
+
+        assert "_validate_nixl_peer_diffusion(config)" in source[at : at + 2500]

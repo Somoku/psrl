@@ -31,3 +31,27 @@ enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
 # working. Raise it on slow or contended clusters; a handshake that is genuinely broken
 # fails on its own, not by waiting longer.
 handshake_timeout_s: 1800
+
+# Whether a rollout's shards must stay addressable by other clients.
+#
+# Declared here rather than left to a `getattr` default, because the two settings below
+# are a matched pair and an undeclared default makes the pairing invisible: a reader of
+# this file could not tell that turning one on requires the other.
+#
+# True keeps every shard registered in place, which is what lets a same-node peer read
+# from this client (peer diffusion). False allows a strided shard to be staged instead --
+# one descriptor plus a local copy rather than one descriptor per row -- but then nothing
+# may read from it, because a staged shard has no permanent remote descriptor.
+#
+# `postXferReq` costs ~2.1us per descriptor, and a 4096-row strided shard needs one per
+# row, so the in-place path measured 3.43s where staging would be ~1.6ms. The two
+# therefore cannot both be had: see `strided_is_cheaper_than_staging`.
+shards_must_be_readable: True
+
+# Whether the planner may redirect duplicate reads onto a same-node peer.
+#
+# Requires `shards_must_be_readable: True` -- a designate that cannot be read from cannot
+# serve its followers. Measured on this cluster, diffusion was a net loss at the current
+# shard layout (2.93s against 2.59s without it), because it forces the designate onto the
+# per-row descriptor path to save NIC bytes that were not the bottleneck.
+peer_diffusion: True

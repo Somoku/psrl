@@ -158,6 +158,29 @@ def _validate_nixl_offload_flags(config: DictConfig) -> None:
         )
 
 
+def _validate_nixl_peer_diffusion(config: DictConfig) -> None:
+    """Refuse peer diffusion without readable shards.
+
+    A designate serves its same-node followers by being *read from*, which requires its
+    shards to keep a permanent remote descriptor. A staged shard has none --
+    `client_read` rejects it with "Remote descriptor must be contiguous for client read"
+    -- so the two settings are a matched pair rather than independent knobs.
+
+    Checked here because the failure otherwise lands mid-transfer, on a follower, naming
+    a descriptor rather than the configuration that removed it.
+    """
+    nixl = config.psrl.get("nixl", {})
+    diffusion = bool(nixl.get("peer_diffusion", True))
+    readable = bool(nixl.get("shards_must_be_readable", True))
+
+    assert not (diffusion and not readable), (
+        "psrl.nixl.peer_diffusion=True requires shards_must_be_readable=True: a "
+        "diffusion designate has to be readable by its followers, and a staged shard "
+        "has no remote descriptor to read. Set peer_diffusion=False to allow staging, "
+        "or shards_must_be_readable=True to allow diffusion."
+    )
+
+
 def _validate_nixl_lora(config: DictConfig) -> None:
     """Reject un-merged LoRA, which the weight transport cannot express (3.11).
 
@@ -390,6 +413,7 @@ def validate_config(
         )
         _validate_nixl_offload_flags(config)
         _validate_nixl_lora(config)
+        _validate_nixl_peer_diffusion(config)
         assert not config.psrl.get("lmcache", {}).get("enable_p2p", False), (
             "psrl.lmcache.enable_p2p requires a PS to route through; it cannot be used "
             "with ps_mode=nixl_direct, where rollouts read train ranks directly"
@@ -424,6 +448,7 @@ def validate_config(
         )
         _validate_nixl_offload_flags(config)
         _validate_nixl_lora(config)
+        _validate_nixl_peer_diffusion(config)
         print(f"NOTICE: NIXL is enabled. Actor strategy used is {config.train_actor_rollout_ref.actor.strategy}")
 
     # Check validate mode

@@ -200,6 +200,59 @@ def schedule_pipelined_reads(
     return ordered
 
 
+def coalesce_to_transport_pairs(
+    waves: Sequence[ChunkWave],
+) -> list[tuple[int, list[tuple[str, str, bool]]]]:
+    """Reduce a per-shard schedule to the ``(key, source)`` pairs a transport can post.
+
+    **The schedule and the transport have different units, and the mismatch is not
+    cosmetic.** `schedule_pipelined_reads` works in shards, because that is what the plan
+    assigns. `client_read` is addressed by ``(key, source)`` and moves *every* shard the
+    plan gives that pair in one transfer. So a pair whose shards were placed in several
+    waves gets fully transferred by the first wave that mentions it, and every later wave
+    reposts a handle that is still in flight -- `NIXL_ERR_REPOST_ACTIVE` -- or, worse,
+    re-fetches bytes that already landed.
+
+    Each pair therefore appears exactly once. Which wave it lands in depends on what
+    gates it:
+
+    - **upstream pairs go to their earliest wave.** They have no dependency, and issuing
+      them early is what the followers' peer reads overlap with. Delaying them would
+      shrink the window the pipeline exists to fill.
+    - **peer pairs go to their latest wave.** A peer read is valid only once the
+      designate has the bytes, so with shards spread across waves the safe point is
+      after the last of those dependencies -- not the first. Choosing the earliest here
+      would issue a read whose later shards the designate has not filled, and that read
+      succeeds.
+
+    Returns ``[(wave_index, [(key, source, is_peer), ...]), ...]`` in wave order, with
+    empty waves dropped: a wave that contributes no pair is not a barrier, because
+    nothing in it has to wait.
+    """
+    first_seen: dict[tuple[str, str], int] = {}
+    last_seen: dict[tuple[str, str], int] = {}
+    is_peer: dict[tuple[str, str], bool] = {}
+
+    for wave in waves:
+        for read in wave.reads:
+            pair = (read.key, read.source)
+            first_seen.setdefault(pair, wave.index)
+            last_seen[pair] = wave.index
+            # A pair is a peer pair if any of its reads is one. In a correct schedule a
+            # pair is wholly one or the other -- `schedule_pipelined_reads` partitions by
+            # shard and a shard has a single source -- but treating a mixed pair as peer
+            # is the safe direction: it waits where it might not need to, rather than
+            # reading bytes that are not there yet.
+            is_peer[pair] = is_peer.get(pair, False) or read.is_peer
+
+    placed: dict[int, list[tuple[str, str, bool]]] = {}
+    for pair, peer in is_peer.items():
+        index = last_seen[pair] if peer else first_seen[pair]
+        placed.setdefault(index, []).append((pair[0], pair[1], peer))
+
+    return [(index, placed[index]) for index in sorted(placed)]
+
+
 def exposed_waves(waves: Sequence[ChunkWave]) -> int:
     """Waves whose peer reads cannot overlap anything.
 

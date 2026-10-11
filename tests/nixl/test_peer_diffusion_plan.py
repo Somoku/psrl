@@ -353,28 +353,72 @@ class TestTwoPhaseExecution:
         """A typo must not silently fall through to reading everything."""
         assert 'assert phase in ("all", "upstream", "peer")' in self._harness()
 
-    def test_the_driver_barriers_between_the_phases(self):
-        """`ray.get` on every actor between the phases is what makes peer reads safe."""
-        harness = self._harness()
-        upstream_at = harness.index('phase="upstream"')
-        peer_at = harness.index('phase="peer"')
-        between = harness[upstream_at:peer_at]
+    def test_the_driver_issues_one_pipelined_call_per_actor(self):
+        """No barrier between waves -- a global barrier is what made two-phase lose.
 
-        assert "ray.get" in between, (
-            "the peer phase is issued without waiting for every actor's upstream phase, "
-            "so a peer may be read before it has the bytes"
-        )
-
-    def test_the_harness_records_why_it_is_not_pipelined(self):
-        """The gap is a design one, so it has to be stated where the choice is made.
-
-        A shared wave counter cannot express the dependency: each client's wave list
-        comes from its own plan, so a designate can run out of upstream work while
-        followers still peer-read chunks it was meant to be filling. Three cluster runs
-        failed exactly that way.
+        `pull_pipelined` returns only when that client is finished, so the driver has
+        nothing to sequence. The ordering peer reads need is carried per chunk and per
+        source by the notification channel instead.
         """
         harness = self._harness()
-        assert "per-chunk completion signalling between rollout actors" in harness
+        assert "g.pull_pipelined.remote(all_agent_names, all_client_names)" in harness
+        assert "def pull_pipelined(self, source_agent_names, source_client_names" in harness
+
+    def test_the_driver_refuses_a_run_with_no_waiting_in_it(self):
+        """A run where nobody waited has no pipeline in it, and must not pass quietly.
+
+        This is the assertion that separates a driven pipeline from the two-phase
+        fallback and from a silently broken channel: all three complete, and only this
+        distinguishes them.
+        """
+        harness = self._harness()
+        assert "assert total_waits > 0" in harness
+        assert "assert total_published == total_waits" in harness
+
+    def test_the_peer_wait_is_per_source_not_per_wave(self):
+        """A chunk can hold shards from several designates; the first report is not enough."""
+        harness = self._harness()
+        assert "sources = sorted({source for _key, source in peer_pairs})" in harness
+        assert "waiter.wait_for(version, depends_on, sources" in harness
+
+    def test_the_schedule_is_coalesced_before_posting(self):
+        """`client_read` is per (key, source); posting a pair twice reposts a live handle.
+
+        The cluster returned `NIXL_ERR_REPOST_ACTIVE` for exactly this: the schedule is
+        per shard, so a key with shards in two waves was posted twice.
+        """
+        harness = self._harness()
+        assert "coalesce_to_transport_pairs" in harness
+
+    def test_publication_follows_the_local_wait(self):
+        """Publishing before the local read completes is the one way to break ordering."""
+        harness = self._harness()
+        wait_at = harness.index(
+            'self.client.wait(key, tag, "READ", target_client=source_client)\n'
+            "                transfers += 1"
+        )
+        publish_at = harness.index("published += publisher.publish(version, wave_index")
+        assert wait_at < publish_at, (
+            "the designate publishes before its own read has landed, so a follower can "
+            "read a buffer that is still being filled -- and that read succeeds"
+        )
+
+    def test_upstream_reads_are_posted_without_a_barrier(self):
+        """An upstream read depends on nothing, so a wave boundary must not block it.
+
+        Measured: a designate doing 653 reads in 4 barriered waves took 2.18s; the same
+        653 reads posted as one batch took 0.899s. NIXL overlaps concurrently posted
+        transfers, and waiting at each wave boundary discards that. The waves still
+        exist -- they decide when to *wait and publish* -- but they no longer gate
+        posting.
+        """
+        harness = self._harness()
+        post_at = harness.index("posted_by_wave.setdefault(wave_index, []).append(")
+        wait_at = harness.index("for key, source_client, tag in posted_by_wave.get(wave_index, []):")
+        assert post_at < wait_at, (
+            "upstream reads are waited on in the same loop that posts them, so wave i+1 "
+            "cannot overlap wave i -- the barrier cost that diffusion was blamed for"
+        )
 
     def test_the_waves_can_reach_both_source_kinds(self):
         """A wave mixes upstream and peer reads, so both name sets must be passed."""
@@ -441,3 +485,215 @@ class TestUpstreamOmissionIsPerShard:
                     f"{name} {key}: {sorted(wanted - via_peer - upstream)} is neither "
                     "peer-covered nor upstream-readable"
                 )
+
+
+class TestFollowerInverse:
+    """The notification direction: who waits on *my* chunks (item D1).
+
+    The plan is addressed from the reader's side because that is who acts on it, but a
+    designate publishing per-chunk completion needs the opposite direction. These tests
+    pin the inverse against the forward plan rather than against a fixture, so the two
+    cannot drift apart.
+    """
+
+    def test_followers_of_is_the_exact_inverse_of_the_peer_plan(self):
+        clients = _cluster(nodes=2, per_node=8, tp=2)
+        plan = CommunicationPlanner().make_comm_plan(clients)
+
+        for designate in clients:
+            expected = {
+                follower
+                for follower, key_plans in plan.peer_pull_plan.items()
+                for per_peer in key_plans.values()
+                if designate in per_peer
+            }
+            assert plan.followers_of(designate) == expected
+
+    def test_a_client_nobody_follows_has_no_followers(self):
+        """The common case, and the reason publishing costs most clients nothing."""
+        clients = _cluster(nodes=1, per_node=4, tp=4)
+        plan = CommunicationPlanner().make_comm_plan(clients)
+
+        assert plan.peer_pull_plan == {}
+        for name in clients:
+            assert plan.followers_of(name) == set()
+
+    def test_every_follower_has_a_designate_that_knows_about_it(self):
+        """No follower may wait on a designate that would never publish to it.
+
+        This is the invariant that turns a missing notification edge from a hang into a
+        test failure: the follower set and the peer plan must cover each other exactly.
+        """
+        clients = _cluster(nodes=3, per_node=8, tp=2)
+        plan = CommunicationPlanner().make_comm_plan(clients)
+
+        for follower, key_plans in plan.peer_pull_plan.items():
+            for per_peer in key_plans.values():
+                for designate in per_peer:
+                    assert follower in plan.followers_of(designate), (
+                        f"{follower} peer-reads from {designate}, but {designate} would "
+                        f"never notify it"
+                    )
+
+    def test_followers_by_chunk_only_names_chunks_someone_wants(self):
+        """A chunk with no follower must not appear, or we publish signals nobody awaits."""
+
+        class _Piece:
+            def __init__(self, shard):
+                self.shard = shard
+
+        class _Chunk:
+            def __init__(self, index, pieces):
+                self.index = index
+                self.pieces = [_Piece(shard) for shard in pieces]
+
+        clients = {
+            "train0": _client("train0", NIXLClientType.PUSH_SIDE, "10.0.0.0", 2, [0, 1]),
+            "gen0": _client("gen0", NIXLClientType.PULL_SIDE, "10.1.0.0", 2, [0]),
+            "gen1": _client("gen1", NIXLClientType.PULL_SIDE, "10.1.0.0", 2, [0]),
+        }
+        plan = CommunicationPlanner().make_comm_plan(clients)
+        # Whichever of the two the planner chose as the reader; the other follows it.
+        designate = "gen0" if plan.followers_of("gen0") else "gen1"
+        followers = plan.followers_of(designate)
+        assert followers, "fixture produced no diffusion, so it tests nothing"
+
+        shared = (KEYS[0], (0,))
+        unwanted = ("not-in-any-plan", (0,))
+        by_chunk = plan.followers_by_chunk(
+            designate, [_Chunk(0, [shared]), _Chunk(1, [unwanted])]
+        )
+
+        assert by_chunk.get(0) == followers
+        assert 1 not in by_chunk
+
+
+class TestDescriptorCostIsMeasuredButNotGated:
+    """Why descriptor cost does not gate diffusion, though it dominates the pull (D1).
+
+    `postXferReq` costs per *descriptor*, not per call. Swept at a fixed 2 GiB payload
+    with `bench_cross_node_bw.py --tensors`:
+
+        1 desc    -> post 0.026 ms, 354 GB/s
+        4096 desc -> post 16.942 ms, 114 GB/s
+
+    A non-contiguous shard registers as a strided range and expands to one descriptor per
+    row, which is where the follower's time went: 399 peer reads x 4096 descriptors
+    x 2.1us = 3.43s, against a measured post_peer of 3.426s and wait_peer of 0.008s.
+
+    **Gating diffusion on this was tried and is worse (1.93x -> 2.25x).** The expansion
+    belongs to the shard's layout, not the link: a strided shard pays 4096 descriptors
+    read from anywhere, so refusing to diffuse it only moved the cost from `post_peer` to
+    `post_up` and threw away the NIC saving. These tests pin that reasoning so the gate is
+    not reintroduced as an "obvious" optimisation.
+    """
+
+    @staticmethod
+    def _client_with_contiguity(name, node_ip, shard_count, owned, is_contiguous):
+        info = _client(name, NIXLClientType.PULL_SIDE, node_ip, shard_count, owned)
+        for tensor_info in info.tensor_infos.values():
+            tensor_info.shard_meta_infos = [
+                NIXLShardMetaInfo(
+                    dtype=torch.bfloat16,
+                    device=torch.device("cuda:0"),
+                    shape=torch.Size((16, 16)),
+                    stride=(16, 1) if is_contiguous else (32, 1),
+                    is_contiguous=is_contiguous,
+                )
+                for _ in tensor_info.shard_meta_infos
+            ]
+        return info
+
+    def _clients(self, is_contiguous):
+        return {
+            "train0": _client("train0", NIXLClientType.PUSH_SIDE, "10.0.0.0", 2, [0, 1]),
+            "gen0": self._client_with_contiguity("gen0", "10.1.0.0", 2, [0], is_contiguous),
+            "gen1": self._client_with_contiguity("gen1", "10.1.0.0", 2, [0], is_contiguous),
+        }
+
+    def test_strided_shards_are_still_diffused(self):
+        """The gate is deliberately absent: excluding them measured worse, not better."""
+        plan = CommunicationPlanner().make_comm_plan(self._clients(is_contiguous=False))
+
+        assert plan.peer_pull_plan != {}, (
+            "strided shards were excluded from diffusion; that was measured at 2.25x "
+            "against 1.93x with them included, because the descriptor expansion is paid "
+            "upstream too"
+        )
+
+    def test_contiguous_shards_are_diffused(self):
+        plan = CommunicationPlanner().make_comm_plan(self._clients(is_contiguous=True))
+
+        assert plan.peer_pull_plan != {}
+
+    def test_the_contiguity_predicate_reports_the_layout(self):
+        """Kept as a measurement aid, so it must still answer correctly."""
+        planner = CommunicationPlanner()
+        strided = self._clients(is_contiguous=False)
+        contiguous = self._clients(is_contiguous=True)
+
+        assert not planner._peer_read_is_worth_it(strided, "gen0", KEYS[0], (0,))
+        assert planner._peer_read_is_worth_it(contiguous, "gen0", KEYS[0], (0,))
+
+    def test_an_unknown_shard_reports_true(self):
+        """Unknown layout must not read as "not worth it".
+
+        Probed via a shard the designate does not own rather than by nulling
+        `shard_meta_infos`: a real client always has metadata for its own shards (the
+        chunk planner calls `get_shard_size_bytes` on them), so a None there would test a
+        state that cannot occur.
+        """
+        clients = self._clients(is_contiguous=True)
+        planner = CommunicationPlanner()
+
+        assert planner._peer_read_is_worth_it(clients, "gen0", KEYS[0], (7,))
+        assert planner._peer_read_is_worth_it(clients, "gen0", "not-a-key", (0,))
+        assert planner._peer_read_is_worth_it(clients, "no-such-client", KEYS[0], (0,))
+
+
+class TestDiffusionCanBeTurnedOff:
+    """A toggle, because whether diffusion wins depends on the shard layout (D1).
+
+    Diffusion trades NIC bytes for descriptors. With contiguous rollout shards a peer
+    read is one descriptor and the trade is a win; with strided shards the designate must
+    stay readable (it cannot stage, or it would have no remote descriptor), so it pays one
+    descriptor per row. Measured on 5 nodes with Qwen3-8B -- gen registers 144 strided
+    shards of 4096 rows -- diffusion ran 1.42-1.93x *slower* than not diffusing at all.
+
+    So the configuration has to be expressible rather than implied, and both settings
+    must produce a correct plan.
+    """
+
+    def test_disabled_means_no_redirects(self):
+        clients = _cluster(nodes=2, per_node=8, tp=2)
+
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+
+        assert plan.peer_pull_plan == {}
+
+    def test_disabled_still_covers_every_shard_upstream(self):
+        """Turning it off must fall back to reading upstream, not drop the bytes."""
+        clients = _cluster(nodes=2, per_node=8, tp=2)
+
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+
+        for name, info in clients.items():
+            if info.type is not NIXLClientType.PULL_SIDE:
+                continue
+            for key in KEYS:
+                wanted = set(info.tensor_infos[key].sharding.shard_indices)
+                upstream = {
+                    shard
+                    for shard_list in plan.get_rollout_pull_plan(name, key).values()
+                    for shard in shard_list
+                }
+                assert wanted <= upstream, (
+                    f"{name} {key}: {sorted(wanted - upstream)} is unreachable with "
+                    f"diffusion disabled"
+                )
+
+    def test_enabled_is_the_default(self):
+        """The plan-level reduction is real, so the regression must not silently win."""
+        clients = _cluster(nodes=2, per_node=8, tp=2)
+
+        assert CommunicationPlanner().make_comm_plan(clients).peer_pull_plan != {}

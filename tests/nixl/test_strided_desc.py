@@ -19,7 +19,13 @@ import pytest
 import torch
 
 from psrl.utils.nixl.nixl_spec import NIXLSharding
-from psrl.utils.nixl.strided_desc import StridedLayout, can_avoid_staging, describe_shard
+from psrl.utils.nixl.strided_desc import (
+    STRIDED_ROW_BUDGET,
+    StridedLayout,
+    can_avoid_staging,
+    describe_shard,
+    strided_is_cheaper_than_staging,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -331,3 +337,120 @@ class TestSpanBytes:
             address=0, row_bytes=128, device_id=0, stride_bytes=256, row_count=0
         )
         assert layout.span_bytes == 0
+
+
+class TestStridedIsNotAlwaysCheaperThanStaging:
+    """Expressible as a strided range is not the same as worth sending as one (D1).
+
+    `postXferReq` charges per *descriptor*, not per call, and a strided shard needs one
+    per row. Swept at a fixed 2 GiB payload with `bench_cross_node_bw.py --tensors`:
+
+        1 desc    -> post 0.026 ms, 354 GB/s
+        4096 desc -> post 16.942 ms, 114 GB/s
+
+    So the in-place path -- whose selling point is avoiding a staging buffer and a copy --
+    becomes the expensive option once the row count is large. On the 5-node run it spent
+    3.43s on 399 reads of 4096-row shards, where one descriptor each plus a local copy
+    would be single-digit milliseconds.
+    """
+
+    def test_a_few_rows_stay_in_place(self):
+        """Below the budget the in-place path keeps its advantage: no buffer, no copy."""
+        layout = StridedLayout(
+            address=0x1000, row_bytes=4096, device_id=0, stride_bytes=8192, row_count=8
+        )
+        assert strided_is_cheaper_than_staging(layout)
+
+    def test_many_rows_prefer_staging(self):
+        """Past the budget the descriptor count dominates every other term."""
+        layout = StridedLayout(
+            address=0x1000, row_bytes=4096, device_id=0, stride_bytes=8192, row_count=4096
+        )
+        assert not strided_is_cheaper_than_staging(layout)
+
+    def test_the_budget_boundary_is_inclusive(self):
+        at = StridedLayout(
+            address=0x1000,
+            row_bytes=4096,
+            device_id=0,
+            stride_bytes=8192,
+            row_count=STRIDED_ROW_BUDGET,
+        )
+        over = StridedLayout(
+            address=0x1000,
+            row_bytes=4096,
+            device_id=0,
+            stride_bytes=8192,
+            row_count=STRIDED_ROW_BUDGET + 1,
+        )
+        assert strided_is_cheaper_than_staging(at)
+        assert not strided_is_cheaper_than_staging(over)
+
+    def test_no_layout_means_no_in_place_path(self):
+        """None is "not expressible", which is a different reason for the same answer."""
+        assert not strided_is_cheaper_than_staging(None)
+
+    def test_a_real_column_slice_of_a_large_tensor_prefers_staging(self):
+        """The case that actually occurs: a column slice carries one row per outer element.
+
+        This is what gen-side registration produces (144 strided shards on Qwen3-8B), and
+        it is why the decision needs a budget rather than just an expressibility check.
+        """
+        base = torch.zeros(4096, 2048, dtype=torch.bfloat16)
+        column_slice = base[:, 0:1024]
+        layout = describe_shard(column_slice)
+
+        assert layout is not None, "a column slice is expressible as a strided range"
+        assert layout.row_count == 4096
+        assert not strided_is_cheaper_than_staging(layout), (
+            "a 4096-row shard would pay 4096 descriptors in place; staging pays one"
+        )
+
+
+class TestReadabilityOverridesTheRowBudget:
+    """Staging is only available to a shard nothing reads from (items A2, D1).
+
+    A staged shard lives in a transfer-local buffer and has **no permanent remote
+    descriptor**, so `client_read` refuses it as a source: "Remote descriptor must be
+    contiguous for client read". That surfaced on the cluster the moment the row budget
+    started staging gen-side shards -- the peer designate became unreadable and its
+    followers failed.
+
+    So the budget and peer diffusion pull in opposite directions, and the tension is
+    structural rather than a tuning question:
+
+    * **with diffusion** a designate must register in place, paying one descriptor per
+      row (4096 of them on Qwen3-8B, measured at 3.43s);
+    * **without diffusion** a rollout is a pure destination and can stage, paying one
+      descriptor plus a local copy.
+
+    Which is faster is an empirical question, and these tests only fix the correctness
+    constraint: readability wins over the budget, always.
+    """
+
+    def test_a_readable_shard_keeps_its_in_place_registration(self):
+        layout = StridedLayout(
+            address=0x1000, row_bytes=4096, device_id=0, stride_bytes=8192, row_count=4096
+        )
+        assert strided_is_cheaper_than_staging(layout, must_be_readable=True), (
+            "a shard another client reads from was staged, which leaves it with no "
+            "remote descriptor and makes every peer read of it fail"
+        )
+
+    def test_a_destination_only_shard_may_be_staged(self):
+        layout = StridedLayout(
+            address=0x1000, row_bytes=4096, device_id=0, stride_bytes=8192, row_count=4096
+        )
+        assert not strided_is_cheaper_than_staging(layout, must_be_readable=False)
+
+    def test_readability_does_not_invent_a_layout(self):
+        """None still means "cannot register in place", whatever the role."""
+        assert not strided_is_cheaper_than_staging(None, must_be_readable=True)
+
+    def test_a_small_readable_shard_is_unaffected(self):
+        """Below the budget both paths agree, so the override changes nothing."""
+        layout = StridedLayout(
+            address=0x1000, row_bytes=4096, device_id=0, stride_bytes=8192, row_count=8
+        )
+        assert strided_is_cheaper_than_staging(layout, must_be_readable=True)
+        assert strided_is_cheaper_than_staging(layout, must_be_readable=False)

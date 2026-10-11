@@ -196,9 +196,16 @@ class TestEdgeCases:
         # So the fast-NIC chunk can be smaller or the same, never meaningfully larger.
         assert result_fast.chunk_bytes <= result_slow.chunk_bytes * 2
 
-    def test_slow_nic_raises_the_floor(self):
-        """A 50 Gbps NIC raises the polling floor — recommended chunk must be larger."""
-        result_slow_nic = choose_chunk_bytes(
+    def test_a_slow_nic_lowers_the_polling_floor(self):
+        """A slower NIC *lowers* the floor, because each chunk takes longer to move.
+
+        The polling tax is `poll_interval / transfer_time`, so halving bandwidth doubles
+        the transfer time and halves the tax -- a smaller chunk becomes affordable. The
+        test previously asserted the opposite ("slow NIC raises the floor") and passed
+        only because the old objective returned the grid maximum for every input, which
+        satisfies `>= 512MB` regardless of what the floor is doing.
+        """
+        slow = choose_chunk_bytes(
             int(15.6 * GB), 183,
             bw_nic_gbs=50.0,
             bw_hbm_gbs=H20["bw_hbm_gbs"],
@@ -207,7 +214,18 @@ class TestEdgeCases:
             polling_overhead_ms=H20["polling_overhead_ms"],
             polling_overhead_threshold=H20["polling_overhead_threshold"],
         )
-        assert result_slow_nic.chunk_bytes >= 512 * MB
+        fast = choose_chunk_bytes(int(15.6 * GB), 183, **H20)
+
+        assert slow.chunk_bytes < fast.chunk_bytes, (
+            f"slow NIC chose {slow.chunk_bytes // MB}MB and fast chose "
+            f"{fast.chunk_bytes // MB}MB; a slower link should tolerate smaller chunks"
+        )
+        # Both must still respect the polling threshold they were given.
+        for result, bw in ((slow, 50.0), (fast, H20["bw_nic_gbs"])):
+            tax = polling_overhead_fraction(
+                result.chunk_bytes, bw, H20["polling_overhead_ms"]
+            )
+            assert tax <= H20["polling_overhead_threshold"]
 
     def test_zero_keys_produces_valid_result(self):
         result = choose_chunk_bytes(int(1 * GB), n_grouped_keys=0, **H20)
@@ -219,3 +237,117 @@ class TestEdgeCases:
         assert abs(result.t_rdma_per_chunk_ms - t_chunk) < 0.001
         pf = polling_overhead_fraction(result.chunk_bytes, H20["bw_nic_gbs"], H20["polling_overhead_ms"])
         assert abs(result.polling_overhead_fraction - pf) < 0.001
+
+
+class TestObjectiveIsMakespanNotRoundDistance:
+    """What the recommender optimises, and why the previous objective was degenerate.
+
+    The old score was `abs(rounds - ceil(T_fmt / t_chunk))`. Both terms fall as the chunk
+    grows, and the second falls faster, so the score was monotone decreasing and the grid
+    maximum (8GB) won for *every* input -- a 16GB model and a 1.3TB model got the same
+    chunk. Several tests passed anyway because `>= 512MB` is true of 8GB.
+
+    The objective is now the pipeline makespan, `(rounds + D - 1) * max(t_chunk,
+    T_fmt / rounds)`, which is what actually determines how long a pull takes.
+    """
+
+    def test_the_recommendation_is_not_simply_the_grid_maximum(self):
+        """The bug signature: every model collapsing onto the largest candidate."""
+        small = choose_chunk_bytes(int(16 * GB), 399, **H20)
+        huge = choose_chunk_bytes(int(1340 * GB), 579, **H20)
+
+        assert small.chunk_bytes < 8 * GB, "recommender returned the grid maximum"
+        assert huge.chunk_bytes < 8 * GB, "recommender returned the grid maximum"
+
+    def test_smallest_affordable_chunk_wins_under_a_linear_rdma_model(self):
+        """`rounds x t_chunk` is invariant, so only the pipeline fill term varies.
+
+        This is a property of the cost model, not a tuning choice: RDMA time is linear in
+        bytes, so halving the chunk doubles the rounds and leaves steady-state time
+        unchanged. The only term that moves is the `D - 1` rounds of fill, which is
+        cheaper with a smaller chunk. The recommendation is therefore pinned to the
+        polling floor until format cost per chunk overtakes transfer cost.
+
+        B3's stated criterion -- "chunk *bytes* vary with model size" -- does not hold
+        under this model, and the honest resolution is to record why rather than to bend
+        the objective until it does.
+        """
+        result = choose_chunk_bytes(int(16 * GB), 399, **H20)
+
+        # One step below the recommendation must breach the polling threshold, which is
+        # what makes the recommendation a floor rather than an optimum.
+        below = result.chunk_bytes // 2
+        tax = polling_overhead_fraction(below, H20["bw_nic_gbs"], H20["polling_overhead_ms"])
+        assert tax > H20["polling_overhead_threshold"], (
+            f"{below // MB}MB has only {tax:.1%} polling tax, so the recommender should "
+            f"have chosen it over {result.chunk_bytes // MB}MB"
+        )
+
+    def test_format_bound_workloads_do_not_shrink_below_the_floor(self):
+        """A huge key count raises T_fmt, but the floor still governs.
+
+        Worth pinning because it is the case where the two terms compete: ungrouped MoE
+        has `T_fmt` in the seconds, yet `T_fmt / rounds` stays under `t_chunk` at every
+        affordable chunk size, so the answer does not move. If a future change makes
+        format cost per chunk dominate, this test fails and the floor stops being the
+        whole story.
+        """
+        grouped = choose_chunk_bytes(int(1340 * GB), 579, **H20)
+        ungrouped = choose_chunk_bytes(int(1340 * GB), 140_000, **H20)
+
+        assert ungrouped.chunk_bytes <= grouped.chunk_bytes
+        for result in (grouped, ungrouped):
+            tax = polling_overhead_fraction(
+                result.chunk_bytes, H20["bw_nic_gbs"], H20["polling_overhead_ms"]
+            )
+            assert tax <= H20["polling_overhead_threshold"]
+
+
+class TestRoundDecisionsAreLocal:
+    """B3's second criterion: no cross-process round trip per transfer round.
+
+    The plan is compiled once during the handshake and carried by each client, so source
+    selection during a pull is a dictionary lookup rather than a query to the meta server.
+    This is what makes the control plane independent of round count -- the property that
+    matters at 10k-GPU scale, where a per-round RPC would be `O(rounds x ranks)`.
+
+    Pinned by source inspection rather than a log grep: a log can be silent because the
+    code path did not run, which is the same failure mode the "0 peer reads deferred"
+    diagnostic had.
+    """
+
+    @staticmethod
+    def _pull_source() -> str:
+        import inspect
+
+        from psrl.utils.nixl.client import NIXLStorageClient
+
+        return "\n".join(
+            inspect.getsource(getattr(NIXLStorageClient, name))
+            for name in (
+                "client_read",
+                "iter_planned_pull_work",
+                "peer_sources_for",
+                "upstream_sources_for",
+                "pull_chunks",
+            )
+        )
+
+    def test_the_pull_path_makes_no_ray_calls(self):
+        source = self._pull_source()
+
+        assert ".remote(" not in source, "the pull path issues a Ray call per round"
+        assert "ray.get" not in source, "the pull path blocks on a Ray future per round"
+
+    def test_source_selection_reads_the_cached_plan(self):
+        """Each accessor resolves against `self._comm_plan`, not a live query."""
+        source = self._pull_source()
+
+        assert "self._comm_plan" in source
+        # And the plan is received once, during the handshake, not fetched per round.
+        import inspect
+
+        from psrl.utils.nixl.client import NIXLStorageClient
+
+        handshake = inspect.getsource(NIXLStorageClient.wait_for_server_info)
+        assert "comm_plan" in handshake

@@ -162,13 +162,33 @@ def choose_chunk_bytes(
         t_chunk = t_rdma_per_chunk(aligned, hw["bw_nic_gbs"], hw["t_lat_ms"])
         rounds = math.ceil(model_bytes / aligned)
 
-        # Prefer: more rounds to hide fmt cost, but not more than needed to cover it.
-        rounds_needed = max(
-            wire_buffer_depth,
-            math.ceil(tf / max(t_chunk, 1e-12)),
-        )
-        excess = abs(rounds - rounds_needed)
-        score = excess + pf  # penalise both over- and under-chunking
+        # Minimise makespan, not the distance to a round count.
+        #
+        # The previous objective scored `abs(rounds - rounds_needed)` where
+        # `rounds_needed = ceil(T_fmt / t_chunk)`. That is monotone in chunk size --
+        # a bigger chunk raises `t_chunk`, so `rounds_needed` falls faster than `rounds`
+        # does -- and the score therefore always bottomed out at the grid's largest
+        # entry. Every model from 16GB to 1.3TB got the same 8GB chunk, which is the one
+        # thing B3's own criterion says must not happen ("chunk *bytes* vary with the
+        # model, not a fixed value").
+        #
+        # The quantity that actually matters is how long the pipeline takes. With two
+        # stages (format, then RDMA) the steady state runs at the slower stage, and
+        # `D - 1` extra rounds fill and drain it:
+        #
+        #     makespan = (rounds + D - 1) x max(t_chunk, T_fmt / rounds)
+        #
+        # Small chunks make `t_chunk` cheap but spread `T_fmt` thin over many rounds;
+        # large chunks do the reverse. The minimum sits where the two stages balance,
+        # which is exactly the pipeline-design intent -- and it moves with the model,
+        # because `T_fmt` grows with key count and bytes while `t_chunk` does not.
+        t_fmt_per_chunk = tf / max(rounds, 1)
+        makespan = (rounds + max(wire_buffer_depth, 1) - 1) * max(t_chunk, t_fmt_per_chunk)
+
+        # Polling tax is already bounded by the `continue` above; adding it here breaks
+        # ties toward the cheaper-to-poll candidate without competing with makespan,
+        # since `pf <= threshold < 1` and makespan is in milliseconds.
+        score = makespan + pf
 
         if score < best_score:
             best_score = score

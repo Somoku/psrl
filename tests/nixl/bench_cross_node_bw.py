@@ -112,11 +112,19 @@ def main() -> None:
     local_descs = reg.trim()
 
     best = None
+    best_post_ms = None
     for rep in range(args.reps):
         handle = agent.initialize_xfer("READ", local_descs, remote_descs, "target", b"bw")
         assert handle, "initialize_xfer failed"
         start = time.perf_counter()
         state = agent.transfer(handle)
+        # Post time is reported separately from completion time, because the two answer
+        # different questions. The 5-node pull spends nearly all of its peer-read time
+        # inside `transfer()` itself, which is consistent with two different cost models
+        # -- a fixed per-submission price, or a per-descriptor one -- and only sweeping
+        # `--tensors` at fixed payload distinguishes them. If post time grows with the
+        # tensor count, the cost is per descriptor and merging submissions cannot help.
+        post_ms = (time.perf_counter() - start) * 1e3
         assert state != "ERR", "transfer submission failed"
         while True:
             state = agent.check_xfer_state(handle)
@@ -127,12 +135,18 @@ def main() -> None:
         agent.release_xfer_handle(handle)
 
         gbps = payload_bytes / elapsed / 1e9
-        print(f"  rep {rep}: {elapsed:.4f} s -> {gbps:.2f} GB/s", flush=True)
+        print(
+            f"  rep {rep}: {elapsed:.4f} s -> {gbps:.2f} GB/s "
+            f"(post {post_ms:.3f} ms, {post_ms * 1e3 / args.tensors:.2f} us/desc)",
+            flush=True,
+        )
         best = gbps if best is None else max(best, gbps)
+        best_post_ms = post_ms if best_post_ms is None else min(best_post_ms, post_ms)
 
     print(
         f"RESULT tensors={args.tensors} payload={payload_bytes / GIB:.2f}GiB "
-        f"best={best:.2f} GB/s",
+        f"best={best:.2f} GB/s post_ms={best_post_ms:.3f} "
+        f"post_us_per_desc={best_post_ms * 1e3 / args.tensors:.2f}",
         flush=True,
     )
 

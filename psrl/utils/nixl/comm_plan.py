@@ -79,6 +79,47 @@ class NIXLCommPlan:
         """Shards of ``key`` this client should take from a same-node peer (item D1)."""
         return self.peer_pull_plan.get(pull_client, {}).get(key, {})
 
+    def followers_of(self, designate: str) -> set[str]:
+        """Clients that peer-read from ``designate`` -- the inverse of the peer plan (D1).
+
+        The plan is addressed from the reader's side, because that is who has to act on
+        it. Per-chunk completion signalling needs the opposite direction: a designate must
+        know whom to notify once a chunk has landed. Deriving it here rather than at the
+        call site keeps the one source of truth; a caller that rebuilt it from its own
+        view would be guessing about clients it never reads from.
+
+        Returns the empty set for a client nobody follows, which is the common case and
+        the reason publishing costs nothing for most clients.
+        """
+        return {
+            follower
+            for follower, per_key in self.peer_pull_plan.items()
+            for per_peer in per_key.values()
+            if designate in per_peer
+        }
+
+    def followers_by_chunk(self, designate: str, chunks: "list") -> dict[int, set[str]]:
+        """``{chunk: followers}`` for the followers that need each of ``designate``'s chunks.
+
+        Publishing every chunk to every follower would work but sends notifications that
+        no one waits on. More importantly the per-chunk set is what a *test* can check
+        against the schedule: if a chunk's follower set is empty, no follower is waiting
+        on it, and a publish there is a sign the schedule and the plan disagree.
+        """
+        wanted: dict[tuple[str, tuple[int, ...]], set[str]] = {}
+        for follower, per_key in self.peer_pull_plan.items():
+            for key, per_peer in per_key.items():
+                for shard in per_peer.get(designate, []):
+                    wanted.setdefault((key, shard), set()).add(follower)
+
+        by_chunk: dict[int, set[str]] = {}
+        for chunk in chunks:
+            for piece in chunk.pieces:
+                followers = wanted.get(piece.shard)
+                if followers:
+                    by_chunk.setdefault(chunk.index, set()).update(followers)
+        return by_chunk
+
     def iter_rollout_pull_work(self, pull_client: str):
         """Yield ``(key, source_client)`` pairs this client is actually scheduled to read.
 
@@ -157,13 +198,28 @@ class CommunicationPlanner:
     #: B3 replaces this constant with the cost model.
     DEFAULT_CHUNK_BYTES = 512 * 1024 * 1024
 
-    def __init__(self, restrict_client_group_comm: bool = False, chunk_bytes: int | None = None):
+    def __init__(
+        self,
+        restrict_client_group_comm: bool = False,
+        chunk_bytes: int | None = None,
+        peer_diffusion: bool = True,
+    ):
         """Initialize the communication planner"""
         # NOTE(lhy): Restrict communication to matching client groups when enabled.
         self.restrict_client_group_comm = restrict_client_group_comm
         # None means "ask the cost model per client" (B3). A value pins every client
         # to that budget, which is what the chunk-size sweep needs.
         self.chunk_bytes = chunk_bytes
+        # Peer diffusion trades NIC bytes for descriptors, and whether that is a win
+        # depends on the rollout's shard layout rather than on the topology. It pays off
+        # when a rollout's shards are contiguous (one descriptor per peer read) and loses
+        # when they are strided -- a designate must stay readable, so it cannot stage, and
+        # it then pays one descriptor per row. Measured on 5 nodes with Qwen3-8B, where
+        # gen registers 144 strided shards at 4096 rows each: 1.42-1.93x *slower* than no
+        # diffusion. Left on by default because the plan-level reduction is real (61% of
+        # reads move to NVLink) and the regression is specific to strided layouts; set
+        # False to measure or to run the configuration that is currently faster.
+        self.peer_diffusion = peer_diffusion
 
     def make_comm_plan(self, clients: dict[str, NIXLClientInfo]) -> NIXLCommPlan:
         """
@@ -296,8 +352,19 @@ class CommunicationPlanner:
           never one that was itself redirected, so no chain forms. Picking the
           lowest-named wanter deterministically is what guarantees this: the designated
           reader is never in the redirected set.
+
+        **Descriptor cost does not enter this decision, and the reason is worth stating
+        because the opposite was tried and measured.** `postXferReq` costs per descriptor
+        (~3.5-4us; see `_peer_read_is_worth_it`), and a strided shard expands to one
+        descriptor per row, so a peer read of such a shard is expensive. But it is
+        *equally* expensive upstream -- the expansion is a property of the shard's layout,
+        not of the link -- so excluding strided shards from diffusion does not remove the
+        cost, it only gives up the NIC saving. Measured: gating them out moved the cost
+        from `post_peer` to `post_up` and made the total **worse** (1.93x -> 2.25x).
         """
         node_of = {name: info.node_ip for name, info in clients.items()}
+        if not self.peer_diffusion:
+            return {}
 
         # (node, key, shard) -> clients on that node wanting exactly those bytes.
         wanted: dict[tuple[str, str, tuple[int, ...]], list[str]] = {}
@@ -331,6 +398,53 @@ class CommunicationPlanner:
                 for shard_list in per_source.values():
                     shard_list.sort()
         return peer_plan
+
+    @staticmethod
+    def _peer_read_is_worth_it(
+        clients: dict[str, NIXLClientInfo],
+        designate: str,
+        key: str,
+        shard_idx: tuple[int, ...],
+    ) -> bool:
+        """Whether this shard is contiguous on the designate's side.
+
+        **Not currently used to gate diffusion**, and kept because the measurement behind
+        it is the one that explains the pull's cost.
+
+        `postXferReq` costs per *descriptor*, not per call. Sweeping descriptor count at a
+        fixed 2 GiB payload (`bench_cross_node_bw.py --tensors`) gave 0.026ms at one
+        descriptor against 16.942ms at 4096 -- a flat ~3.5-4us each -- with bandwidth
+        falling from 354 GB/s to 114 GB/s. A non-contiguous shard registers as a strided
+        range and expands to one descriptor per row (item A2), so the cluster arithmetic
+        closed exactly: 399 peer reads x 4096 descriptors x 2.1us = 3.43s, against a
+        measured `post_peer` of 3.426s and `wait_peer` of 0.008s.
+
+        **But gating diffusion on it made things worse (1.93x -> 2.25x), because the
+        expansion is a property of the layout rather than the link.** A strided shard pays
+        4096 descriptors whether it is read from a peer or from upstream; refusing to
+        diffuse it simply moved the cost from `post_peer` to `post_up` and discarded the
+        NIC saving. The lever is *fewer descriptors* -- i.e. making the shard contiguous
+        before registering it -- not *which link* pays for them.
+
+        Returns True when the layout is unknown, which keeps any future caller from
+        silently disabling diffusion on incomplete metadata.
+        """
+        info = clients.get(designate)
+        if info is None or key not in info.tensor_infos:
+            return True
+        tensor_info = info.tensor_infos[key]
+        sharding = tensor_info.sharding
+        try:
+            position = sharding.shard_indices.index(shard_idx)
+        except ValueError:
+            return True
+        metas = tensor_info.shard_meta_infos
+        if position >= len(metas):
+            return True
+        meta = metas[position]
+        if meta is None:
+            return True
+        return bool(getattr(meta, "is_contiguous", True))
 
     def _build_pull_chunk_plan(
         self,

@@ -253,3 +253,91 @@ class TestBackwardCompatibleComposition:
 
         client.merge_and_finish_cached_xfer()
         assert agent.calls == []
+
+
+class TestStridedShardsCanBeMerged:
+    """Multi-descriptor entries must merge, not be rejected (items A1/A2 + D1).
+
+    A strided shard expands to one descriptor per row (item A2), so a cached entry
+    legitimately holds thousands of descriptors -- the 5-node Qwen3-8B run registers
+    "144 strided shard(s) in place" at 4096 descriptors each. The merge path used to
+    assert `descCount() == 1`, which was not a NIXL limit but a guard against the
+    accumulation silently keeping only `desc[0]`.
+
+    Why it matters: without merging, a client whose shards are strided can only submit
+    one read at a time, and the cluster breakdown put *all* the remaining cost there --
+    post_peer 4.105s against wait_peer 0.007s. The bytes are free; the submissions are
+    the bill.
+    """
+
+    def _cache_strided(self, client, count, tag="chunk0", base=0x1000):
+        descs = [(base + i * 4096, 4096, 0) for i in range(count)]
+        client._cached_xfer_descs.append(
+            (
+                "READ",
+                FakeDescList(descs=list(descs)),
+                FakeDescList(descs=list(descs)),
+                "peer-agent",
+                tag,
+                "peer",
+            )
+        )
+
+    def test_a_multi_descriptor_entry_is_accepted(self):
+        agent = FakeAgent()
+        client = _client(agent)
+        self._cache_strided(client, 4096)
+
+        posted = client.post_cached_xfer()
+
+        assert len(posted) == 1
+        assert posted[0].desc_count == 4096
+
+    def test_every_descriptor_survives_the_merge(self):
+        """The old accumulation took `desc[0]` only; dropping rows loses bytes silently."""
+        agent = FakeAgent()
+        client = _client(agent)
+        self._cache_strided(client, 8, tag="chunk0", base=0x1000)
+        self._cache_strided(client, 8, tag="chunk0", base=0x9000)
+
+        posted = client.post_cached_xfer()
+
+        assert len(posted) == 1
+        # 16, not 2: a merge that kept one descriptor per entry would transfer 2 rows
+        # and silently leave 14 unwritten.
+        assert posted[0].desc_count == 16
+
+    def test_many_strided_reads_become_one_submission(self):
+        """This is the whole point: N posts collapse to one."""
+        agent = FakeAgent()
+        client = _client(agent)
+        for i in range(32):
+            self._cache_strided(client, 128, tag="chunk0", base=0x1000 + i * 0x100000)
+
+        posted = client.post_cached_xfer()
+
+        assert len(posted) == 1
+        assert posted[0].desc_count == 32 * 128
+        assert [k for k, _ in agent.calls].count("initialize") == 1
+
+    def test_mismatched_counts_are_still_rejected(self):
+        """NIXL pairs descriptors element-wise, so unequal sides cannot be merged.
+
+        `_align_desc_counts` equalises them at cache time, so reaching here unequal
+        means that invariant broke -- which must surface rather than transfer a prefix.
+        """
+        agent = FakeAgent()
+        client = _client(agent)
+        client._cached_xfer_descs.append(
+            (
+                "READ",
+                FakeDescList(descs=[(0x1000, 4096, 0), (0x2000, 4096, 0)]),
+                FakeDescList(descs=[(0x1000, 4096, 0)]),
+                "peer-agent",
+                "chunk0",
+                "peer",
+            )
+        )
+
+        with pytest.raises(AssertionError, match="descriptor counts must match"):
+            client.post_cached_xfer()

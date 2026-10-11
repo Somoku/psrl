@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 from psrl.utils.nixl.chunk_pipeline import (
     ChunkWave,
+    coalesce_to_transport_pairs,
     exposed_waves,
     overlap_depth,
     schedule_pipelined_reads,
@@ -22,6 +23,23 @@ from psrl.utils.nixl.chunk_pipeline import (
 from psrl.utils.nixl.chunking import CommitGroup, plan_chunks
 
 pytestmark = pytest.mark.cpu_test
+
+
+def _laid_out_chunks(layout, shard_bytes: int = 512 * 1024):
+    """Chunks with an explicit per-chunk shard layout.
+
+    The module's `_chunks` takes a key count and derives the layout; these tests need to
+    place named shards in named chunks, because the property under test is *where* a pair
+    lands. Built on the real `plan_chunks` so the chunk objects are the ones the
+    scheduler sees, rather than a stand-in whose `pieces` could drift.
+    """
+    groups, sizes = [], {}
+    for chunk_index, refs in enumerate(layout):
+        groups.append(CommitGroup(name=f"g{chunk_index}", shards=tuple(refs)))
+        for ref in refs:
+            sizes[ref] = shard_bytes
+    chunks, _resolved = plan_chunks(groups, sizes, chunk_bytes=shard_bytes)
+    return chunks
 
 
 def _chunks(num_keys: int, shards_per_key: int = 2, shard_bytes: int = 512 * 1024):
@@ -346,3 +364,93 @@ class TestDeterminism:
         assert [(w.index, w.ready_after, len(w.reads)) for w in first] == [
             (w.index, w.ready_after, len(w.reads)) for w in second
         ]
+
+
+class TestCoalesceToTransportPairs:
+    """The schedule is per shard, the transport is per (key, source) (item D1).
+
+    `client_read` moves every shard the plan gives a pair, so a pair whose shards were
+    placed in several waves is fully transferred by the first wave that mentions it.
+    Posting it again reposts a live handle -- the cluster returned
+    `NIXL_ERR_REPOST_ACTIVE` -- so each pair must appear exactly once.
+    """
+
+    def test_each_pair_appears_exactly_once(self):
+        chunks = _laid_out_chunks([[("k", (0,))], [("k", (1,))]])
+        plan = {"k": {"trainer": [(0,), (1,)]}}
+        waves = schedule_pipelined_reads(chunks, plan, {}, "c0")
+
+        coalesced = coalesce_to_transport_pairs(waves)
+
+        posted = [pair for _index, pairs in coalesced for pair in pairs]
+        assert len(posted) == 1, f"pair posted {len(posted)} times: {posted}"
+        assert posted[0][:2] == ("k", "trainer")
+
+    def test_an_upstream_pair_goes_to_its_earliest_wave(self):
+        """It has no dependency, and issuing it early is what followers overlap with."""
+        chunks = _laid_out_chunks([[("k", (0,))], [("k", (1,))]])
+        plan = {"k": {"trainer": [(0,), (1,)]}}
+        waves = schedule_pipelined_reads(chunks, plan, {}, "c0")
+
+        coalesced = coalesce_to_transport_pairs(waves)
+
+        assert coalesced[0][0] == 0
+        assert len(coalesced) == 1
+
+    def test_a_peer_pair_goes_to_its_latest_wave(self):
+        """A peer read is valid only after *every* shard it wants has been filled.
+
+        Taking the earliest wave would issue the read before the designate had the later
+        shards -- and that read succeeds against an unfilled buffer, so nothing
+        downstream would catch it. This asymmetry with the upstream case is the point of
+        the function.
+        """
+        chunks = _laid_out_chunks([[("k", (0,))], [("k", (1,))]])
+        peer_plan = {"k": {"peer0": [(0,), (1,)]}}
+        waves = schedule_pipelined_reads(chunks, {}, peer_plan, "c0")
+
+        coalesced = coalesce_to_transport_pairs(waves)
+
+        assert len(coalesced) == 1
+        index, pairs = coalesced[0]
+        shard_waves = [w.index for w in waves if any(r.is_peer for r in w.reads)]
+        assert index == max(shard_waves), (
+            f"peer pair posted at wave {index} but its shards span {shard_waves}; "
+            "issuing before the last dependency reads an unfilled buffer successfully"
+        )
+        assert pairs[0][2] is True
+
+    def test_upstream_and_peer_pairs_keep_their_kinds(self):
+        chunks = _laid_out_chunks([[("up", (0,)), ("pe", (0,))]])
+        waves = schedule_pipelined_reads(
+            chunks, {"up": {"trainer": [(0,)]}}, {"pe": {"peer0": [(0,)]}}, "c0"
+        )
+
+        coalesced = coalesce_to_transport_pairs(waves)
+
+        kinds = {(key, source): peer for _i, pairs in coalesced for key, source, peer in pairs}
+        assert kinds[("up", "trainer")] is False
+        assert kinds[("pe", "peer0")] is True
+
+    def test_empty_waves_are_dropped(self):
+        """A wave contributing no pair is not a barrier -- nothing in it has to wait."""
+        chunks = _laid_out_chunks([[("k", (0,))], [("other", (9,))]])
+        waves = schedule_pipelined_reads(chunks, {"k": {"trainer": [(0,)]}}, {}, "c0")
+
+        coalesced = coalesce_to_transport_pairs(waves)
+
+        assert all(pairs for _index, pairs in coalesced)
+
+    def test_no_pair_is_lost(self):
+        """Coalescing must not drop work: every scheduled pair has to be posted."""
+        chunks = _laid_out_chunks(
+            [[("a", (0,)), ("b", (0,))], [("a", (1,)), ("c", (0,))], [("b", (1,))]]
+        )
+        upstream = {"a": {"t0": [(0,), (1,)]}, "c": {"t1": [(0,)]}}
+        peer = {"b": {"p0": [(0,), (1,)]}}
+        waves = schedule_pipelined_reads(chunks, upstream, peer, "c0")
+
+        scheduled = {(r.key, r.source) for w in waves for r in w.reads}
+        posted = {(key, source) for _i, pairs in coalesce_to_transport_pairs(waves) for key, source, _p in pairs}
+
+        assert posted == scheduled

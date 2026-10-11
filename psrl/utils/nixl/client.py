@@ -16,6 +16,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
+from psrl.utils.nixl.chunk_notify import ChunkCompletionPublisher, ChunkCompletionWaiter
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.moe_grouping import GroupedShards, entry_is_empty, local_shards_of
@@ -28,7 +29,13 @@ from psrl.utils.nixl.nixl_spec import (
     NIXLTensorInfo,
 )
 from psrl.utils.nixl.prepped_xfer import PreppedXferCache
-from psrl.utils.nixl.strided_desc import StridedLayout, describe_shard
+from psrl.utils.nixl.strided_desc import (
+    STRIDED_ROW_BUDGET,
+    STRIDED_US_PER_DESCRIPTOR,
+    StridedLayout,
+    describe_shard,
+    strided_is_cheaper_than_staging,
+)
 
 if TYPE_CHECKING:
     from torch_memory_saver import torch_memory_saver
@@ -120,6 +127,21 @@ class NIXLStorageClient:
         )  # None means no pinned temp memory
         self.client_group_id = client_group_id
         self.enable_tms_for_temp_buffers = nixl_config.enable_tms_for_temp_buffers and use_gpu
+        # Whether another client may read this one's shards, which decides if a strided
+        # shard has to be registered in place (readable, one descriptor per row) or may be
+        # staged contiguously (one descriptor, plus a local copy).
+        #
+        # Config rather than plan, because of an ordering fact: registration is protocol
+        # step 4 and the comm plan does not arrive until step 6. A client therefore cannot
+        # know at registration time whether the planner made it a diffusion designate, so
+        # the answer has to come from the deployment -- which does know, since peer
+        # diffusion is itself a configuration choice.
+        #
+        # Defaults to True for safety: staging a shard that something later reads leaves
+        # it with no remote descriptor, and the read fails rather than degrading.
+        self.shards_must_be_readable = bool(
+            getattr(nixl_config, "shards_must_be_readable", True)
+        )
 
         if self.enable_tms_for_temp_buffers:
             if torch_memory_saver is None:
@@ -204,6 +226,22 @@ class NIXLStorageClient:
         #: Canonical shard-metadata instances, so equal descriptions are one object on
         #: the wire rather than N copies. See `_intern_shard_meta`.
         self._shard_meta_interner: dict[tuple, NIXLShardMetaInfo] = {}
+        #: Per-chunk completion signalling, built lazily by `chunk_completion_channel`.
+        self._chunk_channel: tuple[ChunkCompletionPublisher, ChunkCompletionWaiter] | None = None
+        #: Notifications drained by the chunk channel that belong to another subsystem.
+        #: Held rather than dropped -- the stream is shared with the handshake.
+        self._foreign_notifs: dict[str, list[bytes]] = {}
+        #: Microseconds spent in each phase of `client_read`'s per-shard loop.
+        #: Three separate attempts to reduce the measured post cost (drop the wave
+        #: barrier, merge descriptors, pre-post every wave) each left it the same or
+        #: worse, because each treated it as submission cost without checking. These
+        #: counters say which call inside the loop the time is actually in.
+        self._read_phase_us: dict[str, float] = {
+            "deserialize": 0.0,
+            "align": 0.0,
+            "initialize": 0.0,
+            "transfer": 0.0,
+        }
 
         # logging
         if logging_path is not None:
@@ -311,6 +349,80 @@ class NIXLStorageClient:
         if self._comm_plan is None:
             return [], []
         return self._comm_plan.get_pull_chunks(self.client_name)
+
+    def peer_followers(self) -> set[str]:
+        """Clients that peer-read from this one, i.e. whom to notify per chunk (item D1)."""
+        if self._comm_plan is None:
+            return set()
+        return self._comm_plan.followers_of(self.client_name)
+
+    def peer_followers_by_chunk(self) -> dict[int, set[str]]:
+        """``{chunk: followers}`` waiting on each of this client's chunks (item D1)."""
+        if self._comm_plan is None:
+            return {}
+        chunks, _ = self.pull_chunks()
+        return self._comm_plan.followers_by_chunk(self.client_name, chunks)
+
+    def chunk_completion_channel(self) -> tuple[ChunkCompletionPublisher, ChunkCompletionWaiter]:
+        """Build the per-chunk signalling pair bound to this client's NIXL agent (item D1).
+
+        Both ends are created together because a client is usually both: a designate for
+        one set of keys and a follower for another. Handing out one without the other
+        invites a caller to publish without ever absorbing, which strands its own peers.
+
+        Foreign payloads are pushed back into the agent's own pending list rather than
+        dropped. The notification stream is shared with the handshake, and this channel
+        runs *after* the handshake but concurrently with other clients still finishing
+        theirs -- so a drain here can legitimately pick up another subsystem's message.
+        """
+        if self._chunk_channel is None:
+            publisher = ChunkCompletionPublisher(
+                sender_name=self.client_name,
+                send=self._send_chunk_notif,
+            )
+            waiter = ChunkCompletionWaiter(
+                drain=self.agent.get_new_notifs,
+                stash_foreign=self._stash_foreign_notif,
+            )
+            self._chunk_channel = (publisher, waiter)
+        return self._chunk_channel
+
+    def _send_chunk_notif(self, follower: str, payload: bytes) -> None:
+        """Send a chunk signal, ensuring the follower's metadata is loaded first.
+
+        A follower this client never *reads* from has never been through
+        `_ensure_client_info_fetched`, so `send_notif` would fail on an unknown agent.
+        Diffusion makes that the normal case: the designate notifies downhill while the
+        bytes flow the other way, so the notification direction has peers the data
+        direction does not.
+        """
+        self._ensure_client_info_fetched(follower)
+        self.agent.send_notif(follower, payload)
+
+    def _stash_foreign_notif(self, agent_name: str, payload: bytes) -> None:
+        """Hold a drained payload that belongs to another subsystem."""
+        self._foreign_notifs.setdefault(agent_name, []).append(payload)
+
+    def take_foreign_notifs(self) -> dict[str, list[bytes]]:
+        """Hand back notifications the chunk channel drained but does not own.
+
+        Exposed rather than internal because the subsystem that wants them is whichever
+        handshake waiter is running; returning them here lets that code merge them into
+        its own loop instead of losing them to a drain it did not make.
+        """
+        taken, self._foreign_notifs = self._foreign_notifs, {}
+        return taken
+
+    def read_phase_us(self) -> dict[str, float]:
+        """Microseconds spent per phase inside `client_read`, and reset the counters.
+
+        Reset on read so a caller can attribute one pull round rather than a running
+        total across rounds, which would hide a per-round regression behind warm-up.
+        """
+        taken = dict(self._read_phase_us)
+        for name in self._read_phase_us:
+            self._read_phase_us[name] = 0.0
+        return taken
 
     def _get_temp_desc_bytes(self, client_name: str, key: str, shard_idx: tuple[int, ...]) -> bytes | None:
         """Get temporary descriptor for non-contiguous shard"""
@@ -804,6 +916,38 @@ class NIXLStorageClient:
                     # that out from shape and stride alone without repeating the
                     # analysis `describe_shard` already did.
                     strided_layout = None if is_contiguous else describe_shard(local_sharded_tensor)
+                    # Expressible as a strided range is not the same as worth transferring
+                    # as one. `postXferReq` charges per descriptor and a strided shard
+                    # needs one per row, so past a few dozen rows staging the shard --
+                    # one descriptor plus a local copy -- is cheaper by orders of
+                    # magnitude. Measured: the strided path spent 3.43s on 399 reads of
+                    # 4096-row shards where one descriptor each would be ~1.6ms.
+                    # A PULL_SIDE client can itself be read from: peer diffusion makes
+                    # one rollout the designate that its same-node followers read, so its
+                    # shards must stay addressable. A staged shard has no permanent remote
+                    # descriptor, and `client_read` rejects such a source outright
+                    # ("Remote descriptor must be contiguous for client read"). So the
+                    # row budget only applies where nothing reads from this client.
+                    # A client whose shards something else reads must keep them
+                    # addressable, however many descriptors that costs: a staged shard
+                    # has no remote descriptor and `client_read` rejects it as a source.
+                    # PUSH_SIDE and PS_FOR_PULL are always read from, by definition.
+                    # PULL_SIDE depends on deployment -- it is read from only when peer
+                    # diffusion designates it -- so that one is configurable.
+                    must_be_readable = self.client_type in (
+                        NIXLClientType.PUSH_SIDE,
+                        NIXLClientType.PS_FOR_PULL,
+                    ) or (
+                        self.client_type is NIXLClientType.PULL_SIDE
+                        and self.shards_must_be_readable
+                    )
+                    stage_despite_strided = strided_layout is not None and not (
+                        strided_is_cheaper_than_staging(
+                            strided_layout, must_be_readable=must_be_readable
+                        )
+                    )
+                    if stage_despite_strided:
+                        strided_layout = None
                     # Reuse one metadata object across shards that describe themselves
                     # identically. Pickle memoises by identity, so for a grouped MoE key
                     # -- whose 128 experts differ only in address, which lives in the
@@ -1021,10 +1165,43 @@ class NIXLStorageClient:
 
                 n_strided = self._serialize_strided_descs(tensor_infos, shard_pos_cache)
                 if n_strided:
+                    # Report the descriptor count, not just the shard count. A strided
+                    # shard expands to one descriptor per row, and `postXferReq` charges
+                    # ~2.1-4us *per descriptor* -- so this line is the difference between
+                    # a transfer that costs microseconds and one that costs seconds.
+                    #
+                    # The old message said only "no staging copy", which reads as a win
+                    # and hid the cost entirely: locating it took several cluster runs
+                    # when one log line would have done. Avoiding the staging copy is
+                    # genuinely cheaper only while the row count stays small.
+                    rows = [
+                        layout.row_count
+                        for layout, _mem_type in self.strided_desc_slice_map.values()
+                    ]
+                    total_descs = sum(rows)
+                    worst = max(rows, default=0)
+                    est_ms = total_descs * STRIDED_US_PER_DESCRIPTOR / 1e3
                     psrl_logger.info(
                         f"{self.client_name}: {n_strided} strided shard(s) registered in place "
-                        f"(no staging copy)"
+                        f"(no staging copy): {total_descs} descriptor(s), worst shard "
+                        f"{worst} rows, est. submit cost {est_ms:.1f}ms at "
+                        f"{STRIDED_US_PER_DESCRIPTOR}us/descriptor"
                     )
+                    if worst > STRIDED_ROW_BUDGET:
+                        # A shard is sharded on its inner (contiguous) dimension, which is
+                        # what makes it strided at all. Row-parallel layers (`o_proj`,
+                        # `down_proj`) are sharded on the input dimension and so hit this;
+                        # column-parallel layers never do. Matching the two sides on that
+                        # dimension removes the re-shard and the expansion with it.
+                        psrl_logger.warning(
+                            f"{self.client_name}: worst strided shard expands to {worst} "
+                            f"descriptors (budget {STRIDED_ROW_BUDGET}), costing about "
+                            f"{worst * STRIDED_US_PER_DESCRIPTOR / 1e3:.1f}ms to submit for "
+                            f"bytes that transfer in microseconds. This comes from "
+                            f"re-sharding a row-parallel weight on its input dimension; "
+                            f"aligning the input-dimension shard count between train and "
+                            f"rollout removes it."
+                        )
 
                 psrl_logger.info(
                     f"{self.client_name}: [timing] register_local_tensors batch xfer_descs done in "
@@ -1386,6 +1563,7 @@ class NIXLStorageClient:
 
             # For non-contiguous shards, record the running key and shard idx
             is_contiguous, running_key, running_shard_idx = True, None, None
+            _phase_t0 = time.time()
             # Get local descriptor (check if it's a temporary one)
             local_desc_bytes = local_info.desc_bytes_list[local_pos]
             if local_desc_bytes is not None:
@@ -1447,12 +1625,16 @@ class NIXLStorageClient:
             )
             local_desc = self._deserialize_to_xfer_descs(local_desc_bytes)
             remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
+            self._read_phase_us["deserialize"] += (time.time() - _phase_t0) * 1e6
+            _phase_t0 = time.time()
             local_desc, remote_desc = self._align_desc_counts(local_desc, remote_desc)
+            self._read_phase_us["align"] += (time.time() - _phase_t0) * 1e6
             # NOTE(claude): Continue after caching so every shard is processed before return.
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("READ", local_desc, remote_desc, target_agent, tag, target_client))
                 continue
             # Real xfer
+            _phase_t0 = time.time()
             try:
                 if running_key is not None and running_shard_idx is not None:
                     assert (
@@ -1483,6 +1665,8 @@ class NIXLStorageClient:
                     f"{self.client_name} creating client READ transfer to {target_client} failed for "
                     f"key {key} shard {shard_idx}."
                 )
+            self._read_phase_us["initialize"] += (time.time() - _phase_t0) * 1e6
+            _phase_t0 = time.time()
             try:
                 state = self.agent.transfer(handle)
             except Exception as e:
@@ -1490,6 +1674,7 @@ class NIXLStorageClient:
                     f"{self.client_name} posting client READ transfer to {target_client} failed for "
                     f"key {key} shard {shard_idx}: {e}"
                 ) from e
+            self._read_phase_us["transfer"] += (time.time() - _phase_t0) * 1e6
             if state == "ERR":
                 raise RuntimeError(
                     f"{self.client_name} posting client READ transfer to {target_client} failed for "
@@ -1729,16 +1914,36 @@ class NIXLStorageClient:
             tag,
             target_client,
         ) in self._cached_xfer_descs:
-            assert local_desc.descCount() == 1 and remote_desc.descCount() == 1, (
-                f"Local and remote descriptor count should be 1, "
-                f"but found {local_desc.descCount()} and {remote_desc.descCount()} "
+            # Both sides must agree in count, which `_align_desc_counts` has already
+            # guaranteed at cache time by splitting whichever side had one descriptor.
+            # The counts themselves may be any size: a strided shard expands to one
+            # descriptor per row (item A2), so 4096-descriptor entries are normal rather
+            # than exceptional.
+            #
+            # This used to assert `descCount() == 1`, which was not a NIXL limit but a
+            # consequence of the accumulation below only ever taking `desc[0]` -- the
+            # assertion existed to stop the other rows being dropped silently. Taking
+            # all of them removes the need for it, and is what lets strided shards reach
+            # the prepped path at all. Without this, a client whose shards are strided
+            # could only submit one read at a time, which the cluster breakdown showed
+            # to be the dominant cost (post_peer 4.1s against wait_peer 0.007s).
+            local_count, remote_count = local_desc.descCount(), remote_desc.descCount()
+            assert local_count == remote_count, (
+                f"Local and remote descriptor counts must match, "
+                f"but found {local_count} and {remote_count} "
                 f"for op type {op_type} target client {target_client} tag {tag}"
             )
             bucket = grouped.setdefault(op_type, {}).setdefault(target_client, {})
             if tag not in bucket:
                 bucket[tag] = [
-                    {"mem_type": local_desc.getType(), "descs": [local_desc[0]]},
-                    {"mem_type": remote_desc.getType(), "descs": [remote_desc[0]]},
+                    {
+                        "mem_type": local_desc.getType(),
+                        "descs": [local_desc[i] for i in range(local_count)],
+                    },
+                    {
+                        "mem_type": remote_desc.getType(),
+                        "descs": [remote_desc[i] for i in range(remote_count)],
+                    },
                     target_agent,
                 ]
             else:
@@ -1750,8 +1955,8 @@ class NIXLStorageClient:
                     f"{bucket[tag][0]['mem_type']} != {local_desc.getType()} or "
                     f"{bucket[tag][1]['mem_type']} != {remote_desc.getType()}"
                 )
-                bucket[tag][0]["descs"].append(local_desc[0])
-                bucket[tag][1]["descs"].append(remote_desc[0])
+                bucket[tag][0]["descs"].extend(local_desc[i] for i in range(local_count))
+                bucket[tag][1]["descs"].extend(remote_desc[i] for i in range(remote_count))
                 assert target_agent == bucket[tag][2], (
                     f"Target agent mismatch for op type {op_type} target client {target_client} tag {tag}: "
                     f"{target_agent} != {bucket[tag][2]}"

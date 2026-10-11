@@ -220,6 +220,23 @@ func (l *Ledger) headroomLocked(class string) Amount {
 	}
 }
 
+// CanEverAdmit reports whether this class could hold an amount at all, ignoring
+// what is running now.
+//
+// A request larger than the class's whole share cannot be admitted by waiting:
+// the share's ceiling is something no release can raise. Waiting on it is a
+// livelock with a configuration cause, so a caller refuses it definitively
+// instead of queueing forever.
+func (l *Ledger) CanEverAdmit(class string, amount Amount) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	share, declared := l.cfg.Classes[class]
+	if !declared || share.Max == 0 {
+		return amount.FitsIn(l.cfg.Total)
+	}
+	return amount.FitsIn(l.cfg.Total.Scale(share.Max))
+}
+
 // reservedForOthersLocked returns capacity held out of this class's reach.
 //
 // Only a class with a request *queued* reserves anything. Reserving against a

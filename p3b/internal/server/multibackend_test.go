@@ -92,7 +92,7 @@ func newMixedStack(t *testing.T, fleetMemoryMB int64) *mixedStack {
 		t.Fatalf("agentenv backend: %v", err)
 	}
 
-	spans, err := timing.New(2*time.Second, 8*time.Second, 5*time.Second, nil)
+	spans, err := timing.New(8*time.Second, 5*time.Second)
 	if err != nil {
 		t.Fatalf("timing: %v", err)
 	}
@@ -102,13 +102,13 @@ func newMixedStack(t *testing.T, fleetMemoryMB int64) *mixedStack {
 	ledger, err := quota.New(quota.Config{
 		Total:    quota.Amount{MemoryMB: fleetMemoryMB, CPUMillis: 100000, Sandboxes: 1000},
 		Classes:  map[string]quota.ClassShare{"rollout": {Guaranteed: 0.7}, "grader": {Guaranteed: 0.2}},
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	})
 	if err != nil {
 		t.Fatalf("ledger: %v", err)
 	}
 	place, err := placement.New(placement.Config{
-		NodeTTL: spans.NodeTTL, ReservationTTL: spans.ReservationTTL(), SweepInterval: spans.SweepInterval(),
+		NodeTTL: spans.NodeTTL, ReservationTTL: timing.ReservationTTL, SweepInterval: timing.SweepInterval,
 	}, mon)
 	if err != nil {
 		t.Fatalf("placement: %v", err)
@@ -121,7 +121,7 @@ func newMixedStack(t *testing.T, fleetMemoryMB int64) *mixedStack {
 	}
 	control, err := NewControl(ControlConfig{
 		Registry: registry, Ledger: ledger, Placement: place, Monitor: mon,
-		Nodes: NewLocalNodeClient(nodeAgent), AcquireTimeout: time.Minute,
+		Nodes: NewLocalNodeClient(nodeAgent),
 	})
 	if err != nil {
 		t.Fatalf("control: %v", err)
@@ -143,19 +143,16 @@ func dockerNodeFor(t *testing.T, memoryMB int64) (*dockerbackend.Backend, *Node)
 	if err := docker.Preflight(context.Background()); err != nil {
 		t.Skipf("daemon not usable: %v", err)
 	}
-	spans, _ := timing.New(2*time.Second, 8*time.Second, 5*time.Second, nil)
+	spans, _ := timing.New(8*time.Second, 5*time.Second)
 	gate, err := node.NewAdmission(node.Config{
 		Envelope: node.Resources{MemoryMB: memoryMB, CPUMillis: 100000},
 		Classes:  map[string]node.ClassShare{"rollout": {Guaranteed: 0.7}, "grader": {Guaranteed: 0.2}},
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	})
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}
-	life, err := node.NewLifecycle("node-a", gate, node.Windows{
-		PauseWindow: spans.PauseWindow(), ReapWindow: spans.ReapWindow(),
-		Lifetime: spans.Lifetime(), SweepInterval: spans.SweepInterval(),
-	})
+	life, err := node.NewLifecycle("node-a", gate, timing.SweepInterval)
 	if err != nil {
 		t.Fatalf("lifecycle: %v", err)
 	}

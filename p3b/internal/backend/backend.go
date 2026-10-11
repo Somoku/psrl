@@ -91,6 +91,12 @@ type Spec struct {
 	RequiredNodeLabel   string
 	ForbiddenNodeLabels []string
 
+	// Lifetime is how long the sandbox may exist, counted from creation. Zero
+	// takes the node's default. It is stated by the caller because the caller
+	// knows what the sandbox is for, and it is the node's backstop for a caller
+	// that dies or forgets to release.
+	Lifetime time.Duration
+
 	// AssignedGPUs are the device indices node admission granted. Written by the
 	// service and never by a caller, which is why it is not part of a spec's
 	// identity.

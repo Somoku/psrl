@@ -10,49 +10,36 @@ import (
 	"psrl.dev/sandboxd/internal/backend"
 )
 
-// Windows are the spans the reclamation sweep enforces.
+// exitRecordTTL is how long the node remembers why a sandbox left.
 //
-// They arrive resolved from the one timing contract rather than being derived
-// here, because the orderings between them are asserted once and must not be
-// re-derived anywhere else.
-type Windows struct {
-	PauseWindow   time.Duration
-	ReapWindow    time.Duration
-	Lifetime      time.Duration
-	SweepInterval time.Duration
-}
+// A caller that reaches for a sandbox just after it is gone gets an attribution
+// rather than silence, and an attribution older than this can explain nothing a
+// caller could still be asking about.
+const exitRecordTTL = 10 * time.Minute
 
-// Validate refuses windows the sweep cannot honour.
-func (w Windows) Validate() error {
-	if w.PauseWindow <= 0 || w.ReapWindow <= 0 || w.Lifetime <= 0 || w.SweepInterval <= 0 {
-		return fmt.Errorf("node reclamation windows must be greater than zero")
-	}
-	if w.PauseWindow >= w.ReapWindow {
-		return fmt.Errorf("pause window (%s) must be shorter than the reap window (%s), or a sandbox is "+
-			"destroyed before it is ever paused", w.PauseWindow, w.ReapWindow)
-	}
-	if w.ReapWindow >= w.Lifetime {
-		return fmt.Errorf("reap window (%s) must be shorter than the lifetime (%s), or the backstop fires "+
-			"first and the reaper never runs", w.ReapWindow, w.Lifetime)
-	}
-	if w.SweepInterval >= w.PauseWindow {
-		return fmt.Errorf("sweep interval (%s) must be shorter than the shortest window it enforces (%s)",
-			w.SweepInterval, w.PauseWindow)
-	}
-	return nil
-}
+// DefaultLifetime is the lifetime a sandbox gets when its create states none.
+// It is a fallback, not the design: the caller states how long its sandbox may
+// live, and this only keeps a caller that omits the field from creating an
+// unbounded one.
+const DefaultLifetime = 4 * time.Hour
 
 // ExitReason says why a sandbox stopped existing. A post mortem starts here, so
 // these must not collapse into one another: an operator acts differently on one
-// released by its caller, one reaped for silence, and one whose owner died.
+// released by its caller, one reaped for outliving its lifetime, and one whose
+// owner died.
 type ExitReason string
 
 const (
 	ExitReleased        ExitReason = "released"
-	ExitReapedIdle      ExitReason = "reaped_idle"
 	ExitReapedLifetime  ExitReason = "reaped_lifetime"
 	ExitReclaimedOrphan ExitReason = "reclaimed_orphan"
 )
+
+// exitRecord attributes a sandbox that is no longer held.
+type exitRecord struct {
+	reason ExitReason
+	at     time.Time
+}
 
 // resident is one sandbox this node holds.
 type resident struct {
@@ -62,25 +49,28 @@ type resident struct {
 	owner     string
 	execMode  string // "persistent" | "one_shot" | "" (one-shot default)
 	createdAt time.Time
+	// lifetime is the absolute span this sandbox may exist, stated on its create.
+	// It is the backstop behind explicit release and owner death, not an idle
+	// window: a sandbox is otherwise reclaimed when its owner says so.
+	lifetime time.Duration
 	// lastActivity moves on both command boundaries, start and return. A stamp
 	// written only when a command returns stays stale for the whole of a long
-	// command, so a sweep reading it would pause a running test suite.
+	// command, so a sweep reading it would report a running test suite as idle.
 	lastActivity time.Time
 	inFlight     int
-	paused       bool
 }
 
 // Lifecycle owns every sandbox on one node and reclaims them in one sweep.
 //
-// One loop, one clock, four reasons. Idle pause and orphan reclamation used to
-// be separate mechanisms on separate clocks, so a caller exiting silently
-// stopped half the answer to the only question that matters here: which
-// sandboxes on this node should go.
+// One loop, one clock, three reasons: released, outlived its lifetime, or its
+// owner died. Idle pause and idle reap are gone: a sandbox's lifetime is stated
+// on its create, owner death is read from owner liveness, and an explicit release
+// is what an idle sandbox normally gets.
 type Lifecycle struct {
 	mu        sync.Mutex
 	nodeID    string
 	admission *Admission
-	windows   Windows
+	sweep     time.Duration
 	residents map[string]*resident
 	now       func() time.Time
 
@@ -93,23 +83,28 @@ type Lifecycle struct {
 	stopped  sync.WaitGroup
 
 	counters map[ExitReason]int64
-	paused   int64
 	failures int64
+
+	// lastExit remembers why each sandbox left, so a caller that reaches for it
+	// after it is gone gets an attribution instead of silence. Pruned by the
+	// sweep once an entry is older than exitRecordTTL.
+	lastExit map[string]exitRecord
 }
 
 // NewLifecycle returns the node's sandbox owner.
-func NewLifecycle(nodeID string, admission *Admission, windows Windows) (*Lifecycle, error) {
-	if err := windows.Validate(); err != nil {
-		return nil, err
+func NewLifecycle(nodeID string, admission *Admission, sweepInterval time.Duration) (*Lifecycle, error) {
+	if sweepInterval <= 0 {
+		return nil, fmt.Errorf("node reclamation sweep interval must be greater than zero")
 	}
 	return &Lifecycle{
 		nodeID:     nodeID,
 		admission:  admission,
-		windows:    windows,
+		sweep:      sweepInterval,
 		residents:  map[string]*resident{},
 		now:        time.Now,
 		ownerAlive: func(string) bool { return true },
 		counters:   map[ExitReason]int64{},
+		lastExit:   map[string]exitRecord{},
 	}, nil
 }
 
@@ -128,14 +123,15 @@ func (l *Lifecycle) SetOwnerLiveness(alive func(owner string) bool) {
 	l.ownerAlive = alive
 }
 
-// Adopt records a sandbox this node now owns.
-func (l *Lifecycle) Adopt(handle backend.Handle, b backend.Backend, leaseID, owner, execMode string) {
+// Adopt records a sandbox this node now owns, with the lifetime its create
+// stated.
+func (l *Lifecycle) Adopt(handle backend.Handle, b backend.Backend, leaseID, owner, execMode string, lifetime time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
 	l.residents[handle.SandboxID] = &resident{
 		handle: handle, backend: b, leaseID: leaseID, owner: owner, execMode: execMode,
-		createdAt: now, lastActivity: now,
+		createdAt: now, lifetime: lifetime, lastActivity: now,
 	}
 }
 
@@ -207,17 +203,45 @@ func (l *Lifecycle) Release(ctx context.Context, sandboxID string, reason ExitRe
 	l.mu.Lock()
 	delete(l.residents, sandboxID)
 	l.counters[reason]++
+	l.lastExit[sandboxID] = exitRecord{reason: reason, at: l.now()}
 	l.mu.Unlock()
 	l.admission.Release(held.leaseID)
 	return nil
 }
 
+// ExitReasonOf reports why a sandbox this node used to hold left it.
+//
+// A caller that reaches for a sandbox after it is gone -- a command against a
+// handle the reaper already released -- gets the attribution rather than an
+// empty answer. The second result is false when the sandbox was never held here
+// or its record has aged out.
+func (l *Lifecycle) ExitReasonOf(sandboxID string) (ExitReason, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	rec, ok := l.lastExit[sandboxID]
+	return rec.reason, ok
+}
+
+// Touch records activity on a sandbox this node holds.
+//
+// A command that does not pass through Node.Exec -- one driven by the sandbox's
+// own in-container agent -- has no other way to tell the node it is busy. An
+// unknown id is ignored: a touch racing a release must not resurrect anything.
+func (l *Lifecycle) Touch(sandboxID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if held, ok := l.residents[sandboxID]; ok {
+		held.lastActivity = l.now()
+	}
+}
+
 // Sweep decides once for every sandbox this node holds.
 //
-// The reasons are ordered by how much they preserve, and the order is the
-// policy rather than an implementation detail: a sandbox is paused before it is
-// destroyed, and the lifetime is a backstop behind the idle windows rather than
-// a competitor to them. Each sandbox is decided for exactly one reason per pass.
+// A sandbox goes for exactly one of three reasons, checked in order: its owner is
+// gone, it has outlived the lifetime its create stated, or its caller released
+// it (which the caller does directly, not through the sweep). The lifetime is an
+// absolute backstop, so it reclaims even a busy sandbox; owner loss is read from
+// liveness rather than from age.
 func (l *Lifecycle) Sweep(ctx context.Context) SweepReport {
 	// One sweep at a time: a second pass entering while the first is still
 	// releasing would decide twice on the same sandbox.
@@ -226,25 +250,25 @@ func (l *Lifecycle) Sweep(ctx context.Context) SweepReport {
 
 	l.mu.Lock()
 	now := l.now()
+	// Attribution records older than exitRecordTTL can explain nothing a caller
+	// could still be asking about, so the sweep is also where they age out.
+	for id, rec := range l.lastExit {
+		if now.Sub(rec.at) >= exitRecordTTL {
+			delete(l.lastExit, id)
+		}
+	}
 	type decision struct {
 		id     string
 		held   *resident
-		action string
 		reason ExitReason
 	}
 	var decisions []decision
 	for id, held := range l.residents {
 		switch {
 		case !l.ownerAlive(held.owner):
-			decisions = append(decisions, decision{id, held, "release", ExitReclaimedOrphan})
-		case now.Sub(held.createdAt) >= l.windows.Lifetime:
-			decisions = append(decisions, decision{id, held, "release", ExitReapedLifetime})
-		case held.inFlight > 0:
-			// Busy. Age alone would read a long command as idle.
-		case now.Sub(held.lastActivity) >= l.windows.ReapWindow:
-			decisions = append(decisions, decision{id, held, "release", ExitReapedIdle})
-		case now.Sub(held.lastActivity) >= l.windows.PauseWindow && !held.paused:
-			decisions = append(decisions, decision{id, held, "pause", ""})
+			decisions = append(decisions, decision{id, held, ExitReclaimedOrphan})
+		case now.Sub(held.createdAt) >= held.lifetime:
+			decisions = append(decisions, decision{id, held, ExitReapedLifetime})
 		}
 	}
 	busy := 0
@@ -260,17 +284,11 @@ func (l *Lifecycle) Sweep(ctx context.Context) SweepReport {
 
 	report := SweepReport{SkippedBusy: busy}
 	for _, d := range decisions {
-		if d.action == "pause" {
-			l.pauseOne(ctx, d.held, &report)
-			continue
-		}
 		if err := l.Release(ctx, d.id, d.reason); err != nil {
 			report.Failures++
 			continue
 		}
 		switch d.reason {
-		case ExitReapedIdle:
-			report.ReapedIdle = append(report.ReapedIdle, d.id)
 		case ExitReapedLifetime:
 			report.ReapedLifetime = append(report.ReapedLifetime, d.id)
 		case ExitReclaimedOrphan:
@@ -278,28 +296,6 @@ func (l *Lifecycle) Sweep(ctx context.Context) SweepReport {
 		}
 	}
 	return report
-}
-
-func (l *Lifecycle) pauseOne(ctx context.Context, held *resident, report *SweepReport) {
-	stateful, canPause := held.backend.(backend.Stateful)
-	if !canPause {
-		return
-	}
-	mode := "hibernate"
-	if held.backend.Capabilities().Supports("freeze") {
-		// A freeze keeps the sandbox on this host and is cheaper to undo.
-		mode = "freeze"
-	}
-	if err := stateful.Pause(ctx, held.handle, mode); err != nil {
-		// Not idle in fact, or no pause to offer. The next sweep decides again,
-		// and neither is a failure worth reporting.
-		return
-	}
-	l.mu.Lock()
-	held.paused = true
-	l.paused++
-	l.mu.Unlock()
-	report.Paused = append(report.Paused, held.handle.SandboxID)
 }
 
 // Start runs the sweep on its own cadence until Stop.
@@ -316,7 +312,7 @@ func (l *Lifecycle) Start(ctx context.Context) {
 	l.stopped.Add(1)
 	go func() {
 		defer l.stopped.Done()
-		ticker := time.NewTicker(l.windows.SweepInterval)
+		ticker := time.NewTicker(l.sweep)
 		defer ticker.Stop()
 		for {
 			select {
@@ -347,8 +343,6 @@ func (l *Lifecycle) Stop() {
 
 // SweepReport is what one pass did, by reason.
 type SweepReport struct {
-	Paused          []string
-	ReapedIdle      []string
 	ReapedLifetime  []string
 	ReclaimedOrphan []string
 	SkippedBusy     int
@@ -357,14 +351,13 @@ type SweepReport struct {
 
 // Released reports how many sandboxes the pass destroyed, for any reason.
 func (r SweepReport) Released() int {
-	return len(r.ReapedIdle) + len(r.ReapedLifetime) + len(r.ReclaimedOrphan)
+	return len(r.ReapedLifetime) + len(r.ReclaimedOrphan)
 }
 
 // LifecycleReport is the node's own accounting for the metric hook.
 type LifecycleReport struct {
 	Resident int
 	Busy     int
-	Paused   int64
 	Exits    map[ExitReason]int64
 	Failures int64
 }
@@ -385,6 +378,6 @@ func (l *Lifecycle) Snapshot() LifecycleReport {
 	}
 	return LifecycleReport{
 		Resident: len(l.residents), Busy: busy,
-		Paused: l.paused, Exits: exits, Failures: l.failures,
+		Exits: exits, Failures: l.failures,
 	}
 }

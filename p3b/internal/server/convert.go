@@ -7,6 +7,8 @@
 package server
 
 import (
+	"time"
+
 	v1 "psrl.dev/sandboxd/api/v1"
 	"psrl.dev/sandboxd/internal/backend"
 	"psrl.dev/sandboxd/internal/node"
@@ -34,6 +36,7 @@ func specFromProto(in *v1.SandboxSpec) backend.Spec {
 		Backend:             in.GetBackend(),
 		RequiredNodeLabel:   in.GetRequiredNodeLabel(),
 		ForbiddenNodeLabels: in.GetForbiddenNodeLabels(),
+		Lifetime:            time.Duration(in.GetLifetimeS()) * time.Second,
 	}
 	if source := in.GetSource(); source != nil {
 		spec.Source = backend.Source{Kind: sourceKindName(source.GetKind()), Reference: source.GetReference()}

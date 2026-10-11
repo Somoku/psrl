@@ -44,13 +44,12 @@ pytestmark = pytest.mark.skipif(
 
 
 def service_config(directory: Path, fleet_memory_mb: int) -> Path:
-    """Write a deployment that states intent once and derives the rest."""
+    """Write a deployment that states how fast its node answers and nothing more."""
     config = {
         "listen": f"unix://{directory}/sandboxd.sock",
         "node_id": "node-test",
         "owner_id": f"pysandbox-test-{int(time.time() * 1000)}",
-        # Short, so a reclamation test does not wait a real episode.
-        "timing": {"episode_deadline_s": 2, "node_ttl_s": 8, "rpc_timeout_s": 5},
+        "timing": {"node_ttl_s": 8, "rpc_timeout_s": 5},
         "fleet": {"memory_mb": fleet_memory_mb, "cpu_millis": 100000, "disk_mb": 100000},
         "node": {"memory_mb": fleet_memory_mb, "cpu_millis": 100000, "disk_mb": 100000},
         "classes": {"rollout": {"guaranteed_share": 0.7}, "grader": {"guaranteed_share": 0.2}},

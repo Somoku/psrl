@@ -187,9 +187,8 @@ func startNode(t *testing.T, binary, workDir, nodeID string, overcommit float64)
 		"node_listen": address,
 		"node_id":     nodeID,
 		"timing": map[string]any{
-			"episode_deadline_s": 1800.0,
-			"node_ttl_s":         120.0,
-			"rpc_timeout_s":      60.0,
+			"node_ttl_s":    120.0,
+			"rpc_timeout_s": 60.0,
 		},
 		"node": map[string]any{
 			"memory_mb":         4096,

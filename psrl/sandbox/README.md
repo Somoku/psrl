@@ -88,8 +88,6 @@ sandbox:
     classes:
       rollout: {guaranteed_share: 0.60}
       grader: {guaranteed_share: 0.25}
-  timing:
-    episode_deadline_s: 1800
   backends:
     docker:
       _target_: psrl.sandbox.backends.DockerBackend
@@ -102,10 +100,10 @@ sandbox:
 ```
 
 `capacity.utilization` is the only safety margin on the node envelope, and a null
-limit uses the node's own cgroup or machine limit. `timing.episode_deadline_s`
-derives the idle pause window, the reap window, and the absolute lifetime in that
-order, so an inverted ordering cannot be configured. `heartbeat_dir` is what makes
-crash recovery work, and it has to be visible to every worker on the node.
+limit uses the node's own cgroup or machine limit. A sandbox's lifetime is stated
+on its spec (`lifetime_timeout_s`), so the node reclaims it without the worker.
+`heartbeat_dir` is what makes crash recovery work, and it has to be visible to
+every worker on the node.
 
 Set `security.require_rootless: true` only after the daemon is rootless, and add
 `egress_firewall_command` where a host firewall can program an `egress` allowlist.

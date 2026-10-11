@@ -57,16 +57,39 @@ type Control struct {
 	// up. A node refusing is normal under load; an unbounded retry would hide a
 	// fleet that is genuinely full behind a slow create.
 	placementAttempts int
-	acquireTimeout    time.Duration
 	// admitPollInterval is how often a queued request re-tries its class. Short
 	// against a sandbox lifetime, so a freed share is picked up promptly, and long
 	// enough that a queue of waiters is not a spin on the ledger's lock.
 	admitPollInterval time.Duration
+	// reservationRenewInterval is how often a create renews its placement
+	// reservation while it provisions. A cold image pull can dwarf the reservation
+	// TTL, and a reservation that lapses mid-provision lets placement send another
+	// sandbox to a node this one is still about to occupy.
+	reservationRenewInterval time.Duration
 
 	mu       sync.Mutex
 	sandbox  map[string]sandboxRecord
 	ownerSeq uint64
+	// provisions is what a create with an idempotency key is doing, so a caller
+	// that has no response yet can tell "still working" from "lost the request".
+	provisions map[string]*provisionRecord
 }
+
+// provisionRecord is what a create with an idempotency key is doing.
+//
+// As coarse as the service can honestly be: it advances when the control plane
+// reaches a new phase -- registering, then done -- rather than while a node pulls
+// an image, because that is one blocking call from here. It is enough to tell a
+// caller its request is being worked on rather than quietly dropped.
+type provisionRecord struct {
+	state     string
+	startedAt time.Time
+	updatedAt time.Time
+}
+
+// provisionRetention is how long a finished create stays queryable, so a caller
+// that polled during the create can still read the outcome just after.
+const provisionRetention = 10 * time.Minute
 
 type sandboxRecord struct {
 	handle        backend.Handle
@@ -84,10 +107,12 @@ type ControlConfig struct {
 	Monitor           *monitor.Monitor
 	Nodes             NodeClient
 	PlacementAttempts int
-	AcquireTimeout    time.Duration
 	// AdmitPollInterval overrides how often a request queued on a full class
 	// re-tries. Zero takes the default.
 	AdmitPollInterval time.Duration
+	// ReservationRenewInterval overrides how often a create renews its placement
+	// reservation while provisioning. Zero takes the default.
+	ReservationRenewInterval time.Duration
 }
 
 // NewControl returns the cluster-level server.
@@ -98,31 +123,51 @@ func NewControl(cfg ControlConfig) (*Control, error) {
 	if cfg.PlacementAttempts <= 0 {
 		cfg.PlacementAttempts = 3
 	}
-	if cfg.AcquireTimeout <= 0 {
-		cfg.AcquireTimeout = 30 * time.Minute
-	}
 	if cfg.AdmitPollInterval <= 0 {
 		cfg.AdmitPollInterval = 250 * time.Millisecond
 	}
+	if cfg.ReservationRenewInterval <= 0 {
+		cfg.ReservationRenewInterval = 20 * time.Second
+	}
 	return &Control{
-		registry:          cfg.Registry,
-		ledger:            cfg.Ledger,
-		placement:         cfg.Placement,
-		monitor:           cfg.Monitor,
-		nodes:             cfg.Nodes,
-		placementAttempts: cfg.PlacementAttempts,
-		acquireTimeout:    cfg.AcquireTimeout,
-		admitPollInterval: cfg.AdmitPollInterval,
-		sandbox:           map[string]sandboxRecord{},
+		registry:                 cfg.Registry,
+		ledger:                   cfg.Ledger,
+		placement:                cfg.Placement,
+		monitor:                  cfg.Monitor,
+		nodes:                    cfg.Nodes,
+		placementAttempts:        cfg.PlacementAttempts,
+		admitPollInterval:        cfg.AdmitPollInterval,
+		reservationRenewInterval: cfg.ReservationRenewInterval,
+		sandbox:                  map[string]sandboxRecord{},
+		provisions:               map[string]*provisionRecord{},
 	}, nil
 }
 
 // Create provisions one sandbox: quota, then routing, then placement, then the
 // node's own admission.
 //
+// A create is observable by its spec's idempotency key, when it has one: a
+// caller that has no response yet can ask what state its create is in, which is
+// what tells "still provisioning" apart from "the request never reached a
+// working service".
+func (c *Control) Create(ctx context.Context, req *v1.CreateRequest) (*v1.CreateResponse, error) {
+	ticket := specFromProto(req.GetSpec()).IdempotencyKey
+	if ticket != "" {
+		c.beginProvision(ticket)
+	}
+	created, err := c.create(ctx, req)
+	if ticket != "" {
+		c.finishProvision(ticket, err)
+	}
+	return created, err
+}
+
+// create is the body of Create, split out so the provision record brackets every
+// return path rather than only the success.
+//
 // Every failure path returns what it took. A create that gave up still holding
 // a grant or a reservation would starve the fleet one slot at a time.
-func (c *Control) Create(ctx context.Context, req *v1.CreateRequest) (*v1.CreateResponse, error) {
+func (c *Control) create(ctx context.Context, req *v1.CreateRequest) (*v1.CreateResponse, error) {
 	spec := specFromProto(req.GetSpec())
 	selected, err := c.registry.Select(spec)
 	if err != nil {
@@ -154,18 +199,21 @@ func (c *Control) Create(ctx context.Context, req *v1.CreateRequest) (*v1.Create
 //
 // A class at its share is a queue, not a verdict: the share clears as sandboxes
 // are released, and the request is for capacity that will exist rather than for a
-// capability that never will. Returning ResourceExhausted immediately made the
-// caller's retry the queue, and a caller that treats the refusal as terminal --
-// a grader step, which cannot be retried without redoing the rollout -- loses the
-// episode to a wait it was never offered. The wait is bounded by AcquireTimeout,
-// which is derived from the episode deadline for exactly this purpose: a queue
-// longer than an episode is a fault rather than contention.
+// capability that never will. So the wait is unbounded -- there is no deadline
+// here, because a deadline can only guess at when the fleet frees a slot. The one
+// thing a wait cannot fix is refused definitively up front: a request larger than
+// the class's whole share can never be admitted, and queueing on it is a livelock
+// with a configuration cause.
 //
 // The demand is enqueued for the whole wait, which is what reserves the class's
 // guarantee against borrowers while it waits. It is withdrawn on every exit path,
 // so a caller that gave up does not leave the class reserving room for a request
 // that no longer exists.
 func (c *Control) admit(ctx context.Context, grantID, class, owner string, amount quota.Amount) error {
+	if !c.ledger.CanEverAdmit(class, amount) {
+		return status.Errorf(codes.OutOfRange,
+			"the %q class can never hold a request this size, so no release will ever make room", class)
+	}
 	admitted, err := c.ledger.Acquire(grantID, class, owner, amount)
 	if err != nil {
 		return status.Error(codes.Internal, err.Error())
@@ -184,7 +232,6 @@ func (c *Control) admit(ctx context.Context, grantID, class, owner string, amoun
 	// few, so the poll costs a lock acquisition per class per interval.
 	ticker := time.NewTicker(c.admitPollInterval)
 	defer ticker.Stop()
-	deadline := time.Now().Add(c.acquireTimeout)
 
 	for {
 		select {
@@ -200,13 +247,39 @@ func (c *Control) admit(ctx context.Context, grantID, class, owner string, amoun
 			if admitted {
 				return nil
 			}
-			if time.Now().After(deadline) {
-				return status.Errorf(codes.ResourceExhausted,
-					"the %q class did not come free within %s; this clears as sandboxes are released",
-					class, c.acquireTimeout)
-			}
 		}
 	}
+}
+
+// createOnRenewing provisions while keeping the placement reservation alive.
+//
+// A cold image pull can take longer than the reservation TTL, and a reservation
+// that lapses mid-provision lets placement send another sandbox to a node this
+// one is still about to occupy. Renewing closes that gap, and it does so without
+// lengthening the TTL, so a genuinely dead create is still reclaimed promptly
+// rather than held for the length of a pull it never started.
+func (c *Control) createOnRenewing(
+	ctx context.Context,
+	reservationID string,
+	provision func() (backend.Created, error),
+) (backend.Created, error) {
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(c.reservationRenewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				c.placement.Renew(reservationID)
+			}
+		}
+	}()
+	return provision()
 }
 
 type placed struct {
@@ -258,7 +331,9 @@ func (c *Control) place(ctx context.Context, selected backend.Backend, spec back
 		// The runtime placement matched on, not the one routing picked: on a node
 		// hosting several they agree, and where they could not, placement's is the
 		// one whose capabilities were checked against this node.
-		created, err := c.nodes.CreateOn(ctx, decision.NodeID, leaseID, decision.Backend, withDevices, callback)
+		created, err := c.createOnRenewing(ctx, decision.ReservationID, func() (backend.Created, error) {
+			return c.nodes.CreateOn(ctx, decision.NodeID, leaseID, decision.Backend, withDevices, callback)
+		})
 		if err != nil {
 			c.placement.Cancel(decision.ReservationID)
 			return placed{}, status.Errorf(codes.Unavailable, "node %s could not create: %v", decision.NodeID, err)
@@ -484,6 +559,59 @@ func (c *Control) forget(id string) (sandboxRecord, bool) {
 	record, known := c.sandbox[id]
 	delete(c.sandbox, id)
 	return record, known
+}
+
+// beginProvision records a create as in flight under its ticket, and ages out the
+// finished records a caller is no longer asking about.
+func (c *Control) beginProvision(ticket string) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, rec := range c.provisions {
+		if now.Sub(rec.updatedAt) >= provisionRetention {
+			delete(c.provisions, id)
+		}
+	}
+	c.provisions[ticket] = &provisionRecord{state: "provisioning", startedAt: now, updatedAt: now}
+}
+
+// finishProvision records a create's outcome under its ticket.
+func (c *Control) finishProvision(ticket string, err error) {
+	state := "created"
+	if err != nil {
+		state = "failed"
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if rec, known := c.provisions[ticket]; known {
+		rec.state = state
+		rec.updatedAt = time.Now()
+	}
+}
+
+// ProvisionState is what one create's ticket reports.
+type ProvisionState struct {
+	State         string
+	Elapsed       time.Duration
+	SinceProgress time.Duration
+}
+
+// ProvisionState reports how a create with this ticket is doing, and whether it
+// is known. An unknown ticket means no create with that key has been seen here,
+// which is not the same as a failure.
+func (c *Control) ProvisionState(ticket string) (ProvisionState, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rec, known := c.provisions[ticket]
+	if !known {
+		return ProvisionState{}, false
+	}
+	now := time.Now()
+	return ProvisionState{
+		State:         rec.state,
+		Elapsed:       now.Sub(rec.startedAt),
+		SinceProgress: now.Sub(rec.updatedAt),
+	}, true
 }
 
 // RenewOwner keeps one caller's grants and reservations alive.

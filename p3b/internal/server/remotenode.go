@@ -410,6 +410,7 @@ func specToWire(spec backend.Spec) map[string]any {
 		"required_features":     spec.RequiredFeatures,
 		"required_node_label":   spec.RequiredNodeLabel,
 		"forbidden_node_labels": spec.ForbiddenNodeLabels,
+		"lifetime_s":            int64(spec.Lifetime / time.Second),
 	}
 	resources := map[string]any{}
 	if spec.Resources.CPUCount > 0 {

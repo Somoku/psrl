@@ -17,7 +17,6 @@ from psrl.sandbox.capacity import CapacityGrant, ResourceQuantity
 from psrl.sandbox.core import (
     ResourceSpec,
     SandboxBackend,
-    SandboxBusyError,
     SandboxCapabilityError,
     SandboxFeature,
     SandboxProvisionError,
@@ -39,6 +38,12 @@ psrl_logger = logging.getLogger(__file__)
 
 # Destruction attempts before a deferred cleanup is reported as a fault rather than a retry.
 _RELEASE_ATTEMPT_ALERT = 5
+
+# The lifetime a sandbox is given when its spec names none. It is a backstop, not
+# the design: whatever knows the work -- the agent loop, from its rollout budgets --
+# states the real value, and this only keeps a spec that omits it from becoming
+# unbounded. It matches the service's own default so both paths reclaim alike.
+DEFAULT_LIFETIME_S = 4 * 60 * 60.0
 
 # The resource class a fork parent is admitted under. It is not a trajectory, so it
 # must not be able to consume a class share a grader or a rollout is waiting for.
@@ -260,10 +265,6 @@ class SandboxManager:
         self._counters: dict[str, int] = {}
         self._cumulative_wait_s = 0.0
         self._wait_samples = 0
-        self._idle_pause_window_s: float | None = None
-        self._idle_reap_window_s: float | None = None
-        self._default_lifetime_s: float | None = None
-        self._idle_task: asyncio.Task[None] | None = None
         if capacity_coordinator is not None and (not capacity_owner_id or capacity_heartbeat_interval_s is None):
             raise ValueError("Sandbox capacity coordination requires an owner id and heartbeat interval.")
 
@@ -273,46 +274,11 @@ class SandboxManager:
         """
         self._counters[key] = self._counters.get(key, 0) + amount
 
-    def configure_lifetime(self, lifetime_s: float | None) -> None:
-        """
-        Set the absolute lifetime applied to a spec that does not name one.
-
-        The lifetime is the backstop behind the reaper: a sandbox that keeps
-        running commands and is therefore never idle still has to end, or a stuck
-        episode holds a node slot for the rest of the run.
-        """
-        if lifetime_s is not None and lifetime_s <= 0:
-            raise ValueError("Sandbox lifetime_s must be greater than zero when set.")
-        self._default_lifetime_s = lifetime_s
-
-    def configure_idle_policy(self, pause_window_s: float | None, reap_window_s: float | None) -> None:
-        """Set the idle windows that release compute and reclaim leaks.
-
-        The pause window is shorter than the reap window, so an idle sandbox is
-        paused before it is destroyed and a running episode is never the first
-        thing the reaper sees. The ordering is asserted here rather than described,
-        because a configuration that inverts it produces a slow leak or a sandbox
-        reclaimed while in use, and neither failure points at the configuration.
-        """
-        for name, window in (("pause_window_s", pause_window_s), ("reap_window_s", reap_window_s)):
-            if window is not None and window <= 0:
-                raise ValueError(f"Sandbox idle {name} must be greater than zero when set.")
-        if pause_window_s is not None and reap_window_s is not None and pause_window_s >= reap_window_s:
-            raise ValueError(
-                f"Sandbox idle pause_window_s ({pause_window_s:g}) must be shorter than reap_window_s "
-                f"({reap_window_s:g}), or a sandbox is destroyed before it is ever paused."
-            )
-        self._idle_pause_window_s = pause_window_s
-        self._idle_reap_window_s = reap_window_s
-
     def _register_lease(self, lease: SandboxLease) -> None:
         """
-        Track the lease, its workflow reservation, and the idle sweep it needs.
+        Track the lease and its workflow reservation.
         """
         self._leases.add(lease)
-        # Started by the first lease, so a deployment that configures idle windows does
-        # not silently lose pause-on-idle and leak reclamation.
-        self.start_idle_reaper()
         workflow_id = lease.workflow_id
         if workflow_id is None:
             return
@@ -910,10 +876,10 @@ class SandboxManager:
         selected: SandboxBackend,
         task_key: tuple[str, str] | None = None,
     ) -> SandboxLease:
-        # A spec that names no lifetime inherits the deployment's backstop, so a
-        # stuck episode cannot hold a node slot for the rest of the run.
-        if spec.lifetime_timeout_s is None and self._default_lifetime_s is not None:
-            spec = replace(spec, lifetime_timeout_s=self._default_lifetime_s)
+        # A spec that names no lifetime inherits the backstop, so a stuck episode
+        # cannot hold a node slot for the rest of the run.
+        if spec.lifetime_timeout_s is None:
+            spec = replace(spec, lifetime_timeout_s=DEFAULT_LIFETIME_S)
         required = self._required_features(spec)
         selected.capabilities.require(*required)
         if spec.required_resume_level is not None:
@@ -1308,137 +1274,6 @@ class SandboxManager:
         """
         return {name: backend.metrics_snapshot() for name, backend in self._backends.items()}
 
-    def start_idle_reaper(self) -> None:
-        """Start the loop that releases compute from idle sandboxes and reclaims leaks.
-
-        The interval follows from the shortest window rather than being configured: a
-        sweep slower than the window it enforces reports an idle sandbox long after
-        the fact, and one much faster wakes the node for nothing.
-
-        Started by the first lease this manager registers, so a deployment that
-        configures idle windows always gets the sweep. Calling it again is a no-op.
-        """
-        if self._idle_task is not None and not self._idle_task.done():
-            return
-        windows = [w for w in (self._idle_pause_window_s, self._idle_reap_window_s) if w is not None]
-        if not windows:
-            return
-        self._idle_task = asyncio.create_task(self._idle_loop(max(1.0, min(windows) / 4)))
-
-    async def _idle_loop(self, interval_s: float) -> None:
-        """
-        Sweep the idle windows once per interval until the manager closes.
-        """
-        while not self._closed:
-            await asyncio.sleep(interval_s)
-            try:
-                if self._idle_pause_window_s is not None:
-                    await self.pause_idle()
-                if self._idle_reap_window_s is not None:
-                    await self.reap_idle()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                psrl_logger.warning("Sandbox idle sweep failed. Retrying next interval.", exc_info=True)
-
-    async def stop_idle_reaper(self) -> None:
-        """
-        Stop the idle sweep, leaving the sandboxes it was watching in place.
-        """
-        task, self._idle_task = self._idle_task, None
-        if task is None:
-            return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-    async def pause_idle(
-        self,
-        window_s: float | None = None,
-        *,
-        now: float | None = None,
-    ) -> list[SandboxRef]:
-        """Pause every sandbox that has been idle for its window.
-
-        Idle is two conditions, not one. A command must not be in flight, and no
-        command boundary may be more recent than the window. Age alone is not
-        enough: a backend that stamps activity when a command returns leaves the
-        stamp stale for the whole duration of a long command, so a reaper reading
-        only the stamp sees a busy sandbox as idle and pauses a running test suite.
-        """
-        window = self._idle_pause_window_s if window_s is None else window_s
-        if window is None:
-            return []
-        current = time.monotonic() if now is None else now
-        paused: list[SandboxRef] = []
-        for lease in list(self._leases):
-            session = lease.session
-            if not self._is_idle(session, window, current):
-                continue
-            try:
-                await session.pause(self._pause_mode(session))
-            except (NotImplementedError, SandboxBusyError):
-                # Not idle in fact, or no pause to offer. Either way the next pass
-                # decides again, and neither is a failure to report.
-                continue
-            except Exception:
-                psrl_logger.warning(f"Sandbox idle pause failed for {lease.ref!r}.", exc_info=True)
-                continue
-            self._count("outcome/paused_idle")
-            paused.append(lease.ref)
-        return paused
-
-    async def reap_idle(
-        self,
-        window_s: float | None = None,
-        *,
-        now: float | None = None,
-    ) -> list[SandboxRef]:
-        """Release every sandbox idle past the reap window.
-
-        The window is longer than the pause window, so a sandbox is always paused
-        before it is destroyed, and a caller that only wants to reclaim leaks does
-        not also lose the state a pause would have kept.
-        """
-        window = self._idle_reap_window_s if window_s is None else window_s
-        if window is None:
-            return []
-        current = time.monotonic() if now is None else now
-        reaped: list[SandboxRef] = []
-        for lease in list(self._leases):
-            if lease in self._pending_releases:
-                continue
-            if not self._is_idle(lease.session, window, current):
-                continue
-            self._count("outcome/reaped_idle")
-            reaped.append(lease.ref)
-            await lease.release()
-        return reaped
-
-    @staticmethod
-    def _is_idle(session: SandboxSession, window_s: float, now: float) -> bool:
-        """
-        Return whether a session is idle for the whole window.
-        """
-        if session.busy:
-            return False
-        last = session.last_activity_at
-        if last is None:
-            # A backend that reports no activity is never treated as idle, because
-            # the policy cannot tell a quiet sandbox from an unreported one.
-            return False
-        return (now - last) >= window_s
-
-    @staticmethod
-    def _pause_mode(session: SandboxSession):
-        """
-        Choose the strongest pause the backend declares, preferring a resident freeze.
-        """
-        from psrl.sandbox.core import PauseMode
-
-        if session.capabilities.supports(SandboxFeature.FREEZE):
-            return PauseMode.FREEZE
-        return PauseMode.HIBERNATE
-
     async def capacity_snapshot(self) -> dict:
         """Return the node envelope's accounting, or an empty mapping without one.
 
@@ -1575,7 +1410,6 @@ class SandboxManager:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await self.stop_idle_reaper()
         if self._reaper_task is not None:
             self._reaper_task.cancel()
             await asyncio.gather(self._reaper_task, return_exceptions=True)

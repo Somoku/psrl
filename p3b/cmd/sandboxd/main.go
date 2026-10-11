@@ -63,10 +63,8 @@ type Config struct {
 	NodeID string `json:"node_id"`
 
 	Timing struct {
-		EpisodeDeadlineS float64            `json:"episode_deadline_s"`
-		NodeTTLS         float64            `json:"node_ttl_s"`
-		RPCTimeoutS      float64            `json:"rpc_timeout_s"`
-		Overrides        map[string]float64 `json:"overrides"`
+		NodeTTLS    float64 `json:"node_ttl_s"`
+		RPCTimeoutS float64 `json:"rpc_timeout_s"`
 	} `json:"timing"`
 
 	Fleet struct {
@@ -204,10 +202,8 @@ func preflight(configPath string, log *slog.Logger) error {
 		return err
 	}
 	spans, err := timing.New(
-		seconds(cfg.Timing.EpisodeDeadlineS),
 		seconds(cfg.Timing.NodeTTLS),
 		seconds(cfg.Timing.RPCTimeoutS),
-		overrides(cfg.Timing.Overrides),
 	)
 	if err != nil {
 		return err
@@ -229,7 +225,7 @@ func preflight(configPath string, log *slog.Logger) error {
 			Sandboxes: 1 << 20,
 		},
 		Classes:  quotaClasses(cfg),
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	}); err != nil {
 		return err
 	}
@@ -250,17 +246,12 @@ func preflight(configPath string, log *slog.Logger) error {
 		LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 		Overcommit:        cfg.Node.Overcommit,
 		UtilizationTarget: cfg.Node.UtilizationTarget,
-		LeaseTTL:          spans.CapacityLeaseTTL(),
+		LeaseTTL:          timing.OwnerLease,
 	})
 	if err != nil {
 		return err
 	}
-	if _, err := node.NewLifecycle(cfg.NodeID, gate, node.Windows{
-		PauseWindow:   spans.PauseWindow(),
-		ReapWindow:    spans.ReapWindow(),
-		Lifetime:      spans.Lifetime(),
-		SweepInterval: spans.SweepInterval(),
-	}); err != nil {
+	if _, err := node.NewLifecycle(cfg.NodeID, gate, timing.SweepInterval); err != nil {
 		return err
 	}
 	log.Info("deployment is servable",
@@ -275,10 +266,8 @@ func run(configPath string, log *slog.Logger) error {
 	}
 
 	spans, err := timing.New(
-		seconds(cfg.Timing.EpisodeDeadlineS),
 		seconds(cfg.Timing.NodeTTLS),
 		seconds(cfg.Timing.RPCTimeoutS),
-		overrides(cfg.Timing.Overrides),
 	)
 	if err != nil {
 		return err
@@ -322,17 +311,12 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 		LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 		Overcommit:        cfg.Node.Overcommit,
 		UtilizationTarget: cfg.Node.UtilizationTarget,
-		LeaseTTL:          spans.CapacityLeaseTTL(),
+		LeaseTTL:          timing.OwnerLease,
 	})
 	if err != nil {
 		return err
 	}
-	life, err := node.NewLifecycle(cfg.NodeID, gate, node.Windows{
-		PauseWindow:   spans.PauseWindow(),
-		ReapWindow:    spans.ReapWindow(),
-		Lifetime:      spans.Lifetime(),
-		SweepInterval: spans.SweepInterval(),
-	})
+	life, err := node.NewLifecycle(cfg.NodeID, gate, timing.SweepInterval)
 	if err != nil {
 		return err
 	}
@@ -399,15 +383,15 @@ func runControl(ctx context.Context, cfg Config, spans timing.Contract, log *slo
 			Sandboxes: 1 << 20,
 		},
 		Classes:  quotaClasses(cfg),
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	})
 	if err != nil {
 		return err
 	}
 	place, err := placement.New(placement.Config{
 		NodeTTL:        spans.NodeTTL,
-		ReservationTTL: spans.ReservationTTL(),
-		SweepInterval:  spans.SweepInterval(),
+		ReservationTTL: timing.ReservationTTL,
+		SweepInterval:  timing.SweepInterval,
 	}, fleet)
 	if err != nil {
 		return err
@@ -415,13 +399,12 @@ func runControl(ctx context.Context, cfg Config, spans timing.Contract, log *slo
 	control, err := server.NewControl(server.ControlConfig{
 		Registry: registry, Ledger: ledger, Placement: place, Monitor: fleet,
 		Nodes:          fleetClient,
-		AcquireTimeout: spans.AcquireTimeout(),
 	})
 	if err != nil {
 		return err
 	}
 
-	go sweepReservations(ctx, place, spans.SweepInterval())
+	go sweepReservations(ctx, place, timing.SweepInterval)
 
 	listener, err := listen(cfg.Listen)
 	if err != nil {
@@ -467,17 +450,12 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 			LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 			Overcommit:        cfg.Node.Overcommit,
 			UtilizationTarget: cfg.Node.UtilizationTarget,
-			LeaseTTL:          spans.CapacityLeaseTTL(),
+			LeaseTTL:          timing.OwnerLease,
 		})
 		if err != nil {
 			return err
 		}
-		life, err = node.NewLifecycle(cfg.NodeID, gate, node.Windows{
-			PauseWindow:   spans.PauseWindow(),
-			ReapWindow:    spans.ReapWindow(),
-			Lifetime:      spans.Lifetime(),
-			SweepInterval: spans.SweepInterval(),
-		})
+		life, err = node.NewLifecycle(cfg.NodeID, gate, timing.SweepInterval)
 		if err != nil {
 			return err
 		}
@@ -498,15 +476,15 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 			Sandboxes: 1 << 20,
 		},
 		Classes:  quotaClasses(cfg),
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	})
 	if err != nil {
 		return err
 	}
 	place, err := placement.New(placement.Config{
 		NodeTTL:        spans.NodeTTL,
-		ReservationTTL: spans.ReservationTTL(),
-		SweepInterval:  spans.SweepInterval(),
+		ReservationTTL: timing.ReservationTTL,
+		SweepInterval:  timing.SweepInterval,
 	}, fleet)
 	if err != nil {
 		return err
@@ -514,7 +492,6 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 	control, err := server.NewControl(server.ControlConfig{
 		Registry: registry, Ledger: ledger, Placement: place, Monitor: fleet,
 		Nodes:          nodes,
-		AcquireTimeout: spans.AcquireTimeout(),
 	})
 	if err != nil {
 		return err
@@ -543,7 +520,7 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 			go func() { _ = server.NewNodeListener(agent, log).Serve(ctx, nl) }()
 		}
 	}
-	go sweepReservations(ctx, place, spans.SweepInterval())
+	go sweepReservations(ctx, place, timing.SweepInterval)
 
 	listener, err := listen(cfg.Listen)
 	if err != nil {
@@ -830,17 +807,6 @@ func trimPrefix(value, prefix string) (string, bool) {
 
 func seconds(value float64) time.Duration {
 	return time.Duration(value * float64(time.Second))
-}
-
-func overrides(raw map[string]float64) map[string]time.Duration {
-	if len(raw) == 0 {
-		return nil
-	}
-	out := make(map[string]time.Duration, len(raw))
-	for name, value := range raw {
-		out[name] = seconds(value)
-	}
-	return out
 }
 
 // startBackends begins any background work a backend owns.

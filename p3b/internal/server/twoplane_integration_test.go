@@ -35,6 +35,7 @@ import (
 	"psrl.dev/sandboxd/internal/backend"
 	"psrl.dev/sandboxd/internal/node"
 	"psrl.dev/sandboxd/internal/server"
+	"psrl.dev/sandboxd/internal/timing"
 )
 
 // fakeExecBackend is a minimal backend that keeps sandboxes in memory.
@@ -90,12 +91,7 @@ func buildNodeForTest(t *testing.T, nodeID string, b backend.Backend) *server.No
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}
-	life, err := node.NewLifecycle(nodeID, gate, node.Windows{
-		PauseWindow:   5 * time.Second,
-		ReapWindow:    10 * time.Second,
-		Lifetime:      60 * time.Second,
-		SweepInterval: 2 * time.Second,
-	})
+	life, err := node.NewLifecycle(nodeID, gate, timing.SweepInterval)
 	if err != nil {
 		t.Fatalf("lifecycle: %v", err)
 	}

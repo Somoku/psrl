@@ -6,13 +6,10 @@ from psrl.sandbox.backends import DockerBackend
 from psrl.sandbox.capacity import SandboxCapacityConfig
 from psrl.sandbox.config import (
     SandboxManagerConfig,
-    bind_capacity_timing,
     build_sandbox_manager,
     placement_manager_config,
-    resolve_timing,
 )
 from psrl.sandbox.core import SandboxBackend, SandboxCapabilities
-from psrl.sandbox.timing import TimingContract
 
 
 class InjectedBackend(SandboxBackend):
@@ -186,15 +183,14 @@ def test_a_backend_cannot_be_both_configured_and_injected() -> None:
         build_sandbox_manager(config, extra_backends=[InjectedBackend()])
 
 
-def test_a_placing_worker_holds_no_local_backend_and_keeps_its_timing() -> None:
+def test_a_placing_worker_holds_no_local_backend_and_keeps_its_capacity() -> None:
     # A placed sandbox consumes another node's envelope, so a worker that also held the local
     # backend would charge itself for containers it never runs.
     config = OmegaConf.create(
         {
             "default_backend": "docker",
             "backends": {"docker": {"_target_": "psrl.sandbox.backends.DockerBackend"}},
-            "capacity": {"utilization": 0.25, "acquire_timeout_s": 60},
-            "timing": {"episode_deadline_s": 120},
+            "capacity": {"utilization": 0.25},
         }
     )
 
@@ -203,53 +199,4 @@ def test_a_placing_worker_holds_no_local_backend_and_keeps_its_timing() -> None:
     assert placed.backends == {}
     assert placed.default_backend == "docker"
     assert placed.capacity.utilization == 0.25
-    assert placed.capacity.acquire_timeout_s == 60
-    assert placed.timing.episode_deadline_s == 120
 
-
-def test_a_placing_worker_still_validates_the_timing_ladder() -> None:
-    # The contract resolves before a manager exists, so an inverted ordering is refused
-    # as the configuration is read rather than once a backend has been built.
-    config = OmegaConf.create(
-        {
-            "default_backend": "docker",
-            "backends": {},
-            "timing": {"pause_window_s": 600.0, "reap_window_s": 60.0},
-        }
-    )
-
-    with pytest.raises(ValueError, match="shorter than"):
-        placement_manager_config(config, backend_name="docker")
-
-
-def test_the_capacity_lease_comes_from_the_timing_contract() -> None:
-    # The lease, its heartbeat, and the admission deadline are spans like any other,
-    # so they follow the one contract rather than a second set of knobs.
-    timing = TimingContract(episode_deadline_s=600).validate()
-
-    bound = bind_capacity_timing(SandboxCapacityConfig(), timing)
-
-    assert bound.lease_ttl_s == timing.capacity_lease_ttl_s
-    assert bound.heartbeat_interval_s == timing.owner_heartbeat_interval_s
-    assert bound.acquire_timeout_s == timing.acquire_timeout_s
-
-
-def test_an_envelope_without_a_contract_keeps_its_own_deadlines() -> None:
-    envelope = SandboxCapacityConfig()
-
-    assert bind_capacity_timing(envelope, None) is envelope
-
-
-def test_a_capacity_lease_always_covers_the_pause_window() -> None:
-    # A paused sandbox still holds the memory its reservation covers, so losing the
-    # lease under a pause would admit new work against spoken-for memory.
-    for deadline in (30, 300, 1800, 7200):
-        bound = bind_capacity_timing(SandboxCapacityConfig(), TimingContract(episode_deadline_s=deadline).validate())
-        assert bound.lease_ttl_s >= TimingContract(episode_deadline_s=deadline).pause_window_s
-        assert bound.heartbeat_interval_s < bound.lease_ttl_s
-
-
-def test_a_deployment_without_an_episode_deadline_runs_without_idle_windows() -> None:
-    config = OmegaConf.create({"default_backend": "docker", "backends": {}, "timing": {"episode_deadline_s": None}})
-
-    assert resolve_timing(config) is None

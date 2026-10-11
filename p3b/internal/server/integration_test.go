@@ -53,7 +53,7 @@ func newStack(t *testing.T, fleetMemoryMB int64) *stack {
 	socket := dockerSocket(t)
 
 	// Short spans, so a reclamation test does not wait an episode.
-	spans, err := timing.New(2*time.Second, 8*time.Second, 5*time.Second, nil)
+	spans, err := timing.New(8*time.Second, 5*time.Second)
 	if err != nil {
 		t.Fatalf("timing: %v", err)
 	}
@@ -76,17 +76,12 @@ func newStack(t *testing.T, fleetMemoryMB int64) *stack {
 	gate, err := node.NewAdmission(node.Config{
 		Envelope: node.Resources{MemoryMB: fleetMemoryMB, CPUMillis: 100000},
 		Classes:  map[string]node.ClassShare{"rollout": {Guaranteed: 0.7}, "grader": {Guaranteed: 0.2}},
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	})
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}
-	life, err := node.NewLifecycle("node-a", gate, node.Windows{
-		PauseWindow:   spans.PauseWindow(),
-		ReapWindow:    spans.ReapWindow(),
-		Lifetime:      spans.Lifetime(),
-		SweepInterval: spans.SweepInterval(),
-	})
+	life, err := node.NewLifecycle("node-a", gate, timing.SweepInterval)
 	if err != nil {
 		t.Fatalf("lifecycle: %v", err)
 	}
@@ -103,15 +98,15 @@ func newStack(t *testing.T, fleetMemoryMB int64) *stack {
 	ledger, err := quota.New(quota.Config{
 		Total:    quota.Amount{MemoryMB: fleetMemoryMB, CPUMillis: 100000, Sandboxes: 1000},
 		Classes:  map[string]quota.ClassShare{"rollout": {Guaranteed: 0.7}, "grader": {Guaranteed: 0.2}},
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	})
 	if err != nil {
 		t.Fatalf("ledger: %v", err)
 	}
 	place, err := placement.New(placement.Config{
 		NodeTTL:        spans.NodeTTL,
-		ReservationTTL: spans.ReservationTTL(),
-		SweepInterval:  spans.SweepInterval(),
+		ReservationTTL: timing.ReservationTTL,
+		SweepInterval:  timing.SweepInterval,
 	}, mon)
 	if err != nil {
 		t.Fatalf("placement: %v", err)
@@ -122,7 +117,7 @@ func newStack(t *testing.T, fleetMemoryMB int64) *stack {
 	}
 	control, err := NewControl(ControlConfig{
 		Registry: registry, Ledger: ledger, Placement: place, Monitor: mon,
-		Nodes: NewLocalNodeClient(agent), AcquireTimeout: time.Minute,
+		Nodes: NewLocalNodeClient(agent),
 	})
 	if err != nil {
 		t.Fatalf("control: %v", err)

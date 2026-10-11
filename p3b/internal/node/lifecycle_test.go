@@ -10,13 +10,15 @@ import (
 	"psrl.dev/sandboxd/internal/backend"
 )
 
+// testLifetime is the lifetime every adopted sandbox states, unless a test wants
+// a different one.
+const testLifetime = 100 * time.Second
+
 type fakeBackend struct {
 	mu         sync.Mutex
 	features   []string
 	released   []string
-	paused     []string
 	releaseErr error
-	pauseErr   error
 }
 
 func (f *fakeBackend) Name() string                 { return "fake" }
@@ -41,72 +43,40 @@ func (f *fakeBackend) Release(_ context.Context, handle backend.Handle) error {
 
 func (f *fakeBackend) Status(context.Context, backend.Handle) (string, error) { return "running", nil }
 
-func (f *fakeBackend) Pause(_ context.Context, handle backend.Handle, _ string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.pauseErr != nil {
-		return f.pauseErr
-	}
-	f.paused = append(f.paused, handle.SandboxID)
-	return nil
-}
-
-func (f *fakeBackend) Resume(context.Context, backend.Handle) error { return nil }
-func (f *fakeBackend) Snapshot(context.Context, backend.Handle, string) (string, error) {
-	return "snap", nil
-}
-func (f *fakeBackend) DeleteSnapshot(context.Context, string) error { return nil }
-
 func (f *fakeBackend) releasedIDs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.released...)
 }
 
-func windows() Windows {
-	return Windows{
-		PauseWindow:   10 * time.Second,
-		ReapWindow:    30 * time.Second,
-		Lifetime:      100 * time.Second,
-		SweepInterval: time.Second,
-	}
+func adopt(t *testing.T, life *Lifecycle, gate *Admission, b backend.Backend, id string) {
+	t.Helper()
+	adoptWithLifetime(t, life, gate, b, id, testLifetime)
 }
 
-func adopt(t *testing.T, life *Lifecycle, gate *Admission, b backend.Backend, id string) {
+func adoptWithLifetime(t *testing.T, life *Lifecycle, gate *Admission, b backend.Backend, id string, lifetime time.Duration) {
 	t.Helper()
 	grant, refusal, ok := gate.Admit("rollout", "worker", Resources{MemoryMB: 10})
 	if !ok {
 		t.Fatalf("admit %s: %q", id, refusal)
 	}
-	life.Adopt(backend.Handle{Backend: "fake", SandboxID: id, NodeID: "node-a"}, b, grant.LeaseID, "worker", "")
+	life.Adopt(backend.Handle{Backend: "fake", SandboxID: id, NodeID: "node-a"}, b, grant.LeaseID, "worker", "", lifetime)
 }
 
-func TestInvertedWindowsAreRefused(t *testing.T) {
-	bad := windows()
-	bad.PauseWindow, bad.ReapWindow = bad.ReapWindow, bad.PauseWindow
-
-	if _, err := NewLifecycle("n", nil, bad); err == nil {
-		t.Fatal("a pause window after the reap window destroys before pausing")
-	}
-}
-
-func TestASweepSlowerThanItsShortestWindowIsRefused(t *testing.T) {
-	bad := windows()
-	bad.SweepInterval = bad.PauseWindow
-
-	if _, err := NewLifecycle("n", nil, bad); err == nil {
-		t.Fatal("a sweep must be faster than the window it enforces")
+func TestAZeroSweepIntervalIsRefused(t *testing.T) {
+	if _, err := NewLifecycle("n", nil, 0); err == nil {
+		t.Fatal("a sweep with no cadence cannot enforce anything")
 	}
 }
 
 func TestABusySandboxIsNeverReclaimed(t *testing.T) {
-	// A backend stamps activity when a command returns, so age alone reads a long
-	// command as idle. In-flight is the other half of the idle test.
+	// A long command runs in flight, and the lifetime backstop has not been
+	// reached, so the sweep must leave it alone and report it as busy.
 	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
 	clock := time.Now()
 	life.SetClock(func() time.Time { return clock })
-	b := &fakeBackend{features: []string{"freeze"}}
+	b := &fakeBackend{}
 	adopt(t, life, gate, b, "sb-busy")
 	done := life.Begin("sb-busy")
 	defer done()
@@ -114,7 +84,7 @@ func TestABusySandboxIsNeverReclaimed(t *testing.T) {
 	clock = clock.Add(50 * time.Second)
 	report := life.Sweep(context.Background())
 
-	if report.Released() != 0 || len(report.Paused) != 0 {
+	if report.Released() != 0 {
 		t.Fatalf("a busy sandbox was reclaimed: %+v", report)
 	}
 	if report.SkippedBusy != 1 {
@@ -122,73 +92,19 @@ func TestABusySandboxIsNeverReclaimed(t *testing.T) {
 	}
 }
 
-func TestACommandThatFinishesMakesTheSandboxIdleAgain(t *testing.T) {
-	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
-	clock := time.Now()
-	life.SetClock(func() time.Time { return clock })
-	b := &fakeBackend{features: []string{"freeze"}}
-	adopt(t, life, gate, b, "sb-1")
-	life.Begin("sb-1")()
-
-	clock = clock.Add(15 * time.Second)
-	report := life.Sweep(context.Background())
-
-	if len(report.Paused) != 1 {
-		t.Fatalf("an idle sandbox must be paused: %+v", report)
-	}
-}
-
-func TestAnIdleSandboxIsPausedBeforeItIsDestroyed(t *testing.T) {
-	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
-	clock := time.Now()
-	life.SetClock(func() time.Time { return clock })
-	b := &fakeBackend{features: []string{"freeze"}}
-	adopt(t, life, gate, b, "sb-1")
-
-	clock = clock.Add(15 * time.Second)
-	paused := life.Sweep(context.Background())
-	clock = clock.Add(20 * time.Second)
-	reaped := life.Sweep(context.Background())
-
-	if len(paused.Paused) != 1 {
-		t.Fatalf("first sweep must pause: %+v", paused)
-	}
-	if len(reaped.ReapedIdle) != 1 {
-		t.Fatalf("second sweep must reap: %+v", reaped)
-	}
-}
-
-func TestAPausedSandboxIsNotPausedAgain(t *testing.T) {
-	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
-	clock := time.Now()
-	life.SetClock(func() time.Time { return clock })
-	b := &fakeBackend{features: []string{"freeze"}}
-	adopt(t, life, gate, b, "sb-1")
-
-	clock = clock.Add(15 * time.Second)
-	life.Sweep(context.Background())
-	second := life.Sweep(context.Background())
-
-	if len(second.Paused) != 0 {
-		t.Fatalf("a paused sandbox was paused again: %+v", second)
-	}
-}
-
 func TestANeverIdleSandboxStillEndsAtItsLifetime(t *testing.T) {
-	// The backstop is what bounds a sandbox that keeps running commands.
+	// The lifetime is the backstop that bounds a sandbox which keeps running
+	// commands, so it reclaims even a busy one.
 	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
 	clock := time.Now()
 	life.SetClock(func() time.Time { return clock })
-	b := &fakeBackend{features: []string{"freeze"}}
+	b := &fakeBackend{}
 	adopt(t, life, gate, b, "sb-busy")
 	done := life.Begin("sb-busy")
 	defer done()
 
-	clock = clock.Add(120 * time.Second)
+	clock = clock.Add(testLifetime + 20*time.Second)
 	report := life.Sweep(context.Background())
 
 	if len(report.ReapedLifetime) != 1 {
@@ -196,15 +112,32 @@ func TestANeverIdleSandboxStillEndsAtItsLifetime(t *testing.T) {
 	}
 }
 
-func TestASandboxWhoseOwnerIsGoneIsReclaimedWithoutWaiting(t *testing.T) {
-	// Waiting for the idle window would hold a node slot for a caller that no
-	// longer exists.
+func TestAShortLifetimeReapsSoonerThanALongOne(t *testing.T) {
 	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
+	clock := time.Now()
+	life.SetClock(func() time.Time { return clock })
+	b := &fakeBackend{}
+	adoptWithLifetime(t, life, gate, b, "sb-short", 30*time.Second)
+	adoptWithLifetime(t, life, gate, b, "sb-long", 600*time.Second)
+
+	clock = clock.Add(60 * time.Second)
+	report := life.Sweep(context.Background())
+
+	if len(report.ReapedLifetime) != 1 || report.ReapedLifetime[0] != "sb-short" {
+		t.Fatalf("only the short-lived sandbox should be reaped: %+v", report)
+	}
+}
+
+func TestASandboxWhoseOwnerIsGoneIsReclaimedWithoutWaiting(t *testing.T) {
+	// Waiting for the lifetime would hold a node slot for a caller that no longer
+	// exists.
+	gate := mustGate(t, envelope())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
 	clock := time.Now()
 	life.SetClock(func() time.Time { return clock })
 	life.SetOwnerLiveness(func(string) bool { return false })
-	b := &fakeBackend{features: []string{"freeze"}}
+	b := &fakeBackend{}
 	adopt(t, life, gate, b, "sb-orphan")
 	done := life.Begin("sb-orphan")
 	defer done()
@@ -218,14 +151,14 @@ func TestASandboxWhoseOwnerIsGoneIsReclaimedWithoutWaiting(t *testing.T) {
 
 func TestEachSandboxIsReclaimedForExactlyOneReason(t *testing.T) {
 	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
 	clock := time.Now()
 	life.SetClock(func() time.Time { return clock })
-	b := &fakeBackend{features: []string{"freeze"}}
+	b := &fakeBackend{}
 	adopt(t, life, gate, b, "sb-1")
 
-	// Past the reap window and past the lifetime at once.
-	clock = clock.Add(500 * time.Second)
+	// Past the lifetime.
+	clock = clock.Add(testLifetime + time.Second)
 	report := life.Sweep(context.Background())
 
 	if report.Released() != 1 {
@@ -238,8 +171,8 @@ func TestEachSandboxIsReclaimedForExactlyOneReason(t *testing.T) {
 
 func TestReleasingReturnsTheCapacityTheSandboxHeld(t *testing.T) {
 	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
-	b := &fakeBackend{features: []string{"freeze"}}
+	life, _ := NewLifecycle("node-a", gate, time.Second)
+	b := &fakeBackend{}
 	adopt(t, life, gate, b, "sb-1")
 	before := gate.Headroom("rollout").MemoryMB
 
@@ -257,8 +190,8 @@ func TestAFailedDestructionKeepsTheReservationCharged(t *testing.T) {
 	// returning the reservation would over-commit the node and turn one stuck
 	// container into a host OOM.
 	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
-	b := &fakeBackend{features: []string{"freeze"}, releaseErr: fmt.Errorf("daemon refused")}
+	life, _ := NewLifecycle("node-a", gate, time.Second)
+	b := &fakeBackend{releaseErr: fmt.Errorf("daemon refused")}
 	adopt(t, life, gate, b, "sb-stuck")
 	before := gate.Headroom("rollout").MemoryMB
 
@@ -274,29 +207,10 @@ func TestAFailedDestructionKeepsTheReservationCharged(t *testing.T) {
 
 func TestReleasingAnUnknownSandboxIsANoOp(t *testing.T) {
 	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
 
 	if err := life.Release(context.Background(), "ghost", ExitReleased); err != nil {
 		t.Fatalf("a retried release must be safe: %v", err)
-	}
-}
-
-func TestABackendThatCannotPauseIsNotAFailure(t *testing.T) {
-	gate := mustGate(t, envelope())
-	life, _ := NewLifecycle("node-a", gate, windows())
-	clock := time.Now()
-	life.SetClock(func() time.Time { return clock })
-	b := &fakeBackend{features: []string{"freeze"}, pauseErr: fmt.Errorf("no pause here")}
-	adopt(t, life, gate, b, "sb-1")
-
-	clock = clock.Add(15 * time.Second)
-	report := life.Sweep(context.Background())
-
-	if report.Failures != 0 {
-		t.Fatalf("a refused pause is not a failure: %+v", report)
-	}
-	if len(report.Paused) != 0 {
-		t.Fatalf("a refused pause must not be reported as paused: %+v", report)
 	}
 }
 
@@ -306,21 +220,21 @@ func TestTheSweepIsReproducibleForTheSameInputs(t *testing.T) {
 		Classes:  map[string]ClassShare{"rollout": {Guaranteed: 1.0}},
 		LeaseTTL: time.Minute,
 	})
-	life, _ := NewLifecycle("node-a", gate, windows())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
 	clock := time.Now()
 	life.SetClock(func() time.Time { return clock })
 	gate.SetClock(func() time.Time { return clock })
-	b := &fakeBackend{features: []string{"freeze"}}
+	b := &fakeBackend{}
 	for i := 0; i < 10; i++ {
 		adopt(t, life, gate, b, fmt.Sprintf("sb-%02d", i))
 	}
 
-	clock = clock.Add(50 * time.Second)
+	clock = clock.Add(testLifetime + time.Second)
 	report := life.Sweep(context.Background())
 
-	for i := 1; i < len(report.ReapedIdle); i++ {
-		if report.ReapedIdle[i-1] >= report.ReapedIdle[i] {
-			t.Fatalf("a sweep's effects must be in a stable order: %v", report.ReapedIdle)
+	for i := 1; i < len(report.ReapedLifetime); i++ {
+		if report.ReapedLifetime[i-1] >= report.ReapedLifetime[i] {
+			t.Fatalf("a sweep's effects must be in a stable order: %v", report.ReapedLifetime)
 		}
 	}
 }
@@ -331,15 +245,15 @@ func TestConcurrentSweepsDecideEachSandboxOnce(t *testing.T) {
 		Classes:  map[string]ClassShare{"rollout": {Guaranteed: 1.0}},
 		LeaseTTL: time.Minute,
 	})
-	life, _ := NewLifecycle("node-a", gate, windows())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
 	clock := time.Now()
 	life.SetClock(func() time.Time { return clock })
 	gate.SetClock(func() time.Time { return clock })
-	b := &fakeBackend{features: []string{"freeze"}}
+	b := &fakeBackend{}
 	for i := 0; i < 50; i++ {
 		adopt(t, life, gate, b, fmt.Sprintf("sb-%02d", i))
 	}
-	clock = clock.Add(500 * time.Second)
+	clock = clock.Add(testLifetime + time.Second)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -368,17 +282,17 @@ func BenchmarkSweep(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	life, err := NewLifecycle("node-a", gate, windows())
+	life, err := NewLifecycle("node-a", gate, time.Second)
 	if err != nil {
 		b.Fatal(err)
 	}
 	clock := time.Now()
 	life.SetClock(func() time.Time { return clock })
-	fake := &fakeBackend{features: []string{"freeze"}}
+	fake := &fakeBackend{}
 	// A production node density, so the sweep is measured where it runs.
 	for i := 0; i < 3200; i++ {
 		grant, _, _ := gate.Admit("rollout", "w", Resources{MemoryMB: 1})
-		life.Adopt(backend.Handle{SandboxID: fmt.Sprintf("sb-%04d", i)}, fake, grant.LeaseID, "w", "")
+		life.Adopt(backend.Handle{SandboxID: fmt.Sprintf("sb-%04d", i)}, fake, grant.LeaseID, "w", "", testLifetime)
 	}
 	ctx := context.Background()
 	b.ReportAllocs()

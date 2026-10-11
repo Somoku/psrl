@@ -67,18 +67,18 @@ async with SandboxClient("unix:///run/sandboxd.sock") as client:
 | `internal/backend/` | the backend contract and the registry that selects one |
 | `internal/backend/dockerbackend/` | containers over the Engine API |
 | `internal/server/` | gRPC and the SDK's JSON listener |
-| `internal/timing/` | every deadline, derived from three declared values |
+| `internal/timing/` | the fleet-liveness spans (node TTL, RPC timeout) and the mechanism's own constants |
 
 ## Configuration
 
-An operator declares intent; the service derives the rest. A value that can be
-derived is not a knob.
+A deployment states how fast its nodes answer; everything else is a property of
+the mechanism, not of the deployment, so it is a constant rather than a knob.
 
 ```json
 {
   "listen": "unix:///run/sandboxd.sock",
   "node_id": "node-a",
-  "timing": { "episode_deadline_s": 1800, "node_ttl_s": 120, "rpc_timeout_s": 60 },
+  "timing": { "node_ttl_s": 120, "rpc_timeout_s": 60 },
   "fleet":  { "memory_mb": 960000, "cpu_millis": 180000, "disk_mb": 4000000 },
   "node":   { "memory_mb": 480000, "cpu_millis": 90000, "disk_mb": 2000000,
               "gpu_indices": [], "local_cpu_ceiling": 0.95, "local_mem_ceiling": 0.9 },
@@ -96,7 +96,6 @@ derived is not a knob.
 
 | Field | Default | Why it matters |
 |---|---|---|
-| `timing.episode_deadline_s` | required | the one number an operator can estimate; every window follows from it |
 | `timing.node_ttl_s` | `120` | silence before a node is drained |
 | `timing.rpc_timeout_s` | `60` | bounds a coordination call, never a command |
 | `fleet.*` | required | the cross-backend ceiling, which no single backend can enforce |
@@ -106,12 +105,10 @@ derived is not a knob.
 | `classes.*.max_share` | unset | a ceiling, even on an idle fleet |
 | `backends[].mode` | `direct` | `direct`: this service places and drives the runtime. `provider`: the backend’s own scheduler does |
 
-Override a derived span only when a deployment genuinely needs a different one.
-The orderings are still asserted against it:
-
-```json
-"timing": { "episode_deadline_s": 1800, "overrides": { "reap_window_s": 600 } }
-```
+A sandbox's lifetime is not a service setting: the caller states it on the create
+(`lifetime_s`), because the caller knows what the sandbox is for. The service
+reclaims the sandbox by it, so a caller that dies or forgets to release leaves
+nothing running.
 
 ## One control plane over several nodes
 

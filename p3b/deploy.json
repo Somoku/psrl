@@ -2,7 +2,6 @@
   "listen": "unix:///run/sandboxd.sock",
   "node_id": "node-250",
   "timing": {
-    "episode_deadline_s": 1800,
     "node_ttl_s": 120,
     "rpc_timeout_s": 60
   },

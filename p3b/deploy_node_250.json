@@ -2,7 +2,6 @@
   "role": "node",
   "node_listen": "0.0.0.0:9090",
   "timing": {
-    "episode_deadline_s": 1800,
     "node_ttl_s": 120,
     "rpc_timeout_s": 60
   },

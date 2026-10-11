@@ -127,6 +127,10 @@ func (n *Node) CreateOn(ctx context.Context, req *v1.CreateOnRequest) (*v1.Creat
 	}
 	spec := specFromProto(req.GetSpec())
 	spec.AssignedGPUs = grant.GPUIndices
+	lifetime := spec.Lifetime
+	if lifetime <= 0 {
+		lifetime = node.DefaultLifetime
+	}
 	created, err := hosted.Create(ctx, n.nodeID, spec, req.GetCallbackTarget())
 	if err != nil {
 		// The sandbox does not exist, so its admission must not stay charged.
@@ -134,7 +138,7 @@ func (n *Node) CreateOn(ctx context.Context, req *v1.CreateOnRequest) (*v1.Creat
 		n.forgetLease(grant.LeaseID)
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	n.lifecycle.Adopt(created.Handle, hosted, grant.LeaseID, ownerOf(spec), spec.ExecMode)
+	n.lifecycle.Adopt(created.Handle, hosted, grant.LeaseID, ownerOf(spec), spec.ExecMode, lifetime)
 	n.forgetLease(grant.LeaseID)
 	return createdToProto(created), nil
 }
@@ -256,13 +260,38 @@ func (n *Node) Sweep(ctx context.Context, _ *v1.Empty) (*v1.SweepReport, error) 
 	report := n.lifecycle.Sweep(ctx)
 	n.admission.Expire()
 	return &v1.SweepReport{
-		Paused:          report.Paused,
-		ReapedIdle:      report.ReapedIdle,
 		ReapedLifetime:  report.ReapedLifetime,
 		ReclaimedOrphan: report.ReclaimedOrphan,
 		SkippedBusy:     int32(report.SkippedBusy),
 		Failures:        int32(report.Failures),
 	}, nil
+}
+
+// sessionGoneError is a command against a sandbox this node no longer holds.
+//
+// It carries the lifecycle's attribution when one is still known, and maps to
+// gRPC NotFound so an SDK classifies it as a lost session rather than a
+// transport fault. `reason` is empty when the node never held the sandbox.
+type sessionGoneError struct {
+	sandboxID string
+	nodeID    string
+	reason    string
+}
+
+func (e *sessionGoneError) Error() string {
+	if e.reason != "" {
+		return fmt.Sprintf("sandbox %q is not held by node %q (exit_reason=%s)",
+			e.sandboxID, e.nodeID, e.reason)
+	}
+	return fmt.Sprintf("sandbox %q is not held by node %q", e.sandboxID, e.nodeID)
+}
+
+// ExitReason exposes the attribution to the wire layer without that layer
+// having to type-switch on this package's concrete error.
+func (e *sessionGoneError) ExitReason() string { return e.reason }
+
+func (e *sessionGoneError) GRPCStatus() *status.Status {
+	return status.New(codes.NotFound, e.Error())
 }
 
 // Exec runs one command in a sandbox this node holds.
@@ -276,7 +305,16 @@ func (n *Node) Sweep(ctx context.Context, _ *v1.Empty) (*v1.SweepReport, error) 
 func (n *Node) Exec(ctx context.Context, handle backend.Handle, command, workdir string, env map[string]string) (int, string, error) {
 	_, held, owned := n.lifecycle.Lookup(handle.SandboxID)
 	if !owned {
-		return 0, "", fmt.Errorf("sandbox %q is not held by node %q", handle.SandboxID, n.nodeID)
+		// The sandbox is gone. Report why it left when the lifecycle still
+		// remembers, so the caller can tell a reaped-idle sandbox from one that
+		// was never here -- and gets a lost-session rather than a transport
+		// fault.
+		reason, _ := n.lifecycle.ExitReasonOf(handle.SandboxID)
+		return 0, "", &sessionGoneError{
+			sandboxID: handle.SandboxID,
+			nodeID:    n.nodeID,
+			reason:    string(reason),
+		}
 	}
 	// A backend whose sandboxes run their own in-sandbox agent is never reached
 	// here — the SDK contacts the agent directly.
@@ -298,6 +336,15 @@ func (n *Node) Exec(ctx context.Context, handle backend.Handle, command, workdir
 		return 0, "", fmt.Errorf("backend %q runs commands through its own in-sandbox agent", held.Name())
 	}
 	return runner.Exec(ctx, handle, command, workdir, env)
+}
+
+// Touch records activity on a sandbox this node holds.
+//
+// The SDK calls it for a sandbox whose commands go straight to an in-container
+// agent, which never reaches Exec; without it the reclamation sweep would judge
+// that sandbox idle from creation and pause it mid-episode.
+func (n *Node) Touch(handle backend.Handle) {
+	n.lifecycle.Touch(handle.SandboxID)
 }
 
 // StatusOn reports a sandbox's state from this node.

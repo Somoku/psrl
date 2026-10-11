@@ -72,13 +72,10 @@ func TestTheExampleTimingAndSharesValidate(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 
-	spans, err := timing.New(
-		seconds(cfg.Timing.EpisodeDeadlineS),
+	if _, err := timing.New(
 		seconds(cfg.Timing.NodeTTLS),
 		seconds(cfg.Timing.RPCTimeoutS),
-		overrides(cfg.Timing.Overrides),
-	)
-	if err != nil {
+	); err != nil {
 		t.Fatalf("the example's timing contract is invalid: %v", err)
 	}
 
@@ -88,7 +85,7 @@ func TestTheExampleTimingAndSharesValidate(t *testing.T) {
 			Sandboxes: 1 << 20,
 		},
 		Classes:  quotaClasses(cfg),
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	}); err != nil {
 		t.Errorf("the example's fleet quota is invalid: %v", err)
 	}
@@ -103,7 +100,7 @@ func TestTheExampleTimingAndSharesValidate(t *testing.T) {
 		LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 		Overcommit:        cfg.Node.Overcommit,
 		UtilizationTarget: cfg.Node.UtilizationTarget,
-		LeaseTTL:          spans.CapacityLeaseTTL(),
+		LeaseTTL:          timing.OwnerLease,
 	}); err != nil {
 		t.Errorf("the example's node admission is invalid: %v", err)
 	}

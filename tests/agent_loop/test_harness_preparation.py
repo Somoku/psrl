@@ -138,4 +138,70 @@ async def test_cancelled_session_setup_cancels_preparation_and_cleans_task(harne
         await running
 
     assert cancelled.is_set(), "Task cancellation must cancel the preparation waiter."
-    loop.close_harness_task.assert_awaited_once_with(task)
+    loop.close_harness_task.assert_awaited_once()
+    cleaned = loop.close_harness_task.await_args.args[0]
+    assert cleaned.sandbox_spec.lifetime_timeout_s == loop.timeouts.sandbox_lifetime_s, (
+        "The task the loop cleans up carries the sandbox lifetime it derived."
+    )
+
+
+async def test_the_rollout_and_grader_specs_get_the_sandbox_lifetime(harness_module) -> None:
+    """A sandbox is reclaimed by a lifetime the caller states, so the loop must state it."""
+    from psrl.workers.agent_loop.timeouts import LIFETIME_SLACK_S
+
+    loop = harness_module.HarnessAgentLoop.__new__(harness_module.HarnessAgentLoop)
+    loop.timeouts = resolve_rollout_timeouts(3600, 900)
+    task = HarnessTaskContext(
+        state=None,
+        prompt="fix",
+        sandbox_spec=SandboxSpec(SandboxSource.image("rollout")),
+        clean_sandbox_spec=SandboxSpec(SandboxSource.image("grader")),
+    )
+
+    out = loop.apply_sandbox_lifetime(task)
+
+    expected = 3600 + 900 + LIFETIME_SLACK_S
+    assert out.sandbox_spec.lifetime_timeout_s == expected
+    assert out.clean_sandbox_spec.lifetime_timeout_s == expected
+    # The original is left alone; the loop works on the copy.
+    assert task.sandbox_spec.lifetime_timeout_s is None
+
+
+async def test_grading_operation_past_its_budget_releases_the_sandbox(harness_module) -> None:
+    """A grading phase past its budget must abort rather than hang.
+
+    The worker thread cannot be killed, so expiry closes the sandbox -- which is what
+    unblocks the thread -- and surfaces a ``TimeoutError`` for the task to report the
+    episode as ungraded.
+    """
+    import time
+
+    class SlowSandbox:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class Manager:
+        def __init__(self) -> None:
+            self.sandbox = SlowSandbox()
+
+        def sync(self, backend=None):  # noqa: ANN001
+            return self.sandbox
+
+    loop = harness_module.HarnessAgentLoop.__new__(harness_module.HarnessAgentLoop)
+    loop.sandbox_manager = Manager()
+
+    def operation(sync_sandbox):
+        # A blocked worker thread that only ends once the sandbox is closed under it.
+        deadline = time.monotonic() + 5
+        while not sync_sandbox.closed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return "late"
+
+    with pytest.raises(TimeoutError):
+        await loop._run_sync_sandbox_operation(None, operation, timeout_s=0.05)
+
+    assert loop.sandbox_manager.sandbox.closed, "Expiry must close the sandbox to unblock the worker."
+    await asyncio.sleep(0.1)  # let the detached thread drain before the loop closes

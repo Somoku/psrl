@@ -47,7 +47,7 @@ CLUSTER-LEVEL   sandboxd-control
 NODE-LEVEL      sandboxd-node (one per node)
   Admission     final admission authority, against live local pressure
   Lifecycle     create, pause, resume, snapshot, release
-  Reclaimer     idle pause, idle reap, lifetime, orphan
+  Reclaimer     lifetime, orphan
   LoadReporter  reports this node's view to Monitor
 
 DATA PLANE      reused, never reimplemented
@@ -151,92 +151,52 @@ another node, which is what keeps a stale fleet view from overriding a local lim
 ### Reclamation is node-level, and it is one loop
 
 Reclamation is a property of the node, not of the caller: a caller that exits must not
-leave its sandboxes until some other clock notices. One loop, one set of windows, four
-reasons.
+leave its sandboxes until some other clock notices. One loop, one clock, three reasons.
 
 ```go
 func (r *Reclaimer) sweep(now time.Time) {
     for _, sb := range r.local.All() {
         switch {
-        case sb.Busy():
-            continue                                   // in flight, decide next pass
-        case sb.Idle(now) > r.pauseWindow && !sb.Paused():
-            r.pause(sb)                                // release compute, keep state
-        case sb.Idle(now) > r.reapWindow:
-            r.release(sb, ReapedIdle)
-        case sb.Age(now) > r.lifetime:
-            r.release(sb, ReapedLifetime)              // backstop for a busy sandbox
-        case sb.OwnerGone(now):
-            r.release(sb, ReclaimedOrphan)
+        case sb.OwnerGone():
+            r.release(sb, ReclaimedOrphan)             // nobody is coming back
+        case sb.Age(now) > sb.lifetime:
+            r.release(sb, ReapedLifetime)              // the absolute backstop
         }
     }
 }
 ```
 
-Idle is two conditions, not one. A command must not be in flight, and no command
-boundary may be more recent than the window: a backend that stamps activity when a
-command *returns* leaves the stamp stale for the whole of a long command, so a sweep
-reading only the stamp pauses a running test suite.
-
-The lifetime is the backstop behind the windows. A sandbox that keeps running commands
-is never idle and still has to end, or one stuck episode holds a node slot for the rest
-of the run.
+A sandbox is otherwise reclaimed when its caller releases it, which is what a finished
+episode does. The lifetime is stated on the create (`lifetime_s`): the caller knows what
+the sandbox is for, so it states the sandbox's whole life -- agent work, the grading that
+follows it, and a margin for provisioning and teardown -- and the node reclaims a caller
+that died or forgot without a second deadline carrying the same meaning.
 
 ---
 
-## Timing: three knobs
+## Timing: how fast the fleet notices
 
-An operator can estimate how long an episode takes. Everything else follows from it, so
-everything else is derived and asserted rather than configured.
+There is no episode-scale derivation. A sandbox's lifetime is stated on its create, and a
+queue wait is answered by admission -- the request fits now, it will fit when other
+sandboxes are released, or it can never fit and is refused outright. So the only timing
+left is how fast the fleet notices that a node or an owner has gone away, and that
+describes the mechanism rather than the workload:
 
 ```yaml
 timing:
-  episode_deadline_s: 1800   # required: one episode, including grading
-  node_ttl_s: 120            # optional: silence before a node is drained
-  rpc_timeout_s: 60          # optional: coordination-call deadline
+  node_ttl_s: 120            # silence before a node is drained
+  rpc_timeout_s: 60          # coordination-call deadline
 ```
 
-| Derived | From | Why that ratio |
+| Constant | Value | Why |
 |---|---|---|
-| `pause_window` | `episode_deadline` x 2 | two episodes of silence is idle, not slow |
-| `reap_window` | `pause_window` x 3 | paused before destroyed, always |
-| `lifetime` | `reap_window` x 4 | backstop, never the first thing to fire |
-| `acquire_timeout` | `episode_deadline` | a queue wait longer than an episode is a fault |
 | `load_report_interval` | `node_ttl` / 4 | several missed reports fit inside one TTL |
-| `monitor_pull_interval` | `node_ttl` / 4 | pull no faster than nodes report |
-| `capacity_lease_ttl` | `pause_window` | capacity outlives a pause |
-| `owner_heartbeat` | `capacity_lease_ttl` / 3 | one lost round trip keeps the lease |
-| `reservation_ttl` | `node_ttl` / 2 | a reservation expires before its node drains |
-| `reservation_renew` | `reservation_ttl` / 3 | same reason |
-| `sweep_interval` | shortest TTL / 4 | a sweep enforces a TTL, so it must be faster |
-| `lifecycle_lease`, `lifecycle_gc` | `capacity_lease_ttl` / 2, then / 2 | crash recovery completes inside the lease |
+| `owner_lease` | 4h | a dead owner's grant outlives any sandbox lifetime; the node reclaims the sandbox by its own lifetime |
+| `reservation_ttl` | 60s | a placement reservation outlives the gap to the node's next report, and a slow create renews it |
+| `sweep_interval` | 15s | a sweep enforces a TTL, so it must be faster |
 
-One `Validate()` asserts every ordering, including the cross-level ones that no
-assertion covers today.
-
-```go
-func (t TimingContract) Validate() error {
-    must(t.PauseWindow < t.ReapWindow,          "a sandbox is paused before it is destroyed")
-    must(t.ReapWindow < t.Lifetime,             "the backstop fires last")
-    must(t.CapacityLease >= t.PauseWindow,      "capacity is not reclaimed under a pause")
-    must(t.LoadReportInterval*3 < t.NodeTTL,    "a node is drained on silence, not on one miss")
-    must(t.ReservationTTL < t.NodeTTL,          "no reservation outlives its node record")
-    must(t.SweepInterval < t.ShortestTTL(),     "a sweep is faster than the TTL it enforces")
-    must(t.LifecycleLease+t.LifecycleGC < t.CapacityLease,
-         "a dead node's containers do not outlive the reservation protecting the node")
-    return nil
-}
-```
-
-An override is explicit and still validated, so a configuration that inverts an
-ordering fails at startup rather than leaking slowly:
-
-```yaml
-timing:
-  episode_deadline_s: 1800
-  overrides:
-    reap_window_s: 60        # still runs Validate()
-```
+Placement asserts the one ordering it depends on -- the reservation TTL is shorter than the
+node TTL -- and the rest are constants whose orderings are fixed where they are defined.
 
 ---
 
@@ -402,7 +362,8 @@ sandbox_service:
   endpoint: unix:///run/sandboxd.sock
 
   timing:
-    episode_deadline_s: 1800
+    node_ttl_s: 120
+    rpc_timeout_s: 60
 
   quota:                       # cross-backend shares, by resource class
     classes:
@@ -512,7 +473,7 @@ rather than leaving a switch.
 | F2 | Command and file traffic go straight to the sandbox agent | `create` returns the resolved endpoint; a control plane in the command path is a defect, not a tuning choice |
 | F3 | Monitor collects one fleet view and Placement pulls it | several Placement replicas share a view; each overlays its own in-flight decisions |
 | F4 | The node is the final admission authority | a rejection asks Placement for another node, so a stale fleet view cannot override a local limit |
-| F5 | Reclamation is node-level, one loop, four reasons | a caller that exits leaves nothing behind; idle pause and orphan reclaim stop being two mechanisms on two clocks |
+| F5 | Reclamation is node-level, one loop, three reasons | a caller that exits leaves nothing behind; release, lifetime, and orphan reclaim are one decision on one clock |
 | F6 | Three timing knobs; everything else derived and asserted in one place | a configuration that inverts an ordering fails at startup instead of leaking |
 | F7 | `mode` is a per-backend deployment property, `direct` or `provider` | `direct` places and drives the node runtime from here, with the provider's control plane out of the path; `provider` defers to it. The same backend can run both ways in one fleet, which is what makes a scheduler ablation possible |
 | F8 | `backend_options` is namespaced, validated, outside routing and outside spec identity | a provider's own tuning is reachable without making the portable spec unportable |

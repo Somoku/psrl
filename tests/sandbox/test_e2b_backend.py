@@ -467,30 +467,25 @@ async def test_a_pause_refuses_while_a_command_is_in_flight() -> None:
 
 
 @pytest.mark.asyncio
-async def test_an_idle_provider_sandbox_can_be_seen_as_idle() -> None:
-    # Idle is two conditions, and a session reporting no activity fails the second forever.
-    # That made the pause releasing a provider's compute dead on this backend.
-    from psrl.sandbox.manager import SandboxManager
-
+async def test_a_provider_sandbox_reports_activity_and_is_not_busy_at_rest() -> None:
+    # A session that reports no activity and no busy flag tells a reclaimer nothing
+    # about whether its work is done, so the backend must report both.
     backend = _agentenv(FakeControl(), FakeFactory())
     session = await backend.create(SandboxSpec(SandboxSource.template("base")))
 
     assert session.last_activity_at is not None
-    assert SandboxManager._is_idle(session, 1.0, session.last_activity_at + 3600)
-    # The window still has to elapse, and a command in flight still outranks it.
-    assert not SandboxManager._is_idle(session, 1.0, session.last_activity_at)
+    assert session.busy is False
 
 
 @pytest.mark.asyncio
-async def test_a_running_command_is_never_idle_however_old_the_stamp() -> None:
+async def test_a_running_command_is_reported_as_busy() -> None:
     # A stamp written only when a command returns stays stale for the whole of a long
-    # command, so age alone would pause a sandbox that is working.
+    # command, so the busy flag is what says a sandbox is working.
     backend = _agentenv(FakeControl(), FakeFactory())
     session = await backend.create(SandboxSpec(SandboxSource.template("base")))
     busy = await _hold_open(session)
-    from psrl.sandbox.manager import SandboxManager
 
-    assert not SandboxManager._is_idle(session, 1.0, session.last_activity_at + 3600)
+    assert session.busy is True
 
     await busy.release()
 

@@ -124,6 +124,10 @@ type wireError struct {
 	// task result would corrupt a reward.
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// ExitReason attributes a `session_lost` sandbox (released/reaped_idle/
+	// reaped_lifetime/reclaimed_orphan) so a post mortem does not have to guess.
+	// Empty when the failure carries no attribution.
+	ExitReason string `json:"exit_reason,omitempty"`
 }
 
 func (j *JSONListener) handle(ctx context.Context, conn net.Conn) {
@@ -178,6 +182,10 @@ func classify(err error) *wireError {
 		code = "capability"
 	case codes.ResourceExhausted:
 		code = "capacity_timeout"
+	case codes.OutOfRange:
+		// The request can never fit its class, so retrying cannot help. Distinct
+		// from capacity_timeout, which clears as sandboxes are released.
+		code = "cannot_admit"
 	case codes.NotFound:
 		code = "session_lost"
 	case codes.Unavailable:
@@ -185,7 +193,17 @@ func classify(err error) *wireError {
 	case codes.DeadlineExceeded:
 		code = "command_timeout"
 	}
-	return &wireError{Code: code, Message: err.Error()}
+	return &wireError{Code: code, Message: err.Error(), ExitReason: exitReasonOf(err)}
+}
+
+// exitReasonOf extracts an attribution from an error that carries one. The
+// concrete type lives in this package (nodeserver.go); the interface keeps the
+// wire layer from depending on it and a wrapped/unrelated error answers "".
+func exitReasonOf(err error) string {
+	if attributed, ok := err.(interface{ ExitReason() string }); ok {
+		return attributed.ExitReason()
+	}
+	return ""
 }
 
 func (j *JSONListener) dispatch(ctx context.Context, req request) (any, error) {
@@ -212,6 +230,8 @@ func (j *JSONListener) dispatch(ctx context.Context, req request) (any, error) {
 		return j.readBytes(ctx, req.Payload)
 	case "write_bytes":
 		return j.writeBytes(ctx, req.Payload)
+	case "touch":
+		return j.touch(ctx, req.Payload)
 	case "fleet":
 		return j.fleet(ctx)
 	case "quota":
@@ -249,6 +269,7 @@ type jsonSpec struct {
 	Backend             string                       `json:"backend"`
 	RequiredNodeLabel   string                       `json:"required_node_label"`
 	ForbiddenNodeLabels []string                     `json:"forbidden_node_labels"`
+	LifetimeS           int64                        `json:"lifetime_s"`
 	BackendOptions      map[string]map[string]string `json:"backend_options"`
 }
 
@@ -264,6 +285,9 @@ func (s jsonSpec) toProto() *v1.SandboxSpec {
 		ExecMode:            execModeValue(s.ExecMode),
 		RequiredResumeLevel: resumeLevelValue(s.RequiredResumeLevel),
 		Backend:             s.Backend,
+		RequiredNodeLabel:   s.RequiredNodeLabel,
+		ForbiddenNodeLabels: s.ForbiddenNodeLabels,
+		LifetimeS:           s.LifetimeS,
 		Resources: &v1.Resources{
 			CpuCount: s.Resources.CPUCount,
 			MemoryMb: s.Resources.MemoryMB,
@@ -327,9 +351,17 @@ func (j *JSONListener) createdJSON(created *v1.CreateResponse) map[string]any {
 	// control plane. Resolved here rather than carried up from the backend,
 	// because the address belongs to this deployment's topology and the backend
 	// only knows that it has no agent to report.
-	if j.dataPlane != nil && created.GetAgent().GetAddress() == "" {
+	if j.dataPlane != nil {
 		if agent, ok := out["agent"].(map[string]any); ok {
-			agent["data_plane"] = j.dataPlane(created.GetHandle().GetNodeId())
+			address := j.dataPlane(created.GetHandle().GetNodeId())
+			// The node plane is resolved for every sandbox, not only the
+			// agentless ones: an agent-backed sandbox uses it to report activity
+			// its commands never carry to the node, and an agentless one also
+			// uses it as its exec driver.
+			agent["node_plane"] = address
+			if created.GetAgent().GetAddress() == "" {
+				agent["data_plane"] = address
+			}
 		}
 	}
 	return out
@@ -361,6 +393,7 @@ func createdJSON(created *v1.CreateResponse) map[string]any {
 		"agent": map[string]any{
 			"address":             created.GetAgent().GetAddress(),
 			"data_plane":          "",
+			"node_plane":          "",
 			"headers":             created.GetAgent().GetHeaders(),
 			"callback_host_alias": created.GetAgent().GetCallbackHostAlias(),
 			"callback_port":       created.GetAgent().GetCallbackPort(),
@@ -495,6 +528,25 @@ func (j *JSONListener) exec(ctx context.Context, raw json.RawMessage) (any, erro
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 	return map[string]any{"exit_code": code, "stdout": output, "stderr": "", "truncated": false}, nil
+}
+
+// touch refreshes a held sandbox's activity.
+//
+// A node-plane call, like exec: the SDK reports activity for a sandbox whose
+// commands bypass the node, and the node that owns the sandbox is the one with
+// the lifecycle to update. A control-only process holds no sandboxes, so it says
+// so rather than accepting the call silently.
+func (j *JSONListener) touch(_ context.Context, raw json.RawMessage) (any, error) {
+	if j.node == nil {
+		return nil, status.Error(codes.Unimplemented,
+			"no node is configured; this process holds no sandboxes")
+	}
+	var payload handlePayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	j.node.Touch(payload.handle())
+	return map[string]any{"ok": true}, nil
 }
 
 func (j *JSONListener) readBytes(ctx context.Context, raw json.RawMessage) (any, error) {

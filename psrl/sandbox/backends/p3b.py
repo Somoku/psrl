@@ -470,6 +470,10 @@ def _to_service_spec(
         idempotency_key=spec.idempotency_key,
         env=dict(spec.env),
         metadata=metadata,
+        # The sandbox's own lifetime, so the service reclaims it without the
+        # worker. It is the one thing the caller knows and the node cannot infer:
+        # how long this sandbox is meant to work.
+        lifetime_s=int(spec.lifetime_timeout_s) if spec.lifetime_timeout_s else None,
     )
 
 

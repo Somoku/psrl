@@ -229,6 +229,23 @@ class HarnessAgentLoop(SessionAgentLoop):
         spec = replace(task.sandbox_spec, mounts=(*task.sandbox_spec.mounts, mount))
         return replace(task, sandbox_spec=spec, runtime_mount_target=mount.target)
 
+    def apply_sandbox_lifetime(self, task: HarnessTaskContext) -> HarnessTaskContext:
+        """State the sandbox lifetime on the specs, so a node can reclaim them.
+
+        It is the one thing the caller knows and the node cannot infer: how long a
+        sandbox is meant to work. Without it a node falls back to its own default,
+        which cannot know this rollout's budgets, and a sandbox is reclaimed by a
+        number unrelated to the episode it is running.
+        """
+        lifetime = self.timeouts.sandbox_lifetime_s
+        rollout = replace(task.sandbox_spec, lifetime_timeout_s=lifetime)
+        grader = (
+            replace(task.clean_sandbox_spec, lifetime_timeout_s=lifetime)
+            if task.clean_sandbox_spec is not None
+            else None
+        )
+        return replace(task, sandbox_spec=rollout, clean_sandbox_spec=grader)
+
     def resolve_request_settings(self, request: dict) -> None:
         """Resolve per-request turn budget and context compaction settings."""
         rollout_config = (
@@ -277,6 +294,7 @@ class HarnessAgentLoop(SessionAgentLoop):
         try:
             task = await self.prepare_harness_task(request)
             task = self.attach_runtime_mount(task)
+            task = self.apply_sandbox_lifetime(task)
             timing["task_prepare_s"] = time.perf_counter() - run_start
             prepare_tasks.append(
                 asyncio.create_task(self.sandbox_manager.prepare(task.sandbox_spec, backend=task.backend))

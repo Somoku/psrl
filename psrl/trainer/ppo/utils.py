@@ -12,7 +12,7 @@ from omegaconf import DictConfig
 from verl import DataProto
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
-from verl.single_controller.ray import RayResourcePool
+from psrl.trainer.ppo.resource_pool import PSRL_RayResourcePool
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
@@ -111,7 +111,7 @@ class ResourcePoolManager:
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[PSRL_Role, list[str]]
     resource_num_per_bundle: dict[str, int] = field(default_factory=dict)
-    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    resource_pool_dict: dict[str, PSRL_RayResourcePool] = field(default_factory=dict)
 
     def create_resource_pool(self):
         """Create Ray resource pools for distributed training.
@@ -123,7 +123,7 @@ class ResourcePoolManager:
         """
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
             # PSRL assigns one worker group to each resource pool.
-            resource_pool = RayResourcePool(
+            resource_pool = PSRL_RayResourcePool(
                 process_on_nodes=process_on_nodes,
                 use_gpu=True,
                 max_colocate_count=1,
@@ -134,7 +134,7 @@ class ResourcePoolManager:
 
         self._check_resource_available()
 
-    def get_resource_pool(self, role: PSRL_Role, replica_idx: int = 0) -> RayResourcePool:
+    def get_resource_pool(self, role: PSRL_Role, replica_idx: int = 0) -> PSRL_RayResourcePool:
         """Get the resource pool of the worker_cls for the given replica_idx."""
         return self.resource_pool_dict[self.mapping[role][replica_idx]]
 

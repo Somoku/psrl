@@ -33,3 +33,44 @@ def compute_session_loss_weights(
         dtype=torch.float32,
         device=response_mask.device,
     )
+
+
+def agg_session_loss(
+    loss_mat: torch.Tensor,
+    loss_mask: torch.Tensor,
+    loss_agg_mode: str,
+    session_loss_weights: torch.Tensor | None = None,
+    **agg_loss_kwargs,
+) -> torch.Tensor:
+    """Aggregate a loss matrix, honouring psrl's `session-mean-token-mean` mode.
+
+    `session-mean-token-mean` is a psrl loss mode: verl's `agg_loss` has never accepted a
+    `session_loss_weights` argument, in either checkout, so passing one through raised
+    `TypeError: agg_loss() got an unexpected keyword argument` -- and it did so on *every*
+    call, because the keyword was passed unconditionally even when the weights were
+    `None` and the mode was plain `token-mean`.
+
+    Keeping the dispatch here rather than patching verl: the mode is psrl's, the weights
+    come from `compute_session_loss_weights` above, and verl is free to keep evolving
+    `agg_loss` without this having to be re-applied.
+
+    Args:
+        session_loss_weights: Per-row FP32 weights from `compute_session_loss_weights`,
+            or None for any mode that does not use them.
+    """
+    from verl.trainer.ppo.core_algos import agg_loss
+
+    if session_loss_weights is None:
+        return agg_loss(
+            loss_mat=loss_mat,
+            loss_mask=loss_mask,
+            loss_agg_mode=loss_agg_mode,
+            **agg_loss_kwargs,
+        )
+
+    # Each row already carries `1 / (S * T_s)`, so the weighted token sum *is* the mean
+    # over sessions of the per-session token mean. Deliberately no further division:
+    # renormalizing inside a micro batch would make the result depend on how rows were
+    # split across workers, which is exactly what the precomputed weights prevent.
+    row_sums = torch.sum(loss_mat * loss_mask, dim=-1)
+    return torch.sum(row_sums * session_loss_weights.to(row_sums.dtype))

@@ -8,6 +8,7 @@ from .memory_logger import (
     log_gpu_memory_now,
 )
 from .ps_logger import get_ps_logger, setup_ps_logger
+from .verl_logging import configure_verl_logging
 from .ray_logger import (
     DualOutputHandler,
     EventType,
@@ -20,6 +21,7 @@ from .ray_logger import (
 )
 
 __all__ = [
+    "configure_verl_logging",
     "DualOutputHandler",
     "FileOnlyHandler",
     "get_worker_info",

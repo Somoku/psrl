@@ -200,6 +200,13 @@ class NIXLStorageClient:
         # Prepped dlists for the hot path (item A1). Holds raw addresses, so it must be
         # cleared whenever registered memory changes -- see deregister_all_local_tensors.
         self._prepped_cache: PreppedXferCache | None = PreppedXferCache(self.agent, self.client_name)
+        # Matches the meta server's budget. These were 1200s against the server's 600s,
+        # so the server gave up first and the clients were still waiting when it did --
+        # which is why a slow start reports "Timeout waiting for agents" on the server and
+        # nothing useful on the clients.
+        self._handshake_timeout = float(
+            getattr(nixl_config, "handshake_timeout_s", 600.0)
+        )
 
         # mem_type -> [(base_addr, nbytes, device_id, mem_type)] tuples for storage registration
         self._mtype_to_reg_region_lists: dict[str, list[tuple[int, int, int, str]]] = {}
@@ -1263,13 +1270,15 @@ class NIXLStorageClient:
 
         psrl_logger.debug(f"{self.client_name} deregistered all local tensors.")
 
-    def connect_to_server(self, timeout: float = 1200.0):
+    def connect_to_server(self, timeout: float | None = None):
         """
         Connect to the storage/meta server.
         """
         assert not self._is_connected, "Already connected to server"
         self.agent.fetch_remote_metadata(self.server_name, self.server_ip, self.server_port)
         self.agent.send_local_metadata(self.server_ip, self.server_port)
+        # `None` selects the configured budget, keeping client and server aligned.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         ready = False
         while not ready:
@@ -1359,13 +1368,15 @@ class NIXLStorageClient:
             pickle.dumps({self.client_name: self._temp_desc_bytes_mapping}),
         )
 
-    def wait_for_server_sharding(self, timeout: float = 1200.0):
+    def wait_for_server_sharding(self, timeout: float | None = None):
         """
         Wait for the server sharding to be fetched.
         """
         assert self._is_connected, "Not connected to server"
         if self._unified_sharding_dict_fetched:
             return
+        # `None` selects the configured budget, keeping client and server aligned.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         while True:
             notifs = self.agent.get_new_notifs()
@@ -1382,7 +1393,7 @@ class NIXLStorageClient:
         self._unified_sharding_dict_fetched = True
         return self._unified_sharding_dict
 
-    def wait_for_server_info(self, timeout: float = 1200.0):
+    def wait_for_server_info(self, timeout: float | None = None):
         """
         Wait for the server info to be fetched.
         For storage_server mode, wait for the storage server info to be fetched.
@@ -1392,6 +1403,8 @@ class NIXLStorageClient:
         # Wait for all client infos (stored in the server) to be fetched
         if self._all_client_infos_fetched:
             return
+        # `None` selects the configured budget, keeping client and server aligned.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         while True:
             notifs = self.agent.get_new_notifs()
@@ -1433,9 +1446,11 @@ class NIXLStorageClient:
             time.sleep(0.1)
         self._all_client_infos_fetched = True
 
-    def wait_for_server_temp_mappings(self, timeout: float = 1200.0):
+    def wait_for_server_temp_mappings(self, timeout: float | None = None):
         """Wait for the server temporary mappings to be fetched."""
         assert self._is_connected, "Not connected to server"
+        # `None` selects the configured budget, keeping client and server aligned.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         while True:
             notifs = self.agent.get_new_notifs()
@@ -1463,7 +1478,7 @@ class NIXLStorageClient:
         for dst_agent_name in dst_agent_names:
             self.agent.send_notif(dst_agent_name, payload)
 
-    def wait_for_update_infos(self, expected_agents: int, timeout: float = 1200.0):
+    def wait_for_update_infos(self, expected_agents: int, timeout: float | None = None):
         """Wait for updated client infos from other clients.
 
         Args:
@@ -1472,6 +1487,8 @@ class NIXLStorageClient:
         """
         assert self._is_connected, "Not connected to server"
         psrl_logger.info(f"{self.client_name}: Waiting for {expected_agents} updated client infos...")
+        # `None` selects the configured budget, keeping client and server aligned.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         already_recved_agents = set()
         while len(already_recved_agents) < expected_agents:
@@ -2434,6 +2451,11 @@ class NIXLMultiStorageClients:
         self.device = torch.device("cuda:0" if use_gpu else "cpu")
         self.server_ip = nixl_config.server_ip
         self.server_port = nixl_config.server_port
+        # Same budget as the single client and the meta server; without it the handshake
+        # waits below raise AttributeError rather than timing out.
+        self._handshake_timeout = float(
+            getattr(nixl_config, "handshake_timeout_s", 600.0)
+        )
         # Initialize NIXL agent
         from psrl.utils.nixl.port_scanner import get_port_scanner
 
@@ -2473,10 +2495,12 @@ class NIXLMultiStorageClients:
         for client in self.multi_clients:
             client.release_temp_memory()
 
-    def connect_to_server(self, timeout: float = 1200.0):
+    def connect_to_server(self, timeout: float | None = None):
         assert not self._is_connected, "Already connected to server"
         self.agent.fetch_remote_metadata(self.server_name, self.server_ip, self.server_port)
         self.agent.send_local_metadata(self.server_ip, self.server_port)
+        # `None` selects the configured budget, keeping client and server aligned.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         ready = False
         while not ready:
@@ -2511,8 +2535,10 @@ class NIXLMultiStorageClients:
             pickle.dumps({client.client_name: client._temp_desc_bytes_mapping for client in self.multi_clients}),
         )
 
-    def wait_for_server_sharding(self, timeout: float = 1200.0):
+    def wait_for_server_sharding(self, timeout: float | None = None):
         assert self._is_connected, "Not connected to server"
+        # `None` selects the configured budget, keeping client and server aligned.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         if self._multi_unified_sharding_dicts_fetched:
             return
@@ -2537,7 +2563,7 @@ class NIXLMultiStorageClients:
         self._multi_unified_sharding_dicts_fetched = True
         return {client.client_name: client._unified_sharding_dict for client in self.multi_clients}
 
-    def wait_for_server_info(self, timeout: float = 1200.0):
+    def wait_for_server_info(self, timeout: float | None = None):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_server_info(timeout)
         if len(self.multi_clients) > 1:
@@ -2546,14 +2572,14 @@ class NIXLMultiStorageClients:
                 client._comm_plan = self.multi_clients[0]._comm_plan
                 client._all_client_infos_fetched = True
 
-    def wait_for_server_temp_mappings(self, timeout: float = 1200.0):
+    def wait_for_server_temp_mappings(self, timeout: float | None = None):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_server_temp_mappings(timeout)
         if len(self.multi_clients) > 1:
             for client in self.multi_clients[1:]:
                 client._all_temp_mappings = self.multi_clients[0]._all_temp_mappings
 
-    def wait_for_update_infos(self, expected_agents: int, timeout: float = 1200.0):
+    def wait_for_update_infos(self, expected_agents: int, timeout: float | None = None):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_update_infos(expected_agents, timeout)
         if len(self.multi_clients) > 1:

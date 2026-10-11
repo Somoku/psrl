@@ -36,6 +36,16 @@ class NIXLMetaServer:
         # staging needs unreadable ones, so a deployment picks one. Defaults on, matching
         # the planner's own default.
         self._peer_diffusion = bool(getattr(nixl_config, "peer_diffusion", True))
+        # How long each handshake phase waits for its clients.
+        #
+        # The default is a cluster-dependent guess, and when it is wrong the failure is
+        # misleading: a run that merely started slowly dies in `wait_for_client_shardings`
+        # with "Timeout waiting for agents", which reads as a connectivity fault rather
+        # than as vLLM still capturing CUDA graphs. Measured on this cluster, reaching the
+        # handshake took 18.6 min on one run and 23.5 min on the next -- the second
+        # exceeded the 600 s budget and lost ~30 minutes of cluster time to a run that was
+        # working.
+        self._handshake_timeout = float(getattr(nixl_config, "handshake_timeout_s", 600.0))
         self.agent = nixl_agent(self.server_name, nixl_agent_config(True, True, self.server_port))
         self.connected_clients: dict[
             str, list[str]
@@ -64,7 +74,7 @@ class NIXLMetaServer:
         if client_name not in self.connected_clients[agent_name]:
             self.connected_clients[agent_name].append(client_name)
 
-    def wait_for_client_shardings(self, expected_agents: int = 1, timeout: float = 600.0):
+    def wait_for_client_shardings(self, expected_agents: int = 1, timeout: float | None = None):
         """
         Wait for all agents to connect and send sharding.
         """
@@ -72,6 +82,9 @@ class NIXLMetaServer:
         if self._is_all_client_shardings_recved:
             # TODO(lhy): Support elastic clients after initial registration.
             return True
+        # `None` selects the configured budget; an explicit value still wins, so a
+        # caller that knows its own bound is not overridden by the config.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         already_recved_agents = set()
         while len(already_recved_agents) < expected_agents:
@@ -89,7 +102,7 @@ class NIXLMetaServer:
                             already_recved_agents.add(agent_name)
                     except Exception:
                         continue
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for agents.")
             time.sleep(0.01)
         self._is_all_client_shardings_recved = True
@@ -98,7 +111,7 @@ class NIXLMetaServer:
             f"sent sharding after {time.time() - start} seconds."
         )
 
-    def wait_for_client_infos(self, expected_agents: int = 1, timeout: float = 600.0):
+    def wait_for_client_infos(self, expected_agents: int = 1, timeout: float | None = None):
         """
         Wait for all agents to connect and send client infos.
         """
@@ -106,6 +119,9 @@ class NIXLMetaServer:
         if self._is_all_client_infos_recved:
             # TODO(lhy): Support elastic clients after initial registration.
             return True
+        # `None` selects the configured budget; an explicit value still wins, so a
+        # caller that knows its own bound is not overridden by the config.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         already_recved_agents = set()
         while len(already_recved_agents) < expected_agents:
@@ -121,7 +137,7 @@ class NIXLMetaServer:
                             already_recved_agents.add(agent_name)
                     except Exception:
                         continue
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for agents.")
             time.sleep(0.01)
         self._is_all_client_infos_recved = True
@@ -130,13 +146,16 @@ class NIXLMetaServer:
             f"sent client infos after {time.time() - start} seconds."
         )
 
-    def wait_for_client_temp_mappings(self, expected_agents: int = 1, timeout: float = 600.0):
+    def wait_for_client_temp_mappings(self, expected_agents: int = 1, timeout: float | None = None):
         """
         Wait for all agents to send temporary mappings.
         """
         psrl_logger.info(f"Waiting for {expected_agents} agents to send temp mappings...")
         if self._is_all_temp_mappings_recved:
             return True
+        # `None` selects the configured budget; an explicit value still wins, so a
+        # caller that knows its own bound is not overridden by the config.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         already_recved_agents = set()
         while len(already_recved_agents) < expected_agents:
@@ -154,7 +173,7 @@ class NIXLMetaServer:
                             already_recved_agents.add(agent_name)
                     except Exception:
                         continue
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for agents temp mappings.")
             time.sleep(0.01)
         self._is_all_temp_mappings_recved = True
@@ -401,11 +420,14 @@ class NIXLMetaServer:
             # Send notification with all temp mappings
             self.agent.send_notif(agent_name, payload)
 
-    def wait_for_update_infos(self, expected_agents: int, timeout: float = 600.0):
+    def wait_for_update_infos(self, expected_agents: int, timeout: float | None = None):
         """
         Wait for expected number of agents to send updated client infos.
         """
         psrl_logger.debug(f"Waiting for {expected_agents} agents to send updated client infos...")
+        # `None` selects the configured budget; an explicit value still wins, so a
+        # caller that knows its own bound is not overridden by the config.
+        budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
         already_recved_agents = set()
         while len(already_recved_agents) < expected_agents:
@@ -426,7 +448,7 @@ class NIXLMetaServer:
                     except Exception as e:
                         psrl_logger.error(f"Failed to parse updated client infos from agent {agent_name}: {e}")
                         raise
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for agents.")
             time.sleep(0.01)
 

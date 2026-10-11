@@ -286,3 +286,44 @@ class TestTheStampIsWrittenWhereReadersCanSeeIt:
 
         for cls in (PSRL_BaseTrainWorker, PSRL_EngineTrainWorker):
             assert "bootstrap_version" in inspect.signature(cls.nixl_protocol).parameters
+
+
+class TestTheHandshakeBudgetIsConfigurable:
+    """Startup slowness must not be indistinguishable from a broken handshake.
+
+    Two multi-node runs died in `wait_for_client_shardings` with "Timeout waiting for
+    agents" while vLLM was still capturing CUDA graphs -- the code was fine and the
+    cluster was merely slower that hour (18.6 min to reach the handshake on one run,
+    23.5 min on the next). The message names agents and connectivity, which is why both
+    runs were first investigated as transport faults.
+    """
+
+    def _source(self, relative: str) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[2] / relative).read_text()
+
+    def test_server_and_client_read_the_same_key(self):
+        """They were 600s and 1200s: the server gave up first, so the clients were still
+        waiting when it did and logged nothing useful."""
+        for relative in ("psrl/utils/nixl/server.py", "psrl/utils/nixl/client.py"):
+            assert 'getattr(nixl_config, "handshake_timeout_s"' in self._source(relative)
+
+    def test_an_explicit_timeout_still_wins(self):
+        """A caller that knows its own bound must not be overridden by the config."""
+        source = self._source("psrl/utils/nixl/server.py")
+
+        assert "self._handshake_timeout if timeout is None else timeout" in source
+
+    def test_both_client_classes_define_the_attribute(self):
+        """`NIXLMultiStorageClients` shares the wait methods; without the attribute they
+        raise AttributeError instead of timing out."""
+        source = self._source("psrl/utils/nixl/client.py")
+
+        assert source.count("self._handshake_timeout = float(") == 2
+
+    def test_the_config_documents_why_it_is_tunable(self):
+        source = self._source("psrl/trainer/config/psrl/nixl.yaml")
+
+        assert "handshake_timeout_s" in source
+        assert "18.6" in source and "23.5" in source

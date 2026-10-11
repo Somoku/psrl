@@ -21,3 +21,13 @@ enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
 #
 # They catch stale, torn and misdirected reads. They do not catch bit corruption of
 # correctly-versioned bytes, which the NIC already checksums.
+
+# How long each NIXL handshake phase waits for its clients, in seconds.
+#
+# Startup, not transport: the clock starts when the meta server begins waiting and the
+# clients are still bringing vLLM up behind it. Measured on a 5-node Qwen3-8B run,
+# reaching the handshake took 18.6 min once and 23.5 min the next time -- same code, same
+# cluster -- so a budget tight enough to fit the first loses the second to a run that was
+# working. Raise it on slow or contended clusters; a handshake that is genuinely broken
+# fails on its own, not by waiting longer.
+handshake_timeout_s: 1800

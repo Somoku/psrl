@@ -216,6 +216,8 @@ func (j *JSONListener) dispatch(ctx context.Context, req request) (any, error) {
 		return j.release(ctx, req.Payload)
 	case "status":
 		return j.status(ctx, req.Payload)
+	case "provision_status":
+		return j.provisionStatus(req.Payload)
 	case "pause":
 		return j.pause(ctx, req.Payload)
 	case "resume":
@@ -437,6 +439,28 @@ func (j *JSONListener) status(ctx context.Context, raw json.RawMessage) (any, er
 		return nil, err
 	}
 	return map[string]any{"status": statusName(reply.GetStatus())}, nil
+}
+
+// provisionStatus reports a create in flight under its ticket, so a caller with no
+// response yet can tell "still provisioning" from "the request was lost". An
+// unknown ticket is reported as such rather than as a failure, because a create
+// that has not been seen here is not one that failed.
+func (j *JSONListener) provisionStatus(raw json.RawMessage) (any, error) {
+	var payload struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	state, known := j.control.ProvisionState(payload.Ticket)
+	if !known {
+		return map[string]any{"state": "unknown"}, nil
+	}
+	return map[string]any{
+		"state":            state.State,
+		"elapsed_s":        state.Elapsed.Seconds(),
+		"since_progress_s": state.SinceProgress.Seconds(),
+	}, nil
 }
 
 func (j *JSONListener) pause(ctx context.Context, raw json.RawMessage) (any, error) {

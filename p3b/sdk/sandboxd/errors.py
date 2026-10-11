@@ -14,11 +14,13 @@ class SandboxError(RuntimeError):
 
 
 class SandboxCapacityTimeout(SandboxError):
-    """Admission never granted a sandbox in time.
+    """Admission did not grant a sandbox.
 
-    No sandbox existed, so no episode ran: this is capacity planning rather than
-    a task, model, or harness failure. Reported as its own type so a caller can
-    classify it apart from a cancelled or failed episode.
+    Two shapes, both capacity faults rather than task failures. A request that
+    fits its class but had to wait is a `capacity_timeout`; one the class can
+    never hold is refused outright as `cannot_admit`. Either way no sandbox
+    existed, so no episode ran, and the caller classifies it apart from a
+    cancelled or failed episode rather than as a failing harness.
     """
 
 

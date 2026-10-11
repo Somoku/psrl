@@ -170,11 +170,18 @@ class SandboxSpec:
     required_resume_level: ResumeLevel | None = None
     backend: str | None = None
 
+    # How long the sandbox may exist, in seconds, counted from creation. None
+    # takes the service's default. It is the service's backstop for a caller that
+    # dies or forgets to release, so it should cover the work the sandbox is for.
+    lifetime_s: int | None = None
+
     backend_options: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.resource_class.strip():
             raise ValueError("A sandbox resource_class cannot be empty; it names the quota share that pays.")
+        if self.lifetime_s is not None and self.lifetime_s <= 0:
+            raise ValueError("A sandbox lifetime_s must be greater than zero when stated.")
         if self.required_resume_level is not None and Feature.RESUME_ANYWHERE not in self.required_features:
             raise ValueError(
                 "A required_resume_level needs RESUME_ANYWHERE in required_features, or the level would "
@@ -219,6 +226,11 @@ class AgentEndpoint:
     # apart from `address` because they are not interchangeable: one speaks the
     # backend's agent protocol, the other speaks this service's node protocol.
     data_plane: str = ""
+    # The owning node's plane for *activity reporting*, resolved for every
+    # sandbox. An agent-backed sandbox's commands never reach the node, so the
+    # node cannot see them; this is where the SDK tells it the sandbox is still
+    # working. Equal to `data_plane` for an agentless sandbox.
+    node_plane: str = ""
     headers: Mapping[str, str] = field(default_factory=dict)
     callback_host_alias: str | None = None
     callback_port: int | None = None
@@ -231,6 +243,21 @@ class SandboxHandle:
     backend: str
     sandbox_id: str
     node_id: str = ""
+
+
+@dataclass(frozen=True)
+class ProvisionStatus:
+    """How a create with a given ticket is progressing.
+
+    Coarse by design: `state` is what the service can honestly report about a
+    create whose provisioning is one blocking step, and `since_progress_s` is time
+    since its last phase change. A caller reads it to tell a create that is still
+    being worked on from one whose request was lost.
+    """
+
+    state: str
+    elapsed_s: float = 0.0
+    since_progress_s: float = 0.0
 
 
 @dataclass(frozen=True)

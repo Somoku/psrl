@@ -40,6 +40,7 @@ from sandboxd.types import (
     FleetReport,
     NodeReport,
     PauseMode,
+    ProvisionStatus,
     QuotaReport,
     ResumeLevel,
     SandboxHandle,
@@ -51,13 +52,18 @@ from sandboxd.types import (
 
 DEFAULT_ENDPOINT = "unix:///run/sandboxd.sock"
 
-# A control call asks a question or moves a reservation. Most answer in
-# milliseconds, but a create can legitimately take minutes: it may pull a cold
-# image, and it may try several nodes before one admits. The budget covers that
-# worst case rather than the median, because the failure mode of a budget set to
-# the median is a timeout reported as a service fault on a service that was
-# working.
-DEFAULT_CONTROL_TIMEOUT_S = 300.0
+# The budget for a control call that is expected to answer promptly: a question, a
+# report, or a reservation move. It is liveness, not a policy -- it is here so a
+# dead service is reported rather than waited on, and it is not a knob a caller
+# tunes. A create is deliberately not in this class: it may pull a cold image or
+# try several nodes, so it carries no client deadline at all. The service bounds
+# its own work; a client deadline shorter than that both cuts a working service
+# and leaves a sandbox provisioning behind the client that gave up.
+CALL_LIVENESS_S = 300.0
+
+# How long an endpoint has to accept a connection. A socket that never opens is a
+# dead service, which is worth reporting rather than waiting on forever.
+CONNECT_LIVENESS_S = 30.0
 
 # How many connections one client keeps to one endpoint. The wire protocol
 # matches replies to requests by order, so a connection serves one call at a
@@ -91,11 +97,9 @@ class Transport:
         self,
         endpoint: str,
         *,
-        timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S,
         pool_size: int = DEFAULT_POOL_SIZE,
     ) -> None:
         self.endpoint = endpoint
-        self.timeout_s = timeout_s
         if pool_size < 1:
             raise ValueError(f"A transport pool needs at least one connection, got {pool_size}.")
         # Idle connections, available for reuse. A call takes one, uses it
@@ -133,9 +137,16 @@ class Transport:
             return
         self._idle.append((reader, writer))
 
-    async def call(self, method: str, payload: Mapping[str, Any], *, timeout_s: float | None = None) -> dict[str, Any]:
-        """Send one request on its own connection and return its reply."""
-        budget = self.timeout_s if timeout_s is None else timeout_s
+    async def call(
+        self, method: str, payload: Mapping[str, Any], *, timeout_s: float | None = CALL_LIVENESS_S
+    ) -> dict[str, Any]:
+        """Send one request on its own connection and return its reply.
+
+        `timeout_s` bounds the wait for a reply and is liveness, not a policy:
+        ``None`` waits however long the service takes, which is what a create
+        needs. Connecting is always bounded, because an endpoint that never
+        accepts a connection is a service that is not working.
+        """
         async with self._slots:
             # Acquiring is inside the try: opening a fresh connection can fail the
             # same ways a live one can (the socket path is gone, the host refused
@@ -144,24 +155,28 @@ class Transport:
             # missing unix socket, say -- reached the caller unconverted, naming
             # neither the service nor the method that was ever reached for.
             try:
-                reader, writer = await asyncio.wait_for(self._acquire(), timeout=budget)
+                reader, writer = await asyncio.wait_for(self._acquire(), timeout=CONNECT_LIVENESS_S)
             except asyncio.TimeoutError as exc:
                 raise SandboxTransportError(
                     f"The sandbox service at {self.endpoint!r} did not accept a connection "
-                    f"for {method!r} within {budget:g}s."
+                    f"for {method!r} within {CONNECT_LIVENESS_S:g}s."
                 ) from exc
             except (ConnectionError, OSError) as exc:
                 raise SandboxTransportError(
                     f"The sandbox service at {self.endpoint!r} could not be reached for {method!r}: {exc}"
                 ) from exc
             try:
-                result = await asyncio.wait_for(self._roundtrip(reader, writer, method, payload), timeout=budget)
+                roundtrip = self._roundtrip(reader, writer, method, payload)
+                if timeout_s is None:
+                    result = await roundtrip
+                else:
+                    result = await asyncio.wait_for(roundtrip, timeout=timeout_s)
             except asyncio.TimeoutError as exc:
                 # The service may still be acting on it, so this connection is
                 # dropped rather than pooled with an unread reply in the pipe.
                 writer.close()
                 raise SandboxTransportError(
-                    f"The sandbox service did not answer {method!r} within {budget:g}s."
+                    f"The sandbox service did not answer {method!r} within {timeout_s:g}s."
                 ) from exc
             except (ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
                 writer.close()
@@ -188,7 +203,12 @@ class Transport:
         body = await reader.readexactly(int.from_bytes(header, "big"))
         reply = json.loads(body)
         if error := reply.get("error"):
-            raise _error_for(error.get("code", ""), error.get("message", ""))
+            raise _error_for(
+                error.get("code", ""),
+                error.get("message", ""),
+                exit_reason=error.get("exit_reason") or "",
+                sandbox_id=str(payload.get("sandbox_id") or ""),
+            )
         return reply.get("result") or {}
 
     async def close(self) -> None:
@@ -204,17 +224,24 @@ class Transport:
                 pass
 
 
-def _error_for(code: str, message: str) -> SandboxError:
+def _error_for(
+    code: str, message: str, *, exit_reason: str = "", sandbox_id: str = ""
+) -> SandboxError:
     """Rebuild a typed failure from the service's reply.
 
     The type is the service's classification, not a guess from the message: the
     caller's response differs per type, and an infrastructure fault read as a
-    task result corrupts a reward.
+    task result corrupts a reward. A lost session also carries the service's
+    attribution, so a post mortem does not have to infer why it went.
     """
+    if code == "session_lost":
+        return SandboxSessionLost(
+            message, sandbox_id=sandbox_id, exit_reason=exit_reason
+        )
     return {
         "capacity_timeout": SandboxCapacityTimeout,
+        "cannot_admit": SandboxCapacityTimeout,
         "capability": SandboxCapabilityError,
-        "session_lost": SandboxSessionLost,
         "command_timeout": SandboxCommandTimeout,
         "transport": SandboxTransportError,
     }.get(code, SandboxError)(message)
@@ -335,7 +362,6 @@ class Sandbox:
 
 def node_plane_agent_factory(
     *,
-    timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S,
     pool_size: int = DEFAULT_POOL_SIZE,
 ):
     """Return a factory that reaches each sandbox's owning node directly.
@@ -366,7 +392,7 @@ def node_plane_agent_factory(
             return None
         pool = pools.get(address)
         if pool is None:
-            pool = Transport(address, timeout_s=timeout_s, pool_size=pool_size)
+            pool = Transport(address, pool_size=pool_size)
             pools[address] = pool
 
         async def run(method: str, payload: Mapping[str, Any], *, timeout_s: float | None = None) -> dict[str, Any]:
@@ -384,11 +410,10 @@ class SandboxClient:
         self,
         endpoint: str = DEFAULT_ENDPOINT,
         *,
-        control_timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S,
         pool_size: int = DEFAULT_POOL_SIZE,
         agent_factory: Any = None,
     ) -> None:
-        self._transport = Transport(endpoint, timeout_s=control_timeout_s, pool_size=pool_size)
+        self._transport = Transport(endpoint, pool_size=pool_size)
         # Returns a runner for a sandbox whose data plane is reachable directly,
         # or None to fall back to the control plane. The default reaches the
         # owning node's own plane, which is what keeps commands off the control
@@ -396,12 +421,19 @@ class SandboxClient:
         #
         # Injected so a test can drive the data plane, and so a deployment whose
         # agents speak another protocol (execd, say) can supply its own.
-        self._agent_factory = agent_factory or node_plane_agent_factory(
-            timeout_s=control_timeout_s, pool_size=pool_size
-        )
+        self._agent_factory = agent_factory or node_plane_agent_factory(pool_size=pool_size)
+        # One pooled transport per node address, used only to report activity for
+        # a sandbox whose commands bypass its node. Kept off the control-plane
+        # transport because the two endpoints are different hosts.
+        self._node_pool_size = pool_size
+        self._node_pools: dict[str, Transport] = {}
 
     async def create(self, spec: SandboxSpec) -> Sandbox:
         """Provision one sandbox.
+
+        Carries no client deadline: a create may pull a cold image or try several
+        nodes, and the service bounds its own work. A client deadline here would
+        both cut a working service and leave a sandbox provisioning behind it.
 
         Raises:
             SandboxCapabilityError: When no backend can serve the spec. Waiting
@@ -409,7 +441,7 @@ class SandboxClient:
             SandboxCapacityTimeout: When the fleet had no room in time. This
                 clears as sandboxes are released.
         """
-        reply = await self._call("create", {"spec": _spec_payload(spec)})
+        reply = await self._call("create", {"spec": _spec_payload(spec)}, timeout_s=None)
         return self._sandbox_from(reply)
 
     async def create_group(self, specs: Sequence[SandboxSpec]) -> list[Sandbox]:
@@ -422,7 +454,9 @@ class SandboxClient:
         """
         if not specs:
             raise ValueError("A sandbox group needs at least one member spec.")
-        reply = await self._call("create_group", {"specs": [_spec_payload(spec) for spec in specs]})
+        reply = await self._call(
+            "create_group", {"specs": [_spec_payload(spec) for spec in specs]}, timeout_s=None
+        )
         return [self._sandbox_from(member) for member in reply.get("members", [])]
 
     async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> Sandbox:
@@ -430,7 +464,7 @@ class SandboxClient:
         payload: dict[str, Any] = {"snapshot": _snapshot_payload(snapshot)}
         if spec is not None:
             payload["spec"] = _spec_payload(spec)
-        return self._sandbox_from(await self._call("restore", payload))
+        return self._sandbox_from(await self._call("restore", payload, timeout_s=None))
 
     async def delete_snapshot(self, snapshot: SnapshotRef) -> None:
         """Delete a capture."""
@@ -459,6 +493,20 @@ class SandboxClient:
             locality_hit_ratio=float(reply.get("locality_hit_ratio", 0.0)),
         )
 
+    async def provision_status(self, ticket: str) -> ProvisionStatus:
+        """Return how a create with this ticket is progressing.
+
+        A create carries no client deadline, so a caller that wants to know its
+        request is being worked on rather than lost asks here. An unknown ticket
+        reads as state ``unknown``, which is not the same as a failure.
+        """
+        reply = await self._call("provision_status", {"ticket": ticket})
+        return ProvisionStatus(
+            state=reply.get("state", "unknown"),
+            elapsed_s=float(reply.get("elapsed_s", 0.0)),
+            since_progress_s=float(reply.get("since_progress_s", 0.0)),
+        )
+
     async def quota(self) -> QuotaReport:
         """Return the cross-backend ledger, for a metric hook."""
         reply = await self._call("quota", {})
@@ -477,6 +525,9 @@ class SandboxClient:
 
     async def close(self) -> None:
         """Close the connection to the service."""
+        node_pools, self._node_pools = self._node_pools, {}
+        for pool in node_pools.values():
+            await pool.close()
         await self._transport.close()
 
     async def __aenter__(self) -> SandboxClient:
@@ -492,8 +543,10 @@ class SandboxClient:
 
     # -- Internals -------------------------------------------------------------
 
-    async def _call(self, method: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-        return await self._transport.call(method, payload)
+    async def _call(
+        self, method: str, payload: Mapping[str, Any], *, timeout_s: float | None = CALL_LIVENESS_S
+    ) -> dict[str, Any]:
+        return await self._transport.call(method, payload, timeout_s=timeout_s)
 
     def _sandbox_from(self, reply: Mapping[str, Any]) -> Sandbox:
         handle = reply.get("handle") or {}
@@ -514,6 +567,7 @@ class SandboxClient:
             AgentEndpoint(
                 address=agent.get("address", ""),
                 data_plane=agent.get("data_plane", ""),
+                node_plane=agent.get("node_plane", ""),
                 headers=agent.get("headers") or {},
                 callback_host_alias=agent.get("callback_host_alias"),
                 callback_port=agent.get("callback_port"),
@@ -547,6 +601,11 @@ class SandboxClient:
             "silence_timeout_s": silence_timeout_s,
         }
         reply = await self._run(agent, "exec", payload, timeout_s=timeout_s)
+        # An agent-backed sandbox runs its own commands, so the node that owns it
+        # never observed this one. Tell it the sandbox is still working; an
+        # agentless sandbox's node proxied the command and already knows.
+        if agent.node_plane and not agent.data_plane:
+            await self._touch(agent, handle)
         return ExecResult(
             exit_code=int(reply["exit_code"]),
             stdout=reply.get("stdout", ""),
@@ -555,7 +614,9 @@ class SandboxClient:
         )
 
     async def _read_bytes(self, handle: SandboxHandle, agent: AgentEndpoint, path: str) -> bytes:
-        reply = await self._run(agent, "read_bytes", {**_handle_payload(handle), "path": path}, timeout_s=None)
+        reply = await self._run(
+            agent, "read_bytes", {**_handle_payload(handle), "path": path}, timeout_s=CALL_LIVENESS_S
+        )
         return base64.b64decode(reply["data"])
 
     async def _write_bytes(self, handle: SandboxHandle, agent: AgentEndpoint, path: str, data: bytes) -> None:
@@ -563,7 +624,7 @@ class SandboxClient:
             agent,
             "write_bytes",
             {**_handle_payload(handle), "path": path, "data": base64.b64encode(data).decode()},
-            timeout_s=None,
+            timeout_s=CALL_LIVENESS_S,
         )
 
     async def _run(
@@ -586,7 +647,29 @@ class SandboxClient:
         runner = self._agent_factory(agent)
         if runner is not None:
             return await runner(method, payload, timeout_s=timeout_s)
-        return await self._transport.call(method, payload, timeout_s=timeout_s or DEFAULT_CONTROL_TIMEOUT_S)
+        return await self._transport.call(method, payload, timeout_s=timeout_s)
+
+    async def _touch(self, agent: AgentEndpoint, handle: SandboxHandle) -> None:
+        """Report activity to the node holding the sandbox, best effort.
+
+        Only needed when the command did not pass through the node: a node that
+        proxied it already saw the activity. A node that is briefly unreachable
+        costs at most one idle window, so a failure here must not fail the
+        command it accompanies -- the note is for the reclaimer, not for the
+        caller's result.
+        """
+        address = agent.node_plane
+        if not address:
+            return
+        try:
+            pool = self._node_pools.get(address)
+            if pool is None:
+                pool = Transport(address, pool_size=self._node_pool_size)
+                self._node_pools[address] = pool
+            await pool.call("touch", _handle_payload(handle), timeout_s=CALL_LIVENESS_S)
+        except Exception:
+            # Best-effort by contract: see the docstring.
+            pass
 
 
 def _handle_payload(handle: SandboxHandle) -> dict[str, Any]:
@@ -637,6 +720,8 @@ def _spec_payload(spec: SandboxSpec) -> dict[str, Any]:
         payload["required_features"] = sorted(feature.value for feature in spec.required_features)
     if spec.required_resume_level is not None:
         payload["required_resume_level"] = spec.required_resume_level.value
+    if spec.lifetime_s is not None:
+        payload["lifetime_s"] = spec.lifetime_s
     if spec.backend_options:
         payload["backend_options"] = {name: dict(values) for name, values in spec.backend_options.items()}
     return payload

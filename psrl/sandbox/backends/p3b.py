@@ -259,12 +259,14 @@ class P3bBackend(SandboxBackend):
         *,
         name: str = "p3b",
         resource_class: str = "rollout",
-        control_timeout_s: float = 60.0,
     ) -> None:
         self._name = name
         self._endpoint = endpoint
         self._resource_class = resource_class
-        self._client = SandboxClient(endpoint, control_timeout_s=control_timeout_s)
+        # No client deadline on a create: provisioning may pull a cold image, and
+        # the service bounds its own work. The client keeps only its internal
+        # liveness for calls expected to answer promptly.
+        self._client = SandboxClient(endpoint)
         self._owner_id = ""
         self._closed = False
 

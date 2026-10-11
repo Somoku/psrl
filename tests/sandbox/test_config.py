@@ -108,9 +108,6 @@ def test_capacity_defaults_are_single_envelope_knobs() -> None:
         lease_ttl_s=180,
         heartbeat_interval_s=30,
     )
-    # An admission deadline is on by default: without it an exhausted node makes the trainer
-    # wait forever instead of reporting a capacity fault.
-    assert SandboxCapacityConfig().acquire_timeout_s is not None
 
 
 def test_shipped_rollout_yaml_declares_the_capacity_classes() -> None:
@@ -132,10 +129,9 @@ def test_shipped_rollout_yaml_declares_the_capacity_classes() -> None:
     assert sum(share.guaranteed_share for share in capacity.classes.values()) < 1
     assert capacity.classes["grader"].guaranteed_share > 0
     assert capacity.classes["rollout"].guaranteed_share > 0
-    assert capacity.acquire_timeout_s is not None
 
 
-def test_capacity_classes_and_deadline_reach_the_manager_config() -> None:
+def test_capacity_classes_reach_the_manager_config() -> None:
     config = OmegaConf.create(
         {
             "default_backend": "docker",
@@ -143,7 +139,6 @@ def test_capacity_classes_and_deadline_reach_the_manager_config() -> None:
                 "memory_mb": 64000,
                 "cpu_cores": 32,
                 "classes": {"rollout": {"guaranteed_share": 0.6}},
-                "acquire_timeout_s": 900,
             },
             "backends": {
                 "docker": {
@@ -158,7 +153,6 @@ def test_capacity_classes_and_deadline_reach_the_manager_config() -> None:
 
     assert manager._capacity_coordinator is not None
     assert config.capacity.classes.rollout.guaranteed_share == 0.6
-    assert config.capacity.acquire_timeout_s == 900
 
 
 def test_a_backend_built_in_code_can_be_injected() -> None:

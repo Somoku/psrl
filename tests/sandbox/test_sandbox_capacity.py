@@ -322,7 +322,6 @@ async def test_expired_owner_reports_capacity_timeout_not_cancellation() -> None
             utilization=1,
             lease_ttl_s=0.06,
             heartbeat_interval_s=0.02,
-            acquire_timeout_s=None,
         )
     )
     await coordinator.acquire("holder", "live-owner", 100, 4)

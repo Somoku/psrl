@@ -603,8 +603,8 @@ class PSRL_AgentLoopManager:
 
         Capacity faults get their own streak rather than none at all. They are not evidence
         about the harness, but they are not harmless either: every sandbox that cannot be
-        admitted costs a full `acquire_timeout_s` and the group is replaced, so a node that
-        has run out of admittable capacity refills forever while the buffer never fills.
+        admitted is refused and the group is replaced, so a node that has run out of
+        admittable capacity refills forever while the buffer never fills.
         That is a livelock with a capacity cause, and it needs to end with a capacity
         diagnosis instead of hanging. Failures seen while the manager is shutting down are
         recorded and dropped, because every in-flight episode fails at that point regardless
@@ -649,12 +649,12 @@ class PSRL_AgentLoopManager:
     def _record_capacity_failure(self, reason: str, *, phase: str) -> None:
         """Account one training group lost to node capacity admission, and bound the wait.
 
-        `phase` names where the starvation was observed. A starved rollout admission costs a
-        full `acquire_timeout_s` before the group is replaced; a starved grading admission
-        costs the same before the episode is kept ungraded. Either way, once the threshold
-        is reached the run cannot make progress: stop with the capacity diagnosis, which
-        says what to look at, instead of grinding for hours. Set
-        `capacity_failure_threshold` to zero to wait indefinitely.
+        `phase` names where the starvation was observed. A starved rollout admission is
+        refused and the group is replaced; a starved grading admission is refused too and
+        the episode is kept ungraded. Either way, once the threshold is reached the run
+        cannot make progress: stop with the capacity diagnosis, which says what to look at,
+        instead of grinding for hours. Set `capacity_failure_threshold` to zero to wait
+        indefinitely.
         """
         if self.capacity_failure_threshold <= 0:
             self._report_coordination_failures()
@@ -665,8 +665,8 @@ class PSRL_AgentLoopManager:
         breakdown = ", ".join(f"{name}={count}" for name, count in self._coordination_failures.most_common())
         self._trip_refill_breaker(
             f"{self._capacity_failure_streak} consecutive training groups could not get a sandbox during "
-            f"{phase} (threshold={self.capacity_failure_threshold}). Every attempt waited the full "
-            f"{self.timeouts.admission_timeout_s:.0f}s admission deadline, so the buffer could never fill. "
+            f"{phase} (threshold={self.capacity_failure_threshold}). Every attempt waited for capacity "
+            "until it was refused, so the buffer could never fill. "
             f"Coordination reasons: {breakdown}. This is a capacity planning fault, not a harness fault: "
             "check that node capacity leases are actually returned (a lease held without a sandbox keeps the "
             "node full), that the node has the disk and memory those sandboxes need, and that the envelope "
@@ -691,7 +691,7 @@ class PSRL_AgentLoopManager:
             f"{total} rollout groups failed for coordination reasons: {breakdown}. These are not counted "
             "against the refill breaker because no episode ran or the run was stopping, but training cannot "
             "make progress while they continue. Check node capacity admission: "
-            "rollout.agent.sandbox.capacity.classes, acquire_timeout_s, and the envelope size."
+            "rollout.agent.sandbox.capacity.classes and the envelope size."
         )
 
     def _trip_refill_breaker(self, diagnosis: str) -> None:

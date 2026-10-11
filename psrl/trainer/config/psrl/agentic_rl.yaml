@@ -11,9 +11,9 @@ thinking_template: multi_traj
 refill_failure_threshold: 32
 
 # Consecutive groups that may be lost to node capacity admission before training aborts. Each
-# attempt already costs the full sandbox `capacity.acquire_timeout_s`, and its replacement pays it
-# again, so an exhausted node would otherwise refill forever while the buffer never fills. Set to
-# 0 to wait indefinitely.
+# attempt waits for capacity until the sandbox service refuses it, and its replacement waits
+# again, so an exhausted node would otherwise refill forever while the buffer never fills. Set
+# to 0 to wait indefinitely.
 capacity_failure_threshold: 4
 
 # Attempts each validation prompt gets before the round drops it and reports accuracy over a

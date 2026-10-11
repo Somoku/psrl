@@ -78,7 +78,6 @@ class HarnessConfig:
     env: Mapping[str, str] = field(default_factory=dict)
     home_dir: str = "/root"
     runtime_mount: str = "/opt/harness"
-    time_budget_s: float = 7200.0
     output_tail_chars: int = 16_384
     callback_base_url: str | None = None
     permission_mode: str | None = None
@@ -104,8 +103,8 @@ class HarnessConfig:
             raise ValueError("Harness kind and executable cannot be empty.")
         if not self.runtime_mount.startswith("/"):
             raise ValueError(f"Harness runtime_mount must be an absolute path, got {self.runtime_mount!r}.")
-        if self.time_budget_s <= 0 or self.output_tail_chars <= 0:
-            raise ValueError("Harness time_budget_s and output_tail_chars must be greater than zero.")
+        if self.output_tail_chars <= 0:
+            raise ValueError("Harness output_tail_chars must be greater than zero.")
         if self.system_prompt_mode not in ("append", "replace", "none"):
             raise ValueError(f"Unsupported harness system_prompt_mode {self.system_prompt_mode!r}.")
         if self.max_output_tokens is not None and self.max_output_tokens <= 0:
@@ -153,17 +152,6 @@ class HarnessConfig:
             else HarnessCompactionConfig(**dict(compaction or {}))
         )
         return cls(**normalized)
-
-
-class HarnessExecBudgetExpired(TimeoutError):
-    """The harness CLI itself overran ``HarnessConfig.time_budget_s``.
-
-    Raised only for the exec that runs the harness command, so a caller can tell the
-    episode's own backstop firing apart from an infrastructure timeout on some other call
-    inside the episode. Both surface as `TimeoutError`, and treating the second as the
-    first reports a completed episode as budget exhaustion, suppresses the retry an
-    infrastructure fault needs, and counts it against the run's failure streak.
-    """
 
 
 @dataclass(frozen=True)
@@ -298,24 +286,19 @@ class Harness(ABC):
         command = (
             f"{shlex.join([str(item) for item in argv])} > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}"
         )
+        # No exec deadline of its own: the episode budget is the single clock that stops
+        # the harness, and it does so by cancelling this task. A separate exec timeout
+        # would be a second clock racing the first.
         task = asyncio.create_task(
             self.sandbox.exec(
                 command,
                 cwd=runtime.workdir,
                 env=self.build_env(runtime),
-                timeout_s=self.config.time_budget_s,
             )
         )
         self._active_exec = task
         try:
             result = await task
-        except TimeoutError as expired:
-            # Mark the one timeout that really is the harness exec budget, so the caller
-            # does not have to infer it from an undistinguished TimeoutError raised by any
-            # other awaited call in this method.
-            raise HarnessExecBudgetExpired(
-                f"Harness {self.config.kind!r} exec exceeded its {self.config.time_budget_s:.0f}s budget."
-            ) from expired
         finally:
             if self._active_exec is task:
                 self._active_exec = None

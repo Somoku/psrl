@@ -29,7 +29,6 @@ from psrl.utils.transferqueue_utils import (
     validate_ready_payload,
 )
 from psrl.workers.agent_loop.loops.utils import TerminateReason
-from psrl.workers.agent_loop.timeouts import resolve_from_config
 from psrl.workers.gen.utils import RolloutInstanceId
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.ps.staleness_controller import EntryInfo
@@ -251,7 +250,6 @@ class PSRL_AgentLoopManager:
         # exception that ends the run.
         self._refill_breaker_diagnosis: str | None = None
 
-        self.timeouts = resolve_from_config(self.config)
         # The driver logs a progress line this often while a buffer is incomplete.
         self.buffer_wait_log_interval_s = float(self.config.psrl.agentic_rl.get("buffer_wait_log_interval_s", 60))
 

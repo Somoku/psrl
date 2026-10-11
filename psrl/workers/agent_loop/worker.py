@@ -33,7 +33,6 @@ from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
-from psrl.workers.agent_loop.timeouts import resolve_from_config
 from psrl.workers.gen.utils import TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
@@ -159,8 +158,6 @@ class PSRL_AgentLoopWorker:
         self.reward_manager = None
         sandbox_config = config.gen_actor_rollout_ref.rollout.agent.sandbox
         self.sandbox_manager = self._build_sandbox_manager(sandbox_config, capacity_coordinator, sandbox_plane)
-        # Every deadline a rollout is held to comes from this one ladder.
-        self.timeouts = resolve_from_config(config)
 
         n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
         n_validate_instances = (

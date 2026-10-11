@@ -130,9 +130,15 @@ agent:
     # Class name of the custom async server class (e.g. AsyncvLLMServer).
     name: null
 
-  # Episode seconds after provisioning, including turns, patch collection, and grading.
-  # Other deadlines derive from this budget. Null uses the default.
+  # Episode seconds of agent work, starting once the sandbox is provisioned. Sandbox
+  # admission and provisioning are excluded: they are scheduling latency, bounded by the
+  # sandbox service's own liveness rather than by a deadline here. Null uses the default.
   trajectory_timeout: 7200
+
+  # Seconds grading may run after the episode. Kept apart from the episode budget because
+  # grading is a separate phase an operator often wants a different answer for. Null means
+  # grading is not timed.
+  grading_timeout: null
 
   # Environment configuration for the agent loop.
   env:

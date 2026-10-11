@@ -26,17 +26,8 @@ import pytest
 from omegaconf import OmegaConf
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 from psrl.workers.agent_loop.manager import BoundedIdSet, PSRL_AgentLoopManager
-from psrl.workers.agent_loop.timeouts import AgentLoopTimeouts
 
 pytestmark = pytest.mark.cpu_test
-
-# A ladder with an explicit admission deadline, so a capacity diagnosis can name it
-# without the test building a whole trainer config tree.
-_STUB_TIMEOUTS = AgentLoopTimeouts(
-    episode_timeout_s=7200.0,
-    setup_allowance_s=900.0,
-    admission_timeout_s=1800.0,
-)
 
 
 def _make_config(threshold: int, capacity_threshold: int) -> OmegaConf:
@@ -76,7 +67,6 @@ class FakeManager:
         self.val_rollout_n = rollout_n
         self.refill_failure_threshold = threshold
         self.capacity_failure_threshold = capacity_threshold
-        self.timeouts = _STUB_TIMEOUTS
 
         self._failed_train_group_ids: BoundedIdSet = BoundedIdSet(failed_id_capacity)
         self._failed_val_group_ids: set[int] = set()
@@ -696,8 +686,9 @@ class TestCapacityFailuresHaveTheirOwnBound:
             )
             assert TerminateReason.SANDBOX_CAPACITY_TIMEOUT.value in diagnosis
             assert "capacity" in diagnosis
-            assert f"{_STUB_TIMEOUTS.admission_timeout_s:.0f}s" in diagnosis, (
-                "The diagnosis must name the admission deadline every attempt burned."
+            assert "waited for capacity until it was refused" in diagnosis, (
+                "The diagnosis must say every attempt waited for capacity, not that it burned "
+                "a deadline that no longer exists."
             )
             assert manager._consecutive_group_failures == 0, "A capacity fault was reported as a broken harness."
 

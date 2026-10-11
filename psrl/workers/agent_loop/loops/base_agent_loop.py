@@ -35,7 +35,6 @@ from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.budget import (
     EpisodeBudget,
     EpisodeBudgetExpired,
-    RolloutDeadlineExceeded,
 )
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 from psrl.workers.agent_loop.timeouts import resolve_from_config
@@ -51,9 +50,10 @@ class AgentLoopBase(ABC):
 
     A loop that provisions a sandbox before doing episode work sets
     `episode_starts_after_provisioning` and calls `arm_episode_budget` once the
-    sandbox and environment are ready. That keeps node capacity admission, which is
-    scheduling latency, out of the episode budget; the admission deadline bounds it
-    instead. Loops that do no provisioning keep the default and are timed from the call.
+    sandbox and environment are ready. That keeps node capacity admission and
+    provisioning, which are scheduling latency, out of the episode budget; those
+    phases are bounded by the sandbox service's own liveness instead. Loops that do no
+    provisioning keep the default and are timed from the call.
     """
 
     episode_starts_after_provisioning = False
@@ -71,9 +71,8 @@ class AgentLoopBase(ABC):
         self.model_config = self.config.gen_actor_rollout_ref.model
         self.rollout_config = self.config.gen_actor_rollout_ref.rollout
         self.rollout_gateway_url = context.rollout_gateway_url.rstrip("/")
-        # One ladder for every deadline this loop enforces, derived from the episode budget
-        # so the harness cap, the setup allowance, and the manager's stall threshold cannot
-        # disagree with each other.
+        # The rollout's two budgets: the episode (agent work) and grading. Read in one
+        # place so the loop and the trainer cannot report different values.
         self.timeouts = resolve_from_config(self.config)
 
         self.reward_manager = context.reward_manager
@@ -726,28 +725,17 @@ class AgentLoopBase(ABC):
                 else:
                     psrl_logger.exception(f"Unsupported value: type={type(v)!r}, key={k!r}.")
 
-            # The budget excludes sandbox admission and preparation for loops that provision
-            # a sandbox, because that time is scheduling latency rather than episode work.
-            # The setup allowance is what keeps the excluded region bounded.
+            # The budget excludes sandbox admission and provisioning for loops that
+            # provision a sandbox: that time is scheduling latency rather than episode
+            # work, and the sandbox service bounds it by liveness instead.
             self.episode_budget = EpisodeBudget(
-                self.timeouts.episode_timeout_s,
+                self.timeouts.trajectory_timeout_s,
                 starts_after_provisioning=self.episode_starts_after_provisioning,
-                setup_limit_s=self.timeouts.setup_timeout_s,
             )
             output, terminate_reason = None, None
             run_task = asyncio.ensure_future(self.run(prompt))
             try:
                 output, terminate_reason = await self.episode_budget.wait_for(run_task)
-            except RolloutDeadlineExceeded as expired:
-                run_task.cancel()
-                await asyncio.gather(run_task, return_exceptions=True)
-                self._record_error(expired)
-                psrl_logger.error(
-                    "Rollout for request %s never started an episode within its %ss setup allowance.",
-                    request_ids,
-                    self.timeouts.setup_timeout_s,
-                )
-                return None, TerminateReason.ROLLOUT_DEADLINE_EXCEEDED
             except EpisodeBudgetExpired as expired:
                 run_task.cancel()
                 await asyncio.gather(run_task, return_exceptions=True)

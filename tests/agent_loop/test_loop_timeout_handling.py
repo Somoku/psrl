@@ -8,7 +8,7 @@ import torch
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.budget import EpisodeBudget
 from psrl.workers.agent_loop.loops.utils import TerminateReason
-from psrl.workers.agent_loop.timeouts import resolve_agent_loop_timeouts
+from psrl.workers.agent_loop.timeouts import resolve_rollout_timeouts
 from tensordict import TensorDict
 
 pytestmark = pytest.mark.cpu_test
@@ -33,8 +33,8 @@ def _loop(trajectory_timeout: float | None = None) -> _Loop:
         trajectory_timeout,
         starts_after_provisioning=loop.episode_starts_after_provisioning,
     )
-    # Mirrors `AgentLoopBase.__init__`: the ladder is what bounds the episode.
-    loop.timeouts = resolve_agent_loop_timeouts(trajectory_timeout, None)
+    # Mirrors `AgentLoopBase.__init__`: the episode budget is what bounds the episode.
+    loop.timeouts = resolve_rollout_timeouts(trajectory_timeout, None)
     loop.last_error = None
     loop.last_error_traceback = ""
     return loop

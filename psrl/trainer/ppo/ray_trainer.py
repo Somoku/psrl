@@ -130,11 +130,9 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 def _log_agent_loop_timeouts(config) -> None:
-    """
-    Resolve and report the rollout deadline ladder.
-    """
-    ladder = resolve_from_config(config)
-    psrl_logger.info("Rollout deadlines: %s.", ladder.describe())
+    """Report the rollout's two budgets: episode work and grading."""
+    timeouts = resolve_from_config(config)
+    psrl_logger.info("Rollout budgets: %s.", timeouts.describe())
 
 
 class ReplayBuffer:

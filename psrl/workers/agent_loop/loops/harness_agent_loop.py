@@ -17,7 +17,6 @@ from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.harness import (
     Harness,
     HarnessConfig,
-    HarnessExecBudgetExpired,
     HarnessResult,
     HarnessRuntime,
     HarnessTaskContext,
@@ -85,23 +84,13 @@ class HarnessAgentLoop(SessionAgentLoop):
     # work, so the episode budget starts only once the harness is about to run.
     episode_starts_after_provisioning = True
 
-    @staticmethod
-    def apply_timeout_ladder(harness_config: HarnessConfig, timeouts) -> HarnessConfig:
-        """Return the harness config with its exec budget taken from the shared ladder.
-
-        The episode budget is what stops the harness and reports why, so the harness's own
-        exec timeout only has to outlive it. Deriving it here means a harness can no longer
-        enforce a different episode length than the framework believes it set.
-        """
-        return replace(harness_config, time_budget_s=timeouts.harness_exec_timeout_s)
-
     def __init__(
         self,
         context: AgentLoopContext,
         harness: HarnessConfig | DictConfig | Mapping[str, Any],
     ) -> None:
         super().__init__(context=context)
-        self.harness_config = self.apply_timeout_ladder(HarnessConfig.from_value(harness), self.timeouts)
+        self.harness_config = HarnessConfig.from_value(harness)
         self.compaction_budget: tuple[int, int] | None = None
         self.prompt_too_long_limit: int | None = None
         # Set by a task hook when grading never ran, so the completed trajectory is kept
@@ -311,33 +300,16 @@ class HarnessAgentLoop(SessionAgentLoop):
             harness_started = time.perf_counter()
             try:
                 harness_result = await harness.run(task.prompt, harness_runtime)
-            except HarnessExecBudgetExpired as expired:
-                # The harness exec backstop fired, which means the episode budget did not.
-                # Record the cause: without it the manager can only report that some
-                # exception happened, with no exception to show.
-                self._record_error(expired)
-                psrl_logger.error(
-                    "Harness %s exceeded its %.0fs exec budget for session %s. The exec budget is a "
-                    "backstop for the %.0fs episode budget, so report this: the episode budget should "
-                    "have stopped it first.",
-                    self.harness_config.kind,
-                    self.harness_config.time_budget_s,
-                    session_id,
-                    self.timeouts.episode_timeout_s,
-                )
-                return None, TerminateReason.TRAJECTORY_TIMEOUT
             except TimeoutError as downstream:
-                # Some call inside the episode timed out without the exec budget expiring, so
-                # the sandbox or the daemon behind it is the fault and the episode budget is
-                # not. Reporting TRAJECTORY_TIMEOUT here would misattribute the cause and let
-                # `is_timeout` suppress the retry an infrastructure fault needs.
+                # A call inside the episode timed out. That is the sandbox or the daemon
+                # behind it, not the episode budget: the episode budget never surfaces as a
+                # TimeoutError. Reporting TRAJECTORY_TIMEOUT here would misattribute the
+                # cause and let `is_timeout` suppress the retry an infrastructure fault needs.
                 self._record_error(downstream)
                 psrl_logger.error(
-                    "Harness %s hit an infrastructure timeout for session %s that was not its "
-                    "%.0fs exec budget: %r.",
+                    "Harness %s hit an infrastructure timeout for session %s: %r.",
                     self.harness_config.kind,
                     session_id,
-                    self.harness_config.time_budget_s,
                     downstream,
                 )
                 return None, TerminateReason.DOWNSTREAM_TIMEOUT

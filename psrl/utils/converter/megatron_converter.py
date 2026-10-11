@@ -36,6 +36,7 @@ from psrl.utils.converter.param_sync import (
     ConversionResult,
     DTypeCastSync,
     ParamSyncPlan,
+    ResidentZeroCenteredGammaSync,
     ZeroCenteredGammaSync,
 )
 from psrl.utils.converter.utils.parallel_states import ParallelStates
@@ -45,10 +46,20 @@ from psrl.utils.nixl.nixl_spec import NIXLSharding
 class MegatronConverter(BaseConverter):
     """Convert Megatron model to a unified format (i.e., HuggingFace) and generate sharding info."""
 
-    def __init__(self, parameter_mapping: ParameterMapping, mpu: ParallelStates | None = None):
+    def __init__(
+        self,
+        parameter_mapping: ParameterMapping,
+        mpu: ParallelStates | None = None,
+        *,
+        resident_exposure: bool = False,
+    ):
         super().__init__(parameter_mapping)
         self.parameter_mapping = parameter_mapping
         self.sync_plan = ParamSyncPlan()
+        # Direct supply: readers hold the registered tensors, so anything exposed must
+        # stay correct between pulls rather than only across a push. See
+        # `ResidentZeroCenteredGammaSync`.
+        self.resident_exposure = resident_exposure
 
         self.parameter_mapping.disable_tie_word_embeddings()
         self.bridge = AutoBridge.from_hf_config(self.parameter_mapping.config)
@@ -225,6 +236,14 @@ class MegatronConverter(BaseConverter):
                 f"RMSNorm2ZeroCenteredRMSNormMapping hf_param must be a resolved string, "
                 f"got {type(mapping.hf_param)} for {full_name}"
             )
+            if self.resident_exposure:
+                # A separate tensor, because the trainer keeps reading `param` as
+                # zero-centred while rollouts read the exposed copy at arbitrary times.
+                exposed = torch.empty_like(param)
+                self.sync_plan.add(
+                    ResidentZeroCenteredGammaSync(key=mapping.hf_param, source_param=param)
+                )
+                return {mapping.hf_param: exposed}
             self.sync_plan.add(ZeroCenteredGammaSync(mapping.hf_param))
             return {mapping.hf_param: param}
 
@@ -540,6 +559,8 @@ def convert_megatron_inplace(
     parameter_mapping: ParameterMapping,
     model,
     mpu: ParallelStates | None = None,
+    *,
+    resident_exposure: bool = False,
 ) -> ConversionResult:
     """
     Convenience function to convert Megatron model to unified state dict and sharding info.
@@ -547,10 +568,13 @@ def convert_megatron_inplace(
         parameter_mapping: Parameter mapping instance for the specific model
         model: The Megatron model instance
         mpu: Megatron parallel states, if None, use current Megatron parallel state
+        resident_exposure: Keep exposed tensors correct at all times rather than only
+            across a push. Required under direct supply, where rollouts read the
+            registered tensors in place and there is no "push finished" moment.
     Returns:
         ConversionResult containing the unified state dict, local sharding dict, and a
         synchronization plan for canonical tensors that are not plain aliases of train parameters.
     """
-    converter = MegatronConverter(parameter_mapping, mpu=mpu)
+    converter = MegatronConverter(parameter_mapping, mpu=mpu, resident_exposure=resident_exposure)
     state_dict, sharding_dict = converter.convert_state_and_sharding_dict(model)
     return ConversionResult(state_dict=state_dict, sharding_dict=sharding_dict, sync_plan=converter.sync_plan)

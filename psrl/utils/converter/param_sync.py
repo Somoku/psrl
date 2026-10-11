@@ -76,6 +76,42 @@ class ZeroCenteredGammaSync:
 
 
 @dataclass
+class ResidentZeroCenteredGammaSync:
+    """Keep a *separate* exposed gamma correct at all times, for direct supply.
+
+    `ZeroCenteredGammaSync` works by borrowing the train parameter: `add_(1)` before a
+    push and `sub_(1)` after it, so the tensor is only briefly in exposed form. Direct
+    supply has no "after the push" -- a rollout reads the registered tensor whenever it
+    pulls -- so the pair cannot be used. Reverting would corrupt whatever read is in
+    flight, and *not* reverting would leave the trainer's own forward reading gamma+1.
+
+    So the exposed value gets its own tensor. `source_param` stays zero-centred for the
+    trainer; `state_dict[key]` holds `source_param + 1` and is refreshed at each version
+    publish. The copy costs one gamma per norm layer, which is negligible beside the
+    weights themselves -- and it is what lets the registered address stay valid, since
+    NIXL descriptors point at this tensor for the life of the run.
+    """
+
+    key: str
+    source_param: torch.Tensor
+
+    def before_push(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Refresh the exposed copy. Under direct supply this is the publish point."""
+        if self.key in state_dict:
+            exposed = state_dict[self.key]
+            exposed.copy_(self.source_param)
+            exposed.add_(1)
+
+    def after_push(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Deliberately nothing: the exposed copy must stay correct between pulls."""
+
+    def after_pull(self, state_dict: dict[str, torch.Tensor]) -> None:
+        if self.key in state_dict:
+            self.source_param.copy_(state_dict[self.key])
+            self.source_param.sub_(1)
+
+
+@dataclass
 class DTypeCastSync:
     """Keep an externally exposed dtype copy synchronized with the real train parameter."""
 

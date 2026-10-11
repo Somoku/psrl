@@ -502,6 +502,33 @@ def test_runtime_timeout_preserves_counts() -> None:
     assert result["f2p_total"] == 1, "Timeout must preserve expected counts."
 
 
+def test_runtime_leaves_grading_untimed_when_the_budget_is_none() -> None:
+    """A null grading budget must reach the sandbox as an untimed exec, not a guess."""
+    from types import SimpleNamespace
+
+    from examples.mini_swe.grading.runtime import run_grading
+
+    seen: dict = {}
+
+    class Session:
+        def write_bytes(self, *args):
+            pass
+
+        def exec(self, *args, **kwargs):
+            seen["timeout_s"] = kwargs.get("timeout_s")
+            return SimpleNamespace(exit_code=0)
+
+        def read_bytes(self, path):
+            return json.dumps(
+                {"resolved": True, "f2p_pass": 1, "f2p_total": 1, "p2p_pass": 0, "p2p_total": 0}
+            ).encode()
+
+    result = run_grading(Session(), _plan("pytest"), workdir="/testbed", timeout_s=None)
+
+    assert seen["timeout_s"] is None, "Grading must run untimed when no budget is configured."
+    assert result["resolved"] is True
+
+
 @pytest.mark.parametrize("scenario", ["pass", "missing", "no_python"])
 def test_runtime_command_executes_real_zipapp(tmp_path: Path, monkeypatch, scenario: str) -> None:
     from types import SimpleNamespace

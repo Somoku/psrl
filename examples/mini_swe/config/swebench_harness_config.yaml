@@ -18,7 +18,6 @@
       resource_class: rollout
     grader_environment:
       memory: "30g"
-      timeout: 1800
       resource_class: grader
   harness:
     kind: claude_code

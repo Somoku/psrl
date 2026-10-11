@@ -37,7 +37,6 @@ def _payload() -> dict[str, Any]:
                 },
                 "grader_environment": {
                     "memory": "30g",
-                    "timeout": 900,
                     "env": {"OVERRIDE": "grader", "GRADER_ONLY": "1"},
                 },
             }

@@ -24,30 +24,18 @@ class EpisodeBudgetExpired(Exception):
     """
 
 
-class RolloutDeadlineExceeded(Exception):
-    """Raised when a rollout exceeds its deadline before the episode has even started.
-
-    The episode clock is not running yet, so this is not a budget expiry: the child spent
-    its whole allowance being admitted and provisioned and never began. Reported separately
-    because the fix is a capacity or setup setting rather than a longer episode.
-    """
-
-
 class EpisodeBudget:
     """A wall-clock budget that can start counting after resource provisioning.
 
     A loop that provisions a sandbox constructs this with
     ``starts_after_provisioning=True`` and calls `arm` once its sandbox and
-    environment are ready. Until then `wait_for` bounds the task by `setup_limit_s`
-    instead, because the wait is bounded by the admission deadline and the backend
-    timeouts rather than by the episode. Any other loop arms on its first `wait_for`,
-    which keeps its previous behaviour of timing the whole call.
+    environment are ready. Until then `wait_for` does not bound the task at all:
+    admission and provisioning are bounded by the sandbox service's own liveness, not
+    by a deadline here, so a slow pull cannot be mistaken for a wedged episode. Any
+    other loop arms on its first `wait_for`, which keeps its previous behaviour of
+    timing the whole call.
 
     ``total_s`` of ``None`` disables enforcement entirely.
-
-    ``setup_limit_s`` bounds the pre-episode phase. Without it, a loop that never arms has
-    nothing bounding it, and a wedged provisioning step would hold the sandbox until the
-    manager's stall watchdog noticed the silence.
     """
 
     def __init__(
@@ -55,15 +43,16 @@ class EpisodeBudget:
         total_s: float | None,
         *,
         starts_after_provisioning: bool = False,
-        setup_limit_s: float | None = None,
     ) -> None:
         self.total_s = total_s
-        self.setup_limit_s = setup_limit_s
         self._starts_after_provisioning = starts_after_provisioning
         self._created_at = time.monotonic()
         self._armed_at: float | None = None
         self._wait_s = 0.0
         self._armed = asyncio.Event()
+        # Set by the episode once its own work is done, so the phases that follow it --
+        # grading in particular -- run under their own budget instead of this one.
+        self._released = asyncio.Event()
 
     @property
     def armed(self) -> bool:
@@ -79,6 +68,21 @@ class EpisodeBudget:
         self._wait_s = now - self._created_at
         self._armed.set()
 
+    def release(self) -> None:
+        """Stop enforcing the budget now that the episode's own work is done.
+
+        The episode ends when its work ends, not when the whole ``run`` returns:
+        patch collection is episode work, but grading that follows it is a separate
+        phase with its own budget. Releasing here is what keeps a slow grader from
+        being cut by, or charged to, the episode clock.
+        """
+        self._released.set()
+
+    @property
+    def released(self) -> bool:
+        """Return whether the episode has declared its own work finished."""
+        return self._released.is_set()
+
     def wait_s(self) -> float:
         """Return the wall-clock time spent before the episode started."""
         if self._armed_at is not None:
@@ -91,12 +95,6 @@ class EpisodeBudget:
             return None
         return max(0.0, self.total_s - (time.monotonic() - self._armed_at))
 
-    def setup_remaining_s(self) -> float | None:
-        """Return the provisioning allowance left, or ``None`` when unbounded."""
-        if self.setup_limit_s is None or self._armed_at is not None:
-            return None
-        return max(0.0, self.setup_limit_s - (time.monotonic() - self._created_at))
-
     async def wait_for(self, task: asyncio.Task[_T]) -> _T:
         """Await `task` under the budget.
 
@@ -104,46 +102,45 @@ class EpisodeBudget:
             The task's result.
 
         Raises:
-            EpisodeBudgetExpired: When the budget expires after the episode has started,
-                or when an unprovisioned loop exceeds it.
-            RolloutDeadlineExceeded: When the task is still provisioning after
-                `setup_limit_s`.
+            EpisodeBudgetExpired: When the episode budget expires after the episode has
+                started and before it releases the budget.
         """
         if not self._starts_after_provisioning:
             self.arm()
-        if self.total_s is None and self.setup_limit_s is None:
+        if self.total_s is None:
             return await task
         while True:
+            if self._released.is_set():
+                # The episode's timed work is done. Its tail -- grading -- runs under
+                # its own budget, so this one no longer bounds the task.
+                return await task
             remaining = self.remaining_s()
-            if remaining is None:
-                # Provisioning is still in progress. Wait for either the episode or the
-                # arming that starts the episode clock, bounded by the setup allowance.
-                setup_remaining = self.setup_remaining_s()
-                if setup_remaining is not None and setup_remaining <= 0:
-                    raise RolloutDeadlineExceeded(
-                        f"Rollout spent its whole {self.setup_limit_s:g}s setup allowance without starting "
-                        f"an episode. The sandbox was never made ready, so no agent work happened."
-                    )
-                armed = asyncio.ensure_future(self._armed.wait())
-                try:
+            released = asyncio.ensure_future(self._released.wait())
+            try:
+                if remaining is None:
+                    # The episode has not started, so provisioning is still in flight. That
+                    # phase is not charged to the episode and carries no deadline here, so
+                    # wait for the arming that starts the clock, for a release, or for the
+                    # task itself.
+                    armed = asyncio.ensure_future(self._armed.wait())
+                    try:
+                        done, _ = await asyncio.wait(
+                            {task, armed, released}, return_when=asyncio.FIRST_COMPLETED
+                        )
+                    finally:
+                        armed.cancel()
+                else:
                     done, _ = await asyncio.wait(
-                        {task, armed},
-                        timeout=setup_remaining,
-                        return_when=asyncio.FIRST_COMPLETED,
+                        {task, released}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
                     )
-                finally:
-                    armed.cancel()
-                if task in done:
-                    return task.result()
-                if not done:
-                    raise RolloutDeadlineExceeded(
-                        f"Rollout spent its whole {self.setup_limit_s:g}s setup allowance without starting "
-                        f"an episode. The sandbox was never made ready, so no agent work happened."
-                    )
-                continue
-            done, _ = await asyncio.wait({task}, timeout=remaining)
+            finally:
+                released.cancel()
             if task in done:
                 return task.result()
+            if self._released.is_set():
+                return await task
+            if remaining is None:
+                continue
             raise EpisodeBudgetExpired(
                 f"Episode budget of {self.total_s}s expired "
                 f"(waited {self.wait_s():.0f}s before the episode started)."

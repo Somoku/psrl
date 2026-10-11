@@ -71,6 +71,17 @@ def _raise_if_episode_is_over(lease: SandboxLease | None) -> None:
         raise asyncio.CancelledError
 
 
+def _swallow_task_result(task: asyncio.Task) -> None:
+    """Retrieve a detached task's result so its late failure is not logged as unhandled.
+
+    Used when an operation is abandoned rather than awaited: the worker thread keeps
+    running against a sandbox that was just closed, and its eventual exception is
+    expected rather than actionable.
+    """
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.result()
+
+
 class HarnessAgentLoop(SessionAgentLoop):
     """
     Run one task-scoped harness and turn its TITO session into training data.
@@ -139,9 +150,14 @@ class HarnessAgentLoop(SessionAgentLoop):
         artifact: Any,
         clean_snapshot: SnapshotRef | None,
         timing: dict[str, float],
+        grading_timeout_s: float | None,
     ) -> dict:
         """
         Run optional task evaluation and return task-specific reward fields.
+
+        Grading runs after the episode has released its budget, so it is bounded here
+        instead: ``grading_timeout_s`` is the grading wall clock, or ``None`` for no
+        bound at all.
         """
         return {}
 
@@ -155,14 +171,28 @@ class HarnessAgentLoop(SessionAgentLoop):
         self,
         backend: str | None,
         operation: Callable[[SyncSandboxManager], Any],
+        timeout_s: float | None = None,
     ) -> Any:
-        """
-        Run blocking harness code with cancellation-safe sandbox ownership.
+        """Run blocking harness code with cancellation-safe sandbox ownership.
+
+        ``timeout_s`` bounds the operation at the wall clock. It cannot stop the worker
+        thread, so on expiry the sandbox is closed -- which is what releases the sandbox
+        lease and lets the blocked call fail -- and a ``TimeoutError`` is raised for the
+        caller to classify. That is the only bound a grading phase has left once the
+        episode budget has released it.
         """
         sync_sandbox = self.sandbox_manager.sync(backend=backend)
         operation_task = asyncio.create_task(asyncio.to_thread(operation, sync_sandbox))
         try:
-            return await asyncio.shield(operation_task)
+            if timeout_s is None:
+                return await asyncio.shield(operation_task)
+            return await asyncio.wait_for(asyncio.shield(operation_task), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            await sync_sandbox.aclose()
+            # The worker thread outlives the sandbox it was blocked on. Retrieve its
+            # eventual result so a late failure is not reported as unhandled.
+            operation_task.add_done_callback(_swallow_task_result)
+            raise
         except asyncio.CancelledError:
             await sync_sandbox.aclose()
             with contextlib.suppress(Exception):
@@ -353,6 +383,12 @@ class HarnessAgentLoop(SessionAgentLoop):
             await self.delete_session(session_id)
             session_id = None
 
+            # The rollout is over: its sandbox is gone and its patch and TITO trajectory
+            # are collected. The episode budget has no episode work left to bound, so
+            # release it -- grading below is a separate phase with its own budget, and
+            # leaving this clock running would charge a slow grader to the episode.
+            self.episode_budget.release()
+
             if not training_data or any(item["num_turns"] <= 0 or not item["response_ids"] for item in training_data):
                 harness_result = await harness.collect_diagnostics(harness_result)
                 await self._dump_harness_training_data(
@@ -377,6 +413,7 @@ class HarnessAgentLoop(SessionAgentLoop):
                 artifact,
                 clean_snapshot,
                 timing,
+                self.timeouts.grading_timeout_s,
             )
             timing["elapsed_s"] = time.perf_counter() - run_start
             reward_info = self._build_reward_info(

@@ -191,9 +191,12 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
         artifact: MiniSWEHarnessArtifact,
         clean_snapshot: SnapshotRef | None,
         timing: dict[str, float],
+        grading_timeout_s: float | None,
     ) -> dict:
         """
         Grade the Mini-SWE patch and return reward-specific metadata.
+
+        ``grading_timeout_s`` bounds the grading phase; ``None`` leaves it untimed.
         """
         grading_started = time.perf_counter()
         observation = task.state.payload["observation"]
@@ -209,7 +212,7 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
             grader_result = self._integrity_failure_result(swe_problem, artifact.integrity, patch_policy)
         else:
             try:
-                grader_result = await self._grade_patch(task, artifact.patch, clean_snapshot)
+                grader_result = await self._grade_patch(task, artifact.patch, clean_snapshot, grading_timeout_s)
             except SandboxCapacityTimeout:
                 # The grader sandbox was never admitted. The rollout itself is complete and
                 # valid, so keep it and report it as ungraded: discarding it would throw away
@@ -222,6 +225,17 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
                 grader_result = self._grader_unavailable_result(swe_problem)
                 psrl_logger.error(
                     "Grader sandbox was never admitted for task %r; keeping the trajectory as ungraded.",
+                    observation.get("swe_task_id", ""),
+                )
+            except TimeoutError:
+                # Grading overran its own budget and the grader sandbox had to be released.
+                # Like a starved grader, the episode is complete and honest, so keep it and
+                # report it as ungraded rather than train the timeout as a measured zero.
+                self.grader_unavailable = True
+                grader_result = self._grader_unavailable_result(swe_problem, error="grading_timeout")
+                psrl_logger.error(
+                    "Grading exceeded its %ss budget for task %r; keeping the trajectory as ungraded.",
+                    grading_timeout_s,
                     observation.get("swe_task_id", ""),
                 )
         timing["grading_s"] = time.perf_counter() - grading_started
@@ -258,7 +272,7 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
         }
 
     @staticmethod
-    def _grader_unavailable_result(swe_problem: dict) -> dict:
+    def _grader_unavailable_result(swe_problem: dict, *, error: str = "grader_capacity_timeout") -> dict:
         """Return a grader-shaped result for an episode the grader never saw.
 
         Distinct from `_integrity_failure_result`: nothing was measured here, so the
@@ -273,7 +287,7 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
             "p2p_pass": 0,
             "p2p_total": len(swe_problem.get("PASS_TO_PASS", [])),
             "timeout": False,
-            "error": "grader_capacity_timeout",
+            "error": error,
             "elapsed_s": 0.0,
             "output_tail": "",
             "resolved_by": "grader_unavailable",
@@ -300,6 +314,7 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
         task: HarnessTaskContext[MiniSWEHarnessTaskState],
         patch: str,
         clean_snapshot: SnapshotRef | None,
+        grading_timeout_s: float | None,
     ) -> dict | None:
         if not patch:
             return None
@@ -311,5 +326,7 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
                 sync_sandbox,
                 clean_snapshot,
                 task.clean_sandbox_spec,
+                grading_timeout_s=grading_timeout_s,
             ),
+            timeout_s=grading_timeout_s,
         )

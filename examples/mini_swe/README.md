@@ -411,7 +411,7 @@ subclasses it and supplies only the following hooks:
 | `prepare_harness_task` | Return prompt, rollout `SandboxSpec`, backend, and opaque task state |
 | `prepare_harness_sandbox` | Optionally initialize the acquired sandbox (e.g. git sanitization) and add timing entries |
 | `collect_harness_artifact` | Optionally collect a patch, answer file, or other result before sandbox deletion |
-| `finalize_harness_task` | Optionally grade the artifact in a clean environment and return reward fields |
+| `finalize_harness_task` | Optionally grade the artifact in a clean environment and return reward fields; receives the `grading_timeout` budget (`None` = untimed) |
 | `close_harness_task` | Release task-only resources such as environments or concurrency slots |
 
 Only `prepare_harness_task` is abstract. Tasks without artifacts or an external
@@ -810,9 +810,9 @@ which is written by `prepare_swebench.py`.
 | `sandbox_config.environment.template` | Data-affine | Provider template/snapshot ID for AgentEnv or CubeSandbox |
 | `sandbox_config.environment.cwd` | Data-affine | Working directory inside container (`/testbed` for SWE-bench images) |
 | `sandbox_config.environment.forward_env` | Infrastructure | Additional host environment names to forward; proxy variables are always included once |
-| `sandbox_config.environment` | Infrastructure | Shared image/template, cwd, env, forwarded env and timeout base for rollout and grader |
+| `sandbox_config.environment` | Infrastructure | Shared image/template, cwd, env, forwarded env and command-timeout base |
 | `sandbox_config.rollout_environment` | Infrastructure | Rollout-only overrides, including `memory` and command `timeout` |
-| `sandbox_config.grader_environment` | Infrastructure | Fresh-verifier overrides; resources must match rollout to reuse a microVM snapshot |
+| `sandbox_config.grader_environment` | Infrastructure | Fresh-verifier overrides; resources must match rollout to reuse a microVM snapshot. Grading's wall clock is `rollout.agent.grading_timeout`, not a key here |
 | `sandbox_config.environment.container_timeout` | Infrastructure | Max container lifetime (default: `2h`) |
 | `sandbox_config.backend` | Infrastructure | Optional backend name from PSRL's worker-local sandbox registry |
 | `sandbox_config.policy_profile` | Infrastructure | Docker policy profile; set `null` for microVM providers |

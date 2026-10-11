@@ -28,7 +28,7 @@ class GradingSession(Protocol):
     The small file and execution interface shared by PSRL and standalone Docker.
     """
 
-    def exec(self, command: str, *, cwd: str, timeout_s: float) -> object: ...
+    def exec(self, command: str, *, cwd: str, timeout_s: float | None) -> object: ...
     def write_bytes(self, path: str, data: bytes) -> None: ...
     def read_bytes(self, path: str) -> bytes: ...
 
@@ -38,18 +38,21 @@ def run_grading(
     plan: GradingPlan,
     *,
     workdir: str,
-    timeout_s: int,
+    timeout_s: float | None,
     skip_editable_install: bool = False,
     python_candidates: tuple[str, ...] = DEFAULT_DRIVER_PYTHONS,
 ) -> dict:
     """
     Execute tests and return the scorecard using the existing reward interface.
 
+    ``timeout_s`` bounds the eval-script process; ``None`` leaves it untimed, which is
+    the deployment's choice for a grader it would rather wait on than cut.
+
     Infrastructure failures preserve expected test counts and cannot resolve a
     task. The caller owns sandbox cleanup, including cancellation after timeout.
     """
-    if timeout_s <= 0:
-        raise ValueError("Grading timeout_s must be greater than zero.")
+    if timeout_s is not None and timeout_s <= 0:
+        raise ValueError("Grading timeout_s must be greater than zero or None.")
     started = time.perf_counter()
     expected = {"f2p_total": len(plan.f2p), "p2p_total": len(plan.p2p)}
 

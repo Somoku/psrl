@@ -11,7 +11,6 @@ import pytest
 from psrl.workers.agent_loop.loops.budget import (
     EpisodeBudget,
     EpisodeBudgetExpired,
-    RolloutDeadlineExceeded,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -109,28 +108,38 @@ async def test_arming_is_idempotent_and_records_only_the_first_wait() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_rollout_that_never_starts_is_stopped_by_the_setup_allowance() -> None:
-    """Provisioning must not be able to hold a sandbox forever waiting for an episode."""
-    budget = EpisodeBudget(60.0, starts_after_provisioning=True, setup_limit_s=0.05)
+async def test_releasing_the_budget_lets_grading_outlast_it() -> None:
+    """Grading runs after the episode, so its budget must not be cut by the episode clock.
 
-    async def wedged_provisioning() -> None:
-        await asyncio.sleep(5)
+    Once the episode releases the budget, the tail of the task -- grading -- is no longer
+    bounded by it, which is what keeps a slow grader from being reported as an episode
+    timeout or charged to the episode's own clock.
+    """
+    budget = EpisodeBudget(0.1, starts_after_provisioning=True)
 
-    with pytest.raises(RolloutDeadlineExceeded, match="setup allowance"):
-        await budget.wait_for(asyncio.ensure_future(wedged_provisioning()))
+    async def episode() -> str:
+        budget.arm()
+        await asyncio.sleep(0.05)  # episode work, inside the budget
+        budget.release()
+        return await _sleep_task(0.3)  # grading, far longer than the episode budget
 
-    assert not budget.armed, "No episode started, so the episode clock must not have started."
+    assert await budget.wait_for(asyncio.ensure_future(episode())) == "finished"
+    assert budget.released
 
 
 @pytest.mark.asyncio
-async def test_the_setup_allowance_does_not_leak_into_the_episode_clock() -> None:
-    """A generous setup allowance must not shorten the episode that follows it."""
-    budget = EpisodeBudget(0.3, starts_after_provisioning=True, setup_limit_s=5.0)
+async def test_provisioning_is_not_charged_to_the_episode() -> None:
+    """Provisioning carries no deadline here, and must not shorten the episode that follows.
+
+    Admission and provisioning are bounded by the sandbox service's own liveness, so a
+    wait longer than the episode budget is legal and must leave the episode clock untouched.
+    """
+    budget = EpisodeBudget(0.3, starts_after_provisioning=True)
 
     async def episode() -> str:
-        await asyncio.sleep(0.2)  # provisioning, inside the setup allowance
+        await asyncio.sleep(0.4)  # provisioning, longer than the episode budget
         budget.arm()
         return await _sleep_task(0.2)  # episode work, inside the episode budget
 
     assert await budget.wait_for(asyncio.ensure_future(episode())) == "finished"
-    assert budget.wait_s() >= 0.2, "Setup time must not be charged to the episode."
+    assert budget.wait_s() >= 0.4, "Setup time must not be charged to the episode."

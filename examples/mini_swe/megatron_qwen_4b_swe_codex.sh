@@ -102,8 +102,12 @@ clip_ratio_high=0.28
 #
 # One multi-turn trajectory shares a 65536-token budget between prompt and response,
 # and max_model_len matches it so the CLI compaction trigger stays trainable.
-max_turns=80
-val_max_turns=160
+#
+# Codex takes no turn cap of its own, so the episode is bounded by
+# `agent.trajectory_timeout` rather than by a turn count: -1 leaves turns unlimited.
+max_turns=-1
+val_max_turns=-1
+trajectory_timeout=1800
 max_prompt_length=32768
 max_response_length=32768
 packing_length=$((max_prompt_length + max_response_length))
@@ -197,6 +201,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.top_k=${top_k} \
     gen_actor_rollout_ref.rollout.multi_turn.enable=True \
     gen_actor_rollout_ref.rollout.multi_turn.max_turns=$max_turns \
+    gen_actor_rollout_ref.rollout.agent.trajectory_timeout=$trajectory_timeout \
     gen_actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
     gen_actor_rollout_ref.rollout.agent.env.name=mini_swe_env \
     gen_actor_rollout_ref.rollout.agent.data.name=mini_swe_agent_data \
@@ -215,6 +220,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=${packing_length} \
     train_actor_rollout_ref.rollout.multi_turn.max_turns=$val_max_turns \
+    train_actor_rollout_ref.rollout.agent.trajectory_timeout=$trajectory_timeout \
     train_actor_rollout_ref.rollout.max_model_len=${max_model_len} \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
     train_actor_rollout_ref.rollout.val_kwargs.do_sample=True \

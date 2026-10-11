@@ -64,6 +64,19 @@ nixl:
   server_port: ${network.listen_port}
   max_pinned_temp_memory_slots: 4
   enable_tms_for_temp_buffers: False
+  # Rollouts here are pure destinations: peer diffusion is off (see below), so nothing
+  # reads their shards. That lets a row-parallel shard be staged contiguously -- one
+  # descriptor instead of one per row. On Qwen3-8B that is 144 x 4096 descriptors
+  # (~1.2s of submission at the measured 2.1us each) collapsing to 144.
+  #
+  # Must be True wherever something does read this client, or the read fails: a staged
+  # shard has no remote descriptor.
+  shards_must_be_readable: False
+  # Off, and it has to be: a diffusion designate is read from, so it could not stage.
+  # Measured on this config, diffusion was 1.42-1.93x *slower* than not diffusing,
+  # because a designate pays one descriptor per strided row either way -- it only moves
+  # which link pays for them. Staging removes the descriptors instead.
+  peer_diffusion: False
 
 ps:
   mode: nixl_cpu

@@ -524,6 +524,25 @@ class TrainClientActor:
         ray.get(futures)
         # self.client.merge_and_finish_cached_xfer()
 
+    def advance_version(self, base: int):
+        """Refill the weights at a new coordinate base, standing in for a train step.
+
+        A second eval round is only a test if the weights it pulls are *different* from
+        the first. Re-filling at the same base reproduces identical bytes, so a rollout
+        that received nothing would pass exactly as a rollout that received the new
+        version -- which is the confusion the steady-state switch-back check exists to
+        resolve (item D4).
+
+        Returns the new offsets because they are what the judge compares against; the
+        gen side cannot derive them, since the shift is this call's argument.
+        """
+        self.coord_offsets = fill_state_dict_by_coord(self.state_dict, strict=False, base=base)
+        # NIXL reads the registered tensors directly, so there is nothing to re-register:
+        # the addresses are unchanged and only their contents moved. Re-registering here
+        # would invalidate every remote descriptor for no reason.
+        torch.cuda.synchronize()
+        return self.coord_offsets
+
     def get_coord_offsets(self):
         """The per-key global coordinate offsets this rank filled with.
 
@@ -606,6 +625,9 @@ class GenClientActor:
             )
         self.dp_size = computed_dp_size
         self.model_config = model_config
+        # None means "use vLLM's default", which is what disaggregate wants. Colocate
+        # sets it, because the card is shared with a train rank.
+        self.gpu_memory_utilization = gen_config.get("gpu_memory_utilization", None)
         self.trust_remote_code = False
         self.gen_dtype = model_config.get("gen_dtype", "bfloat16")
         self.client_name = gen_client_name(0, rank)
@@ -644,6 +666,17 @@ class GenClientActor:
         }
         if self.dp_size > 1:
             llm_kwargs["data_parallel_size"] = self.dp_size
+        if self.gpu_memory_utilization is not None:
+            # Colocate shares the card with a train rank, so vLLM's default (>0.9) is not
+            # available: it reserves a fraction of *total* memory and refuses to start
+            # when that much is not free. With a trainer already holding its parameters
+            # the startup check fails with "Free memory on device ... is less than desired
+            # GPU memory utilization", which is the design's memory account showing up as
+            # an error rather than a bug.
+            #
+            # Disaggregate leaves this None and keeps vLLM's default, so the two
+            # placements do not share a tuning constant that only one of them needs.
+            llm_kwargs["gpu_memory_utilization"] = self.gpu_memory_utilization
         llm = LLM(**llm_kwargs)
         self.model = llm.llm_engine.model_executor.driver_worker.model_runner.model
         self.print(f"local rank {self.rank} model: {self.model}")
@@ -867,6 +900,186 @@ class GenClientActor:
         self._wave_work(0)  # builds the cache
         return len(self._cached_waves or [])
 
+    def pull_pipelined(self, source_agent_names, source_client_names, version=1):
+        """Run this client's whole pull as one pipelined pass (item D1).
+
+        Unlike `pull_from_ps(phase=...)` this returns only when the client is done, so
+        the driver issues one call per actor and no barrier between waves. That is the
+        point: a driver barrier is global, and a global barrier makes every client wait
+        for the slowest one at every chunk, which is what made the two-phase version add
+        cost instead of hiding it.
+
+        The dependency that replaces the barrier is per-chunk and per-source: before
+        peer-reading chunk ``i`` this client waits for exactly the designates that serve
+        it, and nothing else. A designate publishes chunk ``i`` the moment its own read
+        of ``i`` has completed, so a follower proceeds as soon as *its* data is ready
+        rather than when everyone's is.
+
+        Both roles run in the same loop because a client is typically both -- designate
+        for the shards it reads upstream, follower for the ones it does not. Splitting
+        them into two passes would reintroduce the barrier through the back door.
+        """
+        total_start_time = time.time()
+        agent_of = dict(zip(source_client_names, source_agent_names))
+        publisher, waiter = self.client.chunk_completion_channel()
+        followers_by_chunk = self.client.peer_followers_by_chunk()
+
+        if self._cached_waves is None:
+            self._wave_work(0)
+        waves = self._cached_waves or []
+
+        # The schedule is per shard; the transport is per (key, source). Coalescing is
+        # what keeps a pair from being posted twice -- `client_read` moves all of a
+        # pair's shards at once, so a pair spanning waves would repost a live handle.
+        from psrl.utils.nixl.chunk_pipeline import coalesce_to_transport_pairs
+
+        wave_pairs = coalesce_to_transport_pairs(waves)
+        ready_after = {wave.index: wave.ready_after for wave in waves}
+
+        issued = 0
+        transfers = 0
+        published = 0
+        waited_on = 0
+        # Where the time goes, split by cause. Two hypotheses have already been wrong
+        # here -- "the wave barrier costs it" (removing the barrier made it *worse*:
+        # 2.59x vs 1.99x) and before that "peer reads are slow because of the link"
+        # (same-node is 14x faster per byte than cross-node). Both were reasoned from
+        # totals. These counters make the next conclusion come from the breakdown.
+        t_post_upstream = 0.0
+        t_wait_upstream = 0.0
+        t_gate = 0.0
+        t_post_peer = 0.0
+        t_wait_peer = 0.0
+
+        # Posting is separated from waiting. An upstream read depends on nothing, so a
+        # wave boundary must not block it; only *peer* reads have a dependency.
+        #
+        # But posting *all* waves before waiting on any delays the first publish until
+        # every read is submitted, and submission is not free: the designate's
+        # post_up=1.62s for 653 reads is time its followers spend gated (measured
+        # gate=2.42s). So posting is done wave by wave, interleaved with the waiting and
+        # publishing below -- wave i's reads are submitted, waited on, and published
+        # before wave i+1 is submitted. That keeps the first publish early, which is the
+        # only thing a follower actually needs.
+        posted_by_wave: dict[int, list[tuple[str, str, str]]] = {}
+
+        def post_upstream_wave(wave_index, pairs):
+            nonlocal issued, t_post_upstream
+            post_start = time.time()
+            for key, source, peer in pairs:
+                if peer:
+                    continue
+                issued += 1
+                tag = f"gen_pipelined_up_w{wave_index}"
+                shards = self.client.client_read(
+                    agent_of.get(source, source),
+                    source,
+                    key,
+                    tag,
+                    merge_and_cache_xfer=False,
+                )
+                if len(shards) > 0:
+                    posted_by_wave.setdefault(wave_index, []).append((key, source, tag))
+            t_post_upstream += time.time() - post_start
+
+        for wave_index, pairs in wave_pairs:
+            post_upstream_wave(wave_index, pairs)
+            peer_pairs = [(key, source) for key, source, peer in pairs if peer]
+
+            # Wait for this wave's own upstream transfers before publishing it. Waiting
+            # per wave rather than for everything is what keeps the publish points
+            # early: a follower gets chunk 0 while chunks 1..n are still in flight.
+            wait_start = time.time()
+            for key, source_client, tag in posted_by_wave.get(wave_index, []):
+                self.client.wait(key, tag, "READ", target_client=source_client)
+                transfers += 1
+            t_wait_upstream += time.time() - wait_start
+
+            # Publish only after this wave's reads have landed. Publishing earlier is
+            # the one way to break ordering: a follower would read a buffer still being
+            # filled, and that read succeeds.
+            followers = followers_by_chunk.get(wave_index)
+            if followers:
+                published += publisher.publish(version, wave_index, sorted(followers))
+
+            if peer_pairs:
+                # Wait per source, not for "the wave": a chunk can hold shards from
+                # several designates, and proceeding once the first reports would read
+                # the others' buffers before they are filled -- successfully, which is
+                # why this cannot be left to a retry.
+                sources = sorted({source for _key, source in peer_pairs})
+                depends_on = ready_after.get(wave_index)
+                if depends_on is None:
+                    depends_on = wave_index - 1
+                gate_start = time.time()
+                waiter.wait_for(version, depends_on, sources, timeout=600.0)
+                t_gate += time.time() - gate_start
+                waited_on += len(sources)
+
+                peer_tag = f"gen_pipelined_peer_w{wave_index}"
+                peer_waits = []
+                peer_post_start = time.time()
+                # Peer reads are posted individually. Merging them was tried and is
+                # **measurably worse**: post_peer went 4.105s -> 6.270s, because the
+                # merge path materialises every descriptor into a Python list and these
+                # shards are strided at 4096 descriptors each (399 x 4096 is 1.6M
+                # element accesses). The prepped path did engage -- no fallback warning --
+                # so the regression is the descriptor marshalling ahead of it, not NIXL.
+                #
+                # Which means `post_peer` is **not** submission cost, and that is now a
+                # measured fact rather than an inference: three attempts to reduce it as
+                # if it were (remove the barrier, merge, pre-post all waves) each made it
+                # the same or worse. What it is instead has to come from instrumenting
+                # inside `client_read`, which is the next step. Leaving it unmerged is
+                # the configuration with the best measured number so far (1.93x).
+                for key, source in peer_pairs:
+                    issued += 1
+                    shards = self.client.client_read(
+                        agent_of.get(source, source),
+                        source,
+                        key,
+                        peer_tag,
+                        merge_and_cache_xfer=False,
+                    )
+                    if len(shards) > 0:
+                        peer_waits.append((key, source))
+                t_post_peer += time.time() - peer_post_start
+                peer_wait_start = time.time()
+                for key, source_client in peer_waits:
+                    self.client.wait(key, peer_tag, "READ", target_client=source_client)
+                t_wait_peer += time.time() - peer_wait_start
+                transfers += len(peer_waits)
+
+        self.client.merge_and_finish_cached_xfer()
+        total_end_time = time.time()
+        phases = self.client.read_phase_us()
+        self.print(
+            f"Pipelined pull done: {total_end_time - total_start_time}s "
+            f"({len(waves)} waves, {len(wave_pairs)} posting waves, {issued} pairs, "
+            f"{transfers} transfers, {published} notifs published, "
+            f"{waited_on} source-waits, {waiter.drains} drains) "
+            f"[breakdown post_up={t_post_upstream:.3f} wait_up={t_wait_upstream:.3f} "
+            f"gate={t_gate:.3f} post_peer={t_post_peer:.3f} wait_peer={t_wait_peer:.3f}] "
+            f"[inside client_read, seconds: "
+            f"deser={phases['deserialize'] / 1e6:.3f} align={phases['align'] / 1e6:.3f} "
+            f"init={phases['initialize'] / 1e6:.3f} xfer={phases['transfer'] / 1e6:.3f}]"
+        )
+        return {
+            "waves": len(waves),
+            "posting_waves": len(wave_pairs),
+            "issued": issued,
+            "transfers": transfers,
+            "published": published,
+            "waited_on": waited_on,
+            "drains": waiter.drains,
+            "seconds": total_end_time - total_start_time,
+            "post_upstream": t_post_upstream,
+            "wait_upstream": t_wait_upstream,
+            "gate": t_gate,
+            "post_peer": t_post_peer,
+            "wait_peer": t_wait_peer,
+        }
+
     def _wave_work(self, wave_index: int) -> list:
         """``(key, source)`` pairs belonging to chunk ``wave_index`` (item D1).
 
@@ -1052,6 +1265,57 @@ def test_nixl_e2e(cfg: DictConfig):
         f"Ray has too few generation nodes. required={gen_nnodes!r}, available={len(ray_nodes_sorted)!r}."
     )
     gen_nodes = [ray_nodes_sorted[-i - 1] for i in range(gen_nnodes)]
+
+    # Colocate places train and gen on the *same* GPUs, which is the arrangement every
+    # conclusion in design 3.7 is about and the one this harness could not express: with
+    # `num_gpus=1` each, Ray guarantees they never share a device, so the timing-exclusion
+    # path was unreachable. Taking the first nodes for both and halving the request is
+    # what puts a train rank and a gen rank on one card.
+    #
+    # The fractional request is a *scheduling* statement, not a memory split: each actor
+    # still sees the whole device. That is exactly the colocate situation -- two processes
+    # on one GPU, which is why the design requires the trainer to offload before rollout
+    # allocates its KV cache rather than relying on them fitting together.
+    colocate = bool(cfg.test.get("colocate", False))
+    colocate_bundles = None
+    if colocate:
+        assert num_train == num_gen, (
+            f"colocate pairs each train rank with a gen rank on one GPU, so the counts "
+            f"must match; got num_train={num_train} num_gen={num_gen}"
+        )
+        gen_nodes = train_nodes
+        # A placement group with one bundle per GPU, not a bare fractional request.
+        #
+        # `num_gpus=0.5` alone lets Ray pack *any* two actors onto a device, and it
+        # chose two gen actors: 8 actors landed on 4 devices, so vLLM's TP=2 tried to
+        # init two NCCL ranks on one GPU and failed with "invalid usage". The pairing
+        # has to be train-with-gen, which means the placement must be expressed rather
+        # than left to the scheduler.
+        #
+        # PACK, not STRICT_SPREAD: the latter demands one bundle per *node*, so asking
+        # for 8 bundles on a 5-node cluster never becomes ready and the run dies on a
+        # placement-group timeout rather than anything to do with colocate. PACK keeps
+        # the bundles together, and one `GPU: 1` bundle per pair is what reserves a whole
+        # card for exactly one train rank and one gen rank.
+        from ray.util.placement_group import placement_group
+
+        colocate_bundles = placement_group(
+            [{"GPU": 1, "CPU": 2} for _ in range(num_train)],
+            strategy="PACK",
+        )
+        ray.get(colocate_bundles.ready(), timeout=300)
+    gpus_per_actor = 0.5 if colocate else 1
+
+    def _placement(index: int, node_id: str):
+        """Where one actor goes: a colocate bundle, or a node."""
+        if colocate_bundles is not None:
+            from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+            return PlacementGroupSchedulingStrategy(
+                placement_group=colocate_bundles,
+                placement_group_bundle_index=index,
+            )
+        return NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
     # print(f"train_nodes: {train_nodes}, gen_nodes: {gen_nodes}")
     train_engine_type = cfg.test.train_engine_type
 
@@ -1059,12 +1323,17 @@ def test_nixl_e2e(cfg: DictConfig):
         {
             "logging_path": log_dir,
             "ps_manager_ip": listen_ip,
-            "nixl": {
-                "server_ip": cfg.nixl.server_ip,
-                "server_port": cfg.nixl.server_port,
-                "max_pinned_temp_memory_slots": cfg.nixl.max_pinned_temp_memory_slots,
-                "enable_tms_for_temp_buffers": cfg.nixl.enable_tms_for_temp_buffers,
-            },
+            # The whole `nixl` section, not a hand-picked subset. Copying named keys
+            # meant a new config option was silently dropped: `peer_diffusion: False`
+            # was set in the YAML, never reached the planner, and the run diffused
+            # anyway -- with no error, because a missing key just takes its default.
+            #
+            # Resolved on the way in. The section's values interpolate against siblings
+            # (`server_ip: ${network.listen_ip}`), and those siblings do not exist in this
+            # smaller config, so copying the node unresolved defers the lookup to a place
+            # where it fails: `InterpolationKeyError: network.listen_ip not found`, raised
+            # inside the server actor rather than here.
+            "nixl": OmegaConf.to_container(cfg.nixl, resolve=True),
             "ps_mode": cfg.ps.mode,
         }
     )
@@ -1133,9 +1402,9 @@ def test_nixl_e2e(cfg: DictConfig):
 
     train_actors = [
         TrainClientActor.options(
-            num_gpus=1,
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=train_nodes[rank // NUM_GPU_PER_NODE]["NodeID"], soft=False
+            num_gpus=gpus_per_actor,
+            scheduling_strategy=_placement(
+                rank, train_nodes[rank // NUM_GPU_PER_NODE]["NodeID"]
             ),
         ).remote(
             global_store,
@@ -1157,9 +1426,9 @@ def test_nixl_e2e(cfg: DictConfig):
     ]
     gen_actors = [
         GenClientActor.options(
-            num_gpus=1,
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=gen_nodes[rank // NUM_GPU_PER_NODE]["NodeID"], soft=False
+            num_gpus=gpus_per_actor,
+            scheduling_strategy=_placement(
+                rank, gen_nodes[rank // NUM_GPU_PER_NODE]["NodeID"]
             ),
         ).remote(
             global_store,
@@ -1254,41 +1523,85 @@ def test_nixl_e2e(cfg: DictConfig):
         all_agent_names = source_agent_names + [a for a, _c in gen_names]
         all_client_names = source_client_names + [c for _a, c in gen_names]
 
-        # The chunk pipeline is scheduled (`chunk_pipeline.py`, 18 unit tests) but not
-        # driven from here, and the reason is a gap the schedule cannot close on its own.
+        # The chunk pipeline is driven by per-chunk completion signalling
+        # (`chunk_notify.py`), not by a driver barrier. The difference matters:
         #
-        # A single shared wave counter does not express the dependency. Each client's
-        # wave list is derived from *its own* plan, so a designate that owns fewer chunks
-        # than a follower expects runs out of upstream work while followers are still
-        # peer-reading chunks it was supposed to be filling -- the counter advances for
-        # everyone regardless. Three cluster runs failed on this, each time with the
-        # coordinate judge catching bytes that a peer read before its designate had
-        # them: the ordering looks right per client and is wrong globally.
+        # A shared wave counter cannot express this dependency. Each client's wave list
+        # comes from *its own* plan, so a designate with fewer chunks than a follower
+        # expects runs out of upstream work while followers are still peer-reading chunks
+        # it was supposed to be filling -- the counter advances for everyone regardless.
+        # Three cluster runs failed that way, each caught by the coordinate judge: the
+        # ordering looks right per client and is wrong globally.
         #
-        # Closing it needs the designate's progress to gate the follower's wave, not a
-        # shared index -- i.e. per-chunk completion signalling between rollout actors,
-        # which is `GroupCompletionTracker` plus a notification channel these actors do
-        # not have. That is the next piece of work, not something to approximate here.
+        # A driver barrier per wave would be correct but self-defeating: it is global, so
+        # every client waits for the slowest at every chunk. That is what made the
+        # two-phase version cost more than not diffusing at all.
         #
-        # So the harness runs the two-phase arrangement, which is correct and measured:
-        # 16/16 clients at 399/399, slower than no diffusion but not wrong.
-        ray.get(
+        # So the gate is per-chunk and per-source, carried over NIXL notifications
+        # designate -> follower. One call per actor, no barrier in between.
+        results = ray.get(
             [
-                g.pull_from_ps.remote(source_agent_names, source_client_names, phase="upstream")
-                for g in gen_actors
-            ]
-        )
-        upstream_done = time.time()
-        print(f"[PASS] gen upstream pull done. time: {upstream_done - start_time}s")
-        ray.get(
-            [
-                g.pull_from_ps.remote(all_agent_names, all_client_names, phase="peer")
+                g.pull_pipelined.remote(all_agent_names, all_client_names)
                 for g in gen_actors
             ]
         )
         end_time = time.time()
-        print(f"[PASS] gen peer pull done. time: {end_time - upstream_done}s")
+        total_published = sum(r["published"] for r in results)
+        total_waits = sum(r["waited_on"] for r in results)
+        print(
+            f"[PASS] gen pipelined pull done. time: {end_time - start_time}s "
+            f"({total_published} notifs published, {total_waits} source-waits across "
+            f"{len(results)} clients)"
+        )
+        # A run where nobody waited is a run with no pipeline in it -- the two-phase
+        # fallback and a broken channel both look like this, so it must not pass quietly.
+        # With diffusion enabled, a run where nobody waited has no pipeline in it -- the
+        # two-phase fallback and a broken channel both look like this, so it must not
+        # pass quietly. With diffusion disabled there is deliberately nothing to wait on,
+        # and the plan says so, so the assertion follows the plan rather than a constant.
+        diffusion_planned = cfg.nixl.get("peer_diffusion", True)
+        if diffusion_planned:
+            assert total_waits > 0, (
+                "no client waited on a peer chunk: diffusion was planned but the pipeline "
+                "did not run"
+            )
+        else:
+            assert total_waits == 0, (
+                f"{total_waits} peer-chunk waits with diffusion disabled: a staged shard "
+                f"has no remote descriptor, so these reads cannot be valid"
+            )
+        assert total_published == total_waits, (
+            f"notification graph is asymmetric: {total_published} published against "
+            f"{total_waits} waited on"
+        )
         print(f"[PASS] gen pull from {label} done. time: {end_time - start_time}s")
+
+        # Baseline in the *same* run: every client reads everything upstream, no
+        # diffusion and no pipeline. Comparing against a number from an earlier run is
+        # not comparing like with like -- cluster state, model load order and NIC
+        # contention all move between runs, and the pipeline's whole claim is a
+        # difference of a few seconds. Measuring both here makes the difference
+        # attributable to the code rather than to the day.
+        #
+        # Runs second so it cannot be credited with warming anything the pipeline then
+        # benefits from. It rereads bytes already in place, which is wasteful but
+        # harmless: the same shards, from the same sources, into the same buffers.
+        if os.environ.get("PSRL_E2E_BASELINE", "1") == "1":
+            baseline_start = time.time()
+            ray.get(
+                [
+                    g.pull_from_ps.remote(source_agent_names, source_client_names, phase="all")
+                    for g in gen_actors
+                ]
+            )
+            baseline_end = time.time()
+            pipelined_seconds = end_time - start_time
+            baseline_seconds = baseline_end - baseline_start
+            print(
+                f"[MEASURE] pipelined {pipelined_seconds:.3f}s vs no-diffusion baseline "
+                f"{baseline_seconds:.3f}s "
+                f"(ratio {pipelined_seconds / baseline_seconds:.3f})"
+            )
     else:
         futures = []
         for g in gen_actors:
@@ -1316,6 +1629,61 @@ def test_nixl_e2e(cfg: DictConfig):
         )
         print(f"[PASS] Gen client {gen_idx}: {judged}/{total} keys match their coordinates.")
     print("[PASS] All GenClientActor parameters match the coordinate function.")
+
+    # Second round: a new version must actually arrive (item D4).
+    #
+    # One round cannot distinguish "the transfer works" from "the transfer worked once".
+    # The failure this guards is silent: a steady-state switch-back that re-reads the
+    # checkpoint, or a rollout that keeps serving a cached version, both produce *valid*
+    # weights -- merely the wrong ones -- so nothing raises and the only visible symptom
+    # is a loss curve that stops moving.
+    #
+    # The train side refills at a shifted coordinate base, which is what makes round two
+    # a real test: re-filling at the same base would reproduce identical bytes, and a
+    # rollout that received nothing would pass exactly as one that received the update.
+    if cfg.test.get("rounds", 1) > 1:
+        print("[ROUND 2] Advancing the train-side version...")
+        version_shift = 1_000_000
+        per_rank_offsets_v2 = ray.get(
+            [t.advance_version.remote(version_shift) for t in train_actors]
+        )
+        coord_offsets_v2: dict[str, int] = {}
+        for rank_offsets in per_rank_offsets_v2:
+            coord_offsets_v2.update(rank_offsets)
+
+        # The shift must have changed something, or the round proves nothing.
+        assert coord_offsets_v2 != coord_offsets, (
+            "advancing the version left the coordinate offsets unchanged, so round two "
+            "cannot tell a fresh pull from a stale one"
+        )
+
+        round2_start = time.time()
+        if direct_supply:
+            ray.get(
+                [
+                    g.pull_pipelined.remote(all_agent_names, all_client_names)
+                    for g in gen_actors
+                ]
+            )
+        else:
+            ray.get(
+                [
+                    g.pull_from_ps.remote(source_agent_names, source_client_names)
+                    for g in gen_actors
+                ]
+            )
+        print(f"[PASS] round 2 pull done. time: {time.time() - round2_start}s")
+
+        gen_state_dicts_v2 = ray.get([g.get_state_dict.remote() for g in gen_actors])
+        for gen_idx, state_dict in enumerate(gen_state_dicts_v2):
+            judged, total = assert_state_dict_matches_coords(
+                state_dict, coord_offsets_v2, f"Gen client {gen_idx} (round 2)"
+            )
+            print(
+                f"[PASS] Gen client {gen_idx}: {judged}/{total} keys match the "
+                f"*new* version's coordinates."
+            )
+        print("[PASS] Round 2: every rollout picked up the new version, not a cached one.")
 
     # Shutdown all actors and Ray
     for t in train_actors:

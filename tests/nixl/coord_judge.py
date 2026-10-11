@@ -180,15 +180,21 @@ def fill_state_dict_by_coord(
     state_dict: dict[str, torch.Tensor],
     *,
     strict: bool = True,
+    base: int = 0,
 ) -> dict[str, int]:
     """Fill every tensor in a state dict, giving each key a disjoint coordinate range.
 
     Returns the per-key global offsets, which the matching assertion needs. Disjoint
     ranges are what make a *cross-key* mix-up detectable -- two keys filled from zero
     would be interchangeable.
+
+    ``base`` shifts every coordinate, which is how a second version is made genuinely
+    different from the first. Without it a re-fill produces identical bytes, and a reader
+    that received nothing at all would be indistinguishable from one that received the
+    new version -- the exact confusion a steady-state switch-back test has to avoid.
     """
     offsets: dict[str, int] = {}
-    cursor = 0
+    cursor = base
     for key in sorted(state_dict):
         tensor = state_dict[key]
         offsets[key] = cursor

@@ -1,0 +1,155 @@
+"""The four-dimensional configuration matrix and its CI tiers (implementation item T4).
+
+The design does not run a full Cartesian product -- backend x precision x placement x
+parallelism is hundreds of combinations and most add no information. It names three tiers
+by risk, and the value of writing them down is that "which configurations are covered" is
+otherwise a question nobody can answer without reading every YAML.
+
+These tests check the matrix against the configs that exist, so a tier entry with no
+runnable config fails here rather than being discovered when someone tries to run CI.
+They deliberately do *not* run the configurations: that is a multi-node job measured in
+tens of minutes, and its result is recorded in the implementation checklist.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+from omegaconf import OmegaConf
+
+pytestmark = pytest.mark.cpu_test
+
+CONFIG_DIR = Path(__file__).resolve().parent / "config"
+
+
+@dataclass(frozen=True)
+class Combination:
+    """One cell of the matrix, as the design names it."""
+
+    backend: str
+    train_dtype: str
+    rollout_dtype: str
+    placement: str
+    tier: str
+    #: Config file implementing it, or None when it is not yet runnable.
+    config: str | None
+    why: str = ""
+
+
+#: Every cell the design lists, with the config that realises it.
+#:
+#: `config=None` is a deliberate record of a gap rather than an omission: the FP8 cells
+#: need the cast path (A9 is verified at unit level but not wired into the harness), and
+#: the FSDP2 cells need an FSDP2 e2e config. Writing them down keeps the matrix honest
+#: about what is *not* covered.
+MATRIX: tuple[Combination, ...] = (
+    Combination(
+        "megatron", "bf16", "fp8", "disaggregate", "every-ci",
+        None, "cast path not wired into the harness (A9 is unit-verified only)",
+    ),
+    Combination(
+        "fsdp2", "fp32", "bf16", "disaggregate", "every-ci",
+        None, "no FSDP2 e2e config yet; converter is verified under torchrun",
+    ),
+    Combination(
+        "megatron", "bf16", "bf16", "colocate", "every-ci",
+        "nixl_e2e_colocate.yaml", "timing-exclusion path",
+    ),
+    Combination(
+        "megatron", "bf16", "bf16", "disaggregate", "daily",
+        "nixl_e2e_5node_direct.yaml", "TP mismatch exercises shard algebra",
+    ),
+    Combination(
+        "fsdp2", "bf16", "bf16", "disaggregate", "daily",
+        None, "the cell that makes the version barrier (E1) mandatory",
+    ),
+    Combination(
+        "megatron", "fp8", "fp8", "colocate", "daily",
+        None, "FP8-native; needs TE fp8_param plus the cast path",
+    ),
+)
+
+
+def _load(name: str):
+    return OmegaConf.load(CONFIG_DIR / name)
+
+
+class TestEveryNamedConfigExists:
+    @pytest.mark.parametrize(
+        "combination", [c for c in MATRIX if c.config], ids=lambda c: c.config
+    )
+    def test_the_config_file_is_present(self, combination: Combination):
+        assert (CONFIG_DIR / combination.config).is_file()
+
+    @pytest.mark.parametrize(
+        "combination", [c for c in MATRIX if c.config], ids=lambda c: c.config
+    )
+    def test_the_config_matches_the_cell_it_claims(self, combination: Combination):
+        """A config drifting from its matrix row would silently change what CI covers."""
+        cfg = _load(combination.config)
+
+        assert cfg.test.train_engine_type == combination.backend
+        assert cfg.model.train_dtype.startswith(combination.train_dtype[:2])
+        assert cfg.model.gen_dtype.startswith(combination.rollout_dtype[:2])
+        is_colocate = bool(cfg.test.get("colocate", False))
+        assert is_colocate == (combination.placement == "colocate")
+
+
+class TestGapsAreRecordedNotHidden:
+    def test_every_uncovered_cell_says_why(self):
+        """An empty config slot must carry its reason, or it reads as an oversight."""
+        for combination in MATRIX:
+            if combination.config is None:
+                assert combination.why, f"{combination} has no config and no reason"
+
+    def test_the_colocate_cell_is_covered(self):
+        """T3's output: the timing-exclusion path is the one every-ci cell that runs."""
+        colocate = [c for c in MATRIX if c.placement == "colocate" and c.tier == "every-ci"]
+
+        assert colocate and all(c.config for c in colocate)
+
+    def test_at_least_one_cell_per_placement_is_runnable(self):
+        """Both placements must be exercisable, or §3.7's conclusions stay untested."""
+        for placement in ("disaggregate", "colocate"):
+            runnable = [c for c in MATRIX if c.placement == placement and c.config]
+            assert runnable, f"no runnable config for {placement}"
+
+
+class TestTiersArePartitioned:
+    def test_every_cell_has_a_known_tier(self):
+        for combination in MATRIX:
+            assert combination.tier in ("every-ci", "daily", "pre-release")
+
+    def test_the_every_ci_tier_stays_small(self):
+        """It runs on every change, so growth here is a direct cost on iteration speed."""
+        every_ci = [c for c in MATRIX if c.tier == "every-ci"]
+
+        assert len(every_ci) <= 4, (
+            f"{len(every_ci)} configurations in the per-change tier; the design names "
+            f"three, and each one is a multi-node run"
+        )
+
+
+class TestTheTwoDisaggregateConfigsDifferByOneThing:
+    """The PS and direct-supply configs must stay comparable.
+
+    They exist to be diffed: if they differed in more than the supply mode, a performance
+    difference between them could not be attributed.
+    """
+
+    def test_they_differ_only_in_supply_related_keys(self):
+        ps = OmegaConf.to_container(_load("nixl_e2e_5node.yaml"), resolve=False)
+        direct = OmegaConf.to_container(_load("nixl_e2e_5node_direct.yaml"), resolve=False)
+
+        differing = {
+            key
+            for key in set(ps["test"]) | set(direct["test"])
+            if ps["test"].get(key) != direct["test"].get(key)
+        }
+
+        assert differing <= {"direct_supply"}, (
+            f"the two configs differ in {sorted(differing)}; a measured difference "
+            f"between them could not be attributed to the supply mode alone"
+        )

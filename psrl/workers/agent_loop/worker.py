@@ -374,7 +374,11 @@ class PSRL_AgentLoopWorker:
         """
         assert len(batch) == 1, "Only support single request for generation"
 
-        agent_name = "mini_swe_claude_code"
+        # The configured loop, not a hardcoded one. A fixed name here silently ignores
+        # `rollout.agent.default_agent_loop`, so any run whose dataset or recipe wants a
+        # different loop fails with "Unregistered agent loop" naming a loop the caller
+        # never asked for -- which reads as a registration bug rather than a config one.
+        agent_name = self.config.gen_actor_rollout_ref.rollout.agent.default_agent_loop
         task = asyncio.create_task(self._run_agent_loop(agent_name, batch))
         task.add_done_callback(self._create_task_done_callback(task))
         self.agent_programs.add(task)

@@ -175,6 +175,14 @@ class TestPeerDescriptorsAreIncluded:
         def __init__(self, peer_pull_plan):
             self.peer_pull_plan = peer_pull_plan
 
+        def followers_of(self, designate):
+            return {
+                follower
+                for follower, per_key in self.peer_pull_plan.items()
+                for per_peer in per_key.values()
+                if designate in per_peer
+            }
+
     def test_a_named_peer_is_included(self):
         clients = {**DIRECT, "gen1": NIXLClientType.PULL_SIDE}
         plan = self._Plan({"gen1": {"w": {"gen0": [(0,)]}}})
@@ -201,10 +209,34 @@ class TestPeerDescriptorsAreIncluded:
 
         assert "gen0" not in server.relevant_for("agent_gen1")
 
-    def test_a_designate_does_not_gain_its_followers(self):
-        """Diffusion is one-directional: the designate reads upstream only."""
+    def test_a_designate_gains_its_followers(self):
+        """Diffusion is one-directional for *data* and the other way for *signalling*.
+
+        Bytes move follower <- designate, but per-chunk completion notifications move
+        designate -> follower, so the designate must be able to address clients it never
+        reads from. Granting only the read direction made the designate fail on its own
+        publish with "Target client ... not found in client infos" -- on the client whose
+        reads were all satisfiable, which is a misleading place to look.
+        """
         clients = {**DIRECT, "gen1": NIXLClientType.PULL_SIDE}
         plan = self._Plan({"gen1": {"w": {"gen0": [(0,)]}}})
         server = _Server(clients, comm_plan=plan)
 
-        assert "gen1" not in server.relevant_for("agent_gen0")
+        assert "gen1" in server.relevant_for("agent_gen0")
+
+    def test_the_fan_out_stays_scoped_in_both_directions(self):
+        """Adding the notification direction must not widen this to every rollout."""
+        clients = {
+            **DIRECT,
+            "gen1": NIXLClientType.PULL_SIDE,
+            "gen2": NIXLClientType.PULL_SIDE,
+            "gen3": NIXLClientType.PULL_SIDE,
+        }
+        # gen0 serves gen1 only; gen2 and gen3 are unrelated to it.
+        plan = self._Plan({"gen1": {"w": {"gen0": [(0,)]}}, "gen3": {"w": {"gen2": [(0,)]}}})
+        server = _Server(clients, comm_plan=plan)
+
+        relevant = server.relevant_for("agent_gen0")
+        assert "gen1" in relevant
+        assert "gen2" not in relevant
+        assert "gen3" not in relevant

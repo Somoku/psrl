@@ -1,0 +1,53 @@
+{
+  "gpu": "NVIDIA H20",
+  "sweep": [
+    {
+      "regions": 1,
+      "full_md_bytes": 2139,
+      "conn_only_bytes": 1640,
+      "one_region_bytes": 603,
+      "bytes_per_region": 499.0,
+      "conn_only_compression": 1.3042682926829268
+    },
+    {
+      "regions": 16,
+      "full_md_bytes": 8487,
+      "conn_only_bytes": 1643,
+      "one_region_bytes": 604,
+      "bytes_per_region": 427.75,
+      "conn_only_compression": 5.165550821667681
+    },
+    {
+      "regions": 256,
+      "full_md_bytes": 110008,
+      "conn_only_bytes": 1644,
+      "one_region_bytes": 605,
+      "bytes_per_region": 423.296875,
+      "conn_only_compression": 66.91484184914842
+    },
+    {
+      "regions": 1024,
+      "full_md_bytes": 434873,
+      "conn_only_bytes": 1645,
+      "one_region_bytes": 606,
+      "bytes_per_region": 423.07421875,
+      "conn_only_compression": 264.3604863221884
+    },
+    {
+      "regions": 4096,
+      "full_md_bytes": 1734329,
+      "conn_only_bytes": 1645,
+      "one_region_bytes": 606,
+      "bytes_per_region": 423.0185546875,
+      "conn_only_compression": 1054.3033434650456
+    }
+  ],
+  "verdict": {
+    "conn_only_is_constant": true,
+    "conn_only_range_bytes": [
+      1640,
+      1645
+    ],
+    "max_compression": 1054.3033434650456
+  }
+}

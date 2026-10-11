@@ -268,3 +268,49 @@ class TestStridedAndGradTargets:
 
         assert base.data.narrow(1, 0, 64).ne(0).any(), "fill did not reach the base buffer"
         assert base.data.narrow(1, 64, 32).eq(0).all(), "fill spilled outside the view"
+
+
+class TestVersionShiftMakesASecondRoundMeaningful:
+    """A second transfer round is only a test if round two's bytes differ (item D4).
+
+    Re-filling at the same base reproduces identical tensors, so a rollout that received
+    nothing would pass exactly as one that received the update. Both failure modes a
+    steady-state switch-back can have -- re-reading the checkpoint, or serving a cached
+    version -- yield *valid* weights, so the judge has to be what distinguishes them.
+    """
+
+    def test_a_shifted_base_changes_the_bytes(self):
+        state_dict = {"w": torch.zeros(8, 8)}
+        fill_state_dict_by_coord(state_dict, strict=False)
+        first = state_dict["w"].clone()
+
+        fill_state_dict_by_coord(state_dict, strict=False, base=1_000)
+
+        assert not torch.equal(first, state_dict["w"])
+
+    def test_a_shifted_base_changes_the_offsets(self):
+        state_dict = {"a": torch.zeros(4), "b": torch.zeros(4)}
+
+        first = fill_state_dict_by_coord(state_dict, strict=False)
+        second = fill_state_dict_by_coord(state_dict, strict=False, base=1_000)
+
+        assert first != second
+
+    def test_the_previous_version_fails_the_new_judge(self):
+        """The property that makes round two meaningful: stale weights are rejected."""
+        state_dict = {"w": torch.zeros(8, 8)}
+        fill_state_dict_by_coord(state_dict, strict=False)
+        stale = state_dict["w"].clone()
+        new_offsets = fill_state_dict_by_coord(state_dict, strict=False, base=1_000)
+
+        with pytest.raises(AssertionError):
+            assert_state_dict_matches_coord({"w": stale}, new_offsets, strict=False)
+
+    def test_keys_stay_disjoint_under_a_shift(self):
+        """The shift must not collapse two keys onto one range."""
+        state_dict = {"a": torch.zeros(4), "b": torch.zeros(4)}
+
+        offsets = fill_state_dict_by_coord(state_dict, strict=False, base=500)
+
+        assert offsets["a"] != offsets["b"]
+        assert min(offsets.values()) >= 500

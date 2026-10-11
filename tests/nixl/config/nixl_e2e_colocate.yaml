@@ -1,0 +1,100 @@
+# @package _global_
+#
+# Colocate variant: train and gen share the same GPUs (implementation item T3).
+#
+# Every conclusion in design 3.7 is about this arrangement, and the harness could not
+# express it: with `num_gpus=1` per actor Ray guarantees train and gen never land on the
+# same device, so the timing-exclusion path was unreachable by construction. Here each
+# actor asks for half a GPU and both sets are placed on the same nodes, which puts one
+# train rank and one gen rank on each card.
+#
+# The halved request is a scheduling statement, not a memory split -- each actor still
+# sees the whole device. That is precisely the colocate situation the design addresses:
+# two processes on one GPU, which is why the trainer must offload before rollout
+# allocates its KV cache rather than expecting both to fit at once.
+#
+# 8 train + 8 gen on one node, so this runs where the 5-node configs cannot.
+defaults:
+  - _self_
+
+test:
+  num_train: 8
+  num_gen: 8
+  train_engine_type: megatron
+
+  # Train and gen on the same GPUs.
+  colocate: true
+  # Two transfer rounds, with the train side advancing its version in between (item D4).
+  # One round shows the transfer works; it cannot show that a *second* version arrives,
+  # which is the property a steady-state switch-back depends on. Both failure modes there
+  # -- re-reading the checkpoint, or serving a cached version -- produce valid weights and
+  # raise nothing.
+  rounds: 2
+  # Direct supply, so there is no PS competing for the same memory. Colocate plus a PS
+  # would put three consumers on one card and confuse what the measurement is about.
+  direct_supply: true
+
+  fsdp_hybrid:
+    ddp_size: 2
+    fsdp_size: 4
+
+  megatron:
+    # TP=2 against gen TP=2: the input dimension matches, so row-parallel weights need no
+    # LCM re-shard and stay contiguous. That keeps descriptor counts low enough that the
+    # measurement reflects colocate itself rather than the strided-shard cost.
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+
+  gen:
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
+    # The card is shared with a train rank holding its parameters, so vLLM cannot have
+    # its usual >0.9 of total memory -- it checks free memory at startup and refuses.
+    # Measured: a Qwen3-8B train rank holds ~25 GiB of a 95 GiB card, leaving ~70 GiB,
+    # so 0.5 leaves headroom for the trainer to grow during a step.
+    #
+    # This is the design's colocate memory account appearing as a config value. The real
+    # system reclaims the trainer's share by offloading before rollout wakes; this
+    # harness has no switch, so both sides coexist and each gets half.
+    gpu_memory_utilization: 0.5
+
+model:
+  path: ${oc.env:PSRL_WORKSPACE}/models/Qwen3-8B
+  trust_remote_code: false
+  # Same precision both sides: the configuration that needs the version barrier (E1) in
+  # disaggregate, and that colocate makes safe for free via timing exclusion.
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
+
+logging:
+  path: ${oc.env:PSRL_WORKSPACE}/psrl/unit_tests/nixl/log_colocate
+  level: INFO
+
+network:
+  listen_ip: ${oc.env:LOCAL_IP}
+  listen_port: 23462
+  torch_port_train: 29506
+  torch_port_gen: 29507
+  backend: nccl
+
+nixl:
+  server_mode: meta_server
+  server_ip: ${network.listen_ip}
+  server_port: ${network.listen_port}
+  max_pinned_temp_memory_slots: 4
+  enable_tms_for_temp_buffers: False
+  # Rollouts are pure destinations here as well, so a row-parallel shard may be staged
+  # contiguously instead of registering one descriptor per row.
+  shards_must_be_readable: False
+  # Diffusion needs readable shards, which staging precludes; and with train and gen on
+  # the same card there is no NIC hop to save in the first place.
+  peer_diffusion: False
+
+ps:
+  mode: nixl_cpu

@@ -1,0 +1,48 @@
+{
+  "gpu": "NVIDIA H20",
+  "us_per_descriptor": 2.1,
+  "repeats": 10,
+  "shapes": [
+    {
+      "shape": "o_proj  cell",
+      "rows": 4096,
+      "cell_cols": 1024,
+      "payload_mib": 8.0,
+      "scatter_ms": 0.022679567337036133,
+      "contiguous_copy_ms": 0.01214444637298584,
+      "strided_penalty": 1.8674846625766872,
+      "scatter_gbps": 369.87513365395006,
+      "descriptor_ms_if_strided_rdma": 8.601600000000001,
+      "speedup_vs_descriptors": 379.26649446938245
+    },
+    {
+      "shape": "down_proj cell",
+      "rows": 4096,
+      "cell_cols": 3072,
+      "payload_mib": 24.0,
+      "scatter_ms": 0.05801394581794739,
+      "contiguous_copy_ms": 0.02347491681575775,
+      "strided_penalty": 2.471316353249226,
+      "scatter_gbps": 433.7892147342031,
+      "descriptor_ms_if_strided_rdma": 8.601600000000001,
+      "speedup_vs_descriptors": 148.26779800485457
+    },
+    {
+      "shape": "o_proj  70B",
+      "rows": 8192,
+      "cell_cols": 2048,
+      "payload_mib": 32.0,
+      "scatter_ms": 0.07829256355762482,
+      "contiguous_copy_ms": 0.030374154448509216,
+      "strided_penalty": 2.5776047096338996,
+      "scatter_gbps": 428.57751075302696,
+      "descriptor_ms_if_strided_rdma": 17.203200000000002,
+      "speedup_vs_descriptors": 219.72968080599532
+    }
+  ],
+  "verdict": {
+    "worst_speedup_vs_descriptors": 148.26779800485457,
+    "gate_margin": 10.0,
+    "p2_is_worth_building": true
+  }
+}

@@ -117,6 +117,10 @@ heterogeneous_rollout:
 # per node in `agent.node_ips`, and every agent loop worker places its sandboxes through
 # them. A node agent owns its node's Docker daemon and its capacity envelope, so `capacity.*`
 # is enforced where the containers actually run.
+#
+# The spans below are how fast this fleet notices a node or an owner has gone away. They are
+# the mechanism's own defaults, not episode deadlines: a sandbox's lifetime is stated on its
+# create, and a queue wait is answered by admission rather than by a deadline here.
 sandbox_placement:
 
   # Off uses the local backend each worker already runs. On, the fleet is `agent.node_ips`

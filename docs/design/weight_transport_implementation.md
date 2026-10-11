@@ -1782,7 +1782,7 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       `test_chunk_availability.py` 21 passed
 
 ### 阶段 E
-- [ ] **E1 模块已落地并单测通过（13 passed），接线待 FSDP2 bf16 同精度配置**：
+- [ ] **E1 模块已落地并单测通过（13 passed），判据所需的 FSDP2 同精度配置已跑通，接线待做**：
       `psrl/workers/ps/version_barrier.py`。
       发布前按预算等待 v 的在飞读者归零；**超限即发布并把 v 标记 INVALID**，
       读者改拉 v+1（更新的权重，算法上是改善）——
@@ -1790,8 +1790,13 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       `requires_version_barrier` 把「谁需要」写成配置的函数：
       FSDP2 同精度 **必需**（无 master params，整个 optimizer step 都在写），
       Megatron 同精度是优化，**cast 路径与 colocate 恒为不需要**（结构上无共享内存）。
-      **仍待做**：接到发布路径，并跑「关掉后观测到权重破坏」的 L2 判据
-      —— 需要 FSDP2 + bf16 + bf16 + disaggregate 配置。
+      **前置已就绪**：`nixl_e2e_5node_fsdp2.yaml` 已端到端跑通
+      （FSDP2 + bf16+bf16 + disaggregate，8/8 client × 399/399 keys，拉取 2.91s），
+      这正是 `requires_version_barrier` 返回 True 的那一格。
+
+      **仍待做**：接到发布路径，并跑「关掉后观测到权重破坏」的 L2 判据。
+      当前 barrier 无生产输入 —— `HolderIndex.total_in_flight` 只被测试构造，
+      生产的在飞读计数在 `NIXLStorageClient` 的 xfer handle 侧，需要把它接上。
 - [x] **E2 已落地并验证**：`psrl/utils/nixl/staleness.py`，`test_staleness.py` 13 passed。
       两种陈旧的恢复路径**互为无效**，这正是必须分开的理由：
       descriptor 陈旧时换源只是把错地址带到新 peer；版本陈旧时重取 descriptor
@@ -1873,7 +1878,7 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       **顺带验证了 descriptor 规划的 §2.3**：TP 匹配（train TP=2 == gen TP=2）时
       输入维无需 LCM 重分片，**最差分片仅 4 行**（对比不匹配时的 4096 行），
       原地提交成本 0.9ms。
-- [ ] **T4 矩阵与 CI 分档已显式化并自检（10 passed），两格待实现**：
+- [ ] **T4 矩阵与 CI 分档已显式化并自检（16 passed），FSDP2 格已补齐，余一格待 cast 路径**：
       `tests/nixl/test_config_matrix.py`。
       把「哪些组合被覆盖」从「读遍所有 YAML 才知道」变成一张可断言的表：
       每个 cell 要么指向一个真实配置并与之对账（后端/精度/放置必须一致），
@@ -1885,7 +1890,7 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       | 每次 CI | megatron + bf16+**fp8** + disaggregate | ⏳ cast 路径未接入 harness（A9 仅单测级） |
       | 每次 CI | **fsdp2** + fp32+bf16 + disaggregate | ⏳ 无 FSDP2 e2e 配置 |
       | 每日 | megatron + bf16+bf16 + disaggregate（TP 不匹配） | ✅ `nixl_e2e_5node_direct.yaml` |
-      | 每日 | fsdp2 + bf16+bf16 + disaggregate | ⏳ 正是 E1 版本屏障必需的那一格 |
+      | 每日 | fsdp2 + bf16+bf16 + disaggregate | ✅ `nixl_e2e_5node_fsdp2.yaml`，**8/8 client × 399/399 keys，拉取 2.91s** |
       | 每日 | megatron + fp8+fp8 + colocate | ⏳ 需 TE `fp8_param` + cast 路径 |
 
       另有两条结构性断言：**每次 CI 档不得超过 4 格**（每格都是一次多节点运行，

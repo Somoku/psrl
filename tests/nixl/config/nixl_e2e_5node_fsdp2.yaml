@@ -19,8 +19,10 @@ defaults:
   - _self_
 
 test:
-  num_train: 24
-  num_gen: 16
+  # 16 GPUs across 2 nodes: FSDP2 shards over the whole train world, so its size is
+  # free -- unlike Megatron, whose TP x PP x CP must divide it.
+  num_train: 8
+  num_gen: 8
   train_engine_type: fsdp2
 
   # No PS workers, no push step: the rollout reads the trainer directly.
@@ -42,7 +44,10 @@ test:
     tensor_parallel_size: 2
     pipeline_parallel_size: 1
     expert_parallel_size: 1
-    data_parallel_size: 1
+    # Written out rather than left as 1: 8 gen / (TP=2 x PP=1) = 4, and the validator
+    # only cross-checks this when it is > 1, so leaving the inherited default would mean
+    # nobody checks the arithmetic.
+    data_parallel_size: 4
 
 model:
   # Qwen3-8B: GQA (32 heads / 8 kv heads), the layout that exposed the
@@ -53,7 +58,7 @@ model:
   gen_dtype: bfloat16
 
 logging:
-  path: ${oc.env:PSRL_WORKSPACE}/psrl/unit_tests/nixl/log_5node_fsdp2
+  path: ${oc.env:PSRL_WORKSPACE}/psrl/unit_tests/nixl/log_fsdp2
   level: INFO
 
 network:

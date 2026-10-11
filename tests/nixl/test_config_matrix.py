@@ -191,3 +191,43 @@ class TestEveryMatrixBackendIsOneTheHarnessAccepts:
         accepted = self._harness_backends()
 
         assert "megatron" in accepted
+
+
+class TestTheFsdpAliasIsHandledAtEveryBranch:
+    """`fsdp` and `fsdp2` must move together everywhere, not just where I remembered.
+
+    Adding the alias only to the model-construction branch left `protocol` falling through
+    every `elif`, which surfaced on the cluster as `UnboundLocalError: state_dict` after
+    ~16 minutes of startup. An equality test against the bare string is the shape that
+    misses; a set membership test is the shape that does not.
+    """
+
+    def _harness_source(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parent / "test_nixl_e2e.py").read_text()
+
+    def test_no_branch_tests_the_bare_fsdp_name(self):
+        import re
+
+        offenders = re.findall(
+            r'engine_type == "fsdp"|engine_type != "fsdp"', self._harness_source()
+        )
+
+        assert not offenders, (
+            f'{len(offenders)} branch(es) test `engine_type == "fsdp"`, which excludes the '
+            f'`fsdp2` spelling the config matrix uses; use a set membership test'
+        )
+
+    def test_fsdp2_reaches_the_same_branches_as_fsdp(self):
+        """Every tuple that names `fsdp` must also name `fsdp2`."""
+        import re
+
+        source = self._harness_source()
+        tuples = re.findall(r"engine_type in \(([^)]*)\)", source)
+
+        assert tuples, "found no membership tests to check"
+        for group in tuples:
+            names = set(re.findall(r'"([a-z0-9_]+)"', group))
+            if "fsdp" in names:
+                assert "fsdp2" in names, f"branch {group!r} names fsdp but not fsdp2"

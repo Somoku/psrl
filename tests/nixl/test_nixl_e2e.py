@@ -132,6 +132,14 @@ def validate_parallel_config(cfg: DictConfig) -> None:
         assert num_train % (ddp_size * fsdp_size) == 0, (
             f"HSDP DDP*FSDP does not divide num_train. num_train={num_train!r}, product={ddp_size * fsdp_size!r}."
         )
+    elif train_engine_type in ("fsdp", "fsdp2"):
+        # FSDP2 shards over the whole train world, so num_train needs no divisibility
+        # constraint -- unlike Megatron, whose TP x PP x CP must divide it. The gen-side
+        # DP check above already covers this backend, and applies it the same way it does
+        # for the others: only when `data_parallel_size > 1`, since 1 means "derived".
+        # Asserting unconditionally here rejected the inherited `data_parallel_size: 1`,
+        # which is this file's convention for unset rather than a claim of DP=1.
+        pass
     elif train_engine_type == "megatron":
         megatron = cfg.test.megatron
         train_tp = megatron.tensor_model_parallel_size
@@ -370,6 +378,19 @@ class TrainClientActor:
         for k in sorted(os.environ):
             self.print(f"{k}={os.environ[k]}")
 
+    @property
+    def _is_fsdp_family(self) -> bool:
+        """One predicate for every branch that means "FSDP, any generation".
+
+        `fsdp` and `fsdp2` are the same thing here -- both call `fully_shard`, and FSDP1 is
+        rejected by config validation -- so the two names must move together. Branching on
+        the raw string at each site is how the first attempt missed one: the alias was
+        added to the model-construction branch but not to `protocol`, which then fell
+        through every `elif` and raised `UnboundLocalError: state_dict` on the cluster
+        instead of here.
+        """
+        return self.engine_type in ("fsdp", "fsdp2", "fsdp_hybrid")
+
     def _get_replica_id(self):
         if self.engine_type in ("fsdp", "fsdp2"):
             return 0
@@ -458,7 +479,7 @@ class TrainClientActor:
 
     def protocol(self, model_path):
         self.print("step0: convert_fsdp/megatron_inplace")
-        if self.engine_type == "fsdp" or self.engine_type == "fsdp_hybrid":
+        if self.engine_type in ("fsdp", "fsdp2", "fsdp_hybrid"):
             from transformers import AutoConfig
 
             model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=self.trust_remote_code)

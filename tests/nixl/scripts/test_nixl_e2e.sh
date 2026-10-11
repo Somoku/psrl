@@ -180,3 +180,14 @@ if [ $CASE -eq 8 ]; then
         model.train_dtype=bfloat16 \
         2>&1 | tee test_nixl_e2e.log
 fi
+
+# CASE 9: FSDP2 at matched bf16, direct supply (implementation items T4 and E1).
+# The config is the source of truth for the shape; this case exists so the cell can be
+# run by name. It is the one that makes the version barrier mandatory: FSDP2 has no
+# master parameters, so the whole optimizer step writes what a rollout may be reading.
+if [ $CASE -eq 9 ]; then
+    PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
+        --config-name=nixl_e2e_5node_fsdp2 \
+        model.path=${PSRL_WORKSPACE}/models/Qwen3-8B \
+        2>&1 | tee test_nixl_e2e.log
+fi

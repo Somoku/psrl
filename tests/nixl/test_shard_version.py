@@ -251,8 +251,18 @@ class TestTheStampIsWrittenWhereReadersCanSeeIt:
 
         assert "get_ps_model_version" not in body
 
-    def test_the_trainer_reads_the_version_before_the_handshake(self):
-        """Which is what lets the worker take it as an argument instead."""
+    def test_the_trainer_reads_the_version_before_dispatching_any_handshake(self):
+        """Before the *meta server's* dispatch, not merely before the actor group's.
+
+        `PSManager` is a Ray actor, so its calls serialise. Once `nixl_protocol` is
+        running it sits in `wait_for_client_shardings`, and any later call on that
+        handle queues behind it -- including this version read. The train ranks are in
+        turn waiting on that read before they start their half of the handshake, so the
+        handshake can never complete.
+
+        Measured: zero clients connected in 27 minutes, with all six vLLM replicas up
+        and healthy, which looked exactly like the slow-startup failure it was not.
+        """
         from pathlib import Path
 
         source = (
@@ -260,9 +270,12 @@ class TestTheStampIsWrittenWhereReadersCanSeeIt:
         ).read_text()
 
         read_at = source.index("bootstrap_version = (")
-        protocol_at = source.index('"nixl_protocol", actor_protocol_mode, bootstrap_version')
+        server_dispatch_at = source.index("self.ps_manager_handle.nixl_protocol.remote()")
+        worker_dispatch_at = source.index(
+            '"nixl_protocol", actor_protocol_mode, bootstrap_version'
+        )
 
-        assert read_at < protocol_at
+        assert read_at < server_dispatch_at < worker_dispatch_at
 
     def test_only_direct_supply_stamps(self):
         """With a PS the weights come from it, so a train-rank stamp would claim

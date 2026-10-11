@@ -2238,6 +2238,21 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             actor_protocol_mode = "meta" if self.is_rollout_mode_in_actor else "full"
             rollout_full_tag = "all" if self.is_rollout_mode_in_actor else "rollout"
 
+            # Read the bootstrap version before *any* handshake work is dispatched.
+            #
+            # `PSManager` is a Ray actor, so its calls serialise: once
+            # `nixl_protocol` is running it sits in `wait_for_client_shardings`, and
+            # every later call on that handle queues behind it. Reading the version
+            # after the dispatch below therefore blocks until the handshake finishes --
+            # but the handshake cannot finish, because the train ranks are waiting on
+            # this very `ray.get` before they start their half of it. Measured: zero
+            # clients connected in 27 minutes, with every vLLM replica up and healthy.
+            bootstrap_version = (
+                None
+                if has_ps_data_plane(self.config.psrl.ps_mode)
+                else ray.get(self.ps_manager_handle.get_ps_model_version.remote())
+            )
+
             with log_dual_events("Executing NIXL protocol", psrl_logger, event_type=EventType.INIT):
                 futures = []
                 # The meta server takes part in every NIXL mode: the handshake and the
@@ -2245,15 +2260,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 futures.append(self.ps_manager_handle.nixl_protocol.remote())
                 if has_ps_data_plane(self.config.psrl.ps_mode):
                     futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
-                # Read the version *before* the handshake starts: the train ranks stamp
-                # their already-loaded weights with it from inside the protocol, where
-                # they cannot ask the manager themselves without deadlocking against its
-                # own `wait_for_client_infos`.
-                bootstrap_version = (
-                    None
-                    if has_ps_data_plane(self.config.psrl.ps_mode)
-                    else ray.get(self.ps_manager_handle.get_ps_model_version.remote())
-                )
+                # `bootstrap_version` was read above, before the meta server began
+                # serialising on its own handshake.
                 futures.extend(
                     self.actor_wg.execute_all_async(
                         "nixl_protocol", actor_protocol_mode, bootstrap_version

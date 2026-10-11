@@ -181,6 +181,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.rollout_gateway.tito_debug=false \
     psrl.rollout_gateway.tool_call_parser=qwen_xml \
     \
+    gen_actor_rollout_ref.rollout.agent.sandbox.backends.p3b.endpoint=28.49.198.250:9000 \
+    \
     gen_actor_rollout_ref.rollout.agent.default_agent_loop=mini_swe_claude_code \
     gen_actor_rollout_ref.rollout.agent.traj_reward_mode=traj \
     gen_actor_rollout_ref.rollout.agent.sandbox.default_backend=p3b \

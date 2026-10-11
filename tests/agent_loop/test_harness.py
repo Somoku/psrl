@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -302,10 +303,41 @@ async def test_codex_writes_responses_provider_config_and_uses_session_as_key() 
     assert 'wire_api = "responses"' in codex_config
     assert "requires_openai_auth = false" in codex_config
     assert "supports_websockets = false" in codex_config
+    assert 'model_reasoning_effort = "medium"' in codex_config
+    assert 'model_reasoning_summary = "auto"' in codex_config
+    assert 'model_catalog_json = "/root/.codex/model_catalog.json"' in codex_config
+    assert "enabled = false" in codex_config  # analytics / feedback disabled
+    # Hosted web_search must be off: the gateway rejects its schema and the task
+    # forbids fetching the solution from the web. Must be a top-level key.
+    assert tomllib.loads(codex_config)["web_search"] == "disabled"
     assert harness.build_env(_runtime())["OPENAI_API_KEY"] == "session-1"
     command = harness.build_command("fix", _runtime())
     assert command[0] == "/opt/harness/bin/codex"
     assert command[1:4] == ("exec", "--skip-git-repo-check", "--json")
+
+
+@pytest.mark.asyncio
+async def test_codex_catalog_enables_apply_patch_and_carries_base_instructions() -> None:
+    from psrl.workers.agent_loop.harness.codex import _base_instructions
+
+    sandbox = FakeSandbox()
+    harness = create_harness(
+        HarnessConfig(kind="codex", executable="codex", reasoning_effort="high"),
+        sandbox,
+    )
+
+    await harness.prepare(_runtime())
+
+    catalog = json.loads(sandbox.writes["/root/.codex/model_catalog.json"])
+    assert len(catalog["models"]) == 1
+    entry = catalog["models"][0]
+    assert entry["slug"] == "Qwen/Qwen3"
+    # apply_patch is only exposed when the catalog marks the model freeform.
+    assert entry["apply_patch_tool_type"] == "freeform"
+    assert entry["shell_type"] == "unified_exec"
+    assert entry["default_reasoning_level"] == "high"
+    assert entry["model_messages"]["instructions_template"] == _base_instructions()
+    assert _base_instructions().strip() != ""
 
 
 @pytest.mark.asyncio
@@ -316,8 +348,13 @@ async def test_codex_writes_compaction_threshold_with_context_headroom() -> None
     await harness.prepare(_runtime(10_240, 7_680))
 
     codex_config = sandbox.writes["/root/.codex/config.toml"].decode()
-    assert "model_context_window = 10240" in codex_config
-    assert "model_auto_compact_token_limit = 7680" in codex_config
+    parsed = tomllib.loads(codex_config)
+    # Compaction keys must be top-level, not nested under a preceding table.
+    assert parsed["model_context_window"] == 10240
+    assert parsed["model_auto_compact_token_limit"] == 7680
+    assert parsed["analytics"]["enabled"] is False
+    assert parsed["feedback"]["enabled"] is False
+    assert parsed["model_providers"]["psrl"]["wire_api"] == "responses"
 
 
 @pytest.mark.asyncio

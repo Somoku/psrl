@@ -683,6 +683,34 @@ It expects `data/swe_gym_293/{train,val}.parquet` and their prefetched images
 from [`prepare/README.md`](prepare/README.md) Path C, and it exports
 `SWE_STRICT_NO_TEST_PATCH=1` / `SWE_TEST_PATCH_POLICY_SCOPE=all_tests`.
 
+**Ready-to-run (Megatron, Codex).** `megatron_qwen_4b_swe_codex.sh` is the Codex
+twin of the recipe above: same model and data, `default_agent_loop=mini_swe_codex`,
+and it pins `tito_tool_normalization=none` (Codex resends tool arguments verbatim,
+so it needs no harness-specific canonicalizer) with `tito_debug=true` for the first
+validation pass. Codex runs with thinking enabled and its native `apply_patch`
+tool: the harness adapter writes a static model catalog into the sandbox
+(`apply_patch_tool_type=freeform`, plus the pinned base instructions) and points
+Codex at it with `model_catalog_json`, because Codex only exposes `apply_patch`
+when the model catalog marks the model freeform.
+
+```bash
+# 1. Rebuild the Codex runtime tree at the pinned version (sha256-checked).
+bash examples/mini_swe/prepare/docker_scripts/build_harness_runtimes.sh codex
+
+# 2. Build the Codex parquets (--agent-name mini_swe_codex); see prepare/README.md Path C.
+
+# 3. Launch (staleness defaults to 1).
+bash examples/mini_swe/megatron_qwen_4b_swe_codex.sh
+```
+
+During the first run, confirm:
+
+- SMG logs (`tito_debug=true`) show `mismatch_count==0` and a single trajectory per
+  session — a prefix miss would fork a phantom trajectory per turn.
+- The `--json` trajectory contains `command_execution` items, `apply_patch`
+  custom-tool calls, and `reasoning` items.
+- Reward on `swe_gym_293` validation is comparable to the Claude Code recipe.
+
 **Generic (any model/dataset, FSDP).** Point the trainer at the harness config
 and a parquet whose `agent_name` selects the harness. Harness mode requires TITO
 auto trajectory IDs so sub-agent / compaction branches stay in one session:

@@ -71,6 +71,9 @@
     kind: codex
     executable: codex
     trajectory_format: codex_jsonl
+    # Drives Codex's `model_reasoning_effort` and the catalog's default reasoning
+    # level; the model catalog (written by the adapter) enables `apply_patch`.
+    reasoning_effort: medium
     compaction:
       enabled: true
       compact_percent: 75

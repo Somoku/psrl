@@ -347,6 +347,36 @@ def responses_stream_response(
                     output_index=output_index,
                     item=final_item,
                 )
+            elif item_type == "custom_tool_call":
+                # Custom tools (e.g. Codex apply_patch) carry a free-form `input`
+                # string rather than JSON `arguments`. Codex reads the payload
+                # from the final `output_item.done` item and consumes
+                # `custom_tool_call_input.delta` for streaming input.
+                item = {**final_item, "input": ""}
+                yield response_event(
+                    "response.output_item.added",
+                    output_index=output_index,
+                    item=item,
+                )
+                yield response_event(
+                    "response.custom_tool_call_input.delta",
+                    item_id=item["id"],
+                    call_id=final_item["call_id"],
+                    output_index=output_index,
+                    delta=final_item["input"],
+                )
+                yield response_event(
+                    "response.custom_tool_call_input.done",
+                    item_id=item["id"],
+                    call_id=final_item["call_id"],
+                    output_index=output_index,
+                    input=final_item["input"],
+                )
+                yield response_event(
+                    "response.output_item.done",
+                    output_index=output_index,
+                    item=final_item,
+                )
             else:
                 yield response_event(
                     "response.output_item.added",

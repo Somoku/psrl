@@ -208,6 +208,10 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """
         self.nixl_storage_client.wait_for_update_infos(info_num)
 
+    def pulled_version_set(self) -> set[int]:
+        """Versions the last pull read, for the caller to compare against the announced one."""
+        return set(getattr(self, "pulled_version", set()))
+
     def nixl_pull_model_core(self, ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
         """Pull the model parameters from PS workers via NIXL.
 
@@ -219,6 +223,9 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             self.pull_times = 0
         self.pull_times += 1
         wait_operations = []
+        # Record which versions this pull reads. A set insert per shard, so it stays on;
+        # the atomicity check below is what turns it into an invariant.
+        self.nixl_storage_client.begin_version_observation()
         time_start = time.time()
         for key in self.unified_state_dict:
             for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
@@ -241,6 +248,21 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         self.nixl_storage_client.merge_and_finish_cached_xfer()
         self.cuda_synchronize()
         self.nixl_storage_client.clear_intermediate_cached_data()
+
+        # §3.4 "版本相等性" / atomic group completeness: every shard this pull read must
+        # belong to the same version. More than one means a torn read -- some sources had
+        # republished and some had not -- which otherwise succeeds silently and leaves the
+        # engine serving a model assembled from two versions.
+        #
+        # This does not catch a *uniformly* stale pull, where every source agrees on the
+        # wrong version; the caller compares `pulled_version` against the manager's for
+        # that, since only it knows which version was announced.
+        self.pulled_version = self.nixl_storage_client.observed_versions()
+        assert len(self.pulled_version) <= 1, (
+            f"torn read: pull {self.pull_times} assembled shards from versions "
+            f"{sorted(self.pulled_version)}; the engine would serve a model mixing them"
+        )
+
         time_end = time.time()
         psrl_logger.info(
             f"{self.nixl_storage_client}: NIXL pull model core done ({self.pull_times} times). "

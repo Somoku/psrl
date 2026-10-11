@@ -1279,6 +1279,57 @@ class NIXLStorageClient:
             time.sleep(0.1)
         self._is_connected = True
 
+    def publish_version(self, version: int) -> None:
+        """Stamp every locally registered shard with the version now readable (§3.4).
+
+        O(1) per shard and touches no tensor data -- which is the point. The alternative,
+        hashing content, measured ~61 s for an 8B model against a 1.4 s pull, so it could
+        only run sampled and off by default; a stamp costs 0.06 ms for the same model and
+        does not move when the model or its dtype changes.
+
+        **The stamp only reaches readers through a metadata exchange.** Readers cache
+        remote `NIXLClientInfo` at the handshake (`_ensure_client_info_fetched`) and
+        refresh it only via `wait_for_update_infos`, which production runs on colocate
+        switches rather than every step. So this is useful at points where metadata is
+        about to be distributed -- bootstrap, and a rejoin -- and a *per-step* version
+        check would need a metadata broadcast per step, which costs more than the fault it
+        catches. Measured: stamping after the handshake leaves readers seeing `-1`, which
+        is how this was found.
+        """
+        for tensor_info in self.local_client_info.tensor_infos.values():
+            for meta in tensor_info.shard_meta_infos:
+                if meta is not None:
+                    meta.version = version
+
+    def expect_version(self, version: int | None) -> None:
+        """Declare which version subsequent reads must find at their sources.
+
+        For callers that know `v` up front -- notably peer assignment, which §3.4 names
+        explicitly ("index 指派 peer 时，校验 `version(peer) == v`"). `None` disables the
+        strict check, which is the default: a rollout learns its version *from* the pull,
+        so demanding it beforehand would cost a round trip the design's C2 went out of its
+        way to remove.
+        """
+        self._expected_version = version
+
+    def begin_version_observation(self) -> None:
+        """Start recording which versions the next reads find at their sources.
+
+        The reader's half of the invariant when `v` is not known in advance. Collecting is
+        a set insert per shard, so it stays on; the caller then asks two questions that
+        together cover the same ground as a pre-known expectation:
+
+        * did every shard come from the same version (a torn read, or one stale source,
+          shows up as more than one);
+        * does that version equal the one the manager reports (a *uniformly* stale pull
+          agrees with itself and would otherwise pass).
+        """
+        self._observed_versions: set[int] = set()
+
+    def observed_versions(self) -> set[int]:
+        """Versions seen since `begin_version_observation`, or empty if not recording."""
+        return set(getattr(self, "_observed_versions", set()))
+
     def send_local_sharding(self, sharding_dict: dict[str, NIXLSharding]):
         """
         Send local sharding to the server.
@@ -1560,6 +1611,26 @@ class NIXLStorageClient:
             ), f"Shard {shard_idx} not found in local or remote shards for key {key}"
             local_pos = local_info.sharding.shard_indices.index(shard_idx)
             remote_pos = remote_info.sharding.shard_indices.index(shard_idx)
+
+            # §3.4 "版本相等性": the source must hold the version this reader was told to
+            # pull. Checked here because this is where the remote shard's metadata is
+            # already in hand, so the invariant costs a comparison rather than a round
+            # trip -- which is what lets it stay on rather than being a debug mode.
+            #
+            # A stale shard is the fault a missed publish produces, and without this it is
+            # silent: the read succeeds and returns last version's bytes.
+            remote_version = remote_info.shard_meta_infos[remote_pos].version
+            expected_version = getattr(self, "_expected_version", None)
+            if expected_version is not None:
+                assert remote_version == expected_version, (
+                    f"version mismatch reading {key} shard {shard_idx} from "
+                    f"{target_client}: expected v{expected_version}, source holds "
+                    f"v{remote_version}"
+                    + (" (never published)" if remote_version == -1 else "")
+                )
+            observed = getattr(self, "_observed_versions", None)
+            if observed is not None:
+                observed.add(remote_version)
 
             # For non-contiguous shards, record the running key and shard idx
             is_contiguous, running_key, running_shard_idx = True, None, None

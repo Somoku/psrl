@@ -86,7 +86,7 @@ class PSRL_BaseTrainWorker:
     def init_nixl_client(self):
         pass
 
-    def nixl_protocol(self, mode: str = "full"):
+    def nixl_protocol(self, mode: str = "full", bootstrap_version: int | None = None):
         pass
 
     def nixl_sleep(self, mode: str = "full"):
@@ -327,15 +327,26 @@ class PSRL_BaseTrainWorker:
         """
         self.param_sync_plan.before_push(self.unified_state_dict)
 
+        # Stamp before the barrier, so that by the time rank 0 announces the version
+        # every rank's shards already carry it. Stamping after would leave a window in
+        # which a reader is told v is readable while some rank still reports v-1.
+        next_version = (
+            ray.get(
+                self.train_interface.ps_manager_handle.get_ps_model_version.remote(
+                    debug_info="direct_supply_publish"
+                )
+            )
+            + 1
+        )
+        self.nixl_storage_client.publish_version(next_version)
+
         assert dist.is_initialized(), "Pytorch distributed is not initialized."
         dist.barrier()
 
         if self.worker_rank == 0:
             ps_manager_handle = self.train_interface.ps_manager_handle
-            curr_version = ray.get(
-                ps_manager_handle.get_ps_model_version.remote(debug_info="direct_supply_publish")
-            )
-            next_version = curr_version + 1
+            # The same number every rank stamped above. Re-reading it here would race a
+            # concurrent publish and could announce a version the shards do not carry.
             ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_version))
             # C3: the publication point. The weights are in place (the optimizer step
             # returned before `push_model` was called) and no transfer is outstanding,

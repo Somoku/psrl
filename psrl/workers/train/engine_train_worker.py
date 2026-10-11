@@ -225,12 +225,16 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         else:
             raise NotImplementedError(f"nixl_convert_params does not support strategy '{strategy}'.")
 
-    def nixl_protocol(self, mode: str = "full"):
+    def nixl_protocol(self, mode: str = "full", bootstrap_version: int | None = None):
         """Run the 8-step NIXL server handshake.
 
         Args:
             mode: `full` registers real tensors. `meta` registers only metadata before
                 parameter server weights arrive.
+            bootstrap_version: Version to stamp the already-loaded weights with, for
+                direct supply. The caller supplies it because this runs inside the
+                handshake, where asking the PSManager would deadlock against its own
+                `wait_for_client_infos`.
         """
         meta_only = mode == "meta"
         if self.unified_state_dict is None or self.local_sharding_dict is None:
@@ -245,6 +249,19 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         self.nixl_storage_client.register_local_tensors(
             self.unified_state_dict, unified_sharding_dict, meta_only=meta_only
         )
+        # Stamp between registration and send: `register_local_tensors` is what builds
+        # `local_client_info`, and `send_local_info` is what ships it to peers who then
+        # cache it. Stamping outside this window does nothing useful -- before, there is
+        # no metadata to write into; after, the copy peers hold already says "never
+        # published", and the first pull is rejected as stale against a correct bootstrap.
+        #
+        # The version is passed in rather than read from the PSManager here: this runs
+        # *inside* the handshake, and the manager is simultaneously blocked in
+        # `wait_for_client_infos` waiting for this very rank. A `ray.get` to it deadlocks
+        # until the handshake times out -- measured, not hypothesised.
+        if bootstrap_version is not None and not meta_only:
+            self.nixl_storage_client.publish_version(bootstrap_version)
+
         psrl_logger.info("nixl client protocol step 5: send_local_info")
         self.nixl_storage_client.send_local_info()
         psrl_logger.info("nixl client protocol step 6: wait_for_server_info")

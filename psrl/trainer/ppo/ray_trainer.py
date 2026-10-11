@@ -2245,7 +2245,20 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 futures.append(self.ps_manager_handle.nixl_protocol.remote())
                 if has_ps_data_plane(self.config.psrl.ps_mode):
                     futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
-                futures.extend(self.actor_wg.execute_all_async("nixl_protocol", actor_protocol_mode))
+                # Read the version *before* the handshake starts: the train ranks stamp
+                # their already-loaded weights with it from inside the protocol, where
+                # they cannot ask the manager themselves without deadlocking against its
+                # own `wait_for_client_infos`.
+                bootstrap_version = (
+                    None
+                    if has_ps_data_plane(self.config.psrl.ps_mode)
+                    else ray.get(self.ps_manager_handle.get_ps_model_version.remote())
+                )
+                futures.extend(
+                    self.actor_wg.execute_all_async(
+                        "nixl_protocol", actor_protocol_mode, bootstrap_version
+                    )
+                )
                 futures.append(self.rollout_coordinator.nixl_protocol.remote(rollout_full_tag))
                 ray.get(futures)
 
@@ -2267,6 +2280,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         self.actor_wg.world_size
                     )
                 )
+
             else:
                 psrl_logger.info("Binding PS worker group")
                 ray.get(self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg))

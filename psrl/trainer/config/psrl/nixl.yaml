@@ -11,3 +11,13 @@ max_pinned_temp_memory_slots: 16
 
 # Enable TMS management for NIXL temp buffers
 enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
+
+# Per-shard weight version stamps (3.4 "版本相等性").
+#
+# Direct supply removes the PS as the place to ask "which version is this", so the stamp
+# travels with the shard. The checks are metadata-only -- O(1) per shard, independent of
+# model size, dtype and quantisation -- which is why they are on rather than opt-in:
+# measured 0.06 ms per publish for an 8B model, against ~61 s to hash its contents.
+#
+# They catch stale, torn and misdirected reads. They do not catch bit corruption of
+# correctly-versioned bytes, which the NIC already checksums.

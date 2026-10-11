@@ -425,6 +425,16 @@ class NIXLShardMetaInfo:
     #: field existed -- or by a peer that predates it -- keeps the old, stricter
     #: behaviour of routing through staging.
     is_strided_expressible: bool = False
+    #: Weight version these bytes belong to (§3.4, "版本相等性"). Direct supply deletes
+    #: the PS as the place to ask "which version is this", so the stamp travels with the
+    #: shard instead. `-1` means registered but never published, which is distinct from
+    #: "published at version 0" and has to stay so: at startup every shard is genuinely
+    #: unpublished, and conflating that with v0 would make the first pull unverifiable.
+    #:
+    #: An integer rather than a content hash because the check has to be affordable enough
+    #: to leave on. Hashing an 8B model costs ~61 s against a 1.4 s pull, and it grows
+    #: with model size and dtype; a stamp is O(1) for any model.
+    version: int = -1
 
     def serialize(self) -> tuple:
         """
@@ -432,7 +442,7 @@ class NIXLShardMetaInfo:
 
         Returns:
             tuple: ``(dtype_str, device_str, shape_tuple, stride, is_contiguous,
-            is_strided_expressible)``
+            is_strided_expressible, version)``
         """
         return (
             str(self.dtype),
@@ -441,6 +451,7 @@ class NIXLShardMetaInfo:
             self.stride,
             self.is_contiguous,
             self.is_strided_expressible,
+            self.version,
         )
 
     @staticmethod
@@ -463,6 +474,9 @@ class NIXLShardMetaInfo:
             # Tolerate the 5-element form: a peer on the older layout simply reports no
             # strided capability, which is the safe reading.
             is_strided_expressible=t[5] if len(t) > 5 else False,
+            # Same tolerance as above: a peer on the older layout reports no version,
+            # which reads as "unpublished" and so is never mistaken for a match.
+            version=t[6] if len(t) > 6 else -1,
         )
 
     def can_xfer_to(self, other: "NIXLShardMetaInfo") -> bool:

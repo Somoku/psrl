@@ -1153,7 +1153,48 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             self._last_pulled_model_version = await ps_manager_handle.pull_model_state_dict_nixl.remote(
                 pulled_instance_ids
             )
+            # Only meaningful where the metadata behind it is fresh: see
+            # `_assert_pulled_the_announced_version`. Counted here rather than read off a
+            # worker -- `pull_times` lives on the vLLM worker, across the collective_rpc
+            # boundary, and is not an attribute of this server.
+            self._nixl_pulls_done = getattr(self, "_nixl_pulls_done", 0) + 1
+            if self._nixl_pulls_done == 1:
+                await self._assert_pulled_the_announced_version(self._last_pulled_model_version)
         psrl_logger.info("NIXL pull model done.")
+
+    async def _assert_pulled_the_announced_version(self, announced: int) -> None:
+        """The bytes read must belong to the version the manager just handed out (§3.4).
+
+        The per-shard check inside the pull catches a *torn* read -- shards from different
+        versions. It cannot catch a uniformly stale one, where every source still holds
+        v-1 and therefore agrees with itself. That is exactly what a missed publish
+        produces, and it is the failure mode with no symptom: the pull succeeds, the
+        version counter advances, and the engine serves last step's weights.
+
+        Compared here rather than before the pull because a rollout learns its version
+        *from* the pull; demanding it up front would reintroduce the round trip C2 removed.
+
+        **Scoped to the first pull, and the scope is a real limit, not a convenience.**
+        The version a reader sees lives in cached remote metadata, refreshed only by
+        `wait_for_update_infos` -- which production runs at the handshake and on colocate
+        switches, not every step. Asserting this on later pulls compares against a stamp
+        that predates them and fails on correct runs; making it meaningful per step would
+        need a metadata broadcast per step, which costs more than the fault it catches.
+
+        What that leaves covered is bootstrap: that the weights the rollouts first read
+        are the version the manager says they are. Steady-state staleness is covered
+        instead by the torn-read check inside the pull, which needs no fresh metadata
+        because it only compares shards against each other.
+        """
+        observed = await self.engine.collective_rpc("pulled_version_set")
+        seen = set().union(*observed) if observed else set()
+        # An empty set means nothing was read -- a no-op pull, not a stale one.
+        if not seen or seen == {announced}:
+            return
+        raise AssertionError(
+            f"stale pull: the manager announced v{announced} but the shards read carry "
+            f"{sorted(seen)}; the engine would serve weights from the wrong version"
+        )
 
     async def ray_pull_model(self) -> None:
         assert self.gen_interface.ps_manager_handle is not None, "ray_pull_model requires a PS manager handle"

@@ -55,3 +55,26 @@ shards_must_be_readable: True
 # shard layout (2.93s against 2.59s without it), because it forces the designate onto the
 # per-row descriptor path to save NIC bytes that were not the bottleneck.
 peer_diffusion: True
+
+# Whether publishing waits for readers of the previous version to drain (item E1).
+#
+# `auto` means "decide from the backend and precision"; `validate_config` replaces it and
+# the resolved boolean is what a dumped config shows. Set it to an explicit true/false to
+# override -- which is what the E1 criterion needs, since observing weight corruption by
+# turning the barrier *off* is the only way to show the barrier is doing anything.
+#
+# Needed when publishing overwrites memory a rollout may be reading. Under FSDP2 at
+# matched precision that is the whole optimizer step, because there are no master
+# parameters -- the live weights *are* what gets written. On a cast path the rollout reads
+# a separate quantised buffer, and under colocate rollout is paused for the duration, so
+# both are structurally safe and this stays False.
+await_readers_before_publish: auto
+
+# How long that wait may last, in milliseconds.
+#
+# Bounded on purpose: a budget that can reach a step's duration would delay every publish
+# to close a race that lasts microseconds. Past the budget the publish proceeds and the
+# previous version is marked invalid, which readers detect and answer by re-pulling the
+# newer version -- a strictly better model, so the fallback is an algorithmic improvement
+# rather than a stall.
+conflict_wait_budget_ms: 50.0

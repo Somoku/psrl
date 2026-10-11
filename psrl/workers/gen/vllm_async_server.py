@@ -1041,6 +1041,21 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # `_pull_commit_instance_ids` is set by `pull_model` and consumed here.
         self._pull_commit_deferred = True
         self._pull_commit_instance_ids = None
+
+        # E1: announce the read before it starts, so a publisher about to overwrite these
+        # weights can wait for it. The version reported is the one *being left behind*,
+        # which is what the publisher is about to overwrite; the new version is only
+        # assigned by the pull itself.
+        #
+        # Wrapped in try/finally because a count that never goes back to zero is worse
+        # than no count at all: the publisher would wait out its whole budget on every
+        # publish from then on, forever, with nothing in the logs to say why.
+        ps_manager_handle = self.gen_interface.ps_manager_handle
+        reading_version = int(self.curr_rollout_instance_model_version[data_parallel_rank])
+        # The same `(worker_id, dp_rank)` pair the version commit below uses to name this
+        # reader, so the count and the commit agree on who is reading.
+        reader_id = (self.base_worker_id, data_parallel_rank)
+        await ps_manager_handle.begin_read.remote(reader_id, reading_version)
         try:
             lock = shared_pull_model_context_async(self.gen_interface.ps_manager_handle)
             async with lock:
@@ -1049,6 +1064,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 lock.commit_instance_ids = self._pull_commit_instance_ids
         finally:
             self._pull_commit_deferred = False
+            await ps_manager_handle.end_read.remote(reader_id, reading_version)
 
         # The commit reports the version it assigned, so the steady-state path makes no
         # round trip here. The read remains for the modes that commit no version, rather

@@ -25,6 +25,10 @@ from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceI
 from psrl.workers.ps.broadcast import build_broadcast_plan
 from psrl.workers.ps.ps_worker_group import PSWorkerGroup
 from psrl.workers.ps.request_status_tracker import RequestStatusTracker, _state_locked
+from psrl.workers.ps.version_barrier import (
+    PublishOutcome,
+    VersionBarrier,
+)
 from psrl.workers.ps.staleness_controller import (
     BufferStatus,
     EntryInfo,
@@ -81,9 +85,29 @@ class PSManager(RequestStatusTracker):
         self.val_rollout_n = self.psrl_config.val_rollout_n
 
         self.rollout_instance_tracker: dict[RolloutInstanceId, RolloutInstanceStatus] = {}
+        # In-flight version reads, as `{version: {rollout_instance_id: count}}`.
+        #
+        # E1's barrier has to know how many readers are mid-pull for the version it is
+        # about to overwrite. Only the readers themselves know that, so they report it and
+        # this is where the reports meet the publisher. Counted per instance rather than
+        # as a bare total so a reader that dies mid-pull cannot leave the count stuck
+        # above zero forever -- `end_read` decrements by identity, and `abort_reads`
+        # clears one instance's contribution wholesale.
+        self._inflight_reads: dict[int, dict[RolloutInstanceId, int]] = {}
         # NOTE(lhy): Version zero represents the loaded checkpoint and avoids a `None` check
         # during the initial pull before the first training push.
         self.model_store: ModelStore = ModelStore(version_tag=0)
+
+        # Bound to `self.count_readers`, which reads this actor's own registry -- so the
+        # barrier needs no messaging and cannot go stale relative to it.
+        #
+        # The budget is a fraction of a step rather than a constant: waiting is only ever
+        # cheaper than the corruption it prevents, and a budget comparable to the step
+        # would delay every publish to fix a race that lasts microseconds.
+        self._publish_barrier = VersionBarrier(
+            count_readers=self.count_readers,
+            budget_ms=float(getattr(psrl_config, "conflict_wait_budget_ms", 50.0)),
+        )
 
         self.staleness_inventory: StalenessInventory | None = None
 
@@ -856,6 +880,61 @@ class PSManager(RequestStatusTracker):
 
         return self.rollout_instance_tracker[rollout_instance_id].version_tag
 
+    @_state_locked
+    def begin_read(self, rollout_instance_id: RolloutInstanceId, version: int) -> None:
+        """Record that ``rollout_instance_id`` has started reading ``version``.
+
+        Called before the first transfer of a pull, not per shard: the barrier's unit is
+        "a rollout is mid-pull", because that is the window in which overwriting the
+        parameters corrupts it.
+        """
+        per_version = self._inflight_reads.setdefault(version, {})
+        per_version[rollout_instance_id] = per_version.get(rollout_instance_id, 0) + 1
+
+    @_state_locked
+    def end_read(self, rollout_instance_id: RolloutInstanceId, version: int) -> None:
+        """Record that a read of ``version`` finished.
+
+        Decrements only this instance's count, and only if it has one: a reader that
+        reports an end it never began -- after a restart, say -- must not drive the total
+        negative, which would make the barrier read as satisfied while a real read is
+        still in flight.
+        """
+        per_version = self._inflight_reads.get(version)
+        if not per_version:
+            return
+        remaining = per_version.get(rollout_instance_id, 0) - 1
+        if remaining > 0:
+            per_version[rollout_instance_id] = remaining
+        else:
+            per_version.pop(rollout_instance_id, None)
+        if not per_version:
+            self._inflight_reads.pop(version, None)
+
+    @_state_locked
+    def abort_reads(self, rollout_instance_id: RolloutInstanceId) -> None:
+        """Drop every in-flight read attributed to one rollout instance.
+
+        For a reader that will not report its ends -- killed, restarted, or abandoned by a
+        timeout. Without this the version it was reading never drains and the barrier
+        waits out its whole budget on every publish from then on.
+        """
+        for version in list(self._inflight_reads):
+            per_version = self._inflight_reads[version]
+            per_version.pop(rollout_instance_id, None)
+            if not per_version:
+                self._inflight_reads.pop(version, None)
+
+    def count_readers(self, version: int) -> int:
+        """How many reads of ``version`` are in flight, summed over rollout instances.
+
+        Deliberately not `@_state_locked`: it is polled by the barrier in a tight loop, and
+        a reader trying to *end* its read takes the same lock. Under the lock this would
+        make a finishing reader wait behind a barrier that is waiting for it to finish.
+        A plain dict read of an int is safe here, and the worst case is one poll stale.
+        """
+        return sum(self._inflight_reads.get(version, {}).values())
+
     def get_ps_model_version(self, debug_info: str = None) -> int:
         """Get the current model version."""
         psrl_logger.debug(f"Getting the PS model version. Model store: {self.model_store}. Debug info: {debug_info}.")
@@ -1250,7 +1329,34 @@ class PSManager(RequestStatusTracker):
         """
         Record the version tag of the model state dict pushed to the PS via NIXL.
         The actual model state dict is stored in the PS worker group.
+
+        E1: the previous version is drained before this version becomes current. Under
+        FSDP2 at matched precision the whole optimizer step writes the memory a rollout
+        may be reading, so a reader mid-pull would collect half-updated parameters. Under
+        colocate or on a cast path there is no shared memory to protect and
+        `requires_version_barrier` says so, leaving this a counter check.
         """
+        previous_version = self.model_store.version_tag
+        # The decision was made in `validate_config`, which can see the backend and both
+        # dtypes; this actor receives only `config.psrl` and could not reach them.
+        if self.psrl_config.nixl.get("await_readers_before_publish", False):
+            report = self._publish_barrier.publish(previous_version)
+            if report.outcome is PublishOutcome.INVALIDATED:
+                # Past the budget with readers still live: the previous version's bytes
+                # are being overwritten under them, so it must not be read again. They
+                # find out from `is_invalidated` and re-pull the newer version, which is
+                # a strict improvement rather than a stalled run.
+                psrl_logger.warning(
+                    f"Version {previous_version} invalidated after waiting "
+                    f"{report.waited_ms:.1f}ms with {report.readers_remaining} reader(s) "
+                    f"still in flight."
+                )
+            elif report.outcome is PublishOutcome.DRAINED:
+                psrl_logger.debug(
+                    f"Waited {report.waited_ms:.1f}ms for version {previous_version} "
+                    f"to drain before publishing {version_tag}."
+                )
+
         self.model_store = ModelStore(
             version_tag=version_tag,
         )

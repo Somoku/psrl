@@ -158,6 +158,58 @@ def _validate_nixl_offload_flags(config: DictConfig) -> None:
         )
 
 
+def _resolve_version_barrier(config: DictConfig) -> None:
+    """Decide whether publishing must wait for readers, and record the decision (E1).
+
+    Resolved here because it is the one place that can see all three inputs: the training
+    backend, and both dtypes. `PSManager` receives only `config.psrl`, so it cannot work
+    this out for itself and must be told.
+
+    The answer, from `requires_version_barrier`:
+
+    * **FSDP2 / HSDP at matched dtype: required.** No master parameters, so the whole
+      optimizer step writes the memory a rollout may be reading.
+    * **Megatron at matched dtype: wanted.** Its conflict window is only the write-back
+      instant, but narrow is not zero and the cost when nobody is reading is a counter
+      check.
+    * **A cast path, or colocate: never.** A cast path reads a separate quantised buffer,
+      and colocate pauses rollout for the duration, so neither shares memory with the
+      writer.
+
+    Written into the config rather than returned, so the value a run actually used is
+    visible in a dumped config -- and an explicit `psrl.nixl.await_readers_before_publish`
+    still wins, which is what the "turn it off and watch the weights break" criterion
+    needs.
+    """
+    from psrl.workers.ps.version_barrier import requires_version_barrier
+
+    nixl = config.psrl.nixl
+    decided = nixl.get("await_readers_before_publish", "auto")
+    # An explicit true/false is the operator's call and is left alone. Testing truthiness
+    # would not do: `auto` is a non-empty string and so is true, while an explicit `False`
+    # -- the setting the E1 criterion needs, to observe the corruption it prevents -- is
+    # false and would be silently re-derived.
+    if isinstance(decided, bool):
+        return
+
+    actor = config.actor_rollout_ref.actor
+    megatron = actor.get("megatron") or {}
+    # The training dtype lives under the backend's own block, not on the model, and the
+    # rollout side has no dtype at all -- it is quantised or it is not. So "matched
+    # precision" is: the trainer is not quantising and the rollout is not either. A
+    # rollout that casts reads a separate buffer, which is exactly the case with no shared
+    # memory to protect.
+    train_dtype = str(megatron.get("dtype", "bfloat16"))
+    quantized = bool(config.actor_rollout_ref.rollout.get("quantization"))
+
+    nixl.await_readers_before_publish = requires_version_barrier(
+        backend=str(config.train_actor_rollout_ref.actor.strategy),
+        train_dtype="cast" if quantized else train_dtype,
+        rollout_dtype=train_dtype,
+        colocate=bool(config.psrl.colocate_validate_and_train),
+    )
+
+
 def _validate_nixl_peer_diffusion(config: DictConfig) -> None:
     """Refuse peer diffusion without readable shards.
 
@@ -432,6 +484,7 @@ def validate_config(
         _validate_nixl_offload_flags(config)
         _validate_nixl_lora(config)
         _validate_nixl_peer_diffusion(config)
+        _resolve_version_barrier(config)
         assert not config.psrl.get("lmcache", {}).get("enable_p2p", False), (
             "psrl.lmcache.enable_p2p requires a PS to route through; it cannot be used "
             "with ps_mode=nixl_direct, where rollouts read train ranks directly"
@@ -467,6 +520,7 @@ def validate_config(
         _validate_nixl_offload_flags(config)
         _validate_nixl_lora(config)
         _validate_nixl_peer_diffusion(config)
+        _resolve_version_barrier(config)
         print(f"NOTICE: NIXL is enabled. Actor strategy used is {config.train_actor_rollout_ref.actor.strategy}")
 
     # Check validate mode

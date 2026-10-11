@@ -29,7 +29,12 @@ test_files=${TEST_FILES:-/apdcephfs_zwfy10/share_303541817/yunsonzhang/data/aime
 OUTPUT_DIR=${PSRL_PATH}/output
 mkdir -p "$OUTPUT_DIR"
 
-staleness=${1:-3}
+# `STALENESS` rather than `$1`: the trailing `$@` forwards extra Hydra overrides, and a
+# positional read would consume the first of them *and* leave it in `$@`. It then landed
+# inside `experiment_name`, so `default_local_dir` contained an `=` and Hydra rejected the
+# whole command with "mismatched input '='" -- naming the override, not the script that
+# mangled it.
+staleness=${STALENESS:-3}
 project_name=psrl_example
 experiment_name=GRPO-Qwen3-8B-megatron-direct-staleness_${staleness}
 CKPTS_DIR=${OUTPUT_DIR}/ckpts/"${project_name}"/"${experiment_name}"

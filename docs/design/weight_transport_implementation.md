@@ -1280,6 +1280,25 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       作为**正确性约束**而非调优项固定下来（可读性永远压过行数预算），
       测试 `TestReadabilityOverridesTheRowBudget` 钉住它。
 
+      **补充（CPU 实测量化了这条"结构性"论断）：读源数 = ceil(train_TP / gen_TP)。**
+      在 `test_direct_supply_plan.py::TestTheReadCountAgainstPsIsNowPinned` 里
+      用真实几何构造 24 train rank（TP=4）+ 8 rollout（gen TP=2）测出：
+
+      | | 每 key 读源数 | 总读次数 |
+      |---|---|---|
+      | 直供 TP=4 / gen_TP=1 | **4.00** | 12,768 |
+      | 直供 TP=4 / gen_TP=2 | 2.00 | 6,384 |
+      | 直供 TP=4 / gen_TP=4 | **1.00** | 3,192 |
+      | 有 PS | **1.00** | 3,192 |
+
+      **所以 2.93s vs 1.14s 里有一部分不是直供固有的，而是 TP 配置造成的**：
+      出脚本用 `TP=4 / GEN_TP=1`，每个 key 要跨 4 个 train rank 拼，
+      而 PS worker 一份就是完整 shard。`GEN_TP` 现已可覆盖（默认仍 1），
+      但**它不是免费的**：`GEN_INSTANCES` 会按同一比例缩小（TP=1 → 4 实例，TP=4 → 1），
+      并发度随之下降。因此这是个权衡，不是可以随手改的常数 ——
+      真正的出路仍然是让 gen 侧分片在注册时连续（消除 strided），
+      那样既不增加源数也不牺牲实例数。
+
       **因此结论是：在当前的分片布局下，peer 扩散本身就是净亏的，而且无法靠调度或
       传输参数挽回。** 无扩散基线之所以快（2.0~2.6s），正是因为它的 rollout 是纯目的地、
       可以 staging，用一个 descriptor 搬完一个分片。

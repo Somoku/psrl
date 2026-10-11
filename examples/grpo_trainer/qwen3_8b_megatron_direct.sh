@@ -50,7 +50,14 @@ CP=${CP:-1}
 EP=${EP:-1}
 ETP=${ETP:-1}
 
-GEN_TP=1
+# 1, as in the baseline. Raising this toward `TP` reduces how many train ranks a rollout
+# must gather one key from -- at `GEN_TP == TP` every key comes from a single source, the
+# same as from a PS worker -- but it divides the instance count by the same factor
+# (`GEN_INSTANCES` below), so it is a concurrency trade, not a free win.
+#
+# The read count itself is measured, not assumed:
+# `tests/nixl/test_direct_supply_plan.py::TestTheReadCountAgainstPsIsNowPinned`.
+GEN_TP=${GEN_TP:-1}
 GEN_PP=1
 
 VAL_TP=1

@@ -145,3 +145,127 @@ class TestNoRolloutsIsNotAnError:
         plan = CommunicationPlanner().make_comm_plan(clients)
 
         assert plan.rollout_pull_from_ps_plan == {}
+
+
+class TestTheReadCountAgainstPsIsNowPinned:
+    """Why direct supply loses to a PS on time, as an assertion rather than a note.
+
+    An earlier version of D1 was judged on probe counts (9,576 probes collapsing to 653
+    reads) and that was the wrong metric: probes against an absent shard are cheap --
+    `client_read` returns early on an empty shard list -- so collapsing them saved nothing.
+    What costs time is the number of *transfers*, and that is set by how many sources a
+    reader must gather one key from.
+
+    The arithmetic under TP=4 x PP=2 with gen TP=2:
+
+      * a train rank holds a quarter of any row-parallel key, so no single rank can serve
+        a whole key and a reader gathers from 2 sources on average;
+      * a PS worker holds complete shards, so the same reader gathers from 1.
+
+    Two sources instead of one is a structural 2x on transfer count, and it is what the
+    measured 2.93s against 1.14s reflects. The way out is not a transport parameter: it is
+    making the *gen-side shard* contiguous at registration, which is the sharding-layout
+    change the design points at. These tests fix the current number so that change has to
+    move it deliberately.
+    """
+
+    TOTAL_SHARDS = 8
+
+    def _info(self, name, ctype, shards_per_key, node_ip, gpu):
+        sharding = NIXLSharding(
+            shard_mesh=OrderedDict([(0, self.TOTAL_SHARDS)]),
+            shard_indices=list(shards_per_key),
+        )
+        meta = NIXLShardMetaInfo(
+            dtype=torch.bfloat16,
+            device=torch.device("cuda:0"),
+            shape=torch.Size([64, 64]),
+            stride=(64, 1),
+            is_contiguous=True,
+        )
+        n = len(list(shards_per_key))
+        return NIXLClientInfo(
+            name=name,
+            node_ip=node_ip,
+            node_gpu_id=gpu,
+            type=ctype,
+            tensor_infos={
+                key: NIXLTensorInfo(
+                    desc_bytes_list=[None] * n,
+                    temp_desc_bytes_list=[None] * n,
+                    sharding=sharding,
+                    shard_meta_infos=[meta] * n,
+                )
+                for key in KEYS
+            },
+            meta=b"",
+        )
+
+    def _cluster(self, with_ps: bool):
+        clients = {}
+        # 24 train ranks at TP=4: rank r holds 2 of the 8 shards, so half a key each.
+        for r in range(24):
+            clients[f"train{r}"] = self._info(
+                f"train{r}",
+                NIXLClientType.PUSH_SIDE,
+                [(r % 4,), (r % 4 + 4,)],
+                f"10.0.0.{1 + r // 8}",
+                r % 8,
+            )
+        # 8 rollout replicas on one node, gen TP=2, so four share each shard set.
+        for i in range(8):
+            clients[f"gen{i}"] = self._info(
+                f"gen{i}",
+                NIXLClientType.PULL_SIDE,
+                [(s,) for s in range(i % 2, self.TOTAL_SHARDS, 2)],
+                "10.0.0.1",
+                i,
+            )
+        if with_ps:
+            for p in range(2):
+                for kind in (NIXLClientType.PS_FOR_PULL, NIXLClientType.PS_FOR_PUSH):
+                    clients[f"{kind.name.lower()}{p}"] = self._info(
+                        f"{kind.name.lower()}{p}",
+                        kind,
+                        [(s,) for s in range(self.TOTAL_SHARDS)],
+                        f"10.0.2.{p + 1}",
+                        0,
+                    )
+        return clients
+
+    def _sources_per_key(self, clients) -> float:
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+        counts = []
+        for i in range(8):
+            for key in KEYS:
+                srcs = plan.get_rollout_pull_plan(f"gen{i}", key) or {}
+                if srcs:
+                    counts.append(len(srcs))
+        return sum(counts) / len(counts)
+
+    def test_a_train_rank_cannot_serve_a_whole_key(self):
+        """The structural fact behind everything else in this class.
+
+        At TP=4 a rank holds a quarter of the key space; the reader needs the whole key,
+        so no plan can hide the fact that the data lives on several ranks.
+        """
+        direct = self._sources_per_key(self._cluster(with_ps=False))
+
+        assert direct > 1.0, f"expected a split read, got {direct} source(s) per key"
+
+    def test_a_ps_worker_serves_a_whole_key_from_one_source(self):
+        """Which is exactly the advantage the PS has, and why deleting it costs time."""
+        with_ps = self._sources_per_key(self._cluster(with_ps=True))
+
+        assert with_ps == pytest.approx(1.0)
+
+    def test_direct_costs_more_transfers_than_the_ps_does(self):
+        """Pinned numerically so the eventual layout fix has to move it on purpose."""
+        direct = self._sources_per_key(self._cluster(with_ps=False))
+        with_ps = self._sources_per_key(self._cluster(with_ps=True))
+
+        assert direct == pytest.approx(2.0), (
+            f"source count changed to {direct}; if the sharding layout was made "
+            f"contiguous this should drop toward the PS's {with_ps}, and this assertion "
+            f"is where that improvement gets recorded"
+        )

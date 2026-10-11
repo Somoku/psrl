@@ -83,7 +83,11 @@ network:
   torch_port_gen: 29507
   backend: nccl
 
-nixl:
+# Startup budget, not transfer budget: 1800s, matching production. The client default
+  # is 600s, which client init can exceed on a busy cluster -- and the timeout then
+  # surfaces on the *train* clients at `wait_for_server_sharding`, reading as a
+  # notification fault rather than a budget that was too tight.
+  handshake_timeout_s: 1800
   server_mode: meta_server
   server_ip: ${network.listen_ip}
   server_port: ${network.listen_port}

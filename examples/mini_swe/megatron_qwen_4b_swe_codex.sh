@@ -178,7 +178,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.sandbox_placement.enabled=false \
     psrl.nixl.server_port=23456 \
     psrl.rollout_gateway.trajectory_id_strategy=auto \
-    psrl.rollout_gateway.tito_tool_normalization=none \
+    psrl.rollout_gateway.tito_tool_normalization=codex \
     psrl.rollout_gateway.tito_debug=false \
     psrl.rollout_gateway.tool_call_parser=qwen_xml \
     \

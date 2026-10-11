@@ -711,6 +711,10 @@ During the first run, confirm:
   custom-tool calls, and `reasoning` items.
 - Reward on `swe_gym_293` validation is comparable to the Claude Code recipe.
 
+`tito_tool_normalization=codex` selects SMG's Codex tool-input canonicalizer (drops the
+redundant `cd /testbed && ` prefix on `exec_command`) so replayed histories keep matching
+the stored TITO prefix.
+
 **Generic (any model/dataset, FSDP).** Point the trainer at the harness config
 and a parquet whose `agent_name` selects the harness. Harness mode requires TITO
 auto trajectory IDs so sub-agent / compaction branches stay in one session:

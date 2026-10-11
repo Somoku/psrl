@@ -8,6 +8,8 @@ from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 
+from psrl.utils.common.worker_naming import train_client_name
+from psrl.utils.ps_mode import has_ps_data_plane, uses_nixl
 from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import (
     EventType,
@@ -985,6 +987,31 @@ class PSManager(RequestStatusTracker):
         if self.psrl_config.broadcast_init.enabled:
             self.enable_broadcast_init_on_server()
 
+    def bind_direct_supply_sources(self, train_world_size: int) -> None:
+        """Name the train ranks as the pull sources, for `ps_mode=nixl_direct` (T2).
+
+        The gen workers resolve what to read by asking this manager, and under direct
+        supply the answer is the train ranks rather than a PS worker group. Giving the
+        same three lists the same meaning keeps one read path on the gen side: a pull
+        takes an ``(agent, client)`` pair either way, so direct supply needs a different
+        pair, not a different pull.
+
+        A train rank is its own NIXL agent, so its agent and client names are the same
+        string -- unlike a PS worker, which runs separate push-side and pull-side clients
+        under one agent. That is why all three lists coincide here and do not there.
+
+        Derived from the world size rather than queried from the workers: these names are
+        a pure function of rank (`train_client_name`), and the manager is bound before the
+        handshake completes, so an RPC to each rank would be both unnecessary and racy.
+        """
+        self.ps_nixl_agent_names = [train_client_name(rank) for rank in range(train_world_size)]
+        self.ps_nixl_train_storage_client_names = list(self.ps_nixl_agent_names)
+        self.ps_nixl_gen_storage_client_names = list(self.ps_nixl_agent_names)
+        psrl_logger.info(
+            f"Direct supply: pull sources are the {train_world_size} train ranks "
+            f"{self.ps_nixl_agent_names}"
+        )
+
     def enable_broadcast_init_on_server(self) -> None:
         """
         Report that broadcast initialization was enabled during meta server construction.
@@ -1307,8 +1334,14 @@ class PSManager(RequestStatusTracker):
         has just assigned it -- the read could only ever return what was set here, or
         something newer, which would make the caller record a version it did not pull.
         """
-        assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", (
-            "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
+        # Version bookkeeping, not data movement: this records which version a rollout
+        # instance has, and the weights live in the PS workers or -- under direct supply
+        # -- in the train ranks. Gating it on the data plane would block direct supply
+        # from ever advancing a rollout's version, which does not fail loudly: the pull
+        # succeeds and silently returns the previous weights.
+        assert uses_nixl(self.psrl_config.ps_mode), (
+            f"pull_model_state_dict_nixl needs a NIXL transport, got "
+            f"ps_mode={self.psrl_config.ps_mode!r}"
         )
         assert self.model_store is not None, "Model instance is not initialized."
 

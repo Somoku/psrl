@@ -5,6 +5,31 @@ import math
 import os
 import threading
 import time
+
+# Must precede this module's vLLM/megatron imports. That chain reaches modelopt ->
+# tilelang, which loads its own `libcudart_stub.so`; a later `flashinfer.comm` import
+# then resolves cudaDeviceReset against the stub and dies with "undefined symbol".
+#
+# The fix belongs here rather than only in `main_ppo`, because this module is imported
+# *inside a function* (`main_ppo.py` line ~464) -- by then the module-level ordering
+# there has long since run, so it cannot protect this chain. The failure surfaces far
+# away, inside `verl.workers.rollout.vllm_rollout.utils`, which is why it reads as a
+# vLLM problem rather than an import-order one.
+try:
+    import flashinfer.comm  # noqa: F401
+except Exception as _flashinfer_exc:  # pragma: no cover - optional on CPU-only runs
+    # Logged, not swallowed. A bare `pass` here hides the one thing worth knowing: if
+    # this import fails *now*, the next one -- made lazily by vLLM, deep inside
+    # `verl.workers.rollout` -- fails identically but far from the cause, and reads as a
+    # vLLM bug. The warning is what connects the two.
+    import warnings as _warnings
+
+    _warnings.warn(
+        f"flashinfer.comm preload failed ({type(_flashinfer_exc).__name__}: "
+        f"{_flashinfer_exc}); a later lazy import of it will fail the same way",
+        stacklevel=2,
+    )
+
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -22,7 +47,6 @@ from transfer_queue import KVBatchMeta
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import (
-    SubRayResourcePool,
     create_colocated_worker_cls_fused,
     sort_placement_group_by_node_ip,
 )
@@ -76,7 +100,11 @@ from psrl.trainer.ppo.batch_schedule import (
     get_batch_schedule_strategy,
     resolve_sample_keys,
 )
-from psrl.trainer.ppo.session_loss import compute_session_loss_weights
+from psrl.trainer.ppo.session_loss import agg_session_loss, compute_session_loss_weights
+from psrl.trainer.ppo.resource_pool import (
+    PSRL_RayWorkerGroup,
+    PSRL_SubRayResourcePool,
+)
 from psrl.trainer.ppo.utils import (
     PSRL_Role,
     ResourcePoolManager,
@@ -84,6 +112,7 @@ from psrl.trainer.ppo.utils import (
     compute_advantage_for_multi_trajectories,
 )
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+from psrl.utils.ps_mode import has_ps_data_plane, requires_ps_workers, uses_nixl
 from psrl.utils.common.worker_naming import WorkerKey, ps_agent_name, train_client_name
 from psrl.utils.config import resolve_train_model_dtype
 from psrl.utils.dataset import DataProcessor
@@ -382,6 +411,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.is_rollout_mode_in_actor = (
             self.config.psrl.colocate_validate_and_train and self.config.trainer.val_before_train
         )
+        # One-way marker for "this trainer has held real weights at some point" (item D4).
+        #
+        # Deliberately not derived from `is_rollout_mode_in_actor`: that flag flips on
+        # every colocate switch, so it cannot tell "first arrival" from "back again".
+        # Reading the checkpoint on a steady-state switch-back is silent data loss --
+        # training resumes from the last *saved* version and every step since is
+        # discarded, with valid weights and no error anywhere.
+        self._trainer_has_held_real_weights = False
         psrl_logger.warning(
             f"[INIT] is_rollout_mode_in_actor: {self.is_rollout_mode_in_actor} "
             f"(colocate_validate_and_train={self.config.psrl.colocate_validate_and_train}, "
@@ -1498,7 +1535,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 elastic_shared_pool.max_colocate_count,
             )
 
-        def _build_elastic_sub_resource_pool(subgroup_world_size: int, tag: str) -> SubRayResourcePool:
+        def _build_elastic_sub_resource_pool(subgroup_world_size: int, tag: str) -> PSRL_SubRayResourcePool:
             nonlocal elastic_subpool_group_idx
             assert elastic_shared_pool is not None, "elastic_shared_pool must be initialized in elastic_rm_mode"
             if subgroup_world_size <= 0:
@@ -1518,7 +1555,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 start_bundle_index = (elastic_subpool_group_idx * subgroup_world_size) % (max_start + 1)
             elastic_subpool_group_idx += 1
 
-            sub_rp = SubRayResourcePool(
+            sub_rp = PSRL_SubRayResourcePool(
                 process_on_nodes=elastic_shared_pool.store,
                 use_gpu=elastic_shared_pool.use_gpu,
                 name_prefix=f"{elastic_shared_pool.name_prefix}_{tag}",
@@ -1721,7 +1758,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             if len(class_dict) == 1:
                 role = next(iter(class_dict.keys()))
                 return {
-                    role: RayWorkerGroup(
+                    role: PSRL_RayWorkerGroup(
                         resource_pool=resource_pool,
                         ray_cls_with_init=class_dict[role],
                         **wg_kwargs,
@@ -1730,7 +1767,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # colocate
             else:
                 worker_dict_cls = create_colocated_worker_cls_fused(class_dict=class_dict)
-                wg_dict = RayWorkerGroup(
+                wg_dict = PSRL_RayWorkerGroup(
                     resource_pool=resource_pool,
                     ray_cls_with_init=worker_dict_cls,
                     **wg_kwargs,
@@ -1965,11 +2002,23 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             train_model_dtype=train_model_dtype,
             gen_model_dtype=PrecisionType.to_dtype(self.config.gen_actor_rollout_ref.rollout.dtype),
         )
-        if self.config.psrl.ps_mode == "cpu" or self.config.psrl.ps_mode == "cpu_ref":
+        if self.config.psrl.ps_mode == "nixl_direct":
+            # Trainer-direct supply (design 3.3): rollouts read the train ranks, so there
+            # is no PS data plane to create. The meta server still runs -- it carries the
+            # handshake and the comm plan, which is metadata rather than weights.
+            #
+            # Verified end to end in `tests/nixl/config/nixl_e2e_5node_direct.yaml`:
+            # 16/16 rollouts at 399/399 with zero PSStorageWorker processes. This branch
+            # is what makes that reachable from production rather than only from the
+            # harness, and it is the prerequisite for removing the PS path entirely
+            # (items D3/T2) -- deleting the worker before this exists would leave
+            # production with no transport at all.
+            psrl_logger.info("ps_mode=nixl_direct: no PS workers; rollouts read train ranks.")
+        elif self.config.psrl.ps_mode == "cpu" or self.config.psrl.ps_mode == "cpu_ref":
             # PSManager is used to store the model state dict
             # No need to create PS WorkerGroup
             pass
-        elif self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+        elif requires_ps_workers(self.config.psrl.ps_mode):
             # PSManager hosts metadata while colocated PS workers store model state.
             assert self.config.psrl.nixl.server_ip == self.config.psrl.ps_manager_ip, (
                 "PSManager IP and NIXL server IP must be the same"
@@ -2046,7 +2095,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         psrl_config=self.config.psrl,
                     ),
                 )
-                if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+                if uses_nixl(self.config.psrl.ps_mode):
                     ps_nixl_futures = self.ps_wg.execute_all_async("init_nixl_client")
                 # Initialize the model skeleton on meta device. Load weights after NIXL setup.
                 model_init_futures.extend(self.ps_wg.execute_all_async("init_model"))
@@ -2102,8 +2151,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # --- Step 5: Initialize NIXL clients and parameters ---
 
         if self.is_rollout_mode_in_actor:
-            assert self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu", (
-                "Fused trainer and validator only support NIXL PS mode."
+            assert uses_nixl(self.config.psrl.ps_mode), (
+                f"a fused trainer and validator needs a NIXL transport, got "
+                f"ps_mode={self.config.psrl.ps_mode!r}"
             )
             # init actor wg -> offload -> init validate wg
             psrl_logger.info("Initializing actor model")
@@ -2169,57 +2219,96 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.info("All workers' models initialized successfully!")
 
         # initialize NIXL
-        if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+        if uses_nixl(self.config.psrl.ps_mode):
             if ps_nixl_futures:
                 ray.get(ps_nixl_futures)
             rollout_world_size = ray.get(self.rollout_coordinator.world_size.remote())
+
+            # Count only the agents that will actually register. Under direct supply there
+            # is no PS worker group, and an over-count here does not fail locally -- the
+            # meta server blocks waiting for agents that never arrive, which surfaces as a
+            # handshake timeout rather than as a missing PS.
+            ps_world_size = self.ps_wg.world_size if has_ps_data_plane(self.config.psrl.ps_mode) else 0
             psrl_logger.info(
-                f"Initializing NIXL server with {self.ps_wg.world_size} PS workers, "
+                f"Initializing NIXL server with {ps_world_size} PS workers, "
                 f"{self.actor_wg.world_size} actor workers, {rollout_world_size} rollout workers"
             )
-            expected_nixl_client_agents = self.ps_wg.world_size + self.actor_wg.world_size + rollout_world_size
+            expected_nixl_client_agents = ps_world_size + self.actor_wg.world_size + rollout_world_size
             ray.get(self.ps_manager_handle.init_nixl_server.remote(expected_nixl_client_agents))
             actor_protocol_mode = "meta" if self.is_rollout_mode_in_actor else "full"
             rollout_full_tag = "all" if self.is_rollout_mode_in_actor else "rollout"
 
             with log_dual_events("Executing NIXL protocol", psrl_logger, event_type=EventType.INIT):
                 futures = []
+                # The meta server takes part in every NIXL mode: the handshake and the
+                # comm plan are metadata, and direct supply still needs both.
                 futures.append(self.ps_manager_handle.nixl_protocol.remote())
-                futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
+                if has_ps_data_plane(self.config.psrl.ps_mode):
+                    futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
                 futures.extend(self.actor_wg.execute_all_async("nixl_protocol", actor_protocol_mode))
                 futures.append(self.rollout_coordinator.nixl_protocol.remote(rollout_full_tag))
                 ray.get(futures)
 
-            # Bind the PS worker group to PSManager before initial pull, so that PSManager's
-            # ps_nixl_agent_names are populated and gen workers can call get_ps_nixl_agent_names.
-            psrl_logger.info("Binding PS worker group")
-            ray.get(self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg))
-            psrl_logger.info("PS worker group bound successfully!")
-
-            # NOTE(lhy): New runs load PS directly, while resumed runs load the actor and push to PS.
-            if self._resolve_resume_checkpoint_paths() is None:
-                # Now that all NIXL buffers are allocated (meta tensors replaced),
-                # write the preloaded checkpoint tensors into the PS registered buffers.
-                with log_dual_events("Loading PS checkpoint weights", psrl_logger, event_type=EventType.INIT):
-                    # Wait only if checkpoint prefetch outlasted the NIXL protocol.
-                    ray.get(preload_futures)
-                    ray.get(self.ps_wg.execute_all_async("write_checkpoint_to_registered_tensors"))
-                # Broadcast rank zero weights to avoid independent checkpoint reads on every PS worker.
-                if self.config.psrl.broadcast_init.enabled:
-                    with log_dual_events(
-                        "Broadcast init: PS rank-0 → all workers", psrl_logger, event_type=EventType.INIT
-                    ):
-                        ray.get(self.ps_manager_handle._coordinate_broadcast_init.remote())
+            # Name the pull sources before the initial pull, so that PSManager's
+            # `ps_nixl_agent_names` are populated and gen workers can resolve what to read.
+            #
+            # Both modes bind; only the answer differs. What direct supply additionally
+            # skips is everything about a PS *holding* weights -- there is no buffer to
+            # write a checkpoint into and no rank-0 PS to broadcast from, because the
+            # train ranks already hold real weights by this point.
+            if not has_ps_data_plane(self.config.psrl.ps_mode):
+                # Direct supply still has to answer "what do I read", because the gen
+                # workers resolve their sources through the PSManager either way. Bind
+                # the train ranks under the same names a PS group would have used, so
+                # the gen side keeps one pull path.
+                psrl_logger.info("Binding direct-supply sources (train ranks)")
+                ray.get(
+                    self.ps_manager_handle.bind_direct_supply_sources.remote(
+                        self.actor_wg.world_size
+                    )
+                )
             else:
-                # Push resumed actor weights before the initial pull so all workers receive them first.
-                self._resume_load_and_push_to_ps()
+                psrl_logger.info("Binding PS worker group")
+                ray.get(self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg))
+                psrl_logger.info("PS worker group bound successfully!")
+
+                # NOTE(lhy): New runs load PS directly, while resumed runs load the actor
+                # and push to PS.
+                if self._resolve_resume_checkpoint_paths() is None:
+                    # Now that all NIXL buffers are allocated (meta tensors replaced),
+                    # write the preloaded checkpoint tensors into the PS registered buffers.
+                    with log_dual_events(
+                        "Loading PS checkpoint weights", psrl_logger, event_type=EventType.INIT
+                    ):
+                        # Wait only if checkpoint prefetch outlasted the NIXL protocol.
+                        ray.get(preload_futures)
+                        ray.get(self.ps_wg.execute_all_async("write_checkpoint_to_registered_tensors"))
+                    # Broadcast rank zero weights to avoid independent checkpoint reads on
+                    # every PS worker.
+                    if self.config.psrl.broadcast_init.enabled:
+                        with log_dual_events(
+                            "Broadcast init: PS rank-0 → all workers",
+                            psrl_logger,
+                            event_type=EventType.INIT,
+                        ):
+                            ray.get(self.ps_manager_handle._coordinate_broadcast_init.remote())
+                else:
+                    # Push resumed actor weights before the initial pull so all workers
+                    # receive them first.
+                    self._resume_load_and_push_to_ps()
 
             # Pull initial PS weights now. A sleeping colocated actor pulls later in `switch_to_trainer_mode`.
             initial_pull_tag = "all" if self.is_rollout_mode_in_actor else "rollout"
             with log_dual_events("Initial pull: PS → gen/actor workers", psrl_logger, event_type=EventType.INIT):
                 initial_pull_futures = []
                 initial_pull_futures.append(self.rollout_coordinator.initial_pull_from_ps.remote(initial_pull_tag))
-                if not self.is_rollout_mode_in_actor:
+                # Under direct supply the train ranks are the source, so having them pull
+                # is not merely redundant -- `nixl_pull_model` resolves its sources by
+                # asking the PSManager for PS agent names, and there are none, so it
+                # asserts. The rollouts still pull; they read these ranks.
+                if not self.is_rollout_mode_in_actor and has_ps_data_plane(
+                    self.config.psrl.ps_mode
+                ):
                     initial_pull_futures.extend(self.actor_wg.execute_all_async("pull_model"))
                 ray.get(initial_pull_futures)
 
@@ -2588,10 +2677,23 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         psrl_logger.info("Step 7: Pulling actor model from PS...")
         # pull actor model
-        ray.get(self.actor_wg.execute_all_async("pull_model"))
+        #
+        # Direct supply has no PS to pull from, and the actor it would pull into is the
+        # weight source itself -- its trainer-format parameters never left. Attempting it
+        # fails inside `nixl_pull_model`, which resolves sources by asking the PSManager
+        # for PS agent names and asserts when there are none.
+        if has_ps_data_plane(self.config.psrl.ps_mode):
+            ray.get(self.actor_wg.execute_all_async("pull_model"))
 
         # Apply a deferred checkpoint after actor wakeup and NIXL reconnection.
         deferred_path = getattr(self, "_deferred_actor_ckpt_path", None)
+        # D4: a steady-state switch-back must restore, never re-read storage. The
+        # deferred path is only ever set while resuming a run, so it being present here
+        # after the trainer has already held weights would mean the two paths crossed.
+        assert not (deferred_path is not None and self._trainer_has_held_real_weights), (
+            "a steady-state switch-back is about to load a checkpoint; that would roll "
+            "training back to the last save and discard every step since, without error"
+        )
         if deferred_path is not None:
             psrl_logger.info(f"Resume (NIXL): loading deferred actor checkpoint from {deferred_path}...")
             self.actor_wg.load_checkpoint(
@@ -2608,6 +2710,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
 
         self.is_rollout_mode_in_actor = False
+        # Set after the weights are actually back, not before: an exception on the way
+        # here must leave the marker false so the next attempt is still a first arrival.
+        self._trainer_has_held_real_weights = True
 
     def _make_broadcast_plan(self, src_agent_names, dst_agent_names) -> dict:
         """Create a broadcast plan mapping source agents to destination agents.
@@ -2632,9 +2737,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         """
         src_agent_names = [NIXL_META_SERVER_NAME]
         dst_agent_names = []
-        # 1. PS storage workers
-        for i in range(self.ps_wg.world_size):
-            dst_agent_names.append(ps_agent_name(i))
+        # 1. PS storage workers -- none under direct supply, where the rollouts read the
+        #    train ranks. Naming a PS agent that never registered would make the meta
+        #    server broadcast to a dead address.
+        if has_ps_data_plane(self.config.psrl.ps_mode):
+            for i in range(self.ps_wg.world_size):
+                dst_agent_names.append(ps_agent_name(i))
         # 2. rollout workers
         for i in range(self.n_rollout_instances):
             tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "rollout" and k.instance_id == i)
@@ -2663,8 +2771,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 )
 
         # recv broadcast results by all clients
-        # 1. ps storage workers
-        futures.extend(self.ps_wg.execute_all_async("nixl_wait_for_update_infos", 1))
+        # 1. ps storage workers -- see above; there are none under direct supply.
+        if has_ps_data_plane(self.config.psrl.ps_mode):
+            futures.extend(self.ps_wg.execute_all_async("nixl_wait_for_update_infos", 1))
         # 2. rollout workers
         futures.extend(
             [
@@ -3396,7 +3505,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if use_session_mean:
             # Diagnostic masks and chunk boundaries can differ from the later training window.
             session_loss_weights = compute_session_loss_weights(data.batch["response_mask"], uids)
-        entropy_agg = agg_loss(
+        entropy_agg = agg_session_loss(
             loss_mat=data.batch["entropy"],
             loss_mask=data.batch["response_mask"],
             loss_agg_mode=actor_config.loss_agg_mode,

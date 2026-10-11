@@ -41,6 +41,7 @@ if not is_cuda_available and os.environ.get("TORCH_CUDA_ARCH_LIST") == "8.0":
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME  # noqa: E402
 from psrl.utils.common.worker_naming import train_client_name  # noqa: E402
+from psrl.utils.ps_mode import has_ps_data_plane  # noqa: E402
 from psrl.utils.logger import (  # noqa: E402
     DualOutputHandler,
     EventType,
@@ -108,9 +109,19 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             train_interface,
         )
 
-        # TODO(linsh): Remove this strategy-specific configuration patch.
-        if self.config.actor.strategy == "megatron":
-            self.config.actor.megatron.use_per_rank_checkpoint = not self.psrl_config.checkpoint.use_dcp_save
+        # Per-rank checkpointing was a patch carried inside the vendored verl checkout:
+        # verl's Megatron checkpoint manager called into `psrl.utils.checkpoint` when
+        # `use_per_rank_checkpoint` was set. Upstream verl has no such field and no such
+        # hook, so the assignment that used to configure it now fails -- the config is in
+        # struct mode, and writing an undeclared key raises.
+        #
+        # Refusing rather than skipping: the flag selects the on-disk checkpoint *format*,
+        # so quietly ignoring a request for per-rank saves would write a shape that a
+        # later resume cannot read, and the mismatch would surface as a load failure long
+        # after the run that produced it.
+        # The `use_dcp_save` / per-rank-saver / progress-thread interaction is validated
+        # centrally in `psrl.utils.config`, which can see `trainer.save_freq`; this worker
+        # only receives its own actor config.
 
         if self.psrl_config.tms.range in ["train", "all"]:
             if torch_memory_saver is None:
@@ -150,7 +161,19 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         """Initialize the NIXL GPU-to-GPU weight-streaming client."""
         # DCP `all_gather_object` can corrupt UCX endpoint addresses read by the
         # background progress thread, so disable that thread during DCP saves.
-        enable_prog_thread = not self.psrl_config.checkpoint.use_dcp_save
+        #
+        # Direct supply overrides that: the train rank is a *source* that rollouts read
+        # at arbitrary times, including while it is computing, and a transfer with no
+        # thread advancing the UCX worker commits successfully and then sits in `PROC`
+        # forever. It surfaces far from here, as the reader's
+        # "Timeout waiting for transfer (..., READ, ...) ... to NIXLTrainClient_N" --
+        # measured on step 2, after step 1's pull had already succeeded, because the
+        # first pull happens while the trainer is otherwise idle.
+        #
+        # `psrl.utils.config` already refuses direct supply with `use_dcp_save=True`, so
+        # the `or` is a statement of which requirement wins rather than a live fallback.
+        serves_direct_reads = not has_ps_data_plane(self.psrl_config.ps_mode)
+        enable_prog_thread = serves_direct_reads or not self.psrl_config.checkpoint.use_dcp_save
         self.nixl_storage_client = NIXLStorageClient(
             client_name=train_client_name(self.rank),
             server_name=NIXL_META_SERVER_NAME,
@@ -191,6 +214,10 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             conversion_result = convert_megatron_inplace(
                 parameter_mapping,
                 self.actor.engine.module,
+                # Under direct supply the rollouts read these tensors in place, at times
+                # this worker does not control, so anything exposed in a corrected form
+                # must stay corrected rather than being reverted after a push.
+                resident_exposure=not has_ps_data_plane(self.psrl_config.ps_mode),
             )
             self.unified_state_dict = conversion_result.state_dict
             self.local_sharding_dict = conversion_result.sharding_dict
@@ -495,7 +522,19 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                     if strategy in {"fsdp", "fsdp2"}:
                         self.config.actor.fsdp_config.load_weight = False
                     elif strategy == "megatron":
-                        self.config.actor.megatron.load_weight = False
+                        # Nothing to set: `load_weight` was a field patched into the
+                        # vendored verl checkout, and upstream's Megatron engine has no
+                        # equivalent -- it always loads, from a distributed checkpoint or
+                        # from HF.
+                        #
+                        # Letting it load is safe rather than merely tolerable. The point
+                        # of "empty" is to skip a load that a later checkpoint restore
+                        # overwrites, so the cost is startup time, not correctness -- and
+                        # under direct supply the train ranks *are* the weight source, so
+                        # initialising them with real weights is the conservative outcome.
+                        # The failure this avoids is the opposite one: silently skipping
+                        # the load would serve uninitialised weights over RDMA.
+                        pass
 
             try:
                 ActorRolloutRefWorker.init_model(self)
@@ -505,8 +544,43 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                     with open_dict(self.config):
                         if strategy in {"fsdp", "fsdp2"}:
                             self.config.actor.fsdp_config.load_weight = True
-                        elif strategy == "megatron":
-                            self.config.actor.megatron.load_weight = True
+                        # No megatron branch: upstream verl has no `load_weight` field to
+                        # restore, and writing one into a struct-mode config raises. See
+                        # the matching comment where it would have been set to False.
+
+            self._maybe_use_per_rank_checkpointing()
+
+    def _maybe_use_per_rank_checkpointing(self) -> None:
+        """Swap in the per-rank checkpoint manager when dist_checkpointing cannot be used.
+
+        `use_dcp_save=False` is not a preference here: under direct supply the NIXL
+        progress thread has to stay running so train ranks can serve rollout reads, and
+        Megatron's dist_checkpointing corrupts the UCX endpoint addresses that thread
+        reads. Without this swap such a run can train but cannot save -- which would only
+        be discovered at the first `save_freq` boundary, potentially hours in.
+        """
+        if self.psrl_config.checkpoint.use_dcp_save:
+            return
+        if self.config.actor.strategy != "megatron":
+            return
+
+        engine = getattr(getattr(self, "actor", None), "engine", None)
+        manager = getattr(engine, "checkpoint_mananager", None)
+        if manager is None:
+            return
+
+        from psrl.utils.checkpoint.megatron_manager import (
+            PSRL_PerRankMegatronCheckpointManager,
+        )
+
+        # Re-class rather than rebuild: the manager is constructed by verl with a dozen
+        # arguments (model, optimizer, scheduler, bridge, provider, peft class...), and
+        # reconstructing it here would duplicate a signature that changes across bumps.
+        manager.__class__ = PSRL_PerRankMegatronCheckpointManager
+        psrl_logger.info(
+            "Using per-rank Megatron checkpoints: dist_checkpointing is unavailable "
+            "while the NIXL progress thread must stay running."
+        )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @gpu_memory_logger_decorator(log_only_rank_0=False)

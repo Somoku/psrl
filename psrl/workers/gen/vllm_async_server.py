@@ -47,6 +47,7 @@ from vllm.v1.engine import PauseMode
 from vllm.v1.engine.async_llm import AsyncLLM
 
 import grpc
+from psrl.utils.ps_mode import uses_nixl
 from psrl.sandbox.config import SandboxManagerConfig
 from psrl.utils.kv_cache import KVCacheManager, LMCacheConfig
 from psrl.utils.logger import (
@@ -1106,7 +1107,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self._last_pulled_model_version = None
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             await self.ray_pull_model()
-        elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+        elif uses_nixl(self.psrl_config.ps_mode):
             await self.nixl_pull_model()
         else:
             raise NotImplementedError(f"PSRL does not support PS mode '{self.psrl_config.ps_mode}' yet.")
@@ -1118,8 +1119,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     async def nixl_pull_model(self) -> None:
         assert self.gen_interface.ps_manager_handle is not None, "nixl_pull_model requires a PS manager handle"
-        assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", (
-            "nixl_pull_model should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
+        assert uses_nixl(self.psrl_config.ps_mode), (
+            f"nixl_pull_model needs a NIXL transport, got "
+            f"ps_mode={self.psrl_config.ps_mode!r}"
         )
         ps_manager_handle = self.gen_interface.ps_manager_handle
         if self._cached_ps_nixl_agent_names is None:
@@ -1234,6 +1236,23 @@ class PSRL_vLLMReplica(vLLMReplica):
                 sandbox=SandboxManagerConfig(),
             ),
         )
+
+    @property
+    def max_concurrency(self) -> int:
+        """Ray actor concurrency for an HTTP server replica.
+
+        verl's rollout replica base used to provide this and no longer does, while this
+        class still passes it to `server_class.options(...)`. Owning it here keeps the
+        value next to the only code that consumes it.
+
+        The floor of 1000 is Ray's own default for async actors: dropping below it would
+        silently reduce concurrency for small `max_num_seqs`. The margin is for control
+        methods (`wake_up`, `sleep`, weight sync), which share the actor's concurrency
+        budget with in-flight generation requests -- without it a saturated server cannot
+        service the very calls that would drain it.
+        """
+        control_method_concurrency = 16
+        return max(1000, self.config.max_num_seqs + control_method_concurrency)
 
     def _get_server_env_vars(self) -> dict[str, str]:
         """Return the platform rollout environment with PSRL overrides applied."""

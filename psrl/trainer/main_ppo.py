@@ -3,6 +3,28 @@ import os
 import random
 import socket
 
+# Must precede anything that reaches megatron.bridge. That chain pulls in modelopt ->
+# tilelang, which loads its own `libcudart_stub.so` into the process; a later
+# `flashinfer.comm` import then resolves cudaDeviceReset against the stub and dies with
+# "undefined symbol: cudaDeviceReset". vLLM's FusedMoE -> all2all_utils -> nixl_ep path
+# imports flashinfer, so the trainer fails at import time unless the real CUDA runtime is
+# bound first. Order, not presence, is what matters -- the same fix the NIXL e2e harness
+# already carries, applied here because this is the production entry point.
+try:
+    import flashinfer.comm  # noqa: F401
+except Exception as _flashinfer_exc:  # pragma: no cover - optional on CPU-only runs
+    # Logged, not swallowed. A bare `pass` here hides the one thing worth knowing: if
+    # this import fails *now*, the next one -- made lazily by vLLM, deep inside
+    # `verl.workers.rollout` -- fails identically but far from the cause, and reads as a
+    # vLLM bug. The warning is what connects the two.
+    import warnings as _warnings
+
+    _warnings.warn(
+        f"flashinfer.comm preload failed ({type(_flashinfer_exc).__name__}: "
+        f"{_flashinfer_exc}); a later lazy import of it will fail the same way",
+        stacklevel=2,
+    )
+
 import hydra
 import numpy as np
 import ray
@@ -12,7 +34,7 @@ from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.device import auto_set_device, is_cuda_available
-from verl.utils.logging_utils import configure_verl_logging
+from psrl.utils.logger import configure_verl_logging
 
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.utils import PSRL_Role
@@ -426,6 +448,36 @@ class TaskRunner:
         OmegaConf.resolve(config)
 
         from concurrent.futures import ThreadPoolExecutor
+
+        # Import `flashinfer.comm` here, before the workers are added, and not only at
+        # module scope.
+        #
+        # The module-level preload is not sufficient in this actor, and the reason is
+        # ordering rather than precedence: `add_*_worker` below imports `megatron.bridge`,
+        # whose chain loads tilelang's `libcudart_stub.so` into the process; vLLM's later
+        # lazy `flashinfer.comm` import then resolves `cudaDeviceReset` against that stub
+        # and dies with "undefined symbol". Verified in an actor: importing
+        # `megatron.bridge` first makes a following `flashinfer.comm` fail; importing
+        # `flashinfer.comm` first makes it succeed.
+        #
+        # `LD_PRELOAD` of the real `libcudart.so.12` does *not* fix it either: the stub is
+        # dlopen'd after exec, so preloading cannot keep it out. Measured -- with the real
+        # runtime mapped (`/proc/self/maps` confirms) the failure still reproduces.
+        #
+        # Doing it here rather than relying on module import order is what makes it hold:
+        # these `add_*_worker` calls run inside a ThreadPoolExecutor, so the imports that
+        # pull in megatron happen on a worker thread, where module-level ordering in this
+        # file says nothing about when they run.
+        try:
+            import flashinfer.comm  # noqa: F401
+        except Exception as _flashinfer_exc:  # pragma: no cover - optional on CPU-only runs
+            import warnings as _warnings
+
+            _warnings.warn(
+                f"flashinfer.comm preload failed ({type(_flashinfer_exc).__name__}: "
+                f"{_flashinfer_exc}); a later lazy import of it will fail the same way",
+                stacklevel=2,
+            )
 
         # Overlap tq.init (network/storage I/O, ~38s) with add_workers (Python imports, ~79s)
         # since they have no shared dependencies. This reduces total from ~117s to ~79s.

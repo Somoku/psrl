@@ -376,6 +376,45 @@ def validate_config(
             )
 
     # Check NIXL compatibility
+    #
+    # `nixl_direct` is trainer-direct supply: rollouts read train ranks and no PS data
+    # plane exists (design 3.3). It validates like the other NIXL modes but must not be
+    # paired with anything that assumes a PS holds the weights, so those pairings are
+    # refused here rather than failing mid-transfer.
+    if config.psrl.ps_mode == "nixl_direct":
+        assert config.psrl.nixl.server_ip == config.psrl.ps_manager_ip, (
+            "PSManager IP and NIXL server IP must be the same"
+        )
+        assert config.train_actor_rollout_ref.actor.strategy != "fsdp", (
+            "FSDP1 is not supported for NIXL because it uses flat_param"
+        )
+        _validate_nixl_offload_flags(config)
+        _validate_nixl_lora(config)
+        assert not config.psrl.get("lmcache", {}).get("enable_p2p", False), (
+            "psrl.lmcache.enable_p2p requires a PS to route through; it cannot be used "
+            "with ps_mode=nixl_direct, where rollouts read train ranks directly"
+        )
+        # The train ranks are the weight source here, so rollouts RDMA-read them while
+        # they are computing. That waits for DONE, which needs the NIXL progress thread,
+        # and `use_dcp_save=True` turns that thread off (DCP's `all_gather_object`
+        # corrupts UCX endpoint addresses). The read then commits and hangs until it
+        # times out, reported on the *reader* as "Timeout waiting for transfer ... to
+        # NIXLTrainClient_N" with nothing logged on the rank that failed to serve it.
+        #
+        # Checked here rather than in the worker because the worker only receives its own
+        # actor config: `trainer.save_freq` is not reachable from there, and a check that
+        # cannot see it either refuses every direct-supply run or none of them.
+        assert not config.psrl.checkpoint.use_dcp_save, (
+            "ps_mode=nixl_direct needs the NIXL progress thread so train ranks can serve "
+            "rollout reads while training, but checkpoint.use_dcp_save=True disables it. "
+            "Set psrl.checkpoint.use_dcp_save=False."
+        )
+        # Saving is supported: with DCP off the train worker swaps in
+        # `PSRL_PerRankMegatronCheckpointManager`, which writes one file per rank instead
+        # of a `torch_dist` directory. The resulting checkpoint is **not resharding-
+        # compatible** -- it can only be resumed at the same world size and parallelism
+        # layout -- which is a real cost of direct supply rather than an oversight.
+
     if config.psrl.ps_mode == "nixl_cpu" or config.psrl.ps_mode == "nixl_gpu":
         assert config.psrl.nixl.server_ip == config.psrl.ps_manager_ip, (
             "PSManager IP and NIXL server IP must be the same"

@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
 
+from psrl.utils.ps_mode import has_ps_data_plane, uses_nixl
 from psrl.utils.converter.param_sync import ParamSyncPlan
 from psrl.utils.logger import DualOutputHandler
 from psrl.workers.train.step_boundary import StepBoundaryRecorder
@@ -296,13 +297,51 @@ class PSRL_BaseTrainWorker:
     def push_model(self):
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             self.ray_push_model()
-        elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+        elif has_ps_data_plane(self.psrl_config.ps_mode):
+            # Pushing is meaningful only when a PS holds the weights. Under direct supply
+            # rollouts read these tensors in place, so there is nothing to push to.
             self.param_sync_plan.before_push(self.unified_state_dict)
             self.nixl_push_model()
             self.wait_for_nixl_push_completion()
             self.param_sync_plan.after_push(self.unified_state_dict)
+        elif uses_nixl(self.psrl_config.ps_mode):
+            self.direct_supply_publish()
         else:
             raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
+
+    def direct_supply_publish(self):
+        """Make this step's weights readable and announce the new version (T2).
+
+        Direct supply moves no bytes here -- the rollouts read these tensors over RDMA
+        whenever they pull -- but the step still has the two obligations a push had:
+
+        1. Refresh anything exposed in a corrected form. `before_push` is what updates
+           those copies, and under direct supply there is no `after_push` to revert them:
+           a reader may arrive at any time, so the exposed value has to stay correct.
+        2. Publish the version. Without it the rollouts keep serving the previous one,
+           and nothing fails -- they pull successfully and silently return stale weights.
+
+        The barrier before publishing is the correctness point. The version is announced
+        once, by rank 0, and it tells every rollout that *all* ranks are readable; a rank
+        still mid-update when the announcement lands would be read as if it were done.
+        """
+        self.param_sync_plan.before_push(self.unified_state_dict)
+
+        assert dist.is_initialized(), "Pytorch distributed is not initialized."
+        dist.barrier()
+
+        if self.worker_rank == 0:
+            ps_manager_handle = self.train_interface.ps_manager_handle
+            curr_version = ray.get(
+                ps_manager_handle.get_ps_model_version.remote(debug_info="direct_supply_publish")
+            )
+            next_version = curr_version + 1
+            ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_version))
+            # C3: the publication point. The weights are in place (the optimizer step
+            # returned before `push_model` was called) and no transfer is outstanding,
+            # which is the moment the design asks publication to land on.
+            self.step_boundaries.on_train_step_end(version=next_version)
+            psrl_logger.debug(f"Direct supply published model version {next_version}.")
 
     def nixl_send_local_info_to(self, dst_agent_names: str | list[str]):
         """
@@ -325,8 +364,9 @@ class PSRL_BaseTrainWorker:
 
     def nixl_pull_model(self):
         """Pull the model from the NIXL storage client."""
-        assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", (
-            "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
+        assert uses_nixl(self.psrl_config.ps_mode), (
+            f"pull_model_state_dict_nixl needs a NIXL transport, got "
+            f"ps_mode={self.psrl_config.ps_mode!r}"
         )
         ps_manager_handle = self.train_interface.ps_manager_handle
         if self._cached_ps_nixl_agent_names is None:
@@ -378,7 +418,7 @@ class PSRL_BaseTrainWorker:
         """
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             raise RuntimeError("ray_pull_model is not supported for TrainWorker in 'cpu' or 'cpu_ref' mode.")
-        elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+        elif uses_nixl(self.psrl_config.ps_mode):
             self.nixl_pull_model()
             # NOTE(linsh): Reload after the first pull because empty initialization leaves
             # optimizer master parameters stale, while later optimizer state remains local.

@@ -43,11 +43,7 @@ from sandboxd import (
     Source as ServiceSource,
 )
 from sandboxd import Sandbox as ServiceSandbox
-from sandboxd.errors import (
-    SandboxCapabilityError,
-    SandboxCapacityTimeout,
-    SandboxError,
-)
+from sandboxd import errors as service_errors
 
 from psrl.sandbox.core import (
     ExecResult,
@@ -56,13 +52,20 @@ from psrl.sandbox.core import (
     ResumeLevel,
     SandboxBackend,
     SandboxCapabilities,
+    SandboxCapabilityError,
+    SandboxCapacityTimeout,
+    SandboxCommandTimeout,
     SandboxExitReason,
     SandboxFeature,
+    SandboxOomError,
     SandboxRef,
     SandboxSession,
+    SandboxSessionLostError,
+    SandboxSetupError,
     SandboxSourceKind,
     SandboxSpec,
     SandboxStatus,
+    SandboxTransportError,
     SnapshotKind,
     SnapshotRef,
 )
@@ -72,6 +75,54 @@ psrl_logger = logging.getLogger(__name__)
 # The service's default socket. A service per node uses this; a shared control
 # plane is reached by host:port.
 DEFAULT_ENDPOINT = "unix:///run/sandboxd.sock"
+
+
+def _exit_reason(raw: str) -> SandboxExitReason:
+    """Map the service's exit label onto PSRL's vocabulary, defaulting to UNKNOWN."""
+    if not raw:
+        return SandboxExitReason.UNKNOWN
+    try:
+        return SandboxExitReason(raw)
+    except ValueError:
+        return SandboxExitReason.UNKNOWN
+
+
+def _translate(exc: service_errors.SandboxError) -> BaseException:
+    """Map a service-side failure onto PSRL's neutral error vocabulary.
+
+    The SDK raises the service's own types; PSRL's callers catch PSRL's. Without
+    this translation the two sets never meet: a lost sandbox would surface as an
+    unclassified exception instead of a lost session, and its attribution would be
+    dropped, so a rollout could not be retried as `container_lost` nor a post
+    mortem tell why it went.
+    """
+    if isinstance(exc, service_errors.SandboxSessionLost):
+        return SandboxSessionLostError(
+            str(exc),
+            sandbox_id=exc.sandbox_id,
+            exit_reason=_exit_reason(exc.exit_reason),
+        )
+    if isinstance(exc, service_errors.SandboxCapacityTimeout):
+        return SandboxCapacityTimeout(str(exc))
+    if isinstance(exc, service_errors.SandboxCapabilityError):
+        return SandboxCapabilityError(str(exc))
+    if isinstance(exc, service_errors.SandboxOomError):
+        return SandboxOomError(str(exc))
+    if isinstance(exc, service_errors.SandboxCommandTimeout):
+        return SandboxCommandTimeout(
+            str(exc), sandbox_preserved=getattr(exc, "sandbox_preserved", False)
+        )
+    if isinstance(exc, service_errors.SandboxTransportError):
+        return SandboxTransportError(str(exc))
+    return SandboxSetupError(str(exc))
+
+
+async def _service_call(awaitable):
+    """Await one SDK call, re-raising a service failure in PSRL's vocabulary."""
+    try:
+        return await awaitable
+    except service_errors.SandboxError as exc:
+        raise _translate(exc) from exc
 
 
 class P3bSession(SandboxSession):
@@ -151,17 +202,21 @@ class P3bSession(SandboxSession):
     ) -> ExecResult:
         """Run one command straight to the sandbox agent endpoint.
 
-        The SDK raises the same SandboxCommandTimeout, SandboxOomError, and
-        SandboxSessionLost types that PSRL already handles — no translation.
+        A service-side failure is re-raised in PSRL's vocabulary — a lost session
+        carries its exit attribution, a command timeout keeps its
+        `sandbox_preserved` flag — so the agent loop classifies the fault by type
+        instead of seeing an unclassified exception.
         """
         self._busy = True
         try:
-            result = await self._sandbox.exec(
-                command,
-                cwd=cwd,
-                env=env,
-                timeout_s=timeout_s,
-                silence_timeout_s=silence_timeout_s,
+            result = await _service_call(
+                self._sandbox.exec(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    timeout_s=timeout_s,
+                    silence_timeout_s=silence_timeout_s,
+                )
             )
         finally:
             self._busy = False
@@ -175,17 +230,17 @@ class P3bSession(SandboxSession):
         )
 
     async def read_bytes(self, path: str) -> bytes:
-        return await self._sandbox.read_bytes(path)
+        return await _service_call(self._sandbox.read_bytes(path))
 
     async def write_bytes(self, path: str, data: bytes) -> None:
-        await self._sandbox.write_bytes(path, data)
+        await _service_call(self._sandbox.write_bytes(path, data))
 
     # -- Control plane: back to the service ------------------------------------
 
     async def status(self) -> SandboxStatus:
         if self._terminated:
             return SandboxStatus.TERMINATED
-        raw = await self._sandbox.status()
+        raw = await _service_call(self._sandbox.status())
         return SandboxStatus(str(raw))
 
     async def terminate(self) -> None:
@@ -198,7 +253,7 @@ class P3bSession(SandboxSession):
             return
         self._terminated = True
         self._exit_reason = SandboxExitReason.RELEASED
-        await self._sandbox.release()
+        await _service_call(self._sandbox.release())
 
     async def stats(self) -> ResourceUsage:
         """Return unknown usage.
@@ -210,7 +265,7 @@ class P3bSession(SandboxSession):
         return ResourceUsage()
 
     async def snapshot(self, kind: SnapshotKind = SnapshotKind.FILESYSTEM) -> SnapshotRef:
-        ref = await self._sandbox.snapshot(kind)
+        ref = await _service_call(self._sandbox.snapshot(kind))
         return SnapshotRef(
             backend=self._backend.name,
             snapshot_id=ref.snapshot_id,
@@ -219,10 +274,10 @@ class P3bSession(SandboxSession):
         )
 
     async def pause(self, mode: PauseMode = PauseMode.HIBERNATE) -> None:
-        await self._sandbox.pause(mode)
+        await _service_call(self._sandbox.pause(mode))
 
     async def resume(self) -> None:
-        await self._sandbox.resume()
+        await _service_call(self._sandbox.resume())
 
     def resolve_callback_url(self, url: str) -> str:
         """Return the URL unchanged.
@@ -323,7 +378,9 @@ class P3bBackend(SandboxBackend):
 
     async def create(self, spec: SandboxSpec) -> SandboxSession:
         self._require_open()
-        sandbox = await self._client.create(_to_service_spec(spec, self._owner_id, self._resource_class))
+        sandbox = await _service_call(
+            self._client.create(_to_service_spec(spec, self._owner_id, self._resource_class))
+        )
         return P3bSession(self, sandbox, spec)
 
     async def connect(self, sandbox_id: str) -> SandboxSession:
@@ -340,13 +397,17 @@ class P3bBackend(SandboxBackend):
     async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> SandboxSession:
         self._require_open()
         service_spec = _to_service_spec(spec, self._owner_id, self._resource_class) if spec is not None else None
-        sandbox = await self._client.restore(
-            ServiceSnapshotRef(
-                backend=snapshot.backend,
-                snapshot_id=snapshot.snapshot_id,
-                kind=str(snapshot.kind.value if hasattr(snapshot.kind, "value") else snapshot.kind),
-            ),
-            service_spec,
+        sandbox = await _service_call(
+            self._client.restore(
+                ServiceSnapshotRef(
+                    backend=snapshot.backend,
+                    snapshot_id=snapshot.snapshot_id,
+                    kind=str(
+                        snapshot.kind.value if hasattr(snapshot.kind, "value") else snapshot.kind
+                    ),
+                ),
+                service_spec,
+            )
         )
         return P3bSession(self, sandbox, spec)
 
@@ -380,7 +441,7 @@ class P3bBackend(SandboxBackend):
         metrics dict, and includes per-node state for debugging.
         """
         self._require_open()
-        report = await self._client.fleet()
+        report = await _service_call(self._client.fleet())
         result = report.as_metrics()
         result["nodes"] = [
             {
@@ -401,7 +462,7 @@ class P3bBackend(SandboxBackend):
         Delegates to QuotaReport.as_metrics() for a flat metrics dict.
         """
         self._require_open()
-        report = await self._client.quota()
+        report = await _service_call(self._client.quota())
         return report.as_metrics()
 
     def _require_open(self) -> None:

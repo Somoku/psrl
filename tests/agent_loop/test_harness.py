@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from examples.mini_swe.config import build_runtime_config
 from examples.mini_swe.utils.harness_task import (
+    _HARNESS_DIAG_PATH,
     _HARNESS_PATCH_PATH,
     build_harness_prompt,
     collect_git_patch,
@@ -54,10 +55,12 @@ class FakeSandbox(SandboxSession):
         runtime_available: bool = True,
         block_cli: bool = False,
         cli_exit_code: int = 0,
+        collect_exit_code: int = 0,
     ) -> None:
         self.runtime_available = runtime_available
         self.block_cli = block_cli
         self.cli_exit_code = cli_exit_code
+        self.collect_exit_code = collect_exit_code
         self.commands: list[tuple[str, str | None, Mapping[str, str] | None]] = []
         self.writes: dict[str, bytes] = {}
         self.cli_started = asyncio.Event()
@@ -83,6 +86,10 @@ class FakeSandbox(SandboxSession):
         # The prepare probe creates the state dir and checks the mounted CLI.
         if command.startswith("mkdir -p /root/.psrl-harness"):
             return ExecResult(0 if self.runtime_available else 1, "", "" if self.runtime_available else "no such file")
+        if _HARNESS_PATCH_PATH in command and not command.startswith("tail -c"):
+            # The patch collector. Its diagnostics are read back through the file API,
+            # never from this response (the backend does not carry stderr).
+            return ExecResult(self.collect_exit_code, "", "")
         if command.startswith("tail -c"):
             return ExecResult(0, "bounded tail", "")
         if "/opt/harness/bin/" in command and self.block_cli:
@@ -281,12 +288,38 @@ async def test_patch_collection_reads_the_patch_file_in_full() -> None:
     # Untracked files become new-file diffs, but nested repositories are skipped.
     assert "git ls-files --others --exclude-standard" in script
     assert '[ -e "$d/.git" ]' in script
+    # The sandbox runs commands with /bin/sh, where bash's `read -d` silently skipped
+    # every untracked file; the NUL list is consumed with `xargs -0` instead.
+    assert "read -r -d" not in script
+    assert "xargs -0" in script
     # The collector never stages, so a nested repo without a commit cannot break it.
     assert "git add" not in script
     # The patch leaves the sandbox as a file rather than as command output.
     assert f"out={_HARNESS_PATCH_PATH}" in script
+    # A self-report the caller can read back when the backend reports no stderr.
+    assert f"diag={_HARNESS_DIAG_PATH}" in script
+    assert "command -v" in script
     assert "cat " not in script
     assert patch == collected.decode()
+
+
+@pytest.mark.asyncio
+async def test_patch_collection_failure_surfaces_collector_diagnostics() -> None:
+    """A failed collection reports the collector's own diagnostics, not just an exit code.
+
+    The sandbox exec channel does not carry stderr on every backend, so the exit code
+    alone said nothing about which step failed.
+    """
+    sandbox = FakeSandbox(collect_exit_code=127)
+    sandbox.writes[_HARNESS_DIAG_PATH] = b"cwd=/testbed\nwc=MISSING\n"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed")
+
+    message = str(excinfo.value)
+    assert "exit 127" in message
+    assert "cwd='/testbed'" in message
+    assert "wc=MISSING" in message
 
 
 @pytest.mark.asyncio
@@ -527,3 +560,4 @@ def test_docker_session_translates_loopback_callback_through_policy() -> None:
     assert session.resolve_callback_url("https://router.internal/sessions/s1") == (
         "https://router.internal/sessions/s1"
     )
+

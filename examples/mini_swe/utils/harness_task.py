@@ -12,6 +12,11 @@ psrl_logger = logging.getLogger(__file__)
 # business going through a diagnostic channel: a truncated patch would grade an
 # incomplete solution and report the result as if it were measured.
 _HARNESS_PATCH_PATH = "/tmp/psrl-harness.patch"
+# Collection diagnostics, written by the script and read back through the file API.
+# The sandbox exec channel does not carry stderr on every backend (the p3b node agent
+# returns an empty stderr), so a failing collection would otherwise report only an
+# exit code with no way to tell which step failed.
+_HARNESS_DIAG_PATH = "/tmp/psrl-harness-collect.diag"
 # A repository read by git, not an interactive command, so one generous call is enough
 # and every retry cost is the agent's work being wasted.
 _PATCH_COLLECT_TIMEOUT_S = 600.0
@@ -67,27 +72,55 @@ async def collect_git_patch(
     """
     base_arg = f"{shlex.quote(base_commit)} --" if base_commit else "--"
     patch_path = shlex.quote(_HARNESS_PATCH_PATH)
-    script = (
-        "set -u\n"
-        f"out={patch_path}\n"
-        ': > "$out"\n'
-        # staged changes (index vs base / HEAD)
-        f'git diff --cached --binary --submodule=diff {base_arg} >> "$out" 2>/dev/null || true\n'
-        # unstaged changes (worktree vs index)
-        'git diff --binary --submodule=diff -- >> "$out" 2>/dev/null || true\n'
-        # untracked files, excluding nested git repositories (agent scratch repos)
-        "git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do\n"
+    diag_path = shlex.quote(_HARNESS_DIAG_PATH)
+    workdir_arg = shlex.quote(workdir)
+    # Per-file body for the untracked pass. It is executed by `sh` (via `xargs -0`),
+    # not by a `while read -d` loop: the sandbox runs commands with `/bin/sh`, and
+    # dash's `read` has no `-d`, so the bash form silently skipped every untracked
+    # file while still exiting 0.
+    untracked_body = (
+        "for f do\n"
         '    [ -z "$f" ] && continue\n'
         '    case "$f" in */) continue ;; esac\n'
         "    skip=0\n"
-        '    d="$(dirname "$f")"\n'
+        '    d=$(dirname "$f")\n'
         '    while [ "$d" != "." ] && [ "$d" != "/" ]; do\n'
         '        if [ -e "$d/.git" ]; then skip=1; break; fi\n'
-        '        d="$(dirname "$d")"\n'
+        '        d=$(dirname "$d")\n'
         "    done\n"
-        '    [ "$skip" = 1 ] && continue\n'
-        '    git diff --no-index --binary /dev/null "$f" >> "$out" 2>/dev/null || true\n'
+        '    if [ "$skip" = 1 ]; then continue; fi\n'
+        # `--no-index` exits 1 when the files differ, which is the normal case here.
+        '    git diff --no-index --binary /dev/null -- "$f" >> "$out" 2>>"$diag" || true\n'
         "done\n"
+    )
+    script = (
+        "set -u\n"
+        f"out={patch_path}\n"
+        f"diag={diag_path}\n"
+        "export out diag\n"
+        ': > "$out"\n'
+        ': > "$diag"\n'
+        # Self-report so a non-zero exit is diagnosable without an stderr channel.
+        "{\n"
+        '    echo "shell=$0"\n'
+        '    echo "cwd=$(pwd)"\n'
+        f'    echo "wanted_cwd={workdir}"\n'
+        "    for tool in git wc dirname xargs tr; do\n"
+        '        printf "%s=%s\\n" "$tool" "$(command -v "$tool" 2>/dev/null || echo MISSING)"\n'
+        "    done\n"
+        f"    ls -ld {workdir_arg} 2>&1 || true\n"
+        '} >> "$diag" 2>&1\n'
+        # staged changes (index vs base / HEAD)
+        f'git diff --cached --binary --submodule=diff {base_arg} >> "$out" 2>>"$diag" '
+        '|| echo "cached_diff_rc=$?" >> "$diag"\n'
+        # unstaged changes (worktree vs index)
+        'git diff --binary --submodule=diff -- >> "$out" 2>>"$diag" '
+        '|| echo "worktree_diff_rc=$?" >> "$diag"\n'
+        'echo "untracked=$(git ls-files --others --exclude-standard -z | tr -cd "\\000" | wc -c)" '
+        '>> "$diag"\n'
+        # untracked files, excluding nested git repositories (agent scratch repos)
+        f"git ls-files --others --exclude-standard -z | xargs -0 sh -c {shlex.quote(untracked_body)} sh\n"
+        'echo "collector=done" >> "$diag"\n'
         'wc -c < "$out"\n'
     )
     try:
@@ -104,8 +137,11 @@ async def collect_git_patch(
         )
         raise
     if result.exit_code != 0:
+        diagnostics = await _read_collector_diagnostics(session)
         raise RuntimeError(
-            f"Could not collect harness patch (exit {result.exit_code}): {result.stderr.strip()}"
+            f"Could not collect harness patch (exit {result.exit_code}, cwd={workdir!r}): "
+            f"{result.stderr.strip() or '<backend reported no stderr>'}\n"
+            f"collector diagnostics:\n{diagnostics}"
         )
     try:
         payload = await session.read_bytes(_HARNESS_PATCH_PATH)
@@ -121,3 +157,20 @@ async def collect_git_patch(
             len(payload),
         )
     return payload.decode(errors="replace")
+
+
+async def _read_collector_diagnostics(session: SandboxSession) -> str:
+    """Read the collector's self-report after a non-zero exit.
+
+    Read as a file rather than from the exec response because the sandbox exec channel
+    does not carry stderr on every backend. Failure to read is itself diagnostic, so it
+    is reported inline instead of masking the collection error.
+    """
+    try:
+        payload = await session.read_bytes(_HARNESS_DIAG_PATH)
+    except Exception:
+        psrl_logger.warning(
+            "Could not read the patch-collector diagnostics from %r.", _HARNESS_DIAG_PATH, exc_info=True
+        )
+        return "<unavailable>"
+    return payload.decode(errors="replace").strip() or "<empty>"

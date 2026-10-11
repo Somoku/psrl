@@ -327,3 +327,35 @@ class TestTheHandshakeBudgetIsConfigurable:
 
         assert "handshake_timeout_s" in source
         assert "18.6" in source and "23.5" in source
+
+    def test_no_wait_compares_against_an_unresolved_timeout(self):
+        """Every `None`-defaulted wait must compare against `budget`, not `timeout`.
+
+        The regression this exists for: the signatures were changed to
+        `timeout: float | None = None` and a `budget` was resolved, but the comparison in
+        some bodies still read `timeout`. That makes `time.time() - start > None` raise
+        `TypeError: '>' not supported between instances of 'float' and 'NoneType'` the
+        moment a caller omits the argument -- which every production caller does.
+
+        It cost a multi-node run, and it surfaced on the *server* as "Timeout waiting for
+        agents" because the clients died before connecting, which is the same symptom as
+        the slow-startup problem this change was meant to fix.
+        """
+        import re
+
+        for relative in ("psrl/utils/nixl/server.py", "psrl/utils/nixl/client.py"):
+            source = self._source(relative)
+            offenders = []
+            for match in re.finditer(r"    (?:async )?def (\w+)\(", source):
+                name = match.group(1)
+                body = source[match.end() : source.find("\n    def ", match.end())]
+                signature = source[match.start() : match.end() + 200]
+                if "timeout: float | None = None" not in signature:
+                    continue
+                if "> timeout:" in body:
+                    offenders.append(f"{relative}::{name}")
+
+            assert not offenders, (
+                f"these waits default `timeout` to None but still compare against it, "
+                f"so omitting the argument raises TypeError: {offenders}"
+            )

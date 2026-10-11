@@ -1283,7 +1283,7 @@ class NIXLStorageClient:
         ready = False
         while not ready:
             ready = self.agent.check_remote_metadata(self.server_name)
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for server metadata to be fetched and connected.")
             time.sleep(0.1)
         self._is_connected = True
@@ -1387,7 +1387,7 @@ class NIXLStorageClient:
                 )
                 self._unified_sharding_dict = next(iter(client_sharding_dicts.values()))
                 break
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for server sharding notification.")
             time.sleep(0.1)
         self._unified_sharding_dict_fetched = True
@@ -1441,7 +1441,7 @@ class NIXLStorageClient:
                     f"payload_bytes={len(notification_bytes)}"
                 )
                 break
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for meta server client infos.")
             time.sleep(0.1)
         self._all_client_infos_fetched = True
@@ -1457,7 +1457,7 @@ class NIXLStorageClient:
             if self.server_name in notifs and notifs[self.server_name]:
                 self._all_temp_mappings = pickle.loads(notifs[self.server_name][0])
                 break
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for temp mappings.")
             time.sleep(0.1)
 
@@ -1510,7 +1510,7 @@ class NIXLStorageClient:
                         )
                     except Exception:
                         continue
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for agents.")
             time.sleep(0.1)
 
@@ -2505,7 +2505,7 @@ class NIXLMultiStorageClients:
         ready = False
         while not ready:
             ready = self.agent.check_remote_metadata(self.server_name)
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for server metadata to be fetched and connected.")
             time.sleep(0.1)
         self._is_connected = True
@@ -2557,7 +2557,7 @@ class NIXLMultiStorageClients:
                         self.multi_client_names.index(client_name)
                     ]._unified_sharding_dict = sharding_dict
                 break
-            if time.time() - start > timeout:
+            if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for server sharding notification.")
             time.sleep(0.1)
         self._multi_unified_sharding_dicts_fetched = True

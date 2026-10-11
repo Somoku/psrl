@@ -326,3 +326,59 @@ class TestThePairedKnobsAreEnforced:
         at = source.index('if config.psrl.ps_mode == "nixl_direct":')
 
         assert "_validate_nixl_peer_diffusion(config)" in source[at : at + 2500]
+
+
+class TestTheSlowerConfigurationAnnouncesItself:
+    """The measured default is the fast one; choosing the slow path should be deliberate.
+
+    Diffusion on costs roughly 1.9x on rollout pulls under direct supply (1.25-1.69s
+    against 0.66-0.90s, against 1.14s for the PS path). It is not refused, because a
+    deployment with spare NIC headroom and few same-node peers may still prefer it -- but
+    a run should have to opt in rather than inherit it from a default nobody revisited.
+    """
+
+    def _messages(self, diffusion: bool) -> list[str]:
+        """Collect what the validator logged.
+
+        `caplog` cannot be used: `configure_verl_logging` sets `propagate = False` on the
+        `psrl` logger so that Ray and vLLM cannot reconfigure its output, which is
+        deliberate -- but it also means records never reach the root handler pytest
+        installs. Attaching a handler directly is the way to observe them.
+        """
+        import logging
+
+        from omegaconf import OmegaConf
+
+        from psrl.utils.config import _validate_nixl_peer_diffusion
+
+        config = OmegaConf.create(
+            {"psrl": {"nixl": {"peer_diffusion": diffusion, "shards_must_be_readable": diffusion}}}
+        )
+        captured: list[str] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record):
+                captured.append(record.getMessage())
+
+        logger = logging.getLogger("psrl")
+        handler = _Collect()
+        logger.addHandler(handler)
+        try:
+            _validate_nixl_peer_diffusion(config)
+        finally:
+            logger.removeHandler(handler)
+        return captured
+
+    def test_diffusion_on_warns_with_the_measurement(self):
+        messages = self._messages(diffusion=True)
+
+        assert any("peer_diffusion" in message for message in messages)
+        # The numbers are the point: a warning without them is indistinguishable from
+        # boilerplate, and the reader cannot tell whether it matters.
+        assert any("0.66" in message for message in messages)
+
+    def test_diffusion_off_is_silent(self):
+        """The recommended configuration must not nag."""
+        messages = self._messages(diffusion=False)
+
+        assert not [m for m in messages if "peer_diffusion" in m]

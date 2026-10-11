@@ -173,6 +173,24 @@ def _validate_nixl_peer_diffusion(config: DictConfig) -> None:
     diffusion = bool(nixl.get("peer_diffusion", True))
     readable = bool(nixl.get("shards_must_be_readable", True))
 
+    if diffusion:
+        # One advisory, next to the only function that is about these two knobs, rather
+        # than in the mode block where a caller validating the pair would not see it.
+        #
+        # Not refused: a deployment with spare NIC headroom and few same-node peers may
+        # still prefer diffusion. But the numbers belong in the message -- a warning
+        # without them reads as boilerplate, and the reader cannot tell whether it
+        # matters.
+        import logging
+
+        logging.getLogger("psrl").warning(
+            "peer_diffusion=True: measured 1.25-1.69s per rollout pull under direct "
+            "supply against 0.66-0.90s with it disabled (and 1.14s for the PS path). "
+            "Diffusion saves cross-node bytes but forces the designate to register in "
+            "place at one descriptor per row. Set psrl.nixl.peer_diffusion=False and "
+            "psrl.nixl.shards_must_be_readable=False unless you have measured otherwise."
+        )
+
     assert not (diffusion and not readable), (
         "psrl.nixl.peer_diffusion=True requires shards_must_be_readable=True: a "
         "diffusion designate has to be readable by its followers, and a staged shard "

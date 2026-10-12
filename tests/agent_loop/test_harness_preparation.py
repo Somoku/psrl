@@ -55,13 +55,13 @@ async def test_grader_preparation_overlaps_rollout_without_allocating_a_grader(h
         clean_sandbox_spec=SandboxSpec(SandboxSource.image("grader")),
     )
 
-    async def run_harness(*args):
+    async def run_harness(*args, **kwargs):
         await asyncio.wait_for(started.wait(), timeout=1)
         assert not finish.is_set(), "Rollout must start before grader preparation finishes."
         assert len(manager._leases) == 1, "Speculative preparation must not reserve grader capacity."
         assert engine.config["Image"] == "rollout", "Only the rollout container should exist."
         finish.set()
-        return SimpleNamespace(exit_code=0, stderr_tail="")
+        return SimpleNamespace(exit_code=0, stderr_tail="", timed_out=False)
 
     harness = SimpleNamespace(prepare=AsyncMock(), run=run_harness, abort=AsyncMock())
     monkeypatch.setattr(harness_module, "create_harness", lambda *args: harness)

@@ -9,6 +9,7 @@ from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.budget import EpisodeBudget
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 from psrl.workers.agent_loop.timeouts import resolve_rollout_timeouts
+from psrl.workers.gen.utils import TokenOutput
 from tensordict import TensorDict
 
 pytestmark = pytest.mark.cpu_test
@@ -95,6 +96,54 @@ async def test_episode_budget_expiry_is_reported_separately() -> None:
     assert reason.is_timeout is True
     assert reason.is_error is False
     assert "Episode budget" in loop.last_error_traceback
+
+
+@pytest.mark.asyncio
+async def test_the_base_cancels_an_episode_that_the_loop_does_not_own() -> None:
+    # Default (`discard`): the base enforces the budget by cancelling `run`, and the
+    # partial work the CLI had produced is lost.
+    loop = _loop(trajectory_timeout=0.05)
+    completed: list[str] = []
+
+    async def run(request):
+        await asyncio.sleep(0.2)
+        completed.append("returned")
+        return TokenOutput(prompt_ids=[1], response_ids=[2], response_mask=[1]), TerminateReason.AGENT_TIMEOUT
+
+    loop.run = run
+    output, reason = await loop.run_with_termination_handling(_request(), raise_on_error=False)
+
+    assert completed == [], "a loop that does not own its budget must be stopped by the base"
+    assert output is None
+    assert reason is TerminateReason.TRAJECTORY_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_a_loop_that_owns_its_budget_is_not_cancelled_by_the_base() -> None:
+    """In `keep` mode the loop stops its own agent work and wraps the episode up.
+
+    The base must not cancel the very episode the loop is collecting and grading, so a
+    run that outlives the budget still returns its own result -- here `AGENT_TIMEOUT`
+    with the partial output -- rather than `TRAJECTORY_TIMEOUT`.
+    """
+    loop = _loop(trajectory_timeout=0.05)
+    loop.episode_budget_enforced_by_loop = True
+    # `_attach_loop_timing` reads the wall clock off the loop's timer.
+    loop.timer = SimpleNamespace(as_dict=lambda: {})
+    loop.ps_manager_handle = None
+    completed: list[str] = []
+
+    async def run(request):
+        await asyncio.sleep(0.2)  # Outlives the budget the base would otherwise enforce.
+        completed.append("returned")
+        return TokenOutput(prompt_ids=[1], response_ids=[2], response_mask=[1]), TerminateReason.AGENT_TIMEOUT
+
+    loop.run = run
+    output, reason = await loop.run_with_termination_handling(_request(), raise_on_error=False)
+
+    assert completed == ["returned"], "the base cancelled a loop that owns its own budget"
+    assert output is not None
+    assert reason is TerminateReason.AGENT_TIMEOUT
 
 
 @pytest.mark.asyncio

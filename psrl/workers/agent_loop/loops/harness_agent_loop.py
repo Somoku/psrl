@@ -95,6 +95,11 @@ class HarnessAgentLoop(SessionAgentLoop):
     # work, so the episode budget starts only once the harness is about to run.
     episode_starts_after_provisioning = True
 
+    # Set from `rollout.agent.trajectory_timeout_action` in __init__; a class default keeps
+    # a loop built without __init__ (a test) on the discard path.
+    keeps_partial_on_timeout = False
+    _agent_timed_out = False
+
     def __init__(
         self,
         context: AgentLoopContext,
@@ -114,6 +119,14 @@ class HarnessAgentLoop(SessionAgentLoop):
         # admitted, so the manager's capacity breaker can count the fault instead of reading
         # it as a generic grader failure.
         self.grader_capacity_timeout = False
+        # Per-request: set when the episode deadline stopped the agent phase.
+        self._agent_timed_out = False
+        self.keeps_partial_on_timeout = self._resolve_timeout_action(
+            context.config.gen_actor_rollout_ref.rollout.agent
+        )
+        # In `keep` mode this loop stops its own agent phase at the deadline and carries
+        # on to collection and grading, so the base must not cancel the episode instead.
+        self.episode_budget_enforced_by_loop = self.keeps_partial_on_timeout
         multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
         if not getattr(multi_turn, "enable", False):
             raise ValueError("Harness training requires rollout.multi_turn.enable=True.")
@@ -124,6 +137,19 @@ class HarnessAgentLoop(SessionAgentLoop):
             )
         if context.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode != "traj":
             raise ValueError("Harness training supports only agent.traj_reward_mode=traj.")
+
+    @staticmethod
+    def _resolve_timeout_action(agent_config) -> bool:
+        """Return whether the episode deadline keeps the partial trajectory.
+
+        ``rollout.agent.trajectory_timeout_action`` is ``discard`` (the episode is
+        cancelled and retried, losing the partial work) or ``keep`` (the agent phase is
+        stopped at the deadline and its patch and trajectory are collected and graded).
+        """
+        action = str(getattr(agent_config, "trajectory_timeout_action", "discard") or "discard").strip()
+        if action not in ("discard", "keep"):
+            raise ValueError(f"rollout.agent.trajectory_timeout_action must be 'discard' or 'keep', got {action!r}.")
+        return action == "keep"
 
     @abstractmethod
     async def prepare_harness_task(self, request: dict) -> HarnessTaskContext:
@@ -258,6 +284,7 @@ class HarnessAgentLoop(SessionAgentLoop):
         )
 
         self.max_turns = self._resolve_turn_limit(rollout_config.multi_turn.max_turns)
+        self._agent_timed_out = False
         context_window = rollout_config.max_model_len or rollout_token_budget(rollout_config)
         if context_window > self.rollout_budget:
             psrl_logger.warning(
@@ -369,9 +396,13 @@ class HarnessAgentLoop(SessionAgentLoop):
             # prepared, and the harness is ready. Only from here on is the wall clock spent
             # on episode work, so this is where the episode budget starts.
             self.arm_episode_budget()
+            # In `keep` mode the harness stops the CLI at the episode deadline and returns
+            # its partial output, which collection and grading below then use. In `discard`
+            # mode the CLI has no deadline of its own; the base cancels the whole episode.
+            agent_deadline_s = self.episode_budget.remaining_s() if self.keeps_partial_on_timeout else None
             harness_started = time.perf_counter()
             try:
-                harness_result = await harness.run(task.prompt, harness_runtime)
+                harness_result = await harness.run(task.prompt, harness_runtime, deadline_s=agent_deadline_s)
             except TimeoutError as downstream:
                 # A call inside the episode timed out. That is the sandbox or the daemon
                 # behind it, not the episode budget: the episode budget never surfaces as a
@@ -386,13 +417,21 @@ class HarnessAgentLoop(SessionAgentLoop):
                 )
                 return None, TerminateReason.DOWNSTREAM_TIMEOUT
             timing["assistant_s"] = time.perf_counter() - harness_started
-            if harness_result.exit_code != 0:
+            self._agent_timed_out = harness_result.timed_out
+            if self._agent_timed_out:
+                psrl_logger.warning(
+                    "Harness %s reached the %.0fs episode budget for session %s; keeping the partial "
+                    "trajectory and grading it (rollout.agent.trajectory_timeout_action=keep).",
+                    self.harness_config.kind,
+                    self.episode_budget.total_s,
+                    session_id,
+                )
+            elif harness_result.exit_code != 0:
                 # The CLI can die without stopping the container, for example when the kernel
                 # OOM-kills it inside the sandbox. The episode continues and is trained, so say
                 # so loudly instead of recording the code as a silent data field.
                 psrl_logger.warning(
-                    "Harness %s exited with code %s for session %s, so the episode ended early. "
-                    "stderr tail: %s",
+                    "Harness %s exited with code %s for session %s, so the episode ended early. stderr tail: %s",
                     self.harness_config.kind,
                     harness_result.exit_code,
                     session_id,
@@ -695,11 +734,21 @@ class HarnessAgentLoop(SessionAgentLoop):
         a measured zero. When the grader sandbox was never admitted it reports
         `GRADER_CAPACITY_TIMEOUT` instead, which is ungraded for the same reason but also
         tells the manager's capacity breaker that grading is starved rather than broken.
+
+        When the episode deadline stopped the agent under `trajectory_timeout_action=keep`,
+        the partial trajectory is complete and graded, so it reports `AGENT_TIMEOUT`: a
+        success kept for training and counted apart from a naturally finished episode,
+        rather than the `TRAJECTORY_TIMEOUT` that discards and retries.
         """
         if self.grader_capacity_timeout:
             return TerminateReason.GRADER_CAPACITY_TIMEOUT
         if self.grader_unavailable:
             return TerminateReason.VERIFIER_ERROR
+        # The episode deadline stopped the agent, but the partial trajectory was kept and
+        # graded. Reported as its own reason so it is trained rather than retried, and so
+        # it is counted apart from a finished episode in metrics.
+        if self._agent_timed_out:
+            return TerminateReason.AGENT_TIMEOUT
         if any(len(item["prompt_ids"]) + len(item["response_ids"]) > self.rollout_budget for item in training_data):
             return TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
         # An unlimited episode has no turn cap to exceed, so it finishes rather than

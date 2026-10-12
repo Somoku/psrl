@@ -27,6 +27,10 @@ psrl_logger = logging.getLogger(__file__)
 # rather than spending the rest of the episode's wall clock waiting for it.
 _DIAGNOSTIC_READ_TIMEOUT_S = 60.0
 
+# The exit code a `HarnessResult` carries when the harness stopped the CLI at its
+# deadline rather than the CLI exiting on its own.
+EXIT_TIME_BUDGET_EXCEEDED = -1
+
 # Trajectory output formats the post-rollout integrity scanner can dispatch on.
 # `auto` resolves to the kind default below, but the scan dispatch key is always a concrete format.
 SUPPORTED_TRAJECTORY_FORMATS = (
@@ -194,6 +198,10 @@ class HarnessResult:
     workdir: str = ""
     stdout_path: str = ""
     stderr_path: str = ""
+    # Set when the harness stopped the CLI at its deadline rather than the CLI exiting.
+    # The output files keep whatever the CLI had produced, so a `keep` caller can still
+    # collect the partial trajectory and grade it.
+    timed_out: bool = False
 
     def diagnostic_text(self) -> str:
         """Return bounded, actionable process diagnostics for rollout failures."""
@@ -294,17 +302,22 @@ class Harness(ABC):
     def build_env(self, runtime: HarnessRuntime) -> Mapping[str, str]:
         """Build environment variables for one task-scoped inference endpoint."""
 
-    async def run(self, prompt: str, runtime: HarnessRuntime) -> HarnessResult:
-        """Run the harness CLI and retain bounded stdout/stderr diagnostic tails."""
+    async def run(self, prompt: str, runtime: HarnessRuntime, *, deadline_s: float | None = None) -> HarnessResult:
+        """Run the harness CLI and retain bounded stdout/stderr diagnostic tails.
+
+        ``deadline_s`` is the episode clock the loop hands down, so the harness stops
+        at the same instant the loop's budget expires rather than a second timer. When
+        it fires, the CLI is cancelled and the result is returned with ``timed_out=True``
+        and the output files intact, so a caller that keeps partial work can still read
+        and grade what the CLI produced. ``None`` runs the CLI to completion and relies
+        on an outside cancellation to stop it.
+        """
         stderr_path = str(PurePosixPath(self._log_dir) / "stderr.log")
         stdout_path = str(PurePosixPath(self._log_dir) / "stdout.log")
         argv = self.build_command(prompt, runtime)
         command = (
             f"{shlex.join([str(item) for item in argv])} > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}"
         )
-        # No exec deadline of its own: the episode budget is the single clock that stops
-        # the harness, and it does so by cancelling this task. A separate exec timeout
-        # would be a second clock racing the first.
         task = asyncio.create_task(
             self.sandbox.exec(
                 command,
@@ -314,7 +327,25 @@ class Harness(ABC):
         )
         self._active_exec = task
         try:
-            result = await task
+            if deadline_s is None:
+                result = await task
+            else:
+                result = await asyncio.wait_for(task, timeout=deadline_s)
+        except asyncio.TimeoutError:
+            # The deadline fired while the CLI was still working. Cancelling the exec is
+            # the best stop this layer can offer; the sandbox lease release is the hard
+            # one. Return the partial output rather than raising, so the caller decides
+            # whether to keep it.
+            return HarnessResult(
+                exit_code=EXIT_TIME_BUDGET_EXCEEDED,
+                timed_out=True,
+                stdout_tail=await self._read_tail(stdout_path),
+                stderr_tail=await self._read_tail(stderr_path),
+                command_name=str(argv[0]) if argv else self.config.executable,
+                workdir=runtime.workdir,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            )
         finally:
             if self._active_exec is task:
                 self._active_exec = None

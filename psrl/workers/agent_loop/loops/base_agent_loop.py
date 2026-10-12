@@ -58,6 +58,13 @@ class AgentLoopBase(ABC):
 
     episode_starts_after_provisioning = False
 
+    # Whether the loop bounds its own episode and must not be cut off by the base's
+    # budget. A loop that keeps a partial trajectory on timeout (`keep`) stops its own
+    # agent work at the deadline and carries on to collection and grading, so the base
+    # must not cancel the very episode the loop is trying to wrap up. Loops that leave
+    # this False have their episode enforced here by cancelling `run`.
+    episode_budget_enforced_by_loop = False
+
     def __init__(
         self,
         context: AgentLoopContext,
@@ -734,20 +741,27 @@ class AgentLoopBase(ABC):
             )
             output, terminate_reason = None, None
             run_task = asyncio.ensure_future(self.run(prompt))
-            try:
-                output, terminate_reason = await self.episode_budget.wait_for(run_task)
-            except EpisodeBudgetExpired as expired:
-                run_task.cancel()
-                await asyncio.gather(run_task, return_exceptions=True)
-                self._record_error(expired)
-                psrl_logger.error(
-                    "Episode budget expired in agent_loop.run for request %s after %ss of episode time "
-                    "(%.0fs spent in admission and preparation).",
-                    request_ids,
-                    self.episode_budget.total_s,
-                    self.episode_budget.wait_s(),
-                )
-                return None, TerminateReason.TRAJECTORY_TIMEOUT
+            if self.episode_budget_enforced_by_loop:
+                # The loop owns the deadline: it stops its own agent work at the budget
+                # and keeps the partial trajectory (`keep`), so the base must not cancel
+                # it here. `episode_budget` is still armed for the loop to read the time
+                # left; it just is not what stops the episode.
+                output, terminate_reason = await run_task
+            else:
+                try:
+                    output, terminate_reason = await self.episode_budget.wait_for(run_task)
+                except EpisodeBudgetExpired as expired:
+                    run_task.cancel()
+                    await asyncio.gather(run_task, return_exceptions=True)
+                    self._record_error(expired)
+                    psrl_logger.error(
+                        "Episode budget expired in agent_loop.run for request %s after %ss of episode time "
+                        "(%.0fs spent in admission and preparation).",
+                        request_ids,
+                        self.episode_budget.total_s,
+                        self.episode_budget.wait_s(),
+                    )
+                    return None, TerminateReason.TRAJECTORY_TIMEOUT
             if output is not None:
                 await self._resolve_version_for_dump(output, prompt)
                 self._attach_loop_timing(output)

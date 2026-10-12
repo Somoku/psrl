@@ -34,6 +34,7 @@ from psrl.sandbox.backends.docker import DockerBackend
 from psrl.sandbox.backends.docker.policy import DockerPolicyProfile
 from psrl.sandbox.backends.docker.session import DockerSession
 from psrl.workers.agent_loop.harness import (
+    EXIT_TIME_BUDGET_EXCEEDED,
     HarnessCompactionConfig,
     HarnessConfig,
     HarnessRuntime,
@@ -213,6 +214,42 @@ async def test_successful_harness_skips_diagnostic_tail_commands() -> None:
     assert result.stdout_tail == ""
     assert result.stderr_tail == ""
     assert not any(command.startswith("tail -c") for command, _, _ in sandbox.commands)
+
+
+@pytest.mark.asyncio
+async def test_the_harness_stops_at_the_deadline_and_keeps_partial_output() -> None:
+    """A `keep` loop hands the harness its episode deadline, so the harness stops the CLI.
+
+    The run has to return rather than raise, with `timed_out` set and the output files
+    still pointing at what the CLI had written, because the loop that chose `keep`
+    collects the partial trajectory and grades it.
+    """
+    sandbox = FakeSandbox(block_cli=True)
+    harness = create_harness(HarnessConfig(kind="codex", executable="codex"), sandbox)
+    await harness.prepare(_runtime())
+
+    result = await harness.run("fix", _runtime(), deadline_s=0.05)
+
+    assert result.timed_out is True
+    assert result.exit_code == EXIT_TIME_BUDGET_EXCEEDED
+    assert sandbox.cli_cancelled, "the deadline stops the CLI rather than leaving it running"
+    # The deadline stops the CLI; it does not discard what the CLI produced.
+    assert result.stdout_path == "/root/.psrl-harness/stdout.log"
+    assert result.stdout_tail == "bounded tail"
+
+
+@pytest.mark.asyncio
+async def test_the_harness_without_a_deadline_runs_the_cli_to_completion() -> None:
+    # `discard` mode passes no deadline, so the harness never stops the CLI on its own;
+    # the base cancels the whole episode instead.
+    sandbox = FakeSandbox()
+    harness = create_harness(HarnessConfig(kind="codex", executable="codex"), sandbox)
+    await harness.prepare(_runtime())
+
+    result = await harness.run("fix", _runtime(), deadline_s=None)
+
+    assert result.timed_out is False
+    assert result.exit_code == 0
 
 
 @pytest.mark.asyncio
@@ -560,4 +597,3 @@ def test_docker_session_translates_loopback_callback_through_policy() -> None:
     assert session.resolve_callback_url("https://router.internal/sessions/s1") == (
         "https://router.internal/sessions/s1"
     )
-

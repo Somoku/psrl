@@ -142,6 +142,12 @@ agent:
   # grading is not timed.
   grading_timeout: null
 
+  # What a harness does when `trajectory_timeout` expires. `discard` cancels the episode
+  # and retries it, losing the partial work. `keep` stops the agent at the deadline and
+  # collects and grades whatever patch and trajectory it produced, training the partial
+  # rollout instead of discarding it. Applies to harness training only.
+  trajectory_timeout_action: discard
+
   # Environment configuration for the agent loop.
   env:
 

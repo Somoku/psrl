@@ -105,6 +105,15 @@ if [ -z "$VLLM_PATH" ]; then
     popd
 fi
 pushd $VLLM_PATH
+# Build-time gates, applied before compiling rather than through apply_patch.sh, which
+# runs after the install and so cannot influence what gets built. Two vLLM v0.30.0 CUDA
+# version checks are looser than the code behind them -- DeepGEMM asserts 12.9 behind a
+# 12.3 gate, cooperative_topk needs CCCL's 12.9 `cuda::ptx` overloads behind a 12.0 gate
+# -- so on a 12.8 toolchain both start compiling and fail. `optional=True` does not help:
+# the failing target takes the whole ninja run down with it. Raising the gates is correct
+# on newer toolchains too, where they still pass.
+git apply --3way "$PSRL_PATH/patch/vllm/v0.30.0-build-gates.patch" || \
+    echo "build gates already applied or not needed"
 python use_existing_torch.py
 python -m uv pip install -r requirements/build/cuda.txt
 python -m uv pip install --no-build-isolation -e .

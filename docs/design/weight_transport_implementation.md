@@ -902,7 +902,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | D3 / T2 | ✅ 生产侧 `nixl_direct` + `ps_mode` 判定集中化 | ⏳ 删除 PS 本体（前置已满足：功能完整、已稳定验证、性能优于 PS） |
 > | E1 | ✅ | ✅ **L2 判据已达成**（撕裂可复现，拦截消除它；7 passed） |
 > | E2 | ✅ | ✅ |
-> | E3 | ✅ | ⏳ 待握手改事件驱动 |
+> | E3 | ✅ 握手解复用 + `admit_joiners` 准入 | ⏳ L3 需要能中途起 instance 的 harness |
 > | E4 | ✅ 上半实测 1054× | ⏳ 下半被 NIXL 缺绑定阻塞 |
 > | F1 | ✅ | ⏳ L4 跨 DC |
 > | T1 / **T3** | ✅ | ✅ |

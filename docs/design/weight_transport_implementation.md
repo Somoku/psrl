@@ -1855,10 +1855,29 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       **离开必须两阶段**：先停止路由（`begin_leave`），等在飞归零后才移除
       （`complete_leave` 在仍有读者时**拒绝**）——
       合并两步会在活跃读上释放内存，而那次读会**成功**。
-      **仍待做**：把 `server.py` 的
-      `_is_all_client_shardings_recved` / `_is_all_client_infos_recved`
-      一次性直线（源码中的 `TODO(lhy): Support elastic clients`）改为事件驱动循环，
-      并跑 L3 运行中扩容。
+      **握手循环已改造**（`psrl/utils/nixl/handshake_notif.py`，
+      `test_handshake_notif.py` 21 passed）。改造中发现阻塞不在循环结构，而在**线格式**：
+      三种握手负载都是 `{client_name: value}` 的 pickle，**结构上无法区分**,
+      `isinstance(obj, dict)` 对三者都成立。服务端靠「自己处在哪个阶段」分辨它们 ——
+      **时间位置就是类型标签**。只要握手是 lock-step 这成立；而后加入的客户端
+      按定义就是乱序的。
+
+      两种失败都**静默**：被错误的 `wait_for_*` 消费掉的通知会进**错误的注册表**
+      （一个 `{name: value}` 和另一个长得一样）；没人在等的通知则直接丢失,
+      因为 `get_new_notifs` 是**破坏性**的,每条只交给一个调用方。第四个读者
+      `wait_for_update_infos` 更糟 —— 它对解析不了的东西**抛异常**而非跳过。
+
+      所以信封带上 kind,**一个解复用 drain** 供四个注册表。单一 drain 不是风格选择:
+      三个读者各自轮询同一条破坏性流,先跑的那个就吞掉别人的信。
+
+      per-kind 的「握手已完成」布尔量**删除**了 —— 布尔量只能表达「第一次握手完成」,
+      而这正是让后续加入隐形的那个答案;改成会继续增长的 roster。
+      `UPDATE_INFO` 的 roster **每轮清空**,因为它问的是「这一轮谁重新注册了」。
+
+      **多节点验证**（run 45）：sharding 1.5s / client infos 0.8s / temp mappings 0.1s,
+      0 超时、0 错误、0 版本违例,两个 step 跑完。
+
+      **仍待做**：跑 L3 运行中扩容（真正让一个客户端在握手之后加入）。
 - [ ] **E4 第一半（partial MD 两段式）模块已落地并实测；第二半被上游阻塞**。
       `psrl/utils/nixl/partial_md.py`，`test_partial_md.py` 10 passed，
       实测 `bench_partial_md.py`（H20）：

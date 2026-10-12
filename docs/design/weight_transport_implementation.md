@@ -900,7 +900,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | D1 / D2 / D5 / D6 / D7 / D8 | ✅ | ✅ **D1 性能判据已达成**（关扩散走 staging，0.66–0.90s vs PS 1.14s） |
 > | **D4** | ✅ | ✅ **连续两轮 eval，8/8 拉到新版本** |
 > | D3 / T2 | ✅ 生产侧 `nixl_direct` + `ps_mode` 判定集中化 | ⏳ 删除 PS 本体（前置已满足：功能完整、已稳定验证、性能优于 PS） |
-> | E1 | ✅ | ⏳ 待 FSDP2 bf16 同精度配置 |
+> | E1 | ✅ | ✅ **L2 判据已达成**（撕裂可复现，拦截消除它；7 passed） |
 > | E2 | ✅ | ✅ |
 > | E3 | ✅ | ⏳ 待握手改事件驱动 |
 > | E4 | ✅ 上半实测 1054× | ⏳ 下半被 NIXL 缺绑定阻塞 |
@@ -1782,7 +1782,7 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       `test_chunk_availability.py` 21 passed
 
 ### 阶段 E
-- [ ] **E1 已接线（22 passed，含真值表），L2 判据待跑**：
+- [x] **E1 已接线并达成 L2 判据（29 passed，含真值表与撕裂复现）**：
       `psrl/workers/ps/version_barrier.py`。
       发布前按预算等待 v 的在飞读者归零；**超限即发布并把 v 标记 INVALID**，
       读者改拉 v+1（更新的权重，算法上是改善）——
@@ -1834,9 +1834,6 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       **这不能证明的事**：FSDP2 的 optimizer step 与真实 NIXL 拉取在真机上确实重叠。
       那是关于集群时序的论断,也正因如此拦截的必要性由配置决定(`requires_version_barrier`)
       而不是靠实测。这里证明的是:**一旦**重叠,结果就是撕裂,而拦截消除它。
-      配置已就绪（`psrl.nixl.await_readers_before_publish=false` 可显式关闭），
-      但**观测破坏本身尚未实现** —— 需要一次训练中读者恰好落在 optimizer 写窗口内，
-      这靠调度而非断言触发，需要一个专门的注入点。
 - [x] **E2 已落地并验证**：`psrl/utils/nixl/staleness.py`，`test_staleness.py` 13 passed。
       两种陈旧的恢复路径**互为无效**，这正是必须分开的理由：
       descriptor 陈旧时换源只是把错地址带到新 peer；版本陈旧时重取 descriptor

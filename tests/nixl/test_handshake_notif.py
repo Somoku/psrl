@@ -251,6 +251,80 @@ class TestTheWaitNoLongerFreezesTheRoster:
     joining client waited forever for a server that had stopped listening.
     """
 
+    def _server(self, scripted_notifs: list[dict[str, list[bytes]]]):
+        """A server whose agent delivers one batch of notifications per drain.
+
+        Scripted rather than timed: the point is that a batch arriving *after* an earlier
+        wait already returned is still absorbed, and a schedule states that without
+        depending on how fast the loop spins.
+        """
+        from psrl.utils.nixl.server import NIXLMetaServer
+
+        class _Agent:
+            def __init__(self):
+                self._batches = list(scripted_notifs)
+
+            def get_new_notifs(self):
+                return self._batches.pop(0) if self._batches else {}
+
+        class _Server:
+            def __init__(self):
+                self.agent = _Agent()
+                self.client_sharding_dicts = {}
+                self.client_infos = {}
+                self._client_temp_mappings = {}
+                self.connected_clients = {}
+                self._handshake_timeout = 5.0
+                self._agents_reported = {kind: set() for kind in NotifKind}
+
+            _add_client = NIXLMetaServer._add_client
+            _drain_notifs = NIXLMetaServer._drain_notifs
+            _wait_for = NIXLMetaServer._wait_for
+
+        return _Server()
+
+    def test_a_client_joining_after_the_handshake_is_picked_up(self):
+        """E3's whole point, as behaviour rather than as a missing flag.
+
+        The first wait settles for one agent. A second agent then arrives and a later
+        wait asks for two. Under the old code the completion flag short-circuited that
+        second call, so it returned the one-agent roster immediately and the joiner
+        waited forever on a server that had stopped listening.
+        """
+        server = self._server(
+            [
+                {"agent_0": [encode(NotifKind.SHARDING, {"c0": "s"})]},
+                {"agent_1": [encode(NotifKind.SHARDING, {"c1": "s"})]},
+            ]
+        )
+
+        server._wait_for(NotifKind.SHARDING, 1, None, "sharding")
+        assert server._agents_reported[NotifKind.SHARDING] == {"agent_0"}
+
+        server._wait_for(NotifKind.SHARDING, 2, None, "sharding")
+
+        assert server._agents_reported[NotifKind.SHARDING] == {"agent_0", "agent_1"}
+        assert server.client_sharding_dicts == {"c0": "s", "c1": "s"}
+
+    def test_a_repeat_wait_for_the_same_count_returns_without_new_traffic(self):
+        """Growth must not cost a re-handshake: the roster already satisfies it."""
+        server = self._server([{"agent_0": [encode(NotifKind.SHARDING, {"c0": "s"})]}])
+
+        server._wait_for(NotifKind.SHARDING, 1, None, "sharding")
+        server._wait_for(NotifKind.SHARDING, 1, None, "sharding")
+
+        assert server._agents_reported[NotifKind.SHARDING] == {"agent_0"}
+
+    def test_waiting_for_an_agent_that_never_arrives_times_out_with_the_count(self):
+        """The message must say how many did report. "Timeout waiting for agents" sent
+        two multi-node runs down the wrong path -- it names connectivity, when the usual
+        cause is that startup was simply slower than the budget."""
+        server = self._server([{}])
+        server._handshake_timeout = 0.05
+
+        with pytest.raises(TimeoutError, match="0 reported"):
+            server._wait_for(NotifKind.SHARDING, 1, None, "sharding")
+
     def test_no_completion_flags_remain(self):
         from pathlib import Path
 

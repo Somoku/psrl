@@ -18,6 +18,7 @@ from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
 from psrl.utils.nixl.chunk_notify import ChunkCompletionPublisher, ChunkCompletionWaiter
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
+from psrl.utils.nixl.handshake_notif import NotifKind, decode, encode
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.moe_grouping import GroupedShards, entry_is_empty, local_shards_of
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
@@ -1344,7 +1345,9 @@ class NIXLStorageClient:
         Send local sharding to the server.
         """
         assert self._is_connected, "Not connected to server"
-        self.agent.send_notif(self.server_name, pickle.dumps({self.client_name: sharding_dict}))
+        self.agent.send_notif(
+            self.server_name, encode(NotifKind.SHARDING, {self.client_name: sharding_dict})
+        )
 
     def send_local_info(self):
         """
@@ -1357,7 +1360,7 @@ class NIXLStorageClient:
             raise RuntimeError("Local client info not registered.")
         self.agent.send_notif(
             self.server_name,
-            pickle.dumps({self.client_name: self.local_client_info.serialize()}),
+            encode(NotifKind.CLIENT_INFO, {self.client_name: self.local_client_info.serialize()}),
         )
 
     def send_local_temp_mapping(self):
@@ -1365,7 +1368,7 @@ class NIXLStorageClient:
         assert self._is_connected, "Not connected to server"
         self.agent.send_notif(
             self.server_name,
-            pickle.dumps({self.client_name: self._temp_desc_bytes_mapping}),
+            encode(NotifKind.TEMP_MAPPING, {self.client_name: self._temp_desc_bytes_mapping}),
         )
 
     def wait_for_server_sharding(self, timeout: float | None = None):
@@ -1474,7 +1477,7 @@ class NIXLStorageClient:
                 "temp_mapping": self._temp_desc_bytes_mapping,
             }
         }
-        payload = pickle.dumps(payload_dict)
+        payload = encode(NotifKind.UPDATE_INFO, payload_dict)
         for dst_agent_name in dst_agent_names:
             self.agent.send_notif(dst_agent_name, payload)
 
@@ -1495,21 +1498,21 @@ class NIXLStorageClient:
             notifs = self.agent.get_new_notifs()
             for agent_name, notif_list in notifs.items():
                 for notif in notif_list:
-                    try:
-                        multi_infos = pickle.loads(notif)
-                        assert isinstance(multi_infos, dict), f"Expected a dict of multi_infos, but got {multi_infos}"
-                        for client_name, info_and_temp_mapping in multi_infos.items():
-                            info = info_and_temp_mapping["info"]
-                            client_temp_mapping = info_and_temp_mapping["temp_mapping"]
-                            client_info = NIXLClientInfo.deserialize(info)
-                            self._all_client_infos[client_name] = client_info
-                            self._all_temp_mappings[client_name] = client_temp_mapping
-                        already_recved_agents.add(agent_name)
-                        psrl_logger.info(
-                            f"Already received {len(already_recved_agents)} agents: {already_recved_agents}"
-                        )
-                    except Exception:
+                    # Route on the tag rather than on "a dict arrived while we were
+                    # waiting". Peer-diffusion chunk notices share this stream, and the
+                    # old shape check accepted them as client infos.
+                    parsed = decode(notif)
+                    if parsed is None or parsed.kind is not NotifKind.UPDATE_INFO:
                         continue
+                    for client_name, info_and_temp_mapping in parsed.entries.items():
+                        self._all_client_infos[client_name] = NIXLClientInfo.deserialize(
+                            info_and_temp_mapping["info"]
+                        )
+                        self._all_temp_mappings[client_name] = info_and_temp_mapping["temp_mapping"]
+                    already_recved_agents.add(agent_name)
+                    psrl_logger.info(
+                        f"Already received {len(already_recved_agents)} agents: {already_recved_agents}"
+                    )
             if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for agents.")
             time.sleep(0.1)
@@ -1526,7 +1529,7 @@ class NIXLStorageClient:
             client_info = self._all_client_infos[client_name]
             client_temp_mapping = self._all_temp_mappings[client_name]
             payload_dict[client_name] = {"info": client_info.serialize(), "temp_mapping": client_temp_mapping}
-        payload = pickle.dumps(payload_dict)
+        payload = encode(NotifKind.UPDATE_INFO, payload_dict)
         for dst_agent_name in dst_agent_names:
             self.agent.send_notif(dst_agent_name, payload)
 
@@ -2515,7 +2518,7 @@ class NIXLMultiStorageClients:
     def send_local_sharding(self, multi_sharding_dicts: dict[str, dict[str, NIXLSharding]]):
         assert self._is_connected, "Not connected to server"
         # multi_sharding_dicts: {client_name: {key: NIXLSharding}}
-        self.agent.send_notif(self.server_name, pickle.dumps(multi_sharding_dicts))
+        self.agent.send_notif(self.server_name, encode(NotifKind.SHARDING, multi_sharding_dicts))
 
     def send_local_info(self):
         assert self._is_connected, "Not connected to server"
@@ -2523,7 +2526,10 @@ class NIXLMultiStorageClients:
             assert client.local_client_info is not None, "Local client info not registered"
         self.agent.send_notif(
             self.server_name,
-            pickle.dumps({client.client_name: client.local_client_info.serialize() for client in self.multi_clients}),
+            encode(
+                NotifKind.CLIENT_INFO,
+                {client.client_name: client.local_client_info.serialize() for client in self.multi_clients},
+            ),
         )
 
     def send_local_temp_mapping(self):
@@ -2532,7 +2538,10 @@ class NIXLMultiStorageClients:
             assert client._temp_desc_bytes_mapping is not None, "Temp desc bytes mapping not registered"
         self.agent.send_notif(
             self.server_name,
-            pickle.dumps({client.client_name: client._temp_desc_bytes_mapping for client in self.multi_clients}),
+            encode(
+                NotifKind.TEMP_MAPPING,
+                {client.client_name: client._temp_desc_bytes_mapping for client in self.multi_clients},
+            ),
         )
 
     def wait_for_server_sharding(self, timeout: float | None = None):

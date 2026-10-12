@@ -7,6 +7,7 @@ from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
 from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLCommPlan
+from psrl.utils.nixl.handshake_notif import NotifKind, decode
 from psrl.utils.nixl.join_admission import JoinDecision, JoinVerdict, classify_join
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
@@ -60,9 +61,10 @@ class NIXLMetaServer:
         self.comm_plan: NIXLCommPlan | None = None
         self._client_temp_mappings: dict[str, dict] = {}
 
-        self._is_all_client_shardings_recved = False
-        self._is_all_client_infos_recved = False
-        self._is_all_temp_mappings_recved = False
+        # Per-kind rosters rather than three "handshake finished" booleans. A boolean
+        # can only say the first handshake completed, and that is the answer that makes
+        # a later join invisible; a roster still grows when one arrives.
+        self._agents_reported: dict[NotifKind, set[str]] = {kind: set() for kind in NotifKind}
 
         # NOTE(claude): Broadcast initialization makes PS workers direct peers, so
         # each receives every PS GPU descriptor.
@@ -74,119 +76,100 @@ class NIXLMetaServer:
         if client_name not in self.connected_clients[agent_name]:
             self.connected_clients[agent_name].append(client_name)
 
-    def wait_for_client_shardings(self, expected_agents: int = 1, timeout: float | None = None):
+    def _assert_reported(self, kind: NotifKind, what: str) -> None:
+        """Guard the plan-building paths against running before anyone has reported.
+
+        Asserts the roster is non-empty rather than that the handshake "finished".
+        Under elastic membership there is no such moment -- clients keep arriving -- so
+        the honest precondition is that there is something to plan with.
         """
-        Wait for all agents to connect and send sharding.
+        assert self._agents_reported[kind], f"No client has sent {what} yet."
+
+    def _drain_notifs(self) -> None:
+        """Consume every pending notification once, routing each to its own registry.
+
+        One drain for all three kinds, because `get_new_notifs` is **destructive**: it
+        hands each notification to exactly one caller. Three loops polling it
+        independently means whichever happens to be running swallows the others' mail.
+        While the handshake was lock-step that was invisible -- the phases never
+        overlapped -- but it is precisely what an out-of-phase join trips over.
+
+        Unknown payloads are left alone rather than raising: other subsystems publish on
+        the same agent stream, and `decode` returns None for anything foreign.
         """
-        psrl_logger.info(f"Waiting for {expected_agents} agents to connect and send sharding...")
-        if self._is_all_client_shardings_recved:
-            # TODO(lhy): Support elastic clients after initial registration.
-            return True
-        # `None` selects the configured budget; an explicit value still wins, so a
-        # caller that knows its own bound is not overridden by the config.
+        for agent_name, notif_list in self.agent.get_new_notifs().items():
+            for raw in notif_list:
+                notif = decode(raw)
+                if notif is None:
+                    continue
+                for client_name, payload in notif.entries.items():
+                    if notif.kind is NotifKind.SHARDING:
+                        self.client_sharding_dicts[client_name] = payload
+                    elif notif.kind is NotifKind.CLIENT_INFO:
+                        self.client_infos[client_name] = NIXLClientInfo.deserialize(payload)
+                    elif notif.kind is NotifKind.TEMP_MAPPING:
+                        self._client_temp_mappings[client_name] = payload
+                    else:
+                        # Resharding re-sends both at once.
+                        self.client_infos[client_name] = NIXLClientInfo.deserialize(payload["info"])
+                        self._client_temp_mappings[client_name] = payload["temp_mapping"]
+                    self._add_client(agent_name, client_name)
+                    self._agents_reported[notif.kind].add(agent_name)
+
+    def _wait_for(
+        self,
+        kind: NotifKind,
+        expected_agents: int,
+        timeout: float | None,
+        what: str,
+    ) -> None:
+        """Block until `expected_agents` have reported `kind`.
+
+        Counts *agents*, not clients: one agent may host several clients and reports for
+        all of them in a single notification.
+
+        There is deliberately no "already done, return early" short circuit. That is what
+        made membership fixed at whatever the first handshake saw -- a later caller
+        asking for more agents than last time is exactly how an elastic join announces
+        itself, and an early return would answer it with the old roster.
+        """
         budget = self._handshake_timeout if timeout is None else timeout
         start = time.time()
-        already_recved_agents = set()
-        while len(already_recved_agents) < expected_agents:
-            notifs = self.agent.get_new_notifs()
-            for agent_name, notif_list in notifs.items():
-                for notif in notif_list:
-                    try:
-                        multi_shardings = pickle.loads(notif)
-                        assert isinstance(multi_shardings, dict), (
-                            f"Expected a dict of multi_shardings, but got {multi_shardings}"
-                        )
-                        for client_name, sharding_dict in multi_shardings.items():
-                            self.client_sharding_dicts[client_name] = sharding_dict
-                            self._add_client(agent_name, client_name)
-                            already_recved_agents.add(agent_name)
-                    except Exception:
-                        continue
+        reported = self._agents_reported[kind]
+        psrl_logger.info(f"Waiting for {expected_agents} agents to send {what}...")
+
+        while len(reported) < expected_agents:
+            self._drain_notifs()
+            if len(reported) >= expected_agents:
+                break
             if time.time() - start > budget:
-                raise TimeoutError("Timeout waiting for agents.")
+                raise TimeoutError(
+                    f"Timeout waiting for {expected_agents} agents to send {what}; "
+                    f"{len(reported)} reported in {time.time() - start:.1f}s."
+                )
             time.sleep(0.01)
-        self._is_all_client_shardings_recved = True
+
         psrl_logger.info(
-            f"All {len(self.client_sharding_dicts)} clients of {expected_agents} agents "
-            f"sent sharding after {time.time() - start} seconds."
+            f"{len(reported)} agents sent {what} after {time.time() - start:.1f} seconds."
         )
+
+    def wait_for_client_shardings(self, expected_agents: int = 1, timeout: float | None = None):
+        """Wait for `expected_agents` to send their sharding."""
+        self._wait_for(NotifKind.SHARDING, expected_agents, timeout, "sharding")
 
     def wait_for_client_infos(self, expected_agents: int = 1, timeout: float | None = None):
-        """
-        Wait for all agents to connect and send client infos.
-        """
-        psrl_logger.info(f"Waiting for {expected_agents} agents to send client infos...")
-        if self._is_all_client_infos_recved:
-            # TODO(lhy): Support elastic clients after initial registration.
-            return True
-        # `None` selects the configured budget; an explicit value still wins, so a
-        # caller that knows its own bound is not overridden by the config.
-        budget = self._handshake_timeout if timeout is None else timeout
-        start = time.time()
-        already_recved_agents = set()
-        while len(already_recved_agents) < expected_agents:
-            notifs = self.agent.get_new_notifs()
-            for agent_name, notif_list in notifs.items():
-                for notif in notif_list:
-                    try:
-                        multi_infos = pickle.loads(notif)
-                        assert isinstance(multi_infos, dict), f"Expected a dict of multi_infos, but got {multi_infos}"
-                        for client_name, info in multi_infos.items():
-                            self.client_infos[client_name] = NIXLClientInfo.deserialize(info)
-                            self._add_client(agent_name, client_name)
-                            already_recved_agents.add(agent_name)
-                    except Exception:
-                        continue
-            if time.time() - start > budget:
-                raise TimeoutError("Timeout waiting for agents.")
-            time.sleep(0.01)
-        self._is_all_client_infos_recved = True
-        psrl_logger.info(
-            f"All {len(self.client_infos)} clients of {expected_agents} agents "
-            f"sent client infos after {time.time() - start} seconds."
-        )
+        """Wait for `expected_agents` to send their client infos."""
+        self._wait_for(NotifKind.CLIENT_INFO, expected_agents, timeout, "client infos")
 
     def wait_for_client_temp_mappings(self, expected_agents: int = 1, timeout: float | None = None):
-        """
-        Wait for all agents to send temporary mappings.
-        """
-        psrl_logger.info(f"Waiting for {expected_agents} agents to send temp mappings...")
-        if self._is_all_temp_mappings_recved:
-            return True
-        # `None` selects the configured budget; an explicit value still wins, so a
-        # caller that knows its own bound is not overridden by the config.
-        budget = self._handshake_timeout if timeout is None else timeout
-        start = time.time()
-        already_recved_agents = set()
-        while len(already_recved_agents) < expected_agents:
-            notifs = self.agent.get_new_notifs()
-            for agent_name, notif_list in notifs.items():
-                for notif in notif_list:
-                    try:
-                        multi_temp_mappings = pickle.loads(notif)
-                        assert isinstance(multi_temp_mappings, dict), (
-                            f"Expected a dict of multi_temp_mappings, but got {multi_temp_mappings}"
-                        )
-                        for client_name, temp_mapping in multi_temp_mappings.items():
-                            self._client_temp_mappings[client_name] = temp_mapping
-                            self._add_client(agent_name, client_name)
-                            already_recved_agents.add(agent_name)
-                    except Exception:
-                        continue
-            if time.time() - start > budget:
-                raise TimeoutError("Timeout waiting for agents temp mappings.")
-            time.sleep(0.01)
-        self._is_all_temp_mappings_recved = True
-        psrl_logger.info(
-            f"All {len(self._client_temp_mappings)} clients of {expected_agents} agents "
-            f"sent temp mappings after {time.time() - start} seconds."
-        )
+        """Wait for `expected_agents` to send their temporary mappings."""
+        self._wait_for(NotifKind.TEMP_MAPPING, expected_agents, timeout, "temp mappings")
 
     def make_unified_sharding(self):
         """
         Make unified sharding for all clients.
         """
-        assert self._is_all_client_shardings_recved, "Not all clients sent sharding yet."
+        self._assert_reported(NotifKind.SHARDING, "sharding")
         assert not self.client_unified_sharding_dicts, "Unified sharding already made."
         _t_start = time.time()
         # We first need to guarantee that all client shardings have the same keys
@@ -274,7 +257,7 @@ class NIXLMetaServer:
         """
         Make communication plan for all clients.
         """
-        assert self._is_all_client_infos_recved, "Not all clients sent client infos yet."
+        self._assert_reported(NotifKind.CLIENT_INFO, "client infos")
         assert not self.comm_plan, "Communication plan already made."
 
         psrl_logger.info("Making communication plan...")
@@ -297,7 +280,7 @@ class NIXLMetaServer:
         """
         Notify all connected clients with their sharding.
         """
-        assert self._is_all_client_shardings_recved, "Not all clients sent sharding yet."
+        self._assert_reported(NotifKind.SHARDING, "sharding")
         assert self.client_unified_sharding_dicts, "Unified sharding not made yet."
         for agent_name, client_names in self.connected_clients.items():
             client_sharding_dicts = {}
@@ -391,7 +374,7 @@ class NIXLMetaServer:
         Each agent only receives the client infos it actually communicates with according
         to the comm plan, rather than the full set of all registered clients.
         """
-        assert self._is_all_client_infos_recved, "Not all clients sent client infos yet."
+        self._assert_reported(NotifKind.CLIENT_INFO, "client infos")
         assert self.comm_plan, "Communication plan not made yet."
 
         # Serialize each client info exactly once up front (avoid repeated serialization per agent)
@@ -413,7 +396,7 @@ class NIXLMetaServer:
         """
         Notify all connected clients with all temp mappings.
         """
-        assert self._is_all_temp_mappings_recved, "Not all clients sent temp mappings yet."
+        self._assert_reported(NotifKind.TEMP_MAPPING, "temp mappings")
         # Prepare notification data with all clients' temp mappings
         payload = pickle.dumps(self._client_temp_mappings)
         for agent_name in self.connected_clients:
@@ -421,41 +404,15 @@ class NIXLMetaServer:
             self.agent.send_notif(agent_name, payload)
 
     def wait_for_update_infos(self, expected_agents: int, timeout: float | None = None):
-        """
-        Wait for expected number of agents to send updated client infos.
-        """
-        psrl_logger.debug(f"Waiting for {expected_agents} agents to send updated client infos...")
-        # `None` selects the configured budget; an explicit value still wins, so a
-        # caller that knows its own bound is not overridden by the config.
-        budget = self._handshake_timeout if timeout is None else timeout
-        start = time.time()
-        already_recved_agents = set()
-        while len(already_recved_agents) < expected_agents:
-            notifs = self.agent.get_new_notifs()
-            for agent_name, notif_list in notifs.items():
-                for notif in notif_list:
-                    try:
-                        multi_infos = pickle.loads(notif)
-                        assert isinstance(multi_infos, dict), f"Expected a dict of multi_infos, but got {multi_infos}"
-                        for client_name, info_and_temp_mapping in multi_infos.items():
-                            info = info_and_temp_mapping["info"]
-                            client_temp_mapping = info_and_temp_mapping["temp_mapping"]
-                            client_info = NIXLClientInfo.deserialize(info)
-                            self.client_infos[client_name] = client_info
-                            self._client_temp_mappings[client_name] = client_temp_mapping
-                            self._add_client(agent_name, client_name)
-                            already_recved_agents.add(agent_name)
-                    except Exception as e:
-                        psrl_logger.error(f"Failed to parse updated client infos from agent {agent_name}: {e}")
-                        raise
-            if time.time() - start > budget:
-                raise TimeoutError("Timeout waiting for agents.")
-            time.sleep(0.01)
+        """Wait for `expected_agents` to re-send their infos after a resharding.
 
-        psrl_logger.info(
-            f"{self.server_name}: Successfully received all {len(already_recved_agents)}/{expected_agents} "
-            f"agents in {time.time() - start:.2f} seconds"
-        )
+        The roster is cleared first, unlike the handshake kinds. Those accumulate,
+        because a client that joined stays joined; this one asks "who has reported *this
+        round*", and carrying last round's answer forward would return immediately with
+        nobody having re-registered.
+        """
+        self._agents_reported[NotifKind.UPDATE_INFO].clear()
+        self._wait_for(NotifKind.UPDATE_INFO, expected_agents, timeout, "updated client infos")
 
     def broadcast_update_client_infos(self, dst_agent_names: list[str], update_client_names: list[str]):
         """

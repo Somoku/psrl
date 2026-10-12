@@ -1813,6 +1813,12 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 
       **多节点回归已过**（run 43）：接线后 0 错误、0 版本违例、6 次 pull 全完成，
       rollout pull **0.46–0.48 s**（接线前 0.66–0.90 s，PS 1.14 s）。
+      **迁移后复测（run 44）**：仓库与 `verl` 换装到新路径、`verl` 升到较新 commit 后重跑同一配置,
+      0 错误、0 版本违例、6 次 pull 全完成,且**两个 step 都跑完**;拉取 0.44–0.59 s,
+      与迁移前同一量级,仍远低于 PS 的 1.14 s。奖励全为 0 不是截断——
+      `response_length/clip_ratio` 为 0.0625 / 0.4375,生成是真实的,
+      两步跑难题拿不到奖励是预期的。
+
       该 run 的 `await_readers_before_publish` 解析为 **False** 且**这是对的** ——
       日志里 `colocate_validate_and_train=True`，colocate 下 rollout 全程暂停，
       结构上不存在在飞读者。也就是说真值表在生产配置上确实生效，而非接线失效。

@@ -83,6 +83,10 @@ class AgentLoopConfig(_VeRLAgentLoopConfig):
 
     route_strategy: str = "round_robin"
     trajectory_timeout: float | None = None
+    # Seconds grading may run after the episode. Kept apart from the episode budget
+    # because grading is a separate phase an operator often wants a different answer
+    # for; null means grading is not timed.
+    grading_timeout: float | None = None
     env: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     data: AgentDataConfig = field(default_factory=AgentDataConfig)
     sandbox: SandboxManagerConfig = field(default_factory=SandboxManagerConfig)

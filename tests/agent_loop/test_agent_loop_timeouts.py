@@ -77,3 +77,31 @@ def test_the_shipped_config_resolves_to_the_configured_budgets() -> None:
     # The shipped default leaves grading untimed.
     assert rollout["agent"]["grading_timeout"] is None
     assert timeouts.grading_timeout_s is None
+
+
+def test_the_shipped_rollout_config_instantiates_into_its_dataclasses() -> None:
+    """Guard the shipped rollout config against drifting from its dataclass schema.
+
+    The trainer instantiates `rollout` with Hydra, which passes every yaml key to the
+    dataclass constructor as a keyword argument, recursively. A key the dataclass does
+    not declare fails the whole run at startup with `unexpected keyword argument` --
+    which is exactly how `agent.grading_timeout` reached the yaml but not
+    `AgentLoopConfig`. Instantiating the shipped block here catches that drift for
+    every nested config, not just the one that happened to break.
+    """
+    from pathlib import Path
+
+    import yaml
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf
+    from psrl.workers.config.rollout import RolloutConfig
+
+    rollout = yaml.safe_load(Path("psrl/trainer/config/rollout/psrl_rollout.yaml").read_text())
+    # `defaults` is Hydra composition metadata, consumed before a target is called.
+    rollout.pop("defaults", None)
+
+    config = instantiate(OmegaConf.create(rollout))
+
+    assert isinstance(config, RolloutConfig)
+    assert config.agent.trajectory_timeout == rollout["agent"]["trajectory_timeout"]
+    assert config.agent.grading_timeout == rollout["agent"]["grading_timeout"]

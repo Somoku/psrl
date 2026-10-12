@@ -329,6 +329,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.reward_gateway_urls: dict[str, str] = {}
         self.reward_model_to_manager = {}
 
+        # Teardown runs on every exit path, and two paths can overlap: a normal
+        # finish and the interrupt that follows it. The flag makes it run once,
+        # because a second pass would touch actors the first one already shut
+        # down.
+        self._components_stopped = False
+
         # Elastic rm
         self.elastic_rm_mode = config.psrl.deployment.elastic_rm.enable
         self.elastic_executor = None
@@ -3790,22 +3796,54 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 progress_bar.close()
                 break
 
-        # Stop all components
-        self.stop_data_processor()
-        self.stop_agent_loop_manager()
-        self.stop_rollout_coordinator()
-        self.stop_reward_manager()
-        if self.elastic_executor is not None:
-            ray.get(self.elastic_executor.stop_busy_loop.remote())
-            self.elastic_executor = None
-        self.stop_ps_manager()
-        self.stop_sandbox_plane()
-        self._shutdown_dump_executor()
-
-        # Kill all PortScanner actors to free resources.
-        for handle in self.port_scanner_handles.values():
-            ray.kill(handle)
+        self.shutdown_components()
 
         # AGENT(VERL): skip `on_batch_end` processing in PSRL.
 
         psrl_logger.info("Training completed successfully!")
+
+    def shutdown_components(self) -> None:
+        """Stop every component of the data pipeline, at most once.
+
+        Runs when training finishes and when it is interrupted, so a device that
+        stops early — an exception, a ctrl-c, a SIGTERM — still releases the
+        sandboxes the agent loop workers are holding. Nothing else can: a
+        sandbox's own lifetime is a backstop measured in hours, and until it
+        expires the containers stay up holding capacity.
+
+        Each step is isolated because the reason to run them at all is that the
+        ones after a failure still run. A teardown that stopped at its first
+        error would strand exactly the sandboxes this exists to release.
+        """
+        if self._components_stopped:
+            return
+        self._components_stopped = True
+
+        steps = (
+            ("data processor", self.stop_data_processor),
+            ("agent loop manager", self.stop_agent_loop_manager),
+            ("rollout coordinator", self.stop_rollout_coordinator),
+            ("reward manager", self.stop_reward_manager),
+            ("elastic executor", self._stop_elastic_executor),
+            ("ps manager", self.stop_ps_manager),
+            ("sandbox plane", self.stop_sandbox_plane),
+            ("dump executor", self._shutdown_dump_executor),
+        )
+        for name, step in steps:
+            try:
+                step()
+            except Exception:
+                psrl_logger.warning(f"Shutting down the {name} failed; continuing teardown.", exc_info=True)
+
+        # Kill all PortScanner actors to free resources.
+        for handle in self.port_scanner_handles.values():
+            try:
+                ray.kill(handle)
+            except Exception:
+                psrl_logger.warning("Could not kill a PortScanner actor during teardown.", exc_info=True)
+
+    def _stop_elastic_executor(self) -> None:
+        """Stop the elastic reward-model executor, if this run built one."""
+        if self.elastic_executor is not None:
+            ray.get(self.elastic_executor.stop_busy_loop.remote())
+            self.elastic_executor = None

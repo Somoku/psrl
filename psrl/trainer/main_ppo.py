@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import signal
 import socket
 
 import hydra
@@ -155,6 +156,28 @@ def _reserve_excess_nodes(config) -> list:
     return reservers
 
 
+# How long the driver waits for the training actor to confirm teardown. Every
+# step of that teardown bounds itself at 60s, so this covers several of them
+# while still leaving the process able to exit. A job manager that kills the
+# driver first is covered by the fleet reclaiming the owner's sandboxes.
+_TEARDOWN_TIMEOUT_S = 180.0
+
+
+def _install_sigterm_teardown() -> None:
+    """Turn a SIGTERM into an exception, so teardown still runs.
+
+    A job manager stops a run by signalling it, and Python's default action for
+    SIGTERM is to exit without unwinding: no `finally` runs, so the job's
+    sandboxes stay up until their own lifetime expires. Raising instead routes
+    the signal through the same path as a ctrl-c.
+    """
+
+    def _raise(_signum, _frame):
+        raise SystemExit("PSRL training was terminated by signal.")
+
+    signal.signal(signal.SIGTERM, _raise)
+
+
 # Define a function to run the PPO-like training process
 def run_ppo(config, task_runner_class=None) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
@@ -207,7 +230,23 @@ def run_ppo(config, task_runner_class=None) -> None:
         runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
     else:
         runner = task_runner_class.remote()
-    ray.get(runner.run.remote(config))
+    _install_sigterm_teardown()
+    try:
+        ray.get(runner.run.remote(config))
+    finally:
+        # The actor holds this job's components, and Ray kills it along with the
+        # driver: a driver that simply exits would strand the sandboxes its agent
+        # loop workers hold, because nothing inside the actor gets a chance to
+        # run. Ask it to release them, and let the fleet's owner reclamation
+        # cover the case where it cannot answer.
+        try:
+            ray.get(runner.terminate.remote(), timeout=_TEARDOWN_TIMEOUT_S)
+        except Exception:
+            psrl_logger.warning(
+                "The training actor did not confirm teardown. Its sandboxes are reclaimed by the "
+                "fleet once this job stops renewing them.",
+                exc_info=True,
+            )
     ray.shutdown()
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
@@ -232,6 +271,10 @@ class TaskRunner:
     def __init__(self):
         self.role_worker_mapping = {}
         self.mapping = {}
+        # Retained so `terminate` can reach the trainer after `run` returns or
+        # is interrupted. The driver kills this actor with itself, so teardown
+        # has to be asked for from outside.
+        self.ray_trainer = None
 
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker (backend selected via config.actor.strategy)."""
@@ -459,12 +502,29 @@ class TaskRunner:
             )
             # Initialize the workers of the trainer.
             trainer.init_workers()
+            self.ray_trainer = trainer
             # Start the training process.
             trainer.fit()
         finally:
             if trainer:
+                # Release the sandboxes and stop the pipeline even when `fit`
+                # raised or the run was interrupted: the components own the
+                # containers, and only this call can hand them back.
+                trainer.shutdown_components()
                 trainer.replay_buffer.close()
             tq.close()
+
+    def terminate(self) -> None:
+        """Release this job's components on request from the driver.
+
+        The driver calls this when it is going away — a ctrl-c, a SIGTERM, an
+        exception — because Ray kills this actor together with the driver and
+        nothing inside it then gets to run. Idempotent: a run that already
+        finished, or one whose `run` unwound through its own `finally`, has
+        released them already.
+        """
+        if self.ray_trainer is not None:
+            self.ray_trainer.shutdown_components()
 
 
 if __name__ == "__main__":

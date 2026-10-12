@@ -527,6 +527,22 @@ func (a *Admission) Renew(owner string) {
 	}
 }
 
+// OwnerAlive reports whether an owner is known here and has renewed within the
+// lease TTL. An owner this node never admitted is not its business, so it answers
+// false only for an owner it has forgotten or has not heard from in time. The
+// check is against the entry's freshness rather than the sweep's bookkeeping, so
+// an owner that has gone silent reads as gone even before the next sweep expires
+// its grants.
+func (a *Admission) OwnerAlive(owner string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	seen, known := a.owners[owner]
+	if !known {
+		return false
+	}
+	return a.now().Sub(seen) <= a.cfg.LeaseTTL
+}
+
 // ReleaseOwner returns everything one owner held.
 func (a *Admission) ReleaseOwner(owner string) int {
 	a.mu.Lock()

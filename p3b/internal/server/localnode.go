@@ -73,6 +73,12 @@ func (l *LocalNodeClient) StatusOn(ctx context.Context, handle backend.Handle) (
 	return l.node.StatusOn(ctx, handle)
 }
 
+// RenewOwnerOn tells the node in this process that an owner is still running.
+func (l *LocalNodeClient) RenewOwnerOn(_ context.Context, _ string, owner string) error {
+	l.node.RenewOwner(owner)
+	return nil
+}
+
 // ExecOn runs one command in a sandbox the node holds.
 func (l *LocalNodeClient) ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (int, string, error) {
 	return l.node.Exec(ctx, handle, command, cwd, env)

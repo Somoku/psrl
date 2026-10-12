@@ -523,6 +523,17 @@ class SandboxClient:
             }
         )
 
+    async def renew_owner(self, owner: str) -> None:
+        """Tell the fleet this owner is still alive.
+
+        Called on a timer while a run holds sandboxes. The control plane refreshes
+        the owner's quota and forwards the renewal to every live node, so a node
+        reclaims that owner's sandboxes only once the caller has really stopped
+        renewing. A failed renewal is retried by the next heartbeat, so this
+        reports nothing to the caller.
+        """
+        await self._call("renew_owner", {"owner": owner})
+
     async def close(self) -> None:
         """Close the connection to the service."""
         node_pools, self._node_pools = self._node_pools, {}

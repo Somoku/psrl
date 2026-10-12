@@ -29,6 +29,9 @@ type NodeClient interface {
 	) (backend.Created, error)
 	ReleaseOn(ctx context.Context, handle backend.Handle) error
 	StatusOn(ctx context.Context, handle backend.Handle) (string, error)
+	// RenewOwnerOn tells one node that an owner is still running, so the node
+	// does not reclaim that owner's sandboxes as orphans.
+	RenewOwnerOn(ctx context.Context, nodeID, owner string) error
 
 	// ExecOn, ReadBytesOn, and WriteBytesOn route command and file traffic to
 	// the node that holds the sandbox. In a single-process deployment they call
@@ -614,7 +617,20 @@ func (c *Control) ProvisionState(ticket string) (ProvisionState, bool) {
 	}, true
 }
 
-// RenewOwner keeps one caller's grants and reservations alive.
-func (c *Control) RenewOwner(owner string) {
+// RenewOwner keeps one caller's grants alive and tells every live node the owner
+// is still there, so a node reclaims that owner's sandboxes only once the caller
+// has really stopped renewing.
+//
+// The fan-out is best effort: a node that is briefly unreachable must not fail
+// the renewal for the nodes that answered. The next heartbeat retries, and the
+// node's own silence TTL is several beats long precisely so one missed renewal
+// is not a reclamation.
+func (c *Control) RenewOwner(ctx context.Context, owner string) {
 	c.ledger.Renew(owner)
+	if c.nodes == nil {
+		return
+	}
+	for _, node := range c.monitor.Fleet() {
+		_ = c.nodes.RenewOwnerOn(ctx, node.NodeID, owner)
+	}
 }

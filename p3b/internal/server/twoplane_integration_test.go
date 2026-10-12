@@ -29,6 +29,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -357,4 +358,64 @@ func (c *capabilityBackend) Create(
 func (c *capabilityBackend) Release(context.Context, backend.Handle) error { return nil }
 func (c *capabilityBackend) Status(context.Context, backend.Handle) (string, error) {
 	return "running", nil
+}
+
+// TestRenewOwnerCrossesTheNodePlane pins the control-to-node heartbeat path.
+//
+// A node reclaims an owner's sandboxes once it has been silent past the lease
+// TTL, so the control plane has to relay the heartbeat over the node plane. A
+// renewal that stopped at the control plane would leave every sandbox on every
+// node to be reclaimed as an orphan while its run is still alive.
+func TestRenewOwnerCrossesTheNodePlane(t *testing.T) {
+	b := newFakeExecBackend("fake")
+	gate, err := node.NewAdmission(node.Config{
+		Envelope: node.Resources{MemoryMB: 4096, CPUMillis: 4000},
+		Classes:  map[string]node.ClassShare{"default": {Guaranteed: 0.5, Max: 1.0}},
+		LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	// The gate is read from the listener's own goroutines, so its clock is driven
+	// through an atomic rather than a plain closure variable.
+	var clockNs atomic.Int64
+	clockNs.Store(time.Now().UnixNano())
+	gate.SetClock(func() time.Time { return time.Unix(0, clockNs.Load()) })
+	life, err := node.NewLifecycle("node-r", gate, timing.SweepInterval)
+	if err != nil {
+		t.Fatalf("lifecycle: %v", err)
+	}
+	n, err := server.NewNode(server.NodeConfig{
+		NodeID: "node-r", Admission: gate, Lifecycle: life, Backends: []backend.Backend{b},
+	})
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	addr := startNodeListener(t, n)
+	fleet := server.NewFleetNodeClient(map[string]*server.RemoteNodeClient{
+		"node-r": server.NewRemoteNodeClient(addr, 10*time.Second),
+	})
+
+	ctx := context.Background()
+	spec := backend.Spec{
+		Source:        backend.Source{Kind: "image", Reference: "alpine:latest"},
+		ResourceClass: "default",
+		WorkflowID:    "owner-r",
+		Resources:     backend.Resources{MemoryMB: 128},
+	}
+	if _, _, refusal, err := fleet.Admit(ctx, "node-r", spec); err != nil || refusal != "" {
+		t.Fatalf("admit: err=%v refusal=%q", err, refusal)
+	}
+
+	clockNs.Add(int64(90 * time.Second))
+	if gate.OwnerAlive("owner-r") {
+		t.Fatal("an owner silent past the lease TTL must read as gone")
+	}
+
+	if err := fleet.RenewOwnerOn(ctx, "node-r", "owner-r"); err != nil {
+		t.Fatalf("renew_owner: %v", err)
+	}
+	if !gate.OwnerAlive("owner-r") {
+		t.Fatal("renew_owner did not reach the node's admission")
+	}
 }

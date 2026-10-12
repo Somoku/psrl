@@ -311,7 +311,10 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 		LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 		Overcommit:        cfg.Node.Overcommit,
 		UtilizationTarget: cfg.Node.UtilizationTarget,
-		LeaseTTL:          timing.OwnerLease,
+		// The node reclaims a running sandbox once its owner has been silent for
+		// OwnerSilenceTTL, so this gate tracks the heartbeat rather than the
+		// control plane's quota lease.
+		LeaseTTL: timing.OwnerSilenceTTL,
 	})
 	if err != nil {
 		return err
@@ -320,6 +323,9 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	if err != nil {
 		return err
 	}
+	// The sweep reads owner liveness from this gate: a caller that stops
+	// heartbeating has its sandboxes reclaimed as orphans.
+	life.SetOwnerLiveness(gate.OwnerAlive)
 	agent, err := server.NewNode(server.NodeConfig{
 		NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backends: local,
 		Pressure: nodePressure(log),
@@ -398,7 +404,7 @@ func runControl(ctx context.Context, cfg Config, spans timing.Contract, log *slo
 	}
 	control, err := server.NewControl(server.ControlConfig{
 		Registry: registry, Ledger: ledger, Placement: place, Monitor: fleet,
-		Nodes:          fleetClient,
+		Nodes: fleetClient,
 	})
 	if err != nil {
 		return err
@@ -450,7 +456,10 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 			LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 			Overcommit:        cfg.Node.Overcommit,
 			UtilizationTarget: cfg.Node.UtilizationTarget,
-			LeaseTTL:          timing.OwnerLease,
+			// The node reclaims a running sandbox once its owner has been silent
+			// for OwnerSilenceTTL, so this gate tracks the heartbeat rather than
+			// the control plane's quota lease.
+			LeaseTTL: timing.OwnerSilenceTTL,
 		})
 		if err != nil {
 			return err
@@ -459,6 +468,9 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		if err != nil {
 			return err
 		}
+		// The sweep reads owner liveness from this gate: a caller that stops
+		// heartbeating has its sandboxes reclaimed as orphans.
+		life.SetOwnerLiveness(gate.OwnerAlive)
 		agent, err = server.NewNode(server.NodeConfig{
 			NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backends: local,
 			Pressure: nodePressure(log),
@@ -491,7 +503,7 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 	}
 	control, err := server.NewControl(server.ControlConfig{
 		Registry: registry, Ledger: ledger, Placement: place, Monitor: fleet,
-		Nodes:          nodes,
+		Nodes: nodes,
 	})
 	if err != nil {
 		return err

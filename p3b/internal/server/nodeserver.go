@@ -347,6 +347,16 @@ func (n *Node) Touch(handle backend.Handle) {
 	n.lifecycle.Touch(handle.SandboxID)
 }
 
+// RenewOwner records that an owner is still using this node's sandboxes.
+//
+// The reclamation sweep reads owner liveness from the admission gate, so a
+// heartbeat is what keeps a live caller's sandboxes from being reclaimed as
+// orphans. An owner this node never admitted is ignored: a renewal for another
+// node's caller must not resurrect anything here.
+func (n *Node) RenewOwner(owner string) {
+	n.admission.Renew(owner)
+}
+
 // StatusOn reports a sandbox's state from this node.
 func (n *Node) StatusOn(ctx context.Context, handle backend.Handle) (string, error) {
 	stored, held, owned := n.lifecycle.Lookup(handle.SandboxID)

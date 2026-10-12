@@ -234,6 +234,8 @@ func (j *JSONListener) dispatch(ctx context.Context, req request) (any, error) {
 		return j.writeBytes(ctx, req.Payload)
 	case "touch":
 		return j.touch(ctx, req.Payload)
+	case "renew_owner":
+		return j.renewOwner(ctx, req.Payload)
 	case "fleet":
 		return j.fleet(ctx)
 	case "quota":
@@ -570,6 +572,27 @@ func (j *JSONListener) touch(_ context.Context, raw json.RawMessage) (any, error
 		return nil, err
 	}
 	j.node.Touch(payload.handle())
+	return map[string]any{"ok": true}, nil
+}
+
+// renewOwner keeps one caller's ownership alive across the fleet.
+//
+// The SDK calls it on a timer: the control plane refreshes the caller's quota and
+// forwards the renewal to every live node, so a node reclaims that caller's
+// sandboxes only once it has really stopped renewing. A failed renewal is retried
+// by the next heartbeat, so a node that is briefly unreachable is not an error.
+func (j *JSONListener) renewOwner(ctx context.Context, raw json.RawMessage) (any, error) {
+	if j.control == nil {
+		return nil, status.Error(codes.Unimplemented,
+			"no control plane is configured; this process cannot renew an owner")
+	}
+	var payload struct {
+		Owner string `json:"owner"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	j.control.RenewOwner(ctx, payload.Owner)
 	return map[string]any{"ok": true}, nil
 }
 

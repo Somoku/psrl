@@ -12,8 +12,11 @@ The service itself is covered by the Go suite and by
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from psrl.sandbox.backends import p3b as p3b_backend
 from psrl.sandbox.backends.p3b import P3bBackend, _to_service_spec
 from psrl.sandbox.core import (
     CredentialRef,
@@ -133,3 +136,84 @@ class TestAReattachIsRefusedRatherThanFaked:
         with pytest.raises(NotImplementedError, match="agent endpoint"):
             await make_backend().connect("sb-1")
 
+
+class _RecordingClient:
+    """A stand-in for the SDK client that records renewals and closes."""
+
+    def __init__(self) -> None:
+        self.renewals: list[str] = []
+        self.closed = False
+
+    async def renew_owner(self, owner: str) -> None:
+        self.renewals.append(owner)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class TestItRenewsOwnershipWhileItHoldsSandboxes:
+    """The node reclaims an owner's sandboxes once it stops hearing from it.
+
+    A sandbox's own lifetime is a backstop measured in hours, so until it expires
+    a killed worker's containers stay up holding capacity. This renewal is the
+    only thing that bounds how long that lasts, which is why it starts with the
+    first sandbox and stops the moment the worker leaves.
+    """
+
+    async def test_it_renews_the_owner_on_a_timer(self, monkeypatch):
+        monkeypatch.setattr(p3b_backend, "OWNER_HEARTBEAT_INTERVAL_S", 0.01)
+        backend = make_backend()
+        client = _RecordingClient()
+        backend._client = client
+        backend.adopt_owner_id(_OWNER)
+
+        backend._ensure_owner_heartbeat()
+        await asyncio.sleep(0.05)
+        await backend.shutdown()
+
+        assert client.renewals, "a worker holding sandboxes must renew its ownership"
+        assert set(client.renewals) == {_OWNER}
+
+    async def test_starting_it_more_than_once_keeps_one_loop(self, monkeypatch):
+        monkeypatch.setattr(p3b_backend, "OWNER_HEARTBEAT_INTERVAL_S", 0.01)
+        backend = make_backend()
+        backend._client = _RecordingClient()
+        backend.adopt_owner_id(_OWNER)
+
+        backend._ensure_owner_heartbeat()
+        first = backend._heartbeat_task
+        backend._ensure_owner_heartbeat()
+
+        assert backend._heartbeat_task is first, "every sandbox shares one renewal loop"
+        await backend.shutdown()
+
+    async def test_it_stops_renewing_when_it_shuts_down(self, monkeypatch):
+        monkeypatch.setattr(p3b_backend, "OWNER_HEARTBEAT_INTERVAL_S", 0.01)
+        backend = make_backend()
+        client = _RecordingClient()
+        backend._client = client
+        backend.adopt_owner_id(_OWNER)
+
+        backend._ensure_owner_heartbeat()
+        await asyncio.sleep(0.05)
+        await backend.shutdown()
+        seen = len(client.renewals)
+        await asyncio.sleep(0.05)
+
+        assert len(client.renewals) == seen, "a closed backend must not keep renewing"
+        assert backend._heartbeat_task is None
+        assert client.closed
+
+    async def test_a_worker_with_no_owner_renews_nothing(self, monkeypatch):
+        # Without an owner id there is no name for the renewal, and the fleet
+        # would have nothing to key liveness on.
+        monkeypatch.setattr(p3b_backend, "OWNER_HEARTBEAT_INTERVAL_S", 0.01)
+        backend = make_backend()
+        client = _RecordingClient()
+        backend._client = client
+
+        backend._ensure_owner_heartbeat()
+        await asyncio.sleep(0.03)
+        await backend.shutdown()
+
+        assert not client.renewals

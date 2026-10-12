@@ -145,6 +145,8 @@ func (n *NodeListener) dispatch(ctx context.Context, req request) (any, error) {
 		return n.createOn(ctx, req.Payload)
 	case "release_on":
 		return n.releaseOn(ctx, req.Payload)
+	case "renew_owner":
+		return n.renewOwner(ctx, req.Payload)
 	case "status_on":
 		return n.statusOn(ctx, req.Payload)
 	case "exec":
@@ -210,6 +212,21 @@ func (n *NodeListener) releaseOn(ctx context.Context, raw json.RawMessage) (any,
 		return nil, err
 	}
 	return map[string]any{}, nil
+}
+
+// renewOwner keeps an owner's sandboxes from being reclaimed as orphans while it
+// is still running. The renewal is a no-op for an owner this node never admitted,
+// so a control plane that fans one heartbeat out to every node costs the nodes
+// nothing they did not already know.
+func (n *NodeListener) renewOwner(_ context.Context, raw json.RawMessage) (any, error) {
+	var payload struct {
+		Owner string `json:"owner"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	n.node.RenewOwner(payload.Owner)
+	return map[string]any{"ok": true}, nil
 }
 
 func (n *NodeListener) statusOn(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -327,32 +344,32 @@ func (n *NodeListener) report(_ context.Context) (any, error) {
 // nodeViewWire is the over-the-wire shape of a NodeView. It uses slices for the
 // set fields because map[string]struct{} does not serialize as JSON.
 type nodeViewWire struct {
-	NodeID          string              `json:"node_id"`
-	Backends        []backendCapWire    `json:"backends"`
-	Envelope        headroomWire        `json:"envelope"`
+	NodeID          string                  `json:"node_id"`
+	Backends        []backendCapWire        `json:"backends"`
+	Envelope        headroomWire            `json:"envelope"`
 	ClassHeadroom   map[string]headroomWire `json:"class_headroom"`
-	LiveSandboxes   int                 `json:"live_sandboxes"`
-	CPUUsedPct      float64             `json:"cpu_used_pct"`
-	MemUsedPct      float64             `json:"mem_used_pct"`
-	GPUFree         int32               `json:"gpu_free"`
-	Draining        bool                `json:"draining"`
-	ImageDigests    []string            `json:"image_digests"`
-	ImageReferences []string            `json:"image_references"`
-	Labels          []string            `json:"labels"`
+	LiveSandboxes   int                     `json:"live_sandboxes"`
+	CPUUsedPct      float64                 `json:"cpu_used_pct"`
+	MemUsedPct      float64                 `json:"mem_used_pct"`
+	GPUFree         int32                   `json:"gpu_free"`
+	Draining        bool                    `json:"draining"`
+	ImageDigests    []string                `json:"image_digests"`
+	ImageReferences []string                `json:"image_references"`
+	Labels          []string                `json:"labels"`
 }
 
 type backendCapWire struct {
-	Name        string            `json:"name"`
-	Features    []string          `json:"features"`
-	ResumeLevel string            `json:"resume_level"`
-	HostMounts  bool              `json:"host_mounts"`
+	Name        string   `json:"name"`
+	Features    []string `json:"features"`
+	ResumeLevel string   `json:"resume_level"`
+	HostMounts  bool     `json:"host_mounts"`
 }
 
 type headroomWire struct {
-	MemoryMB  int64   `json:"memory_mb"`
-	CPUMillis int64   `json:"cpu_millis"`
-	GPUCount  int32   `json:"gpu_count"`
-	DiskMB    int64   `json:"disk_mb"`
+	MemoryMB  int64 `json:"memory_mb"`
+	CPUMillis int64 `json:"cpu_millis"`
+	GPUCount  int32 `json:"gpu_count"`
+	DiskMB    int64 `json:"disk_mb"`
 }
 
 func nodeViewToWire(view placement.NodeView) nodeViewWire {

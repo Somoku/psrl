@@ -222,6 +222,54 @@ func TestARenewingOwnerKeepsItsGrants(t *testing.T) {
 	}
 }
 
+func TestOwnerAliveTracksAdmissionAndRenewal(t *testing.T) {
+	gate := mustGate(t, envelope())
+	clock := time.Now()
+	gate.SetClock(func() time.Time { return clock })
+
+	if gate.OwnerAlive("worker") {
+		t.Fatal("an owner this node never admitted is not its business")
+	}
+	if _, _, ok := gate.Admit("rollout", "worker", Resources{MemoryMB: 100}); !ok {
+		t.Fatal("admit")
+	}
+	if !gate.OwnerAlive("worker") {
+		t.Fatal("an owner that just admitted must read as alive")
+	}
+
+	// Silence past the lease TTL: a node has to treat the owner as gone even
+	// before the next sweep expires the grants.
+	clock = clock.Add(2 * time.Minute)
+	if gate.OwnerAlive("worker") {
+		t.Fatal("an owner silent past the lease TTL must read as gone")
+	}
+
+	gate.Renew("worker")
+	if !gate.OwnerAlive("worker") {
+		t.Fatal("a renewed owner must read as alive again")
+	}
+}
+
+func TestARenewalCannotResurrectAnExpiredOwner(t *testing.T) {
+	// The sweep expires a silent owner by deleting it. A heartbeat that arrives
+	// afterwards belongs to a caller the node already decided has stopped, and a
+	// renewal must not put its accounting back.
+	gate := mustGate(t, envelope())
+	clock := time.Now()
+	gate.SetClock(func() time.Time { return clock })
+	if _, _, ok := gate.Admit("rollout", "dead", Resources{MemoryMB: 100}); !ok {
+		t.Fatal("admit")
+	}
+
+	clock = clock.Add(2 * time.Minute)
+	gate.Expire()
+	gate.Renew("dead")
+
+	if gate.OwnerAlive("dead") {
+		t.Fatal("a renewal must not resurrect an owner the node already expired")
+	}
+}
+
 func TestEveryClassAppearsInTheReportIncludingDefault(t *testing.T) {
 	// A request carries a class either way, and one absent from the report would
 	// be compared against nothing by placement.

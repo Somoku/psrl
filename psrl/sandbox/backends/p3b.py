@@ -109,9 +109,7 @@ def _translate(exc: service_errors.SandboxError) -> BaseException:
     if isinstance(exc, service_errors.SandboxOomError):
         return SandboxOomError(str(exc))
     if isinstance(exc, service_errors.SandboxCommandTimeout):
-        return SandboxCommandTimeout(
-            str(exc), sandbox_preserved=getattr(exc, "sandbox_preserved", False)
-        )
+        return SandboxCommandTimeout(str(exc), sandbox_preserved=getattr(exc, "sandbox_preserved", False))
     if isinstance(exc, service_errors.SandboxTransportError):
         return SandboxTransportError(str(exc))
     return SandboxSetupError(str(exc))
@@ -291,6 +289,17 @@ class P3bSession(SandboxSession):
         return url
 
 
+# How often this worker tells the service its owner is still alive.
+#
+# The node reclaims an owner's sandboxes once it has been silent for three of
+# these, so the interval is the unit that budget is counted in: a shorter one
+# reclaims a killed worker's sandboxes sooner, a longer one tolerates a stalled
+# process before doing so. It is stated here rather than derived because the two
+# sides are separate deployments, and it must stay below a third of the node's
+# silence budget (`timing.OwnerSilenceTTL` in p3b).
+OWNER_HEARTBEAT_INTERVAL_S = 30.0
+
+
 class P3bBackend(SandboxBackend):
     """The p3b service as a PSRL backend.
 
@@ -324,6 +333,7 @@ class P3bBackend(SandboxBackend):
         self._client = SandboxClient(endpoint)
         self._owner_id = ""
         self._closed = False
+        self._heartbeat_task: asyncio.Task[None] | None = None
 
     @property
     def name(self) -> str:
@@ -353,31 +363,67 @@ class P3bBackend(SandboxBackend):
         cause PSRL to refuse before asking the service.
         """
         return SandboxCapabilities(
-            features=frozenset({
-                SandboxFeature.FREEZE,
-                SandboxFeature.HIBERNATE,
-                SandboxFeature.FILESYSTEM_SNAPSHOT,
-                SandboxFeature.FULL_STATE_SNAPSHOT,
-                SandboxFeature.RESTORE,
-                SandboxFeature.NATIVE_FORK,
-                SandboxFeature.RESUME_ANYWHERE,
-                SandboxFeature.WARM_POOL,
-                SandboxFeature.IMAGE_ON_DEMAND,
-            }),
+            features=frozenset(
+                {
+                    SandboxFeature.FREEZE,
+                    SandboxFeature.HIBERNATE,
+                    SandboxFeature.FILESYSTEM_SNAPSHOT,
+                    SandboxFeature.FULL_STATE_SNAPSHOT,
+                    SandboxFeature.RESTORE,
+                    SandboxFeature.NATIVE_FORK,
+                    SandboxFeature.RESUME_ANYWHERE,
+                    SandboxFeature.WARM_POOL,
+                    SandboxFeature.IMAGE_ON_DEMAND,
+                }
+            ),
             resume_level=ResumeLevel.FULL_STATE,
         )
 
     def adopt_owner_id(self, owner_id: str) -> None:
         """Record the owner for this worker's sandboxes.
 
-        Carried as spec metadata for correlation. The service reclaims by its
-        own owner labels, not by anything PSRL writes here.
+        Carried as spec metadata for correlation, and named by the heartbeat
+        that follows. This runs while the manager is built — which can be before
+        an event loop exists — so it only records the id; the renewal loop
+        starts with the first sandbox, in `create`, where a loop is running.
         """
         if not self._owner_id:
             self._owner_id = owner_id
 
+    def _ensure_owner_heartbeat(self) -> None:
+        """Start renewing this worker's ownership of the sandboxes it holds.
+
+        The node reclaims an owner's sandboxes once it has stopped hearing from
+        the owner, and this renewal is the only evidence it has: a sandbox's own
+        lifetime is a backstop measured in hours, which is far longer than a
+        killed worker should be allowed to strand its containers. Idempotent, so
+        every sandbox this worker starts keeps the same single loop.
+        """
+        if self._owner_id and (self._heartbeat_task is None or self._heartbeat_task.done()):
+            self._heartbeat_task = asyncio.create_task(self._renew_owner_loop())
+
+    async def _renew_owner_loop(self) -> None:
+        while not self._closed:
+            await asyncio.sleep(OWNER_HEARTBEAT_INTERVAL_S)
+            if self._closed:
+                return
+            try:
+                await self._client.renew_owner(self._owner_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The next beat retries. A renewal the fleet missed is not a
+                # reason to stop renewing, and the node's silence budget is
+                # three beats wide, so a single failure reclaims nothing.
+                psrl_logger.warning(
+                    "Sandbox owner renewal failed for owner %r; the next beat retries.",
+                    self._owner_id,
+                    exc_info=True,
+                )
+
     async def create(self, spec: SandboxSpec) -> SandboxSession:
         self._require_open()
+        self._ensure_owner_heartbeat()
         sandbox = await _service_call(
             self._client.create(_to_service_spec(spec, self._owner_id, self._resource_class))
         )
@@ -396,15 +442,14 @@ class P3bBackend(SandboxBackend):
 
     async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> SandboxSession:
         self._require_open()
+        self._ensure_owner_heartbeat()
         service_spec = _to_service_spec(spec, self._owner_id, self._resource_class) if spec is not None else None
         sandbox = await _service_call(
             self._client.restore(
                 ServiceSnapshotRef(
                     backend=snapshot.backend,
                     snapshot_id=snapshot.snapshot_id,
-                    kind=str(
-                        snapshot.kind.value if hasattr(snapshot.kind, "value") else snapshot.kind
-                    ),
+                    kind=str(snapshot.kind.value if hasattr(snapshot.kind, "value") else snapshot.kind),
                 ),
                 service_spec,
             )
@@ -420,14 +465,21 @@ class P3bBackend(SandboxBackend):
         return None
 
     async def shutdown(self) -> None:
-        """Close the connection to the service.
+        """Stop renewing this worker's ownership and close the connection.
 
-        Sandboxes outlive the connection: the service holds the lifetime and
-        reclaims by its own sweep, so a worker exiting does not strand them.
+        Sandboxes outlive the connection in the sense that the service holds
+        their lifetime, but not in the sense of staying charged to a worker that
+        is gone: stopping the renewals here is what tells the node this owner has
+        left, so it reclaims them once the silence budget runs out rather than
+        holding them until their own lifetime expires.
         """
         if self._closed:
             return
         self._closed = True
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+            self._heartbeat_task = None
         await self._client.close()
 
     # -- Metric passthroughs ---------------------------------------------------
@@ -471,6 +523,7 @@ class P3bBackend(SandboxBackend):
 
 
 # -- Module-level helpers (no PSRL sandbox state, pure conversion) -------------
+
 
 def _to_service_spec(
     spec: SandboxSpec,

@@ -139,6 +139,11 @@ func (r *RemoteNodeClient) statusOn(ctx context.Context, handle backend.Handle) 
 	return out.Status, nil
 }
 
+func (r *RemoteNodeClient) renewOwnerOn(ctx context.Context, owner string) error {
+	_, err := r.call(ctx, "renew_owner", map[string]any{"owner": owner})
+	return err
+}
+
 func (r *RemoteNodeClient) execOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (int, string, error) {
 	raw, err := r.call(ctx, "exec", map[string]any{
 		"backend": handle.Backend, "sandbox_id": handle.SandboxID, "node_id": handle.NodeID,
@@ -279,6 +284,15 @@ func (f *FleetNodeClient) StatusOn(ctx context.Context, handle backend.Handle) (
 		return "", err
 	}
 	return n.statusOn(ctx, handle)
+}
+
+// RenewOwnerOn tells the named node that an owner is still running.
+func (f *FleetNodeClient) RenewOwnerOn(ctx context.Context, nodeID, owner string) error {
+	n, err := f.node(nodeID)
+	if err != nil {
+		return err
+	}
+	return n.renewOwnerOn(ctx, owner)
 }
 
 // ExecOn runs one command in a sandbox on the node that holds it.
@@ -476,4 +490,3 @@ func createdFromWire(raw json.RawMessage) (backend.Created, error) {
 		WarmStart: out.WarmStart,
 	}, nil
 }
-

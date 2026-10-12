@@ -31,6 +31,14 @@ const (
 	// episode cannot lose the reservation that holds its memory. A sandbox is
 	// reclaimed by its own lifetime; this only bounds a dead owner's accounting.
 	OwnerLease = 4 * time.Hour
+	// OwnerHeartbeatInterval is how often a caller renews its ownership of the
+	// sandboxes it holds. It is the caller's cadence rather than a deadline, and it
+	// exists so a node can tell a live run from an abandoned one.
+	OwnerHeartbeatInterval = 30 * time.Second
+	// OwnerSilenceTTL is how long a node waits for that renewal before it treats
+	// the owner as gone and reclaims its sandboxes. It is three missed beats, so a
+	// single lost heartbeat never reclaims a live run.
+	OwnerSilenceTTL = 3 * OwnerHeartbeatInterval
 	// ReservationTTL outlives the gap between a placement promise and the node's
 	// next report, which carries the grant. Provisioning renews it, so it does not
 	// have to cover a cold image pull.
@@ -85,11 +93,13 @@ func (c Contract) LoadReportInterval() time.Duration {
 // Spans returns every resolved span, for an operator dump or a metric hook.
 func (c Contract) Spans() map[string]time.Duration {
 	return map[string]time.Duration{
-		"node_ttl":            c.NodeTTL,
-		"rpc_timeout":         c.RPCTimeout,
-		"load_report_interval": c.LoadReportInterval(),
-		"owner_lease":         OwnerLease,
-		"reservation_ttl":     ReservationTTL,
-		"sweep_interval":      SweepInterval,
+		"node_ttl":                 c.NodeTTL,
+		"rpc_timeout":              c.RPCTimeout,
+		"load_report_interval":     c.LoadReportInterval(),
+		"owner_lease":              OwnerLease,
+		"owner_heartbeat_interval": OwnerHeartbeatInterval,
+		"owner_silence_ttl":        OwnerSilenceTTL,
+		"reservation_ttl":          ReservationTTL,
+		"sweep_interval":           SweepInterval,
 	}
 }

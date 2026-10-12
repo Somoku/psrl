@@ -344,6 +344,13 @@ class TestTheSlowerConfigurationAnnouncesItself:
         `psrl` logger so that Ray and vLLM cannot reconfigure its output, which is
         deliberate -- but it also means records never reach the root handler pytest
         installs. Attaching a handler directly is the way to observe them.
+
+        The level and `disabled` flag are forced for the duration, and restored. A
+        handler only sees a record that already passed the *logger's* own level check, so
+        any earlier test that raised the `psrl` level -- anything in the suite that calls
+        `configure_verl_logging` -- silently empties this capture. That failed only in
+        the full run and passed when the file was run alone, which reads like a flaky
+        test rather than the ordering dependency it is.
         """
         import logging
 
@@ -362,11 +369,16 @@ class TestTheSlowerConfigurationAnnouncesItself:
 
         logger = logging.getLogger("psrl")
         handler = _Collect()
+        previous_level, previous_disabled = logger.level, logger.disabled
+        logger.setLevel(logging.DEBUG)
+        logger.disabled = False
         logger.addHandler(handler)
         try:
             _validate_nixl_peer_diffusion(config)
         finally:
             logger.removeHandler(handler)
+            logger.setLevel(previous_level)
+            logger.disabled = previous_disabled
         return captured
 
     def test_diffusion_on_warns_with_the_measurement(self):

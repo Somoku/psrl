@@ -9,6 +9,7 @@ from omegaconf import DictConfig
 from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLCommPlan
 from psrl.utils.nixl.handshake_notif import NotifKind, decode
 from psrl.utils.nixl.join_admission import JoinDecision, JoinVerdict, classify_join
+from psrl.utils.nixl.membership import Membership, MembershipChange, MembershipEvent
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
     NIXLClientType,
@@ -65,6 +66,9 @@ class NIXLMetaServer:
         # can only say the first handshake completed, and that is the answer that makes
         # a later join invisible; a roster still grows when one arrives.
         self._agents_reported: dict[NotifKind, set[str]] = {kind: set() for kind in NotifKind}
+        # Admission is injected rather than reached for, so there is exactly one place
+        # that decides admissibility -- A7's `classify_incoming_client`.
+        self._membership = Membership(admit=self._classify_joiner)
 
         # NOTE(claude): Broadcast initialization makes PS workers direct peers, so
         # each receives every PS GPU descriptor.
@@ -165,12 +169,123 @@ class NIXLMetaServer:
         """Wait for `expected_agents` to send their temporary mappings."""
         self._wait_for(NotifKind.TEMP_MAPPING, expected_agents, timeout, "temp mappings")
 
-    def make_unified_sharding(self):
+    def registered_tensor_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Global shape per key, reconstructed from a registered member.
+
+        A7 needs *global* shapes: whether a finer mesh can divide a tensor is a property
+        of the tensor, not of the meshes. Without them `classify_join` has nothing to
+        test divisibility against, so it can only ever answer RESHARD -- a join that
+        should be rejected would be admitted, and every existing client would then raise
+        when it re-registered against the new mesh.
+
+        Nothing stores the global shape, but it is recoverable: a shard covers
+        ``shape[d]`` of dimension ``d`` and the mesh says how many shards tile it, so the
+        global extent is the product. Taken from whichever member declares a key, since
+        they all describe the same tensor.
         """
-        Make unified sharding for all clients.
+        shapes: dict[str, tuple[int, ...]] = {}
+        for client_name, info in self.client_infos.items():
+            sharding_dict = self.client_sharding_dicts.get(client_name) or {}
+            for key, tensor_info in info.tensor_infos.items():
+                if key in shapes:
+                    continue
+                meta = next((m for m in tensor_info.shard_meta_infos if m is not None), None)
+                if meta is None:
+                    continue
+                mesh = dict(getattr(sharding_dict.get(key), "shard_mesh", {}) or {})
+                shapes[key] = tuple(
+                    extent * mesh.get(dim, 1) for dim, extent in enumerate(meta.shape)
+                )
+        return shapes
+
+    def _classify_joiner(self, client: str) -> tuple[bool, bool, str]:
+        """A7's verdict for one joiner, reduced to what `Membership` needs.
+
+        A single REJECT on any key refuses the whole client. Admitting it would make
+        every *existing* client raise during re-registration, so a partial admission is
+        worse than none: the joiner gains nothing and the cluster loses the members it
+        had.
+        """
+        decisions = self.classify_incoming_client(
+            self.client_sharding_dicts.get(client, {}),
+            tensor_shapes=self.registered_tensor_shapes(),
+        )
+        rejected = {k: d for k, d in decisions.items() if d.verdict is JoinVerdict.REJECT}
+        if rejected:
+            key, decision = next(iter(rejected.items()))
+            return False, False, f"{key}: {decision.describe()}"
+        needs_reshard = any(d.requires_reshard for d in decisions.values())
+        reason = ""
+        if needs_reshard:
+            key, decision = next(
+                (k, d) for k, d in decisions.items() if d.requires_reshard
+            )
+            reason = f"{key}: {decision.describe()}"
+        return True, needs_reshard, reason
+
+    def admit_joiners(self, timeout: float | None = None) -> list[MembershipChange]:
+        """Absorb clients that registered after the initial handshake.
+
+        This is the entry point `TODO(lhy): Support elastic clients` named and the
+        handshake never had. The notification plumbing now delivers a late sharding to
+        the right registry (see `handshake_notif`), but delivery alone changes nothing:
+        the unified sharding and the comm plan were built once at startup, so a joiner
+        would sit in `client_sharding_dicts` and appear in no plan.
+
+        **Admission is A7's answer, not a second one.** `classify_join` already decides
+        whether a mesh divides the established one; repeating that judgement here would
+        give the cluster two places to disagree about who is allowed in. What this adds
+        is *when* it is asked and what the cluster owes afterwards.
+
+        Returns one change per joiner. An empty list means nothing new arrived, which is
+        the normal case and is not an error -- callers may poll this.
+        """
+        self._drain_notifs()
+        joiners = sorted(set(self.client_sharding_dicts) - self._membership.members)
+        if not joiners:
+            return []
+
+        changes = [self._membership.join(client) for client in joiners]
+        admitted = [c for c in changes if c.event is MembershipEvent.JOINED]
+        for refused in (c for c in changes if c.event is MembershipEvent.REFUSED):
+            # Refusal is fatal for the joiner and a no-op for everyone else, so the
+            # refused client's sharding must not reach the replan below -- leaving it
+            # there would admit by the back door what A7 just rejected.
+            self.client_sharding_dicts.pop(refused.client, None)
+            psrl_logger.warning(
+                f"Refused join from {refused.client}: {refused.reason}"
+            )
+        if not admitted:
+            return changes
+
+        psrl_logger.info(
+            f"Admitting {len(admitted)} joiner(s): {[c.client for c in admitted]}. "
+            f"Replanning for {len(self._membership.members)} member(s)."
+        )
+        self.make_unified_sharding(rebuild=True)
+        self.notify_all_client_shardings()
+        self._wait_for(
+            NotifKind.CLIENT_INFO,
+            len(self._agents_reported[NotifKind.CLIENT_INFO]) + 1,
+            timeout,
+            "client infos from the joiner",
+        )
+        self.make_comm_plan(rebuild=True)
+        self.notify_all_client_infos_and_comm_plan()
+        return changes
+
+    def make_unified_sharding(self, *, rebuild: bool = False):
+        """Make unified sharding for all clients.
+
+        `rebuild` has to be asked for. Building twice during the initial handshake is a
+        bug -- it means a step ran out of order -- while rebuilding after a join is the
+        whole point of elasticity. A bare "already made" guard cannot tell those apart,
+        so the caller states which one it is.
         """
         self._assert_reported(NotifKind.SHARDING, "sharding")
-        assert not self.client_unified_sharding_dicts, "Unified sharding already made."
+        assert rebuild or not self.client_unified_sharding_dicts, (
+            "Unified sharding already made; pass rebuild=True to replan after a join."
+        )
         _t_start = time.time()
         # We first need to guarantee that all client shardings have the same keys
         all_keys = set()
@@ -236,9 +351,8 @@ class NIXLMetaServer:
         any verdict is REJECT -- admitting it makes every *existing* client raise
         during re-registration (design doc 3.3.1d).
 
-        Not yet wired into `nixl_protocol`, which is still a one-shot barrier; that
-        is implementation item 9c-b. Exposed now so the elasticity boundary is
-        defined and testable before the handshake is restructured.
+        Used by `admit_joiners` as the single source of admissibility, so elasticity
+        and the initial handshake cannot disagree about who is allowed in.
         """
         decisions: dict[str, JoinDecision] = {}
         for key, sharding in new_sharding_dict.items():
@@ -253,12 +367,15 @@ class NIXLMetaServer:
                 decisions[key] = decision
         return decisions
 
-    def make_comm_plan(self):
-        """
-        Make communication plan for all clients.
+    def make_comm_plan(self, *, rebuild: bool = False):
+        """Make communication plan for all clients.
+
+        See `make_unified_sharding` for why `rebuild` is explicit rather than inferred.
         """
         self._assert_reported(NotifKind.CLIENT_INFO, "client infos")
-        assert not self.comm_plan, "Communication plan already made."
+        assert rebuild or not self.comm_plan, (
+            "Communication plan already made; pass rebuild=True to replan after a join."
+        )
 
         psrl_logger.info("Making communication plan...")
         start = time.time()

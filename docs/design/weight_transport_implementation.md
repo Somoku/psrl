@@ -1890,7 +1890,28 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       **多节点验证**（run 45）：sharding 1.5s / client infos 0.8s / temp mappings 0.1s,
       0 超时、0 错误、0 版本违例,两个 step 跑完。
 
-      **仍待做**：跑 L3 运行中扩容（真正让一个客户端在握手之后加入）。
+      **入口已补上**（`NIXLMetaServer.admit_joiners`，`test_admit_joiners.py` 18 passed）。
+      光让通知送达是不够的：unified sharding 与 comm plan 各自**只构建一次**且带
+      「already made」断言,所以后到的客户端会躺在 `client_sharding_dicts` 里、
+      **不出现在任何 plan 中** —— 不报错,也没人读它。
+
+      `admit_joiners` 做 drain → 问 A7（复用既有 `classify_incoming_client`）→
+      记入 `Membership` → replan。**准入不在这里重新推导**:
+      规则有第二份拷贝,正是握手路径与弹性路径开始各说各话的方式。
+
+      两个构建函数改成显式 `rebuild` 参数而不是删掉守卫 —— 初始握手里构建两次
+      是真 bug（说明步骤乱序）,join 之后重建才是目的,光凭「already made」
+      分不出这两件事。
+
+      **写拒绝路径的测试时发现 REJECT 当时根本不可达**：`classify_join` 是拿
+      **张量 shape** 去验整除的,而一个 shape 都没传进去,`blocking_dims` 恒为空,
+      于是每次 join 都返回 RESHARD —— 不可整除的 mesh 会被放进来,
+      然后**所有既有客户端**在重新注册时抛错。全局 shape 没有任何地方存,
+      但可还原:分片 extent × mesh,这就是 `registered_tensor_shapes`。
+
+      **仍待做**：L3 判据本身 —— 真正在一次运行中加入一个 instance。
+      这需要 harness 能**中途再起一个 instance**,当前 harness 没有这个能力;
+      上面的验证到 CPU 层为止。
 - [ ] **E4 第一半（partial MD 两段式）模块已落地并实测；第二半被上游阻塞**。
       `psrl/utils/nixl/partial_md.py`，`test_partial_md.py` 10 passed，
       实测 `bench_partial_md.py`（H20）：

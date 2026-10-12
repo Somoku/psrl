@@ -266,3 +266,6 @@ dmypy.json
 # Compiled Go test binaries, which shadow the sandboxd SDK as a namespace
 # package when left at the repo root.
 *.test
+
+# Local checkpoint root for tests that read real weight maps (see tests/nixl/conftest.py).
+/models

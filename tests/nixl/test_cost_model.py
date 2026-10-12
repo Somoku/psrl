@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 import torch
 
-MODEL_ROOT = Path("/jizhicfs/johnnyslin/models")
+from tests.nixl.conftest import MODEL_ROOT
 
 # Hardware constants for this node, from NVIDIA specs and ibstat (design doc 3.6.5).
 BW_HBM_GBS = 4800.0  # H20 HBM3

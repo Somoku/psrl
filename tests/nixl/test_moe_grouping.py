@@ -15,12 +15,9 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
-from pathlib import Path
 
 import pytest
-
 import torch
-
 from psrl.utils.nixl.moe_grouping import (
     GroupedShards,
     entry_is_empty,
@@ -32,10 +29,9 @@ from psrl.utils.nixl.moe_grouping import (
     parse_expert_key,
 )
 from psrl.utils.nixl.nixl_spec import NIXLSharding
+from tests.nixl.conftest import MODEL_ROOT
 
 pytestmark = pytest.mark.cpu_test
-
-MODEL_ROOT = Path("/jizhicfs/johnnyslin/models")
 
 
 def _hf_keys(model: str) -> list[str]:

@@ -30,7 +30,9 @@ from pathlib import Path
 import pytest
 import torch
 
-MODEL_PATH = Path("/jizhicfs/johnnyslin/models/Qwen2.5-0.5B-Instruct")
+from tests.nixl.conftest import MODEL_ROOT
+
+MODEL_PATH = MODEL_ROOT / "Qwen2.5-0.5B-Instruct"
 # 0.5B at fp32 is ~2GB, so it fits comfortably on one H20 per rank and keeps the
 # conversion fast enough to run several world sizes in CI.
 

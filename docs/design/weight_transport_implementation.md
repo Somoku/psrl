@@ -902,7 +902,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | D3 / T2 | ✅ 生产侧 `nixl_direct` + `ps_mode` 判定集中化 | ⏳ 删除 PS 本体（前置已满足：功能完整、已稳定验证、性能优于 PS） |
 > | E1 | ✅ | ✅ **L2 判据已达成**（撕裂可复现，拦截消除它；7 passed） |
 > | E2 | ✅ | ✅ |
-> | E3 | ✅ 握手解复用 + `admit_joiners` 准入 | ⏳ L3 需要能中途起 instance 的 harness |
+> | E3 | ✅ 握手解复用 + `admit_joiners` 准入 | ✅ **L3 已达成**（真 NIXL agent，后到客户端被准入并重规划） |
 > | E4 | ✅ 上半实测 1054× | ⏳ 下半被 NIXL 缺绑定阻塞 |
 > | F1 | ✅ | ⏳ L4 跨 DC |
 > | T1 / **T3** | ✅ | ✅ |
@@ -1909,9 +1909,20 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       然后**所有既有客户端**在重新注册时抛错。全局 shape 没有任何地方存,
       但可还原:分片 extent × mesh,这就是 `registered_tensor_shapes`。
 
-      **仍待做**：L3 判据本身 —— 真正在一次运行中加入一个 instance。
-      这需要 harness 能**中途再起一个 instance**,当前 harness 没有这个能力;
-      上面的验证到 CPU 层为止。
+      **L3 判据已达成**（`tests/nixl/test_elastic_join_agents.py`，5 passed）：
+      三个**真实 NIXL agent**、DRAM 注册 —— incumbent 完成握手后 joiner 才连上,
+      被准入、被重规划,且 incumbent 仍在 plan 里。
+
+      **这不需要多节点,也不需要 GPU**:要证的是握手协议,不是传输。
+      通知能否送达、是否被认成 sharding、是否驱动重规划,都与内存在不在 GPU、
+      对端在不在另一台主机无关。因此它**不能**证明的是:加入后的 instance
+      能被跨主机 RDMA 读到 —— 那是 D1/D4,由生产 run 覆盖。
+
+      harness 本身有两处必须做对,一开始两处都错了:客户端**必须开 progress thread**,
+      否则 `send_notif` 只在该客户端自己轮询时才 flush,服务端会超时并报
+      「0 个 agent」—— 读起来像连通性故障;以及 joiner 必须**先进入等待**再让服务端
+      重新发布,因为两半互相依赖:它拿不到 sharding 就发不出 client info,
+      而服务端拿不到 info 就结束不了准入。
 - [ ] **E4 第一半（partial MD 两段式）模块已落地并实测；第二半被上游阻塞**。
       `psrl/utils/nixl/partial_md.py`，`test_partial_md.py` 10 passed，
       实测 `bench_partial_md.py`（H20）：

@@ -108,6 +108,11 @@ clip_ratio_high=0.28
 max_turns=-1
 val_max_turns=-1
 trajectory_timeout=1800
+# A codex episode that runs past the trajectory budget is stopped at the deadline and
+# its partial patch and trajectory are kept and graded, instead of being cancelled and
+# re-run with all of its turns discarded. Codex takes no turn cap, so the wall clock is
+# the only bound and an over-budget episode is common enough to be worth keeping.
+trajectory_timeout_action=keep
 max_prompt_length=32768
 max_response_length=32768
 packing_length=$((max_prompt_length + max_response_length))
@@ -202,6 +207,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.multi_turn.enable=True \
     gen_actor_rollout_ref.rollout.multi_turn.max_turns=$max_turns \
     gen_actor_rollout_ref.rollout.agent.trajectory_timeout=$trajectory_timeout \
+    gen_actor_rollout_ref.rollout.agent.trajectory_timeout_action=$trajectory_timeout_action \
     gen_actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
     gen_actor_rollout_ref.rollout.agent.env.name=mini_swe_env \
     gen_actor_rollout_ref.rollout.agent.data.name=mini_swe_agent_data \
@@ -221,6 +227,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.rollout.max_num_batched_tokens=${packing_length} \
     train_actor_rollout_ref.rollout.multi_turn.max_turns=$val_max_turns \
     train_actor_rollout_ref.rollout.agent.trajectory_timeout=$trajectory_timeout \
+    train_actor_rollout_ref.rollout.agent.trajectory_timeout_action=$trajectory_timeout_action \
     train_actor_rollout_ref.rollout.max_model_len=${max_model_len} \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
     train_actor_rollout_ref.rollout.val_kwargs.do_sample=True \

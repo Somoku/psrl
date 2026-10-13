@@ -1,10 +1,11 @@
-From 434a55151862861ba93f2f7789756396afd925db Mon Sep 17 00:00:00 2001
+From e597dfef7d731f9f777fd017161cba940d80535f Mon Sep 17 00:00:00 2001
 From: PSRL <psrl@local>
-Date: Fri, 9 Oct 2026 12:30:43 +0800
+Date: Tue, 13 Oct 2026 14:56:26 +0800
 Subject: [PATCH] PSRL veRL patch
 
 ---
- .../ppo/test_score_centering_on_cpu.py        | 284 ++++++++-
+ .../test_score_centering_alignment_on_cpu.py  | 139 ++++
+ .../ppo/test_score_centering_on_cpu.py        | 284 ++++++-
  verl/models/transformers/qwen3_5.py           |  10 +
  verl/protocol.py                              |  38 +-
  verl/single_controller/ray/base.py            |   6 +-
@@ -14,26 +15,174 @@ Subject: [PATCH] PSRL veRL patch
  verl/trainer/config/model/hf_model.yaml       |   2 +-
  verl/trainer/ppo/core_algos.py                |  15 +-
  verl/trainer/ppo/metric_utils.py              |  38 +-
- verl/trainer/ppo/padding_utils.py             |  54 +-
+ verl/trainer/ppo/padding_utils.py             |  57 +-
  verl/trainer/ppo/rollout_corr_helper.py       |  40 +-
- verl/trainer/ppo/score_centering.py           | 589 +++++++++++++++---
- .../checkpoint/megatron_checkpoint_manager.py | 118 +++-
- verl/utils/config.py                          |  52 +-
+ verl/trainer/ppo/score_centering.py           | 749 ++++++++++++++++--
+ verl/trainer/ppo/score_centering_scores.py    | 260 ++++++
+ .../checkpoint/megatron_checkpoint_manager.py | 118 ++-
+ verl/utils/config.py                          |  54 +-
  verl/utils/dataset/rl_dataset.py              |  35 +-
  verl/utils/experimental/torch_functional.py   |  13 +-
  verl/utils/megatron/dist_checkpointing.py     |  46 ++
  verl/utils/tokenizer/tokenizer.py             |   6 +-
  verl/workers/config/actor.py                  |   1 +
  verl/workers/config/engine.py                 |   7 +
- verl/workers/config/rollout.py                |  18 +-
- verl/workers/engine/fsdp/transformer_impl.py  | 163 +++--
- .../engine/megatron/transformer_impl.py       | 268 +++++---
+ verl/workers/config/rollout.py                |  27 +-
+ verl/workers/engine/fsdp/transformer_impl.py  | 178 +++--
+ .../engine/megatron/transformer_impl.py       | 268 +++++--
  verl/workers/engine_workers.py                |   6 +-
- verl/workers/utils/losses.py                  |  39 +-
- 26 files changed, 1492 insertions(+), 364 deletions(-)
+ verl/workers/utils/losses.py                  |  57 +-
+ 28 files changed, 2093 insertions(+), 369 deletions(-)
+ create mode 100644 tests/trainer/ppo/test_score_centering_alignment_on_cpu.py
+ create mode 100644 verl/trainer/ppo/score_centering_scores.py
 
+diff --git a/tests/trainer/ppo/test_score_centering_alignment_on_cpu.py b/tests/trainer/ppo/test_score_centering_alignment_on_cpu.py
+new file mode 100644
+index 00000000..b8e34bf2
+--- /dev/null
++++ b/tests/trainer/ppo/test_score_centering_alignment_on_cpu.py
+@@ -0,0 +1,139 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Automatic score-centering support alignment and the shared head/sample scoring path.
++
++Ported from veRL #8196 and #8206 and adapted to PSRL's ``ImportanceSampling`` strategy.
++"""
++
++import pytest
++import torch
++
++from verl.trainer.ppo.score_centering import (
++    importance_sampling,
++    score_centering_support_rows,
++    score_centering_topk_correction,
++    support_head_log_probs,
++)
++from verl.trainer.ppo.score_centering_scores import score_centering_shared_scores_from_logits
++
++
++@pytest.mark.parametrize("rule,threshold", [(None, 2.0), ("token", 2.0), ("token", "0.5_5.0")])
++def test_aligned_support_correction_matches_dense_score_gradient(rule, threshold):
++    # Complete support: the sampler drew from the whole head, so the trainer renormalizes over it and
++    # the correction's gradient is the exact expected score on that support.
++    torch.manual_seed(0)
++    n, vocab, k = 3, 11, 4
++    initial = torch.randn(n, vocab)
++    ids = torch.stack([torch.randperm(vocab)[:k] for _ in range(n)])
++    q = torch.rand(n, k)
++    q = q / q.sum(-1, keepdim=True)
++    sampler_lp = q.log()
++    sampling = importance_sampling(rule, threshold)
++    head_mask = torch.ones(n, k, dtype=torch.bool)
++
++    logits = initial.clone().requires_grad_()
++    train_support, _ = support_head_log_probs(logits, ids)
++    correction = score_centering_support_rows(train_support, sampler_lp, head_mask, sampling)
++    (actual,) = torch.autograd.grad(correction.sum(), logits)
++
++    oracle_logits = initial.clone().requires_grad_()
++    oracle_head = oracle_logits.gather(-1, ids)
++    lsm = oracle_head.logsumexp(-1)
++    pS = (oracle_head - lsm.unsqueeze(-1)).exp()
++    with torch.no_grad():
++        # The correction is ``sum_S sg[q w] log p^S``; the classic centering form subtracts the
++        # ``sum_S q w`` mean rescaled by ``p^S``, which cancels because that mean already sums to one.
++        head_mass = sampling.head_mass(pS, q, oracle_head - lsm.unsqueeze(-1) - sampler_lp)
++        residual = head_mass - head_mass.sum(-1, keepdim=True) * pS
++    oracle = (residual * (oracle_head - lsm.unsqueeze(-1))).sum()
++    (oracle_grad,) = torch.autograd.grad(oracle, oracle_logits)
++    torch.testing.assert_close(actual, oracle_grad, atol=1e-6, rtol=1e-5)
++
++
++def test_unaligned_row_keeps_the_head_plus_tail_approximation():
++    # No receipt: the row must not be renormalized over the recorded head as if it were complete.
++    torch.manual_seed(0)
++    logits = torch.tensor([[2.0, 0.8, 0.2, -1.0]], requires_grad=True)
++    head = torch.log_softmax(logits, -1)[:, :2]
++    q = torch.tensor([[0.7, 0.3]]).log()
++    head_mask = torch.ones(1, 2, dtype=torch.bool)
++    sampling = importance_sampling(None, 2.0)
++    correction, _, _ = score_centering_topk_correction(head, q, head_mask, sampling)
++    assert torch.isfinite(torch.autograd.grad(correction.sum(), logits)[0]).all()
++
++
++def test_support_head_log_probs_and_mass_matches_torch_reference():
++    torch.manual_seed(0)
++    n, vocab, k = 4, 9, 3
++    ids = torch.stack([torch.randperm(vocab)[:k] for _ in range(n)])
++    ids[-1] = -1  # one empty (padding) row
++    mask = ids >= 0
++    logits = torch.randn(n, vocab, requires_grad=True)
++    q = torch.rand(n, k)
++    q = q / q.sum(-1, keepdim=True)
++    sampler_lp = q.log()
++    sampling = importance_sampling(None, 2.0)
++
++    support_lp, support_score = support_head_log_probs(logits, ids, chunk_elems=2 * vocab)
++    correction = score_centering_support_rows(support_lp, sampler_lp, mask, sampling)
++    (grad,) = torch.autograd.grad((correction + support_score).sum(), logits)
++
++    gathered = logits.detach().gather(-1, ids.clamp_min(0))
++    # ``support_lp`` is the support-normalized ``log p^S`` and ``support_score`` is the head's log
++    # support score ``logsumexp_v logit_v`` over the support slots.
++    normalizer = gathered.masked_fill(~mask, float("-inf")).logsumexp(-1)
++    expected_score = torch.where(mask.any(-1), normalizer, torch.zeros(n))
++    expected_correction = torch.zeros(n)
++    for row in range(n):
++        if mask[row].any():
++            expected_correction[row] = (q[row] * (gathered[row] - normalizer[row])).sum()
++    torch.testing.assert_close(support_score, expected_score, atol=1e-5, rtol=1e-5)
++    torch.testing.assert_close(correction, expected_correction, atol=1e-5, rtol=1e-5)
++    # Both outputs flow a finite gradient to the logits.
++    assert torch.isfinite(grad).all()
++
++
++@pytest.mark.parametrize("complete", [[True, False, False], [True, True, True], [False, False, False]])
++def test_shared_scoring_returns_sampled_scores_and_alignment(complete):
++    torch.manual_seed(0)
++    n, vocab, k = 3, 11, 4
++    ids = torch.stack([torch.randperm(vocab)[:k] for _ in range(n)])
++    labels = torch.randint(0, vocab, (n,))
++    q = torch.rand(n, k)
++    q = q / q.sum(-1, keepdim=True)
++    q[1:] = q[1:] * 0.5
++    sampler_lp = q.log()
++    complete_t = torch.tensor(complete)
++    sampling = importance_sampling(None, 2.0)
++
++    logits = torch.randn(n, vocab, requires_grad=True)
++    out = score_centering_shared_scores_from_logits(logits, ids, labels, sampler_lp, complete_t, sampling, chunk_size=2)
++    assert set(out) >= {"sc_correction", "log_probs", "sc_support_aligned", "sc_sampler_tail_mass"}
++    assert out["log_probs"].shape == (n,)
++    assert out["sc_correction"].shape == (n,)
++    assert out["sc_support_aligned"].tolist() == [float(c) for c in complete]
++    loss = out["sc_correction"].sum() + out["log_probs"].sum()
++    (grad,) = torch.autograd.grad(loss, logits)
++    assert torch.isfinite(grad).all()
++
++    # The sampled score is the full-vocabulary log-prob for fallback rows and the support-normalized
++    # one for aligned rows.
++    lp = torch.log_softmax(logits.detach(), -1)
++    for row in range(n):
++        if complete[row]:
++            head_lp = lp[row].gather(-1, ids[row])
++            expected = lp[row, labels[row]] - head_lp.logsumexp(-1)
++        else:
++            expected = lp[row, labels[row]]
++        assert torch.isclose(out["log_probs"][row], expected, atol=1e-5)
 diff --git a/tests/trainer/ppo/test_score_centering_on_cpu.py b/tests/trainer/ppo/test_score_centering_on_cpu.py
-index b7cf0526..a8bd3af7 100644
+index b7cf0526..f6d20712 100644
 --- a/tests/trainer/ppo/test_score_centering_on_cpu.py
 +++ b/tests/trainer/ppo/test_score_centering_on_cpu.py
 @@ -27,12 +27,16 @@ from verl.trainer.config.algorithm import RolloutCorrectionConfig
@@ -184,9 +333,9 @@ index b7cf0526..a8bd3af7 100644
 +        logits = torch.randn(rows, vocab, dtype=dtype, requires_grad=True)
 +        weight = torch.randn(rows, k, dtype=dtype)
 +        # chunk_elems=0 disables chunking; 2 * vocab derives two rows per chunk.
-+        head = support_head_log_probs(logits, ids, chunk_elems=0)
++        head, _ = support_head_log_probs(logits, ids, chunk_elems=0)
 +        (grad_unchunked,) = torch.autograd.grad((head * weight).sum(), logits)
-+        ref = support_head_log_probs(logits, ids, chunk_elems=2 * vocab)
++        ref, _ = support_head_log_probs(logits, ids, chunk_elems=2 * vocab)
 +        (grad_chunked,) = torch.autograd.grad((ref * weight).sum(), logits)
 +        torch.testing.assert_close(head, ref)
 +        assert grad_chunked.dtype == dtype
@@ -198,7 +347,7 @@ index b7cf0526..a8bd3af7 100644
 +    vocab = 9
 +    logits = torch.randn(4, vocab)
 +    ids = torch.tensor([[0, 3, 5], [1, 4, 7], [2, 6, 8], [0, 2, 4]])
-+    head = support_head_log_probs(logits, ids)
++    head, _ = support_head_log_probs(logits, ids)
 +    torch.testing.assert_close(head.exp().sum(-1), torch.ones(4), atol=1e-6, rtol=1e-6)
 +
 +
@@ -724,7 +873,7 @@ index 3de61d36..d8693de8 100644
                  has_pred = (
                      pred_vals is not None
 diff --git a/verl/trainer/ppo/padding_utils.py b/verl/trainer/ppo/padding_utils.py
-index 6e44c915..439fce82 100644
+index 6e44c915..d18b7457 100644
 --- a/verl/trainer/ppo/padding_utils.py
 +++ b/verl/trainer/ppo/padding_utils.py
 @@ -23,7 +23,6 @@ from __future__ import annotations
@@ -786,24 +935,28 @@ index 6e44c915..439fce82 100644
      sequence_length = input_ids.size(0)
      teacher_ids = template_sample.get("teacher_ids")
      if teacher_ids is not None:
-@@ -118,8 +138,16 @@ def construct_minimal_padding_template(
+@@ -117,9 +137,20 @@ def construct_minimal_padding_template(
+         ids, log_probs = dummy_rollout_topk(sequence_length, rollout_topk_ids.shape[-1])
          template_sample["rollout_topk_ids"] = ids
          template_sample["rollout_topk_log_probs"] = log_probs
- 
++        if "rollout_support_complete" in template_sample:
++            # Padding rows carry the dummy head, so mark them complete and mask them out downstream.
++            template_sample["rollout_support_complete"] = torch.ones(sequence_length, dtype=torch.bool)
++
 +    # Compact support transport: padding rows contribute no support (zero-length rows, no ids/values).
 +    rollout_topk_lengths = template_sample.get("rollout_topk_lengths")
 +    if rollout_topk_lengths is not None:
 +        template_sample["rollout_topk_lengths"] = rollout_topk_lengths.new_zeros(sequence_length)
 +        template_sample["rollout_support_ids"] = rollout_topk_lengths.new_empty(0)
 +        template_sample["rollout_support_log_probs"] = torch.empty(0, dtype=torch.float32)
-+
+ 
      # Update the fields and remove redundant parts
      template_sample.update(
 +        uid=pad_uid,
          prompts=prompts,
          responses=responses,
          input_ids=input_ids,
-@@ -131,6 +159,9 @@ def construct_minimal_padding_template(
+@@ -131,6 +162,9 @@ def construct_minimal_padding_template(
          rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
          rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
      )
@@ -813,7 +966,7 @@ index 6e44c915..439fce82 100644
      if "multi_modal_inputs" in template_sample:
          template_sample["multi_modal_inputs"] = {}
      if routed_experts is not None:
-@@ -144,6 +175,7 @@ def construct_minimal_padding_template(
+@@ -144,6 +178,7 @@ def construct_minimal_padding_template(
          prompt_len=SYNTHETIC_PADDING_SEQ_LEN - 1,
          response_len=1,
          seq_len=SYNTHETIC_PADDING_SEQ_LEN,
@@ -821,7 +974,7 @@ index 6e44c915..439fce82 100644
      )
      return template_sample, template_tag
  
-@@ -178,26 +210,18 @@ def upsample_batch_to_divisible_size(
+@@ -178,26 +213,18 @@ def upsample_batch_to_divisible_size(
      source_key = batch.keys[source_idx]
      source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
  
@@ -906,7 +1059,7 @@ index eed6de70..522c8077 100644
      return metrics
  
 diff --git a/verl/trainer/ppo/score_centering.py b/verl/trainer/ppo/score_centering.py
-index f27bbd3f..aed2b031 100644
+index f27bbd3f..309084be 100644
 --- a/verl/trainer/ppo/score_centering.py
 +++ b/verl/trainer/ppo/score_centering.py
 @@ -18,10 +18,11 @@ sampler's tail mass, so the centering term only needs the k head log-probs of th
@@ -923,7 +1076,7 @@ index f27bbd3f..aed2b031 100644
  from tensordict import TensorDict
  
  from verl.trainer.ppo.rollout_corr_helper import _parse_rollout_is_threshold
-@@ -29,36 +30,75 @@ from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, slice_i
+@@ -29,36 +30,73 @@ from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, slice_i
  from verl.workers.config import ActorConfig
  from verl.workers.utils.losses import ppo_loss
  
@@ -983,9 +1136,7 @@ index f27bbd3f..aed2b031 100644
      return ids, log_probs
  
  
-+def pad_rollout_topk_log_probs(
-+    response_topk_log_probs: torch.Tensor | list, prompt_length: int
-+) -> torch.Tensor:
++def pad_rollout_topk_log_probs(response_topk_log_probs: torch.Tensor | list, prompt_length: int) -> torch.Tensor:
 +    """Lay response-token top-k log-probs over the unpadded prompt+response sequence.
 +
 +    Response token r is predicted by the logits row ``prompt_length - 1 + r``; the other rows (prompt
@@ -1011,7 +1162,7 @@ index f27bbd3f..aed2b031 100644
  
      Args:
          response_topk_ids: Sampler top-k token ids per response token, shape (R, k), array-like of ints.
-@@ -71,13 +111,11 @@ def pad_rollout_topk(
+@@ -71,13 +109,11 @@ def pad_rollout_topk(
              log_probs: Full-sequence top-k log-probs matching ``ids``, same shape, dtype float32.
      """
      ids = torch.as_tensor(response_topk_ids, dtype=torch.int32)
@@ -1027,7 +1178,7 @@ index f27bbd3f..aed2b031 100644
  
  
  class _TopKLogProbsFromLogits(torch.autograd.Function):
-@@ -127,31 +165,231 @@ class _TopKLogProbsFromLogits(torch.autograd.Function):
+@@ -127,31 +163,264 @@ class _TopKLogProbsFromLogits(torch.autograd.Function):
          return grad_input, None, None
  
  
@@ -1088,7 +1239,7 @@ index f27bbd3f..aed2b031 100644
 +            end = min(start + ctx.chunk_size, n)
 +            work = logits[start:end].to(dtype=torch.float32, copy=True)
 +            if ctx.valid < local_vocab:
-+                work[:, ctx.valid:] = -torch.inf
++                work[:, ctx.valid :] = -torch.inf
 +            work.sub_(maxima[start:end]).exp_().div_(denominators[start:end])
 +            grad = grad_output[start:end].float()
 +            work.mul_(-grad.sum(dim=-1, keepdim=True))
@@ -1154,7 +1305,9 @@ index f27bbd3f..aed2b031 100644
 +    reduced across ranks, and the returned gradient stays on this rank's shard.
 +
 +    The output contains support-normalized log-probs. Callers select the sampled token from this
-+    tensor so the policy term and the centering term use the same distribution and gradient.
++    tensor so the policy term and the centering term use the same distribution and gradient. The
++    second output is the detached ``log p(S)`` log support mass the trainer subtracts from the sampled
++    token's full-vocabulary log-prob to score it under the support-renormalized policy.
 +    """
 +
 +    @staticmethod
@@ -1180,15 +1333,16 @@ index f27bbd3f..aed2b031 100644
 +        normalizer = torch.logsumexp(head, dim=-1, keepdim=True)
 +        normalizer = torch.where(has_support, normalizer, torch.zeros_like(normalizer))
 +        output = torch.where(valid, selected - normalizer, torch.zeros_like(selected))
++        log_support_mass = torch.where(has_support, normalizer, torch.zeros_like(normalizer))
 +        ctx.logits_shape = logits.shape
 +        ctx.logits_dtype = logits.dtype
 +        ctx.chunk_size = chunk_size if chunk_size and chunk_size > 0 else max(logits.shape[0], 1)
 +        ctx.save_for_backward(selected, local_ids, owned, valid, normalizer)
-+        return output
++        return output, log_support_mass
 +
 +    @staticmethod
 +    @torch.autograd.function.once_differentiable
-+    def backward(ctx, grad_output):
++    def backward(ctx, grad_output, grad_support_log_mass):
 +        selected, local_ids, owned, valid, normalizer = ctx.saved_tensors
 +        # Accumulate the head gradient in fp32 (scatter_add_ requires destination and source dtypes
 +        # to agree, and the coefficients are fp32), then cast back to the logits dtype on return.
@@ -1200,8 +1354,15 @@ index f27bbd3f..aed2b031 100644
 +        for start in range(0, rows, ctx.chunk_size):
 +            end = min(start + ctx.chunk_size, rows)
 +            grad = grad_output[start:end].float().masked_fill(~valid[start:end], 0.0)
++            # Rows with no support keep the zeroed normalizer, so ``(selected - normalizer).exp()``
++            # would overflow; gate the softmax to valid slots before it reaches the scatter.
 +            softmax = torch.where(valid[start:end], (selected[start:end] - normalizer[start:end]).exp(), 0.0)
 +            coefficient = grad - softmax * grad.sum(dim=-1, keepdim=True)
++            if grad_support_log_mass is not None:
++                # ``log p(S)`` is logsumexp over the support, so its gradient subtracts the
++                # renormalized support probabilities, scaled by the upstream gradient on the mass.
++                slack = grad_support_log_mass[start:end].reshape(-1)
++                coefficient = coefficient - slack.unsqueeze(-1) * softmax
 +            grad_logits[start:end].scatter_add_(
 +                -1, local_ids[start:end], torch.where(owned[start:end], coefficient, 0.0)
 +            )
@@ -1214,12 +1375,39 @@ index f27bbd3f..aed2b031 100644
 +    process_group=None,
 +    vocab_size: Optional[int] = None,
 +    chunk_elems: int = TOPK_LOG_PROB_CHUNK_ELEMS,
-+) -> torch.Tensor:
-+    """Per-row log-probs renormalized over each row's recorded support (exact top-p<1 mode)."""
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Per-row support-normalized head log-probs and the differentiable ``log p(S)``.
++
++    The head log-probs are ``log p^S`` (the trainer renormalized over the recorded support). ``p(S)``
++    is the full-vocabulary probability mass of the support; subtracting ``log p(S)`` from the sampled
++    token's full-vocabulary log-prob scores it under ``p^S``. Both outputs carry the gradient to the
++    logits, and rows without support report zeros.
++    """
 +    row_chunk = _rows_per_chunk(chunk_elems, logits.shape[-1], logits.shape[0])
-+    return _SupportHeadLogProbs.apply(logits, token_ids, process_group, vocab_size, row_chunk)
++    normalized, log_support_mass = _SupportHeadLogProbs.apply(logits, token_ids, process_group, vocab_size, row_chunk)
++    return normalized, log_support_mass.squeeze(-1)
 +
 +
++def support_head_log_probs_from_support(
++    support_head_log_probs: torch.Tensor,
++    head_mask: torch.Tensor,
++) -> torch.Tensor:
++    """``log p(S)`` from already support-renormalized head log-probs, differentiable in ``logits``.
++
++    ``p(S)`` is the full-vocabulary probability mass of the support, i.e. ``logsumexp_v p^S_v`` minus
++    ``log p(S)`` itself: with ``p^S_v = p_v / p(S)`` the head log-probs carry ``log p_v - log p(S)``,
++    so ``logsumexp_v (log p_v - log p(S)) = log p(S) - log p(S) = 0`` and ``log p(S)`` is recovered by
++    adding back ``-logsumexp`` of the renormalized support log-probs.
++    """
++    masked = support_head_log_probs.masked_fill(~head_mask, -math.inf)
++    log_p_S = -torch.logsumexp(masked, dim=-1)
++    return torch.where(head_mask.any(-1), log_p_S, torch.zeros_like(log_p_S))
+ 
+ 
+-def score_centering_weight_fn(
+-    rollout_is: Optional[str], rollout_is_threshold: str | float
+-) -> Callable[[torch.Tensor], torch.Tensor]:
+-    """Build the token-level IS rule as a function of a ratio, shared by the head and sampled token.
 +@dataclass(frozen=True)
 +class ImportanceSampling:
 +    """Importance-weight strategy for the head and the sampled token (arXiv Eq. 12, A.2/A.3).
@@ -1234,16 +1422,12 @@ index f27bbd3f..aed2b031 100644
 +    ``kind`` is one of ``none`` (no weight), ``tis`` (upper clip), or ``mis`` (band mask); every
 +    method dispatches on it, and only ``mis`` uses the ``low``/``high`` band.
 +    """
- 
++
 +    kind: Literal["none", "tis", "mis"] = "none"
 +    clip: float = 2.0
 +    low: float = 0.5
 +    high: float = 5.0
- 
--def score_centering_weight_fn(
--    rollout_is: Optional[str], rollout_is_threshold: str | float
--) -> Callable[[torch.Tensor], torch.Tensor]:
--    """Build the token-level IS rule as a function of a ratio, shared by the head and sampled token.
++
 +    def head_mass(self, p: torch.Tensor, q: torch.Tensor, log_ratio: torch.Tensor) -> torch.Tensor:
 +        """``q * f(p / q)`` on the head candidates."""
 +        if self.kind == "none":
@@ -1269,7 +1453,7 @@ index f27bbd3f..aed2b031 100644
  
      Args:
          rollout_is: None for no IS weight, "token" for TIS or IcePop depending on
-@@ -159,40 +397,49 @@ def score_centering_weight_fn(
+@@ -159,40 +428,74 @@ def score_centering_weight_fn(
          rollout_is_threshold: Threshold specification, see ``_parse_rollout_is_threshold``: a
              single float or float-like string upper-clamps (TIS); a "lower_upper" string zeros
              ratios outside the band (IcePop).
@@ -1296,6 +1480,31 @@ index f27bbd3f..aed2b031 100644
 +    """
 +    scored = (coefficient != 0) & torch.isfinite(log_probs)
 +    return torch.where(scored, log_probs, torch.zeros_like(log_probs))
++
++
++def score_centering_topk_correction(
++    train_head_log_probs: torch.Tensor,
++    sampler_head_log_probs: torch.Tensor,
++    head_mask: torch.Tensor,
++    sampling: ImportanceSampling,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Head-plus-tail centering correction for the top-k head model (``top_p=1``).
++
++    Shared by ``topk_log_probs_from_logits`` and the FSDP shared-scoring fallback rows so both use the
++    same rescaled-tail model. Returns ``(correction, sampler_head_mass, train_head_mass)``.
++    """
++    train_head_log_probs = train_head_log_probs.float()
++    sampler_head_log_probs = sampler_head_log_probs.float()
++    with torch.no_grad():
++        p = train_head_log_probs.exp().masked_fill(~head_mask, 0.0)
++        q = sampler_head_log_probs.exp().masked_fill(~head_mask, 0.0)
++        p_mass, q_mass = p.sum(-1), q.sum(-1)
++        head_mass = sampling.head_mass(p, q, train_head_log_probs - sampler_head_log_probs)
++        rho = (1 - q_mass).clamp_min(1e-6) / (1 - p_mass).clamp_min(1e-6)
++        alpha = sampling.tail_scale(rho, p.dtype)
++        residual = (head_mass - alpha.unsqueeze(-1) * p).masked_fill(~head_mask, 0.0)
++    correction = (residual * _scored_log_probs(train_head_log_probs, residual)).sum(-1)
++    return correction, q_mass, p_mass
  
  
  def score_centering_correction(
@@ -1338,40 +1547,66 @@ index f27bbd3f..aed2b031 100644
  
      Returns:
          Tuple containing:
-@@ -200,58 +447,230 @@ def score_centering_correction(
+@@ -200,58 +503,325 @@ def score_centering_correction(
                  dtype float32, with gradient to the trainer logits.
              sampler_head_mass: Sampler's head probability mass, shape (N,), dtype float32.
              train_head_mass: Trainer's head probability mass, shape (N,), dtype float32.
 +            tail_ratio: Trainer-to-sampler tail-mass ratio ``rho`` (ones in support mode), shape (N,).
      """
-     train_head_log_probs = train_head_log_probs.float()
-+    sampler_head_log_probs = sampler_head_log_probs.float()
+-    train_head_log_probs = train_head_log_probs.float()
++    if support:
++        # Support mode receives ``log p^S`` (the trainer renormalized over the recorded support). The
++        # complete support has no tail, so ``alpha`` is zero. Report ``rho = 1`` to keep
++        # ``sc_tail_ratio`` neutral in support mode.
++        correction = score_centering_support_rows(train_head_log_probs, sampler_head_log_probs, head_mask, sampling)
++        with torch.no_grad():
++            sampler_head_mass = sampler_head_log_probs.float().exp().masked_fill(~head_mask, 0.0).sum(-1)
++            train_head_mass = train_head_log_probs.float().exp().masked_fill(~head_mask, 0.0).sum(-1)
++        return correction, sampler_head_mass, train_head_mass, torch.ones_like(sampler_head_mass)
++    correction, sampler_head_mass, train_head_mass = score_centering_topk_correction(
++        train_head_log_probs, sampler_head_log_probs, head_mask, sampling
++    )
      with torch.no_grad():
 -        p = train_head_log_probs.exp()
 -        q = sampler_head_log_probs.float().exp()
-+        p = train_head_log_probs.exp().masked_fill(~head_mask, 0.0)
-+        q = sampler_head_log_probs.exp().masked_fill(~head_mask, 0.0)
-         p_mass, q_mass = p.sum(-1), q.sum(-1)
+-        p_mass, q_mass = p.sum(-1), q.sum(-1)
 -        rho = (1 - q_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
 -        alpha = rho * weight_fn(1.0 / rho)
 -        head_weights = weight_fn((train_head_log_probs - sampler_head_log_probs.float()).exp())
 -        residual = q * head_weights - alpha.unsqueeze(-1) * p
 -    correction = (residual * train_head_log_probs).sum(-1)
 -    return correction, q_mass, p_mass
-+        head_mass = sampling.head_mass(p, q, train_head_log_probs - sampler_head_log_probs)
-+        if support:
-+            # A complete support has no tail, so alpha is exactly zero: dropping the term avoids
-+            # evaluating rho on float-noise masses (it would be meaningless and can be O(10)).
-+            residual = head_mass
-+            tail_ratio = torch.ones_like(q_mass)
-+        else:
-+            rho = (1 - q_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
-+            alpha = sampling.tail_scale(rho, p.dtype)
-+            residual = head_mass - alpha.unsqueeze(-1) * p
-+            tail_ratio = rho
-+        residual = residual.masked_fill(~head_mask, 0.0)
-+    correction = (residual * _scored_log_probs(train_head_log_probs, residual)).sum(-1)
-+    return correction, q_mass, p_mass, tail_ratio
++        p_mass = train_head_log_probs.float().exp().masked_fill(~head_mask, 0.0).sum(-1)
++        q_mass = sampler_head_mass
++        tail_ratio = (1 - q_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
++    return correction, sampler_head_mass, train_head_mass, tail_ratio
++
++
++def score_centering_support_rows(
++    train_support_log_probs: torch.Tensor,
++    sampler_head_log_probs: torch.Tensor,
++    head_mask: torch.Tensor,
++    sampling: ImportanceSampling,
++) -> torch.Tensor:
++    """Exact support-mode centering term on a complete-support head.
++
++    Ported from veRL #8196 and adapted to PSRL's ``head_mass``. ``head_mask`` marks the support ``S``:
++    a complete head has no tail, so ``alpha`` is exactly zero and the term is ``sum_S sg[q w] log p^S``
++    with the trainer renormalized over ``S``.
++
++    Args:
++        train_support_log_probs: ``log p^S`` at the head ids, shape (N, k), with gradient to the
++            trainer logits.
++        sampler_head_log_probs: Sampler's log-probs at the same head ids, shape (N, k).
++        head_mask: Boolean support mask, shape (N, k).
++        sampling: IS strategy applied to the ratio ``p^S / q`` on the support.
++    """
++    masking = ~head_mask
++    with torch.no_grad():
++        p = train_support_log_probs.exp().masked_fill(masking, 0.0)
++        q = sampler_head_log_probs.float().exp().masked_fill(masking, 0.0)
++        residual = sampling.head_mass(p, q, train_support_log_probs - sampler_head_log_probs.float())
++    return (residual * _scored_log_probs(train_support_log_probs, residual)).sum(-1)
 +
 +
 +def _flatten_rows(tensor: torch.Tensor) -> torch.Tensor:
@@ -1445,6 +1680,7 @@ index f27bbd3f..aed2b031 100644
 +    cp_layout: Optional[str] = None,
 +    chunk_elems: int = TOPK_LOG_PROB_CHUNK_ELEMS,
 +    labels: Optional[torch.Tensor] = None,
++    sampled_token_ids: Optional[torch.Tensor] = None,
  ) -> dict[str, torch.Tensor]:
      """Per-token centering term from the trainer logits, in the engine's logits-processor slot.
  
@@ -1473,6 +1709,9 @@ index f27bbd3f..aed2b031 100644
 +        chunk_elems: fp32 workspace budget per normalizer chunk, in elements; the row count is
 +            derived from the local vocabulary size. Default: 64M elements (256 MiB).
 +        labels: Next-token ids aligned with ``student_logits``. Required in support mode.
++        sampled_token_ids: Local prediction labels for the FSDP shared-scoring path; when set the
++            head and sampled-token scores share one full-vocabulary pass and the returned dict also
++            carries ``log_probs`` for the engine to reuse instead of a separate cross entropy.
  
      Returns:
          Dict with, each of shape (1, nnz/sp):
@@ -1482,6 +1721,11 @@ index f27bbd3f..aed2b031 100644
 +            sc_tail_ratio: Trainer-to-sampler tail-mass ratio, detached.
 +            sc_policy_log_prob: Sampled-token log-prob under the support-normalized policy. Present
 +                only in support mode and differentiable with respect to ``student_logits``.
++            sc_support_aligned: One for rows the receipt proved complete, zero otherwise.
++            sc_sampler_tail_mass: Sampler probability mass outside the recorded head.
++            sc_support_unknown: Approximate rows with near-unit head mass but no coverage proof.
++            log_probs: Sampled log-probs in the selected per-row domain, present only with
++                ``sampled_token_ids``.
      """
      if data_format != "thd":
          raise NotImplementedError("score centering supports the thd (remove padding) format only.")
@@ -1552,17 +1796,56 @@ index f27bbd3f..aed2b031 100644
 +            f"score centering sampler head has {ids.shape[0]} rows but the trainer logits have "
 +            f"{logits_2d.shape[0]}; the head was not aligned to the model's packed layout."
 +        )
++    sampler_head_log_probs = topk_log_probs.squeeze(0)
++    # Per-token support receipt. ``rollout_support_complete`` witnesses whether the captured head is
++    # the whole sampling support; only those rows may be renormalized over the support, the rest keep
++    # the head-plus-tail approximation so a nucleus that overflows the recording budget is never
++    # scored as if it were complete. A missing receipt keeps the previous all-aligned behavior.
++    receipt = data.get("rollout_support_complete", None)
++    if receipt is None:
++        aligned = head_mask.any(-1)
++    else:
++        aligned = _flatten_rows(receipt).reshape(-1).to(ids.device).to(torch.bool)
++        if aligned.shape[0] != ids.shape[0]:
++            raise ValueError(
++                f"score centering support receipt has {aligned.shape[0]} rows but the trainer logits "
++                f"have {ids.shape[0]}; the receipt was not aligned to the model's packed layout."
++            )
++
++    if sampled_token_ids is not None:
++        # FSDP's full-local-vocabulary path scores the head and the sampled token in one chunked pass
++        # and returns the sampled log-prob, so the engine skips its separate cross entropy.
++        from verl.trainer.ppo.score_centering_scores import score_centering_shared_scores_from_logits
++
++        return score_centering_shared_scores_from_logits(
++            logits_2d,
++            ids,
++            sampled_token_ids.reshape(-1).to(ids.device),
++            sampler_head_log_probs,
++            aligned,
++            sampling,
++            chunk_size=_rows_per_chunk(chunk_elems, logits_2d.shape[-1], logits_2d.shape[0]),
++        )
 +
 +    if sampling_support:
-+        train_head_log_probs = support_head_log_probs(
++        # The primitive returns ``(log p^S, log p(S))``. The correction and the policy term need the
++        # support-normalized form, and the diagnostic needs the mass, so keep both.
++        train_support_log_probs, log_support_mass = support_head_log_probs(
 +            logits_2d, ids, process_group=process_group, vocab_size=vocab_size, chunk_elems=chunk_elems
 +        )
++        train_head_log_probs = train_support_log_probs
 +    else:
++        train_support_log_probs = None
++        log_support_mass = None
 +        train_head_log_probs = topk_log_probs_from_logits(
 +            logits_2d, ids.clamp_min(0), chunk_elems=chunk_elems, process_group=process_group, vocab_size=vocab_size
 +        ).masked_fill(~head_mask, 0.0)
 +    correction, sampler_head_mass, train_head_mass, tail_ratio = score_centering_correction(
-+        train_head_log_probs, topk_log_probs.squeeze(0), head_mask, sampling, support=sampling_support
++        train_head_log_probs,
++        sampler_head_log_probs,
++        head_mask,
++        sampling,
++        support=sampling_support,
      )
 -    return {
 +    output = {
@@ -1571,6 +1854,10 @@ index f27bbd3f..aed2b031 100644
          "sc_train_head_mass": train_head_mass.unsqueeze(0),
 +        "sc_tail_ratio": tail_ratio.unsqueeze(0),
      }
++    # The sampler-tail mass and the aligned/unknown fractions diagnose whether the recorded head
++    # actually covers the sampling support; an unknown row is an approximate row whose head mass is
++    # near one but which no provider receipt proved complete (the case support alignment prevents).
++    tail_mass = (1.0 - sampler_head_mass).clamp_min(0.0)
 +    if sampling_support:
 +        if labels is None:
 +            raise ValueError("score centering support mode requires labels aligned with the trainer logits.")
@@ -1580,16 +1867,35 @@ index f27bbd3f..aed2b031 100644
 +                f"score centering labels have {labels.shape[0]} rows but the trainer logits have {ids.shape[0]}."
 +            )
 +        sampled = head_mask & (ids == labels.unsqueeze(-1))
++        aligned = aligned & head_mask.any(-1)
 +        match_count = sampled.sum(-1)
-+        support_rows = head_mask.any(-1)
-+        if bool((match_count[support_rows] != 1).any()):
-+            raise ValueError("score centering support must contain the sampled token exactly once per active row.")
-+        output["sc_policy_log_prob"] = (train_head_log_probs * sampled).sum(-1).unsqueeze(0)
++        if bool((match_count[aligned] != 1).any()):
++            raise ValueError("score centering support must contain the sampled token exactly once per aligned row.")
++        support_correction = score_centering_support_rows(
++            train_support_log_probs, sampler_head_log_probs, head_mask, sampling
++        )
++        # Keep the support log-mass gradient only on aligned rows; unaligned rows must not push a
++        # support-renormalized log-prob into the policy term (they use the trainer's full-vocabulary
++        # log-prob instead).
++        aligned_log_mass = torch.where(aligned, log_support_mass, torch.zeros_like(log_support_mass))
++        output["sc_correction"] = torch.where(aligned, support_correction, correction).unsqueeze(0)
++        output["sc_train_head_mass"] = torch.where(aligned, aligned_log_mass.detach().exp(), train_head_mass).unsqueeze(
++            0
++        )
++        # The sampled token under the support-renormalized policy on aligned rows: ``train_head_log_probs``
++        # is ``log p^S``, so its sampled slot scores the token under the renormalized support.
++        support_sampled = (sampled.float() * train_head_log_probs).sum(-1)
++        output["sc_policy_log_prob"] = torch.where(
++            aligned, support_sampled, torch.zeros_like(support_sampled)
++        ).unsqueeze(0)
++        output["sc_support_aligned"] = aligned.float().unsqueeze(0)
++        output["sc_sampler_tail_mass"] = tail_mass.unsqueeze(0)
++        output["sc_support_unknown"] = ((~aligned) & (tail_mass <= 1e-6)).float().unsqueeze(0)
 +    return output
  
  
  def score_centering_ppo_loss(
-@@ -261,6 +680,13 @@ def score_centering_ppo_loss(
+@@ -261,6 +831,14 @@ def score_centering_ppo_loss(
      dp_group=None,
      student_logits: torch.Tensor = None,
      data_format: str = "thd",
@@ -1600,10 +1906,11 @@ index f27bbd3f..aed2b031 100644
 +    cp_layout: Optional[str] = None,
 +    chunk_elems: int = TOPK_LOG_PROB_CHUNK_ELEMS,
 +    labels: Optional[torch.Tensor] = None,
++    sampled_token_ids: Optional[torch.Tensor] = None,
  ):
      """Actor loss function used both for the logits processor and the final policy loss.
      - student_logits is not None, compute the centering term in the logits processor.
-@@ -269,22 +695,41 @@ def score_centering_ppo_loss(
+@@ -269,22 +847,45 @@ def score_centering_ppo_loss(
      Args:
          config: Actor configuration.
          model_output: Model output, including log_probs and sc_correction.
@@ -1620,6 +1927,9 @@ index f27bbd3f..aed2b031 100644
 +        cp_layout: Context-parallel layout the model forward used ("zigzag"/"contiguous"), or None.
 +        chunk_elems: fp32 workspace budget per normalizer chunk, in elements. Default: 64M (256 MiB).
 +        labels: Next-token ids aligned with ``student_logits``. Required in support mode.
++        sampled_token_ids: Local prediction labels for the FSDP shared-scoring path; when set the
++            head and sampled-token scores share one full-vocabulary pass and the processor returns
++            ``log_probs`` for the engine to reuse.
  
      Returns:
          student_logits is not None: dict from ``score_centering_logits_processor``.
@@ -1639,6 +1949,7 @@ index f27bbd3f..aed2b031 100644
 +            cp_layout,
 +            chunk_elems,
 +            labels,
++            sampled_token_ids,
 +        )
      rollout_correction = config.policy_loss.get("rollout_correction", None) or {}
      if rollout_correction.get("score_centering", False) and "sc_correction" not in model_output:
@@ -1650,6 +1961,272 @@ index f27bbd3f..aed2b031 100644
 +            "the score_centering micro-batch flag (upstream v1 does this; PSRL's trainer sets it too)."
          )
      return ppo_loss(config, model_output, data, dp_group)
+diff --git a/verl/trainer/ppo/score_centering_scores.py b/verl/trainer/ppo/score_centering_scores.py
+new file mode 100644
+index 00000000..d922839c
+--- /dev/null
++++ b/verl/trainer/ppo/score_centering_scores.py
+@@ -0,0 +1,260 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Shared head/sample scoring for FSDP's full local vocabulary.
++
++Adapted from veRL #8206 to PSRL's ``ImportanceSampling`` strategy: the head scoring and the
++sampled-token score share one chunked full-vocabulary forward normalizer, and the backward only
++rebuilds the dense vocabulary gradient for the rows that fall back to the head-plus-tail
++approximation. Verified-complete rows carry a sparse per-row gradient instead, so their
++vocabulary-sized gradient is never allocated. This is a separate backend path: the general
++auto-correction helper continues to consume full-vocabulary-normalized head probabilities, and this
++helper is not valid for an unmaterialized TP vocabulary shard.
++"""
++
++import torch
++
++try:
++    import triton
++    import triton.language as tl
++except ImportError:
++    triton = None
++    tl = None
++
++
++if triton is not None:
++
++    @triton.jit
++    def _vocabulary_gradient(
++        logits,
++        gradient,
++        maxima,
++        denominators,
++        coefficients,
++        aligned,
++        vocab: tl.constexpr,
++        logits_row_stride: tl.constexpr,
++        logits_col_stride: tl.constexpr,
++        grad_row_stride: tl.constexpr,
++        grad_col_stride: tl.constexpr,
++        block: tl.constexpr,
++    ):
++        row = tl.program_id(0)
++        columns = tl.program_id(1) * block + tl.arange(0, block)
++        in_vocab = columns < vocab
++        if tl.load(aligned + row):
++            values = tl.full((block,), 0.0, tl.float32)
++        else:
++            values = tl.load(
++                logits + row * logits_row_stride + columns * logits_col_stride,
++                mask=in_vocab,
++                other=-float("inf"),
++            ).to(tl.float32)
++            maximum = tl.load(maxima + row)
++            denominator = tl.load(denominators + row)
++            coefficient = tl.load(coefficients + row)
++            values = -coefficient * tl.exp(values - maximum) / denominator
++        tl.store(gradient + row * grad_row_stride + columns * grad_col_stride, values, mask=in_vocab)
++
++
++class _SharedScoreCenteringScores(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, logits, head_ids, labels, sampler_head, aligned, sampling, chunk_size):
++        n = logits.shape[0]
++        chunk_size = chunk_size if chunk_size > 0 else max(n, 1)
++        correction = torch.empty(n, device=logits.device, dtype=torch.float32)
++        sampled = torch.empty_like(correction)
++        train_mass = torch.empty_like(correction)
++        maxima = torch.empty_like(correction)
++        denominators = torch.empty_like(correction)
++        residuals = torch.empty(head_ids.shape, device=logits.device, dtype=torch.float32)
++        head_probabilities = torch.empty_like(residuals)
++        for start in range(0, n, chunk_size):
++            end = min(start + chunk_size, n)
++            work = logits[start:end].to(dtype=torch.float32, copy=True)
++            raw_head = work.gather(-1, head_ids[start:end])
++            raw_sample = work.gather(-1, labels[start:end].unsqueeze(-1)).squeeze(-1)
++            maximum = work.max(-1).values
++            work.sub_(maximum.unsqueeze(-1)).exp_()
++            denominator = work.sum(-1)
++            del work
++            log_denominator = denominator.log()
++            full_head_lp = (raw_head - maximum.unsqueeze(-1)) - log_denominator.unsqueeze(-1)
++
++            complete = aligned[start:end]
++            q_lp = sampler_head[start:end].float()
++            finite = q_lp.isfinite()
++            # A fallback row need not contain a valid complete support. Keep its unselected support
++            # arithmetic finite, as the auto-correction helper does.
++            support = torch.where(complete.unsqueeze(-1), finite, torch.ones_like(finite))
++            support_logits = raw_head.masked_fill(~support, float("-inf"))
++            support_maximum = support_logits.max(-1).values
++            support_log_denominator = (support_logits - support_maximum.unsqueeze(-1)).exp().sum(-1).log()
++            support_lp = (
++                (raw_head - support_maximum.unsqueeze(-1)) - support_log_denominator.unsqueeze(-1)
++            ).masked_fill(~support, 0.0)
++            head_lp = torch.where(complete.unsqueeze(-1), support_lp, full_head_lp)
++            p = head_lp.exp() * (~complete.unsqueeze(-1) | finite)
++            q = q_lp.exp()
++            with torch.no_grad():
++                weight = torch.where(
++                    finite,
++                    sampling.head_mass(p, q, head_lp - q_lp),
++                    torch.zeros_like(q),
++                )
++                p_mass, q_mass = p.sum(-1), q.sum(-1)
++                rho = (1 - q_mass).clamp_min(1e-6) / (1 - p_mass).clamp_min(1e-6)
++                alpha = sampling.tail_scale(rho, p.dtype)
++                residual = torch.where(
++                    complete.unsqueeze(-1),
++                    weight - weight.sum(-1, keepdim=True) * p,
++                    weight - alpha.unsqueeze(-1) * p,
++                )
++            correction[start:end] = (residual * head_lp).sum(-1)
++            sampled[start:end] = torch.where(
++                complete,
++                (raw_sample - support_maximum) - support_log_denominator,
++                (raw_sample - maximum) - log_denominator,
++            )
++            full_support_log_mass = (support_maximum - maximum) + support_log_denominator - log_denominator
++            train_mass[start:end] = torch.where(complete, full_support_log_mass.exp(), full_head_lp.exp().sum(-1))
++            maxima[start:end] = maximum
++            denominators[start:end] = denominator
++            residuals[start:end] = residual
++            head_probabilities[start:end] = p
++        ctx.save_for_backward(logits, head_ids, labels, aligned, residuals, head_probabilities, maxima, denominators)
++        ctx.chunk_size = chunk_size
++        ctx.mark_non_differentiable(train_mass)
++        return correction, sampled, train_mass
++
++    @staticmethod
++    @torch.autograd.function.once_differentiable
++    def backward(ctx, grad_correction, grad_sampled, grad_train_mass):
++        logits, ids, labels, aligned, residual, head_p, maxima, denominators = ctx.saved_tensors
++        n, vocab = logits.shape
++        if grad_correction is None:
++            grad_correction = torch.zeros(n, device=logits.device, dtype=torch.float32)
++        if grad_sampled is None:
++            grad_sampled = torch.zeros(n, device=logits.device, dtype=torch.float32)
++        grad_head = residual * grad_correction.float().unsqueeze(-1)
++        grad_sampled = grad_sampled.float()
++        coefficients = grad_head.sum(-1) + grad_sampled
++        grad_head = grad_head - torch.where(
++            aligned.unsqueeze(-1), coefficients.unsqueeze(-1) * head_p, torch.zeros_like(grad_head)
++        )
++        grad_input = torch.empty_like(logits)
++        if logits.is_cuda and triton is not None and n:
++            block = 8192
++            _vocabulary_gradient[(n, triton.cdiv(vocab, block))](
++                logits,
++                grad_input,
++                maxima,
++                denominators,
++                coefficients,
++                aligned,
++                vocab,
++                logits.stride(0),
++                logits.stride(1),
++                grad_input.stride(0),
++                grad_input.stride(1),
++                block,
++                num_warps=4,
++            )
++        else:
++            grad_input.zero_()
++            for start in range(0, n, ctx.chunk_size):
++                end = min(start + ctx.chunk_size, n)
++                rows = (~aligned[start:end]).nonzero().squeeze(-1) + start
++                work = logits.index_select(0, rows).to(dtype=torch.float32, copy=True)
++                work.sub_(maxima[rows].unsqueeze(-1)).exp_().div_(denominators[rows].unsqueeze(-1))
++                work.mul_(-coefficients[rows].unsqueeze(-1))
++                grad_input.index_copy_(0, rows, work.to(logits.dtype))
++        # Reduce duplicate head/sample ids within the small K+1 matrix. Then overwrite their dense
++        # gradient entries after one fp32 accumulation, without allocating a full-vocabulary fp32
++        # gradient workspace.
++        sparse_ids = torch.cat((ids, labels.unsqueeze(-1)), dim=-1)
++        sparse_values = torch.cat((grad_head, grad_sampled.unsqueeze(-1)), dim=-1)
++        sorted_ids, order = sparse_ids.sort(-1)
++        sorted_values = sparse_values.gather(-1, order)
++        starts = torch.ones_like(sorted_ids, dtype=torch.bool)
++        starts[:, 1:] = sorted_ids[:, 1:] != sorted_ids[:, :-1]
++        groups = starts.long().cumsum(-1) - 1
++        compact_ids = torch.zeros_like(sorted_ids).scatter_(-1, groups, sorted_ids)
++        compact_values = torch.zeros_like(sorted_values).scatter_add_(-1, groups, sorted_values)
++        valid = torch.arange(sparse_ids.shape[-1], device=logits.device).unsqueeze(0) < starts.sum(-1, keepdim=True)
++        # Unused slots repeat the first group's exact id/value, so repeated stores write an identical
++        # result rather than overwriting a live id.
++        compact_ids = torch.where(valid, compact_ids, compact_ids[:, :1])
++        compact_values = torch.where(valid, compact_values, compact_values[:, :1])
++        base = logits.gather(-1, compact_ids).float()
++        base.sub_(maxima.unsqueeze(-1)).exp_().div_(denominators.unsqueeze(-1))
++        base.mul_(-coefficients.unsqueeze(-1))
++        base = torch.where(aligned.unsqueeze(-1), torch.zeros_like(base), base)
++        grad_input.scatter_(-1, compact_ids, (base + compact_values).to(logits.dtype))
++        return grad_input, None, None, None, None, None, None
++
++
++def score_centering_shared_scores_from_logits(
++    logits: torch.Tensor,
++    head_ids: torch.Tensor,
++    sampled_token_ids: torch.Tensor,
++    sampler_head_log_probs: torch.Tensor,
++    support_complete: torch.Tensor,
++    sampling,
++    chunk_size: int = 4096,
++) -> dict[str, torch.Tensor]:
++    """Compute centering and sampled scores in one full-local-vocabulary FSDP path.
++
++    Verified complete rows normalize within the finite sampler head. Other rows retain the
++    full-vocabulary trainer-tail proxy. The full-vocabulary head-mass diagnostic remains detached; it
++    still requires a chunked O(NV) forward scan. This helper is not valid for an unmaterialized TP
++    vocabulary shard.
++
++    Args:
++        logits: Trainer logits, shape (N, V), the full local vocabulary.
++        head_ids: Sampler head ids, shape (N, k).
++        sampled_token_ids: Next-token labels aligned with ``logits``, shape (N,).
++        sampler_head_log_probs: Sampler log-probs at ``head_ids``, shape (N, k).
++        support_complete: Per-row completeness receipt, bool shape (N,).
++        sampling: PSRL importance-sampling strategy.
++        chunk_size: Rows per full-vocabulary forward chunk.
++    """
++    if logits.ndim != 2 or head_ids.ndim != 2 or logits.shape[0] != head_ids.shape[0]:
++        raise ValueError("Expected logits (N, V) and head ids (N, K).")
++    n = logits.shape[0]
++    if sampler_head_log_probs.shape != head_ids.shape or not head_ids.shape[-1]:
++        raise ValueError("Sampler probabilities must match a nonempty head.")
++    if sampled_token_ids.shape != (n,) or support_complete.shape != (n,):
++        raise ValueError("Sampled ids and complete-support receipts must have shape (N,).")
++    aligned = support_complete.bool().contiguous()
++    correction, sampled, train_mass = _SharedScoreCenteringScores.apply(
++        logits,
++        head_ids.long(),
++        sampled_token_ids.long(),
++        sampler_head_log_probs,
++        aligned,
++        sampling,
++        chunk_size,
++    )
++    with torch.no_grad():
++        sampler_mass = sampler_head_log_probs.float().exp().sum(-1)
++        tail_mass = (1 - sampler_mass).clamp(min=0)
++    return {
++        "sc_correction": correction,
++        "log_probs": sampled,
++        "sc_sampler_head_mass": sampler_mass,
++        "sc_train_head_mass": train_mass,
++        "sc_support_aligned": aligned.float(),
++        "sc_sampler_tail_mass": tail_mass,
++        "sc_support_unknown": ((~aligned) & (tail_mass <= 1e-6)).float(),
++    }
 diff --git a/verl/utils/checkpoint/megatron_checkpoint_manager.py b/verl/utils/checkpoint/megatron_checkpoint_manager.py
 index 3c7d487a..40a74679 100644
 --- a/verl/utils/checkpoint/megatron_checkpoint_manager.py
@@ -1879,10 +2456,10 @@ index 3c7d487a..40a74679 100644
          return async_save_request
  
 diff --git a/verl/utils/config.py b/verl/utils/config.py
-index 03ee6213..8d0ac4c9 100644
+index 03ee6213..e0e8b945 100644
 --- a/verl/utils/config.py
 +++ b/verl/utils/config.py
-@@ -86,33 +86,43 @@ def _validate_router_replay_config(actor_config: Any, rollout_correction: Any) -
+@@ -86,33 +86,45 @@ def _validate_router_replay_config(actor_config: Any, rollout_correction: Any) -
  
  
  def _validate_score_centering_config(config: DictConfig) -> None:
@@ -1944,6 +2521,8 @@ index 03ee6213..8d0ac4c9 100644
 +            raise ValueError("score centering requires actor_rollout_ref.rollout.name=vllm.")
 +        if not actor_cfg.rollout.get("topk_log_probs", 0):
 +            raise ValueError("score centering requires actor_rollout_ref.rollout.topk_log_probs > 0.")
++        if actor_cfg.rollout.get("temperature", 1.0) <= 0:
++            raise ValueError("score centering requires stochastic training rollouts with temperature > 0.")
      if (config.get("distillation") or {}).get("enabled", False):
          raise ValueError("score centering cannot be combined with distillation.")
  
@@ -2169,7 +2748,7 @@ index 59ea7ca6..e41eb431 100644
      dist_checkpointing_prefix: str = ""
      dist_ckpt_optim_fully_reshardable: bool = False
 diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
-index 6428bf72..cb56b707 100644
+index 6428bf72..781315f1 100644
 --- a/verl/workers/config/rollout.py
 +++ b/verl/workers/config/rollout.py
 @@ -224,6 +224,10 @@ class RolloutConfig(BaseConfig):
@@ -2183,7 +2762,7 @@ index 6428bf72..cb56b707 100644
      agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
  
      trace: TraceConfig = field(default_factory=TraceConfig)
-@@ -352,15 +356,15 @@ class RolloutConfig(BaseConfig):
+@@ -352,15 +356,24 @@ class RolloutConfig(BaseConfig):
          if self.topk_log_probs:
              if self.name != "vllm":
                  raise ValueError("rollout.topk_log_probs is supported by the vLLM rollout only.")
@@ -2204,10 +2783,19 @@ index 6428bf72..cb56b707 100644
 +                    "rollout.topk_log_probs needs top_p=1.0 and top_k=-1; set sampler_support=True "
 +                    "for truncated sampling (the captured head is then the complete support)."
 +                )
++            if self.sampler_support and 0 < self.topk_log_probs < self.top_k:
++                warnings.warn(
++                    f"rollout.topk_log_probs={self.topk_log_probs} is smaller than the sampling top_k="
++                    f"{self.top_k}. Increasing the recording budget can allow score centering to align the "
++                    "full sampling support. Actual coverage determines whether the trainer-tail "
++                    "approximation is used.",
++                    UserWarning,
++                    stacklevel=2,
++                )
              vllm_kwargs = self.engine_kwargs.setdefault("vllm", {})
              vllm_kwargs["max_logprobs"] = max(vllm_kwargs.get("max_logprobs", 0), self.topk_log_probs)
 diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
-index 15fae90e..26ba4e8d 100644
+index 15fae90e..4115fefd 100644
 --- a/verl/workers/engine/fsdp/transformer_impl.py
 +++ b/verl/workers/engine/fsdp/transformer_impl.py
 @@ -29,6 +29,7 @@ from tensordict import TensorDict
@@ -2385,7 +2973,7 @@ index 15fae90e..26ba4e8d 100644
  
          if calculate_sum_pi_squared and use_fused_kernels:
              raise NotImplementedError(
-@@ -1418,15 +1460,31 @@ class FSDPEngineWithLMHead(FSDPEngine):
+@@ -1418,17 +1460,37 @@ class FSDPEngineWithLMHead(FSDPEngine):
  
                  # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
                  if distillation_use_topk or score_centering:
@@ -2395,6 +2983,9 @@ index 15fae90e..26ba4e8d 100644
 +                        processor_kwargs["sampling_support"] = sampler_support
 +                        processor_kwargs["chunk_elems"] = self.engine_config.score_centering_chunk_elems
 +                        processor_kwargs["labels"] = input_ids_rmpad_rolled
++                        # Share the head scoring with the sampled-token score so the cross entropy is
++                        # not computed twice over the same full-vocabulary forward.
++                        processor_kwargs["sampled_token_ids"] = input_ids_rmpad_rolled
 +                    outputs = logits_processor_func(**processor_kwargs)
                      cu_seqlens = input_ids.offsets()
 -                    for k, v in outputs.items():
@@ -2405,15 +2996,16 @@ index 15fae90e..26ba4e8d 100644
 -                        v = self._gather_and_unpad_packed(v, output_args["pad_size"])
 -                        model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
 +                    if score_centering:
-+                        # All score-centering fields are per-token scalars: gather them in one
-+                        # collective instead of one all-gather per field.
++                        # The shared path returns the sampled log-probs so the engine can skip its own
++                        # cross entropy; the remaining fields are per-token scalars gathered together.
++                        log_probs = outputs.pop("log_probs", None)
++                        if log_probs is not None:
++                            log_probs = log_probs.squeeze(0)
 +                        names = list(outputs.keys())
 +                        packed = torch.stack([outputs[name].squeeze(0) for name in names], dim=1)
 +                        packed = self._gather_and_unpad_packed(packed, output_args["pad_size"])
 +                        for index, name in enumerate(names):
-+                            model_output[name] = torch.nested.nested_tensor_from_jagged(
-+                                packed[:, index], cu_seqlens
-+                            )
++                            model_output[name] = torch.nested.nested_tensor_from_jagged(packed[:, index], cu_seqlens)
 +                    else:
 +                        for k, v in outputs.items():
 +                            v = v.squeeze(0)
@@ -2423,9 +3015,12 @@ index 15fae90e..26ba4e8d 100644
 +                            v = self._gather_and_unpad_packed(v, output_args["pad_size"])
 +                            model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
  
-                 if not distillation_only:
+-                if not distillation_only:
++                if not distillation_only and log_probs is None:
                      # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-@@ -1516,7 +1574,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                     # entropy and the score centering hook reuse the logits in their backward
+                     inplace_backward = not (calculate_entropy or score_centering)
+@@ -1516,7 +1578,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
                      # populated in output_args along the use_remove_padding=True
                      # path of prepare_model_inputs.
                      if distillation_use_topk or score_centering:
@@ -2435,10 +3030,26 @@ index 15fae90e..26ba4e8d 100644
 +                            processor_kwargs["sampling_support"] = sampler_support
 +                            processor_kwargs["chunk_elems"] = self.engine_config.score_centering_chunk_elems
 +                            processor_kwargs["labels"] = input_ids_rmpad_rolled
++                            processor_kwargs["sampled_token_ids"] = input_ids_rmpad_rolled
 +                        outputs = logits_processor_func(**processor_kwargs)
++                        log_probs = None
++                        if score_centering:
++                            log_probs = outputs.pop("log_probs", None)
++                            if log_probs is not None:
++                                log_probs = log_probs.squeeze(0)
                          for k, v in outputs.items():
                              v = v.squeeze(0)
                              assert v.shape == (logits_rmpad.shape[0],), (
+@@ -1524,8 +1597,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                             )
+                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+ 
+-                    log_probs = None
+-                    if not distillation_only:
++                    if not distillation_only and log_probs is None:
+                         log_probs = logprobs_from_logits(
+                             logits=logits_rmpad,
+                             labels=input_ids_rmpad_rolled,
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
 index b75c00c9..5eb97184 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
@@ -2843,10 +3454,10 @@ index aa8f31c1..726bd57e 100644
          # 1. build reference model
          if "ref" in self.role:
 diff --git a/verl/workers/utils/losses.py b/verl/workers/utils/losses.py
-index 94684c05..fd11f77d 100644
+index 94684c05..7b59c83b 100644
 --- a/verl/workers/utils/losses.py
 +++ b/verl/workers/utils/losses.py
-@@ -62,7 +62,13 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+@@ -62,7 +62,16 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
          entropy = no_padding_2_padding(entropy, data)
      sc_outputs = {
          key: no_padding_2_padding(model_output[key], data)
@@ -2857,11 +3468,14 @@ index 94684c05..fd11f77d 100644
 +            "sc_train_head_mass",
 +            "sc_tail_ratio",
 +            "sc_policy_log_prob",
++            "sc_support_aligned",
++            "sc_sampler_tail_mass",
++            "sc_support_unknown",
 +        )
          if key in model_output
      }
  
-@@ -88,6 +94,24 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+@@ -88,6 +97,24 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
      metrics = {}
  
      # select fields and convert to padded tensor
@@ -2886,7 +3500,7 @@ index 94684c05..fd11f77d 100644
      fields = ["response_mask", "old_log_probs", "advantages"]
      if "rollout_is_weights" in data:
          fields.append("rollout_is_weights")
-@@ -103,13 +127,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+@@ -103,13 +130,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
  
      loss_agg_mode = config.loss_agg_mode
  
@@ -2904,7 +3518,7 @@ index 94684c05..fd11f77d 100644
          advantages=advantages,
          response_mask=response_mask,
          loss_agg_mode=loss_agg_mode,
-@@ -125,9 +151,10 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+@@ -125,9 +154,25 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
      metrics.update(pg_metrics)
      metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
      if sc_outputs:
@@ -2914,7 +3528,22 @@ index 94684c05..fd11f77d 100644
 +        for key, value in sc_outputs.items():
 +            if key == "sc_policy_log_prob":
 +                continue
-+            metrics[f"actor/{key}"] = Metric(value=masked_mean(value, response_mask), aggregation=AggregationType.MEAN)
++            if key in ("sc_support_aligned", "sc_sampler_tail_mass", "sc_support_unknown"):
++                # Sum globally normalized token contributions across microbatches; the worker's DP
++                # mean then yields a token-weighted fraction, even for uneven rows.
++                global_tokens = config.global_batch_info["batch_num_tokens"]
++                value = agg_loss(
++                    value,
++                    response_mask,
++                    "token-mean",
++                    dp_size=config.global_batch_info["dp_size"],
++                    batch_num_tokens=global_tokens,
++                )
++                aggregation = AggregationType.SUM if global_tokens is not None else AggregationType.MEAN
++            else:
++                value = masked_mean(value, response_mask)
++                aggregation = AggregationType.MEAN
++            metrics[f"actor/{key}"] = Metric(value=value, aggregation=aggregation)
      policy_loss = pg_loss
  
      # add entropy loss

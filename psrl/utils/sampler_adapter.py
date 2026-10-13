@@ -9,6 +9,12 @@ not leak into the loss.
 Three producers match the three trainable paths: :func:`to_dense_topk` for the top-k head model,
 :func:`to_dense_support` for exact top-p support, and :func:`to_compact_support` for the compact
 support transport (per-row lengths plus flat ids/log-probs).
+
+Every producer also emits the ``rollout_support_complete`` receipt: one boolean per prediction row
+that witnesses whether the captured head is the whole sampling support. The trainer renormalizes only
+the rows the receipt marks complete and keeps the head-plus-tail approximation for the rest, so a
+nucleus that overflows the recording budget degrades to the approximation instead of being scored as
+if it were the complete support.
 """
 
 from __future__ import annotations
@@ -74,6 +80,21 @@ def _pad_support(flat: np.ndarray, offsets: np.ndarray, counts: np.ndarray, widt
     return out
 
 
+def _support_complete_rows(complete: np.ndarray, active: np.ndarray, *, prompt_length: int, rows: int) -> torch.Tensor:
+    """Lay a per-response-row completeness receipt over the full prompt+response sequence.
+
+    Response token ``r`` is predicted by row ``prompt_length - 1 + r``, so the active receipt lands
+    there and every other row (prompt, padding, masked environment/tool) is marked complete, matching
+    upstream's padding template. The trainer masks those rows out, so their value is inert.
+    """
+    seq = torch.ones(prompt_length + rows, dtype=torch.bool)
+    active_rows = np.flatnonzero(active)
+    if active_rows.size:
+        dest = torch.as_tensor(active_rows, dtype=torch.long) + (prompt_length - 1)
+        seq[dest] = torch.as_tensor(complete[active], dtype=torch.bool)
+    return seq
+
+
 def _support_rows(
     distribution: SamplerDistribution, response_mask: list[int], width: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -120,7 +141,14 @@ def to_dense_topk(
     dest = torch.as_tensor(np.flatnonzero(active), dtype=torch.long) + (prompt_length - 1)
     seq_ids[dest] = ids_active
     seq_log_probs[dest] = log_probs_active
-    return {"rollout_topk_ids": seq_ids, "rollout_topk_log_probs": seq_log_probs}
+    # The top-k head is never the whole sampling support (top_p=1 draws from the full vocabulary), so
+    # active rows are marked incomplete and the trainer keeps the head-plus-tail approximation.
+    complete = np.zeros(rows, dtype=np.bool_)
+    return {
+        "rollout_topk_ids": seq_ids,
+        "rollout_topk_log_probs": seq_log_probs,
+        "rollout_support_complete": _support_complete_rows(complete, active, prompt_length=prompt_length, rows=rows),
+    }
 
 
 def to_dense_support(
@@ -146,7 +174,16 @@ def to_dense_support(
     seq_ids, seq_log_probs = pad_rollout_topk(
         torch.from_numpy(ids), torch.from_numpy(log_probs), prompt_length=prompt_length
     )
-    return {"rollout_topk_ids": seq_ids, "rollout_topk_log_probs": seq_log_probs}
+    return {
+        "rollout_topk_ids": seq_ids,
+        "rollout_topk_log_probs": seq_log_probs,
+        "rollout_support_complete": _support_complete_rows(
+            distribution.complete,
+            np.asarray(response_mask, dtype=bool),
+            prompt_length=prompt_length,
+            rows=len(distribution),
+        ),
+    }
 
 
 def to_compact_support(
@@ -173,4 +210,7 @@ def to_compact_support(
         "rollout_topk_lengths": torch.from_numpy(seq_lengths),
         "rollout_support_ids": torch.from_numpy(distribution.token_ids.astype(np.int32)),
         "rollout_support_log_probs": torch.from_numpy(distribution.log_probs.astype(np.float32)),
+        "rollout_support_complete": _support_complete_rows(
+            distribution.complete, np.asarray(response_mask, dtype=bool), prompt_length=prompt_length, rows=rows
+        ),
     }

@@ -83,6 +83,7 @@ def test_compact_support_ships_lengths_flat_ids_and_flat_log_probs():
         "rollout_topk_lengths",
         "rollout_support_ids",
         "rollout_support_log_probs",
+        "rollout_support_complete",
     }
     lengths = out["rollout_topk_lengths"]
     assert lengths.shape == (2 + 3,)
@@ -109,3 +110,19 @@ def test_dense_support_vectorized_padding_over_many_ragged_rows():
     assert ids[5].tolist() == [-1, -1, -1, -1]  # env row
     assert ids[6].tolist() == [40, 41, -1, -1]
     assert ids[7].tolist() == [-1, -1, -1, -1]  # final position
+
+
+def test_adapters_emit_the_support_completeness_receipt():
+    # Complete support only for the first active response row. The env row and prompt/pad rows are
+    # inert and marked complete, matching the padding template.
+    distribution = _distribution([[10, 11, 12], [], [20, 21]], complete=[True, False, False])
+    dense = to_dense_support(distribution, [1, 0, 1], width=3, prompt_length=2)
+    compact = to_compact_support(distribution, [1, 0, 1], width=3, prompt_length=2)
+    topk = to_dense_topk(_distribution([[10, 11], [], [12, 13]]), [1, 0, 1], prompt_length=2)
+
+    # Response token r is predicted by row prompt_length-1+r = 1+r. Only the first active response
+    # row is a complete support, so the env row and every prompt/pad row are inert and complete.
+    assert dense["rollout_support_complete"].tolist() == [True, True, True, False, True]
+    assert compact["rollout_support_complete"].tolist() == [True, True, True, False, True]
+    # The top-k head is never the complete sampling support, so active rows are marked incomplete.
+    assert topk["rollout_support_complete"].tolist() == [True, False, True, False, True]

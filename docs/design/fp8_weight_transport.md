@@ -3,6 +3,10 @@
 > 适用范围：`rollout FP8 + training FP8` 与 `rollout FP8 + training BF16` 两种组合。
 > 本文只写 FP8 相对 `weight_transport.md` 的**增量**。共享架构（PS 索引化、trainer 直供、
 > pull 语义、去冗余规划、chunk 执行层、colocate 原地交接）不在此重复，引用其章节号。
+>
+> 状态：**BF16 / FP32 train → blockwise FP8 rollout 已落地**（`psrl/utils/nixl/block_fp8.py`，
+> 落地项 F2、F3、F6、F7，F4 只含 tile 切分的拒绝），实测见 `weight_transport_FINDINGS.md` §5–§6。FP8-native train、MXFP8 与
+> colocate 指针交接未做。
 
 ---
 
@@ -19,6 +23,7 @@
 2. **scale 是一等 plan 公民，不是附属元数据。** vLLM 自己的 `validate_fp8_block_shape{,_moe}`
    强制每个 TP 分片的 `output_partition_size % block_n == 0`、`input_size_per_partition %
    block_k == 0`，所以 scale 的 block grid **按分片可组合**——全局 grid 恰等于各 rank grid 的拼接。
+   例外是 FP8 MoE：分片切不开 tile 时 vLLM 0.30 把 grid 细化并无损上采样 scale（§10 末行）。
    这正是 `NIXLSharding` 需要的条件，于是 scale 走与 weight 完全相同的 `(key, shard)` 抽象，
    复用同一套去冗余规划、peer 扩散与 chunk 流水。不需要第二条通路。
 
@@ -28,7 +33,7 @@
    所以这条必须是运行时断言（§3.4.6 的形式），不是文档要求。
 
 4. **两种组合差一个算子，不差一条架构。** FP8-native train 直供字节（零转换零缓冲）；
-   BF16 train 在 chunk 流水里插一次 cast，产出 `O(chunk)` 瞬态。链路、plan、pull 语义、
+   BF16 train 在发布点做一次 cast，产物是每 rank 一份常驻的 FP8 发布副本（§5）。链路、plan、pull 语义、
    peer 扩散全部不变——**链路不感知精度**（§3.8 原则）。
 
 5. **FP8-native 是唯一能让 colocate 切换零拷贝的形态。** trainer 持有的就是 rollout 要的字节，
@@ -68,9 +73,9 @@ trainer 参数张量 ─────┤                                    ├�
 
 | | FP8 train | BF16 train |
 |---|---|---|
-| 量化算子 | 无 | `per_block_cast_to_fp8` / `MXFP8Quantizer`，按 chunk |
+| 量化算子 | 无 | `per_block_cast_to_fp8` / `MXFP8Quantizer`，发布时逐张量 |
 | scale 处理 | **仅编码转换**（TE 的 scale ↔ vLLM 的 `weight_scale_inv`） | 随 cast 产出 |
-| 额外显存 | **0**（直读参数） | `O(chunk)`，见 §5 |
+| 额外显存 | **0**（直读参数） | 每 rank 参数字节的一半（常驻发布副本），见 §5 |
 | 数值误差 | 不新增（源头就是 fp8） | 一次 bf16→fp8 |
 | colocate 切换 | 指针交接 | 一次 `M/2` cast |
 
@@ -97,8 +102,8 @@ Hopper 上常驻 `fp8_param` 只在 FP32 scale 下可用；Blackwell 要求 powe
 | blockwise (po2) | 128×128 tile | `float8_e8m0fnu`（1B） | 1/16384 | 0.5001× |
 | MXFP8 | 沿 K 方向 1×32 | E8M0 存 uint8（1B / 32 元素） | **1/32 = 3.125%** | **0.5156×** |
 
-结论：带宽上 MXFP8 比 blockwise 贵 3%，换来 32 元素粒度的量化精度。这个 3% 在跨节点
-链路（实测单 NIC 24.50 GB/s）上是真实成本，在同节点链路（实测 342.95 GB/s）上可忽略。
+结论：带宽上 MXFP8 比 blockwise 贵 3%，换来 32 元素粒度的量化精度。这个 3% 在两种链路上
+都是字节时间的 3%，同节点链路（实测聚合 793 GB/s）上的绝对值约为跨节点（386 GB/s）的一半。
 **于是 wire 选择与 §8 的选源策略耦合**：peer 扩散比例高的部署下 MXFP8 的 3% 几乎免费。
 
 ### 2.2 真正的开销不在字节，在 key 数
@@ -225,24 +230,19 @@ BF16 train + FP8 rollout 打破了它——cast 的产物是一块**新内存**�
 push 架构下这个问题不存在：发送方知道自己发完了。**pull 架构下 trainer 不知道读者何时读完**，
 而提前释放会让读者读到已回收的内存——RDMA 写进来的地址仍然有效，所以**不报错，只是错**。
 
-**解法：buffer 的生命周期挂在 plan 上，而不是挂在计数器或超时上。**
-plan 在握手期编译完成，所以对任意 chunk `c`，「哪些 client 会读 `c` 的哪些 shard」
-是**编译期已知的有限集合**。于是：
+**解法：cast 产物活一个版本，在发布点刷新。** 流式复用的 buffer 只有在所有读者跟随
+trainer 的 cast 节拍读取时才可回收，而 pull 语义下版本 v 的读者可以在 v+1 发布前任意时刻到达。
+挂在 plan 上的回收（「`planned_readers(c)` 全部读完才回收 chunk `c`」）在正确性上成立，
+但它让 trainer 的下一次 cast 等最慢的读者。peer 扩散还会延长持有期：follower 从 designate 读，
+designate 读完上游的时刻就晚于 trainer 的 cast。
 
-```
-chunk c 的 cast buffer 可回收 ⟺ planned_readers(c) 全部完成对 c 的读
-```
+所以 cast 产物是**常驻的发布副本**：trainer 为本 rank 每个需要转换的 shard 留一份 rollout dtype
+的连续拷贝，在推送锁内重量化，读者在锁外随时读。没有回收协议，也没有在飞读者计数。
+发布时逐张量量化，瞬时显存是一个 key。
 
-`planned_readers(c)` 直接来自 §3.5 的三阶段 plan，包含 upstream 读者与
-§3.5.2 的 peer 扩散读者（follower 从 designate 读，designate 的 buffer 就是源，
-所以 designate 的 buffer 必须活到 follower 读完——这正是 peer 扩散对 cast 路径
-多加的一条约束，bf16 路径下没有）。完成检测复用 `GroupCompletionTracker`
-与 §3.6.4 的 1ms 轮询，不新增机制。
-
-**buffer 深度 = 流水级数，不是模型大小。** 这就是 §3.5.6「决定 chunk 大小的是流水级数」
-那条规则在 FP8 下的具体后果：若允许 `D` 个 chunk 同时在飞，常驻 cast buffer 是
-`D × chunk_bytes`，与 `M` 无关。取 `D = 3`（一级在 cast、一级在被读、一级在等回收）
-与 §3.6.5 推出的 chunk 大小，这是个确定的小常数，可以进约束 (b) 的预算表核算。
+**代价按 rank 计。** block FP8 副本是本 rank 参数字节的一半，另加 1/16384 的 scale。
+它占的是 trainer 显存，与 rollout 侧的 KV cache 无关。peer 扩散的 follower 读的是 designate
+落地后的引擎参数，不读 trainer 的副本，所以不延长副本的持有期。
 
 **与 §3.7.2.3 的衔接**：布局转换产物被那一节认定为「第三类字节」。cast 产物是同一类，
 生命周期规则相同——这里把那条规则具体化到 FP8，并补上 peer 扩散带来的额外持有期。
@@ -264,7 +264,7 @@ KV cache，rollout 必须拿到当前版本权重。三种形态的账：
 | 形态 | rollout 要的字节 | 从哪来 | 切换期额外 HBM |
 |---|---|---|---|
 | BF16 train + BF16 rollout | `M` | trainer 参数（同精度直读） | 0（但 trainer 参数必须整块留在 HBM） |
-| BF16 train + FP8 rollout | `M/2` | 一次全量 cast | `O(chunk)`（流水化后） + `M/2` 落地 |
+| BF16 train + FP8 rollout | `M/2` | 一次全量 cast | 每 rank 一份 FP8 副本（合计 `M/2`） |
 | **FP8 train + FP8 rollout** | `M/2` | **trainer 参数就是它** | **0** |
 
 第三行是定性而非定量的差别：rollout 的参数张量可以**指向 trainer 已持有的那块 fp8 内存**，
@@ -273,7 +273,7 @@ KV cache，rollout 必须拿到当前版本权重。三种形态的账：
 本节把它的推论说完：**它也是唯一能让切换时间不随模型规模增长的路径。**
 
 第二行是 Hopper 上 BF16 训练时的现实选择。它比今天好在两点：cast 产物是
-`M/2` 而非 `M`，且全程在 HBM 内、不经 host。按实测同节点带宽 342.95 GB/s 与
+`M/2` 而非 `M`，且全程在 HBM 内、不经 host。按实测同节点带宽 365 GB/s 与
 cast kernel 的显存带宽上界，这是一次「`M/2` 字节的本地操作」，而今天是
 「`M` 字节的两跳 host 往返」。
 
@@ -329,22 +329,17 @@ T_fmt  = N_keys × 12.5μs + 2 × M_v / 4800
 
 FP8 把 `M_v` 减半、把 `N_keys` 近乎翻倍。于是：
 
-- **`M_v/BW` 项减半**，这是跨节点路径（实测单 NIC 24.50 GB/s）上的主项，收益最大。
+- **`M_v/BW` 项减半**，这是跨节点路径（实测节点聚合 386 GB/s）上的主项，收益最大。
 - **`N_keys × 12.5μs` 项翻倍**，控制面占比上升。在同节点路径
-  （实测 342.95 GB/s，比跨节点快 14×）上，字节项本来就小，所以**FP8 下同节点传输
+  （实测聚合 793 GB/s，约为跨节点的 2×）上，字节项更小，所以**FP8 下同节点传输
   可能变成控制面主导**。这改变了 chunk 大小的最优取值：§3.5.6 已给出「轮数与 chunk
   大小的规则是反的」，FP8 下还要再向「少而大的 chunk」偏移一档，因为每 chunk 的
   key 数变多而字节数变少。
-- **peer 扩散的相对价值上升**。扩散把跨节点读换成同节点读，收益是
-  `M_v × (1/24.50 − 1/342.95)`。`M_v` 减半让绝对收益减半，但
-  §8 已测得 61% 的读可以搬到 NVLink，而 FP8 下这 61% 的字节更小、
-  §5 的 cast buffer 持有期更短——**扩散在 FP8 下更容易做成净赢**，
-  因为它的成本（designate buffer 持有期）比收益（跨节点字节）下降得更慢。
+- **peer 扩散的价值不随精度改变**。扩散省的是 trainer 出口（`R × M_v` 降到每节点一份），
+  `M_v` 减半时它与 peer 读的字节同比减半，而成本（每 key 一个 descriptor）不变。
 
-**overlap 的新机会：cast 与传输同流水。** BF16 train 路径下 cast 是纯 GPU 计算、
-传输是 RDMA，两者不争同一资源。chunk `i` 在被读时 chunk `i+1` 正在 cast，
-所以 cast 的代价**完全可隐藏**，前提是 §5 的 buffer 深度 `D ≥ 2`。
-这是 FP8 相对 bf16 唯一多出来的流水级，也是为什么 §5 取 `D = 3` 而不是 2。
+**cast 不在拉取路径上。** BF16 train 路径下 cast 发生在发布点（推送锁内），拉取读的是已经量化好的副本，
+所以 cast 的代价算在 trainer 的发布时间里，不算在 rollout 的 sync 时间里。
 
 **不要做的优化**：把 scale 单独成一波传（「scale 很小，先发完再发 weight」）。
 它违反 §3 的同组不变量，且 scale 在 blockwise 下只占 0.024% 字节——
@@ -494,7 +489,7 @@ scale grid 可组合、scale dtype 在 `_DTYPE_MAP` 里、每个 fp8 weight 都�
 | F4\* | 配置校验与拒绝 | §10 的四条拒绝 + §3/§4 的前提检查，握手期执行 |
 | F5\* | commit group 原子性断言 | 每个 fp8 weight 与其 scale 同组；**运行时断言**（§3.4.6 形式），不是文档要求 |
 | F6 | BF16→FP8 cast 算子 | 复用 vLLM `per_block_cast_to_fp8` / TE `MXFP8Quantizer`，block_shape 由 rollout scale shape 反解 |
-| F7 | cast buffer 生命周期 | 挂到 plan 的 `planned_readers(c)`，复用 `GroupCompletionTracker`；深度 `D=3`（§5） |
+| F7 | cast 产物生命周期 | 常驻发布副本，推送锁内刷新（§5） |
 | F8 | TE scale 编码转换 | 用 `fp8_export.detect_fp8_export_layout` 读 TE 布局；含 MXFP8 unswizzle（§4 末） |
 | F9 | colocate 指针交接（FP8-native） | §6 第三行；bf16 train 的切回路径仍走 §3.3.1 的 CPU reload |
 | F10\* | host 寄存区分片化 + 向 LMCache 显式预留 | §7 |

@@ -1,6 +1,8 @@
 # PSRL 权重传输与 PS 架构设计
 
-> 状态：设计（未落地）。FP8 精度组合的增量架构见 `fp8_weight_transport.md`。
+> 状态：**数据面已落地**。trainer 直供、同节点去冗余、发布副本、cast 与 block FP8
+> 均已接入生产拉取路径。落地状态与待办见 `weight_transport_implementation.md` §9，
+> 实测数据见 `weight_transport_FINDINGS.md`。FP8 精度组合的增量架构见 `fp8_weight_transport.md`。
 > 约束（用户给定，本文据此收敛）：
 > **(a) 不做自动模型接入**，沿用现有显式 layout plan（该决定已重开，见 §8）。
 > **(b) 不引入额外的 GPU 权重存储，也不引入额外的 CPU 权重存储**，一律从 trainer 或 rollout
@@ -33,7 +35,7 @@
 | 项 | 量级 | 是否符合 |
 |---|---|---|
 | CPU 侧权重副本（今天的 `N×M`） | `N×M` → **0** | 符合，这是设计的主要收益 |
-| wire buffer（cast 路径） | `2×chunk`，**与模型无关，且不随 W 增长** | 符合（§3.3 有量化对比）。**slot 归还由 plan 派生的 ack bitmap 驱动**；代价是 W 受 slot 周转约束（§3.5.2.1 约束 ⑤）而非靠加显存容纳大 W |
+| 发布副本（cast 路径与被细切的 shard） | **每 rank 自己 shard 的 wire 字节**，不随 rollout 数增长 | **违反字面，有意为之**：pull 语义下版本 v 的读者可在 v+1 发布前任意时刻到达，cast 产物必须活一个版本（§3.4.2）。同精度且连续的 shard 为 0，被细切的部分由 `publish_copy_budget_mb` 封顶 |
 | 布局转换产物（`ConcatenatedQKVSync` 的 cat） | 约 `0.15×M`，**随模型增长** | **违反字面，但今天就存在、非本设计引入**（§3.7.2.3） |
 | colocate transfer 期的第二份参数 | `0.5×M`~`M`，**仅 transfer 期间** | **违反字面但不可消除**（源与目标必须同时在场）。eval 期 train 侧 offload 到 CPU，GPU 上只剩一份（§3.7.3） |
 | colocate eval 期 train 权重的 CPU 落点 | `M`（每 rank 自己那份 shard） | **违反字面，但这是三家的最佳实践**：腾 GPU 给 KV cache。今天是 `N×M`（N 个 PS 副本），本设计降到 `M`（§3.7.3） |
@@ -285,7 +287,6 @@ index 返回按链路成本排序的 holder，执行层按预编译 plan 读取�
 | **holder 位图** | 每 instance 一个 `Bitmap(num_chunks)` + 节点索引（**不按 key 展开**，见 §3.5.3c，64 instance 约 16KB） | trainer 注册、rollout 完成时搭车上报 | pull 选源 |
 | **可读状态位** | 每个 trainer rank 的「权重注册有效且非中间态」。**§3.4.5 后它退化为 holder 身份的同义词**，不是独立状态 | trainer 注册/注销 holder 时 | pull 准入 |
 | **在飞读者计数** | per-chunk 的整数计数器（**不是「版本×chunk 租约表」**，§3.4.2.1）。保护**参数内存**不被 optimizer 覆盖，仅同精度路径（8c）需要 | rollout 开始/结束读时 ±1 | trainer 回写前检查 |
-| **slot 的 ack bitmap** | 每个 wire buffer slot 一个 `(expected_readers, acked)` 位图，与 holder 位图同构（64 instance = 8 字节）。保护 **wire buffer** 不被下一轮 cast 覆盖，**cast 路径必需**（§3.4.2 末段） | 读者的完成通知捎带（§3.2b，不新增往返）；holder 摘除时从 `expected` 清位 | trainer 复用 slot 前检查 `acked == expected` |
 | **routing plan** | 握手期编译的每 instance 三阶段 plan | planner 一次 | rollout 首次拉取后本地缓存 |
 | **staleness 账本** | Reserve/Occupy/Consume 缓冲（**合并自现有 staleness controller**） | 现有逻辑 | 现有逻辑 |
 
@@ -350,47 +351,32 @@ chunk 粒度只用于 **trainer 侧的本地放行判断**：trainer 自己知�
 四种 train 形态的缓冲账（后端相关，见 §3.9；**此表为 disaggregate**，
 colocate 不需要 wire buffer，见 §3.7.2.2）：
 
-| 后端 | train 形态 | rollout 读到的是 | 额外显存 |
+| 后端 | train 形态 | rollout 读到的是 | 额外显存（每 train rank） |
 |---|---|---|---|
 | Megatron | FP8 train（TE `fp8_param`）+ FP8 rollout | TE 常驻 fp8 参数 + scale（转码后） | **0**，直读 |
-| Megatron | BF16 train + BF16 rollout | Megatron 参数本身 | **0**，直读 |
-| Megatron | BF16 train + FP8 rollout | cast 产出的 fp8 wire buffer | `2×chunk`（cast 本来就需要的落点） |
-| **FSDP2** | **fp32 train + 任意 rollout dtype** | cast 产出的 wire buffer | `2×chunk`，**恒定需要**（§3.9.3） |
+| Megatron / FSDP2 | 同精度，shard 不被读方细切 | trainer 参数本身 | **0**，直读 |
+| Megatron / FSDP2 | 同精度，shard 被读方细切 | 发布副本（连续拷贝） | 被细切 shard 的字节，`publish_copy_budget_mb` 封顶 |
+| Megatron / FSDP2 | BF16 / fp32 train + BF16 / FP8 rollout | 发布副本（cast 产物） | 本 rank shard 的 wire 字节 |
 
 另有一项与 dtype 无关的常驻开销：**布局转换产物**约 `0.15×M`，
 只对走 `ConcatenatedQKVMapping` 的模型存在（§3.7.2.3）。
 
-前两种零缓冲，后两种需要落地缓冲，且**它天然是有界的**：cast 按 chunk 流式进行，
-一个 chunk（默认 512MB）cast 完就被 rollout 读走、立刻复用，所以显存是
-`O(chunk)` 而非 `O(M)`。**这一点值得量化，因为它常被误解为「要在 GPU 上冗余一份量化参数」**：
-
-| 模型 | 若冗余全量 fp8 | 本设计实际（`2×chunk`） |
-|---|---|---|
-| 7B | 7GB | **1GB** |
-| 32B | 32GB | **1GB** |
-| 1T（MoE，chunk 调到 4GB） | 1TB | **8GB** |
-
-**wire buffer 的大小与模型大小无关**，这是 chunk 流式复用的直接结果。
-注意这块缓冲**在 disaggregate 下必须是 NIXL 注册过的**，而注册昂贵，所以它常驻、
-不能每步分配释放——所以它是固定成本而非瞬态成本。
-**colocate 下不注册**，走 CUDA IPC 的可复用 buffer（§3.7.2.1、§3.7.3）。
-chunk 大小由流水级数决定而非模型规模（§3.5.6）：1TB 场景下 `2×512MB` 可忽略，
-小模型下占比不小（7B 模型上 1GB 不是小数目，应把 chunk 调小）。
-
-这是约束 (b) 允许的最小代价，而且它买到的不只是带宽减半（§3.8），
-**还顺带消除了读写冲突**（§3.4 cast 路径）。
+发布副本是**每 rank 自己 shard 的一份**，与 rollout 数无关，也不随 trainer 规模放大：
+`P` 个 train rank 的副本合计恰好是一份 wire 格式的模型。副本必须活一个版本而不能流式复用，
+理由见 §3.4.2：pull 语义下读者可以在下次发布前的任意时刻到达。
+副本**在 disaggregate 下必须是 NIXL 注册过的**，因此常驻、按 dtype 合成一块注册，
+注册区域数不随 key 数增长。**colocate 下不注册**，走 CUDA IPC（§3.7.2.1、§3.7.3）。
 
 **「零额外 buffer」有一条前提必须说清**：直读参数要求**参数地址永久稳定**，
 因而**禁止 trainer 做 CPU offload**。所以前两行的零 buffer 只适用于
 「disaggregate + 同精度 + trainer 常驻」。
 一旦 trainer 需要在 eval 时 offload 腾显存（§3.7.3），
-就必须退回 wire buffer 方案——**零 buffer 与可 offload 互斥**（§3.7.3.0a）。
+就必须改读发布副本：**零 buffer 与可 offload 互斥**（§3.7.3.0a）。
 
 > **为什么这比 SkyRL 的 sidecar 更省**：SkyRL 的 producer 要把 gather 结果 pack 进
 > CUDA IPC ring slot，consumer 再 pull 进 receive ring，两侧各一份 K×chunk。
-> 本设计在 Megatron bf16 直读路径下根本不 pack，参数张量自己就是传输源，
-> descriptor 直接指向它。FSDP2 下有一份 `2×chunk` 的 cast 落点，
-> 但仍比 SkyRL 的「两侧各 K×chunk」少，且 cast 这件事本来就要做。
+> 本设计在同精度直读路径下根本不 pack，参数张量自己就是传输源，descriptor 直接指向它。
+> cast 路径下每 rank 一份 wire 格式的副本，rollout 侧零缓冲（直写引擎参数）。
 
 **Megatron 不需要 gather，shard 代数已经处理。** `megatron_converter.py` 全文没有任何
 `all_gather`：converter 为每个参数**声明** `NIXLSharding`（`get_sharding_for_param`），
@@ -839,198 +825,35 @@ master shard 上，**完全不触碰 rollout 正在读的 bf16 参数**。
 
 **消除②和③：让被读的字节不是 optimizer 要写的字节。**
 
-**统一解法：唯一的发布点是一块 wire buffer，而它只在真正需要时存在。**
-
-与其按 dtype 组合分出多套语义，不如统一成一条规则：
-
-> **rollout 永远读「发布缓冲」，而发布缓冲是否是一块独立内存，取决于源头是否已经
->天然提供了一份不被 optimizer 改写的字节。**
+**统一解法：读者读的是「发布缓冲」，而发布缓冲是否是独立内存，取决于源头字节能否直接被读。**
 
 **适用范围先划清：下面这张表只对 disaggregate 成立。**
-colocate 下所有组合走同一条路径（pack 进可复用 buffer，§3.7.2.1），
-不需要区分发布缓冲的种类，因为 rollout 已暂停、不存在「读的字节是否被改写」这个问题。
+colocate 下 rollout 已暂停，不存在「读的字节是否被改写」这个问题，所有组合走同一条路径。
 
-disaggregate 下的分类，**选择由「有无额外字节产生」决定，不由 dtype 决定**：
-
-| 情形 | 发布缓冲是什么 | 额外显存 | 冲突 | 适用 |
-|---|---|---|---|---|
-| **cast 路径**（train dtype != rollout dtype，含 fp32→bf16/fp8/fp4、bf16→fp8/fp4、fp8→fp4） | cast 产物本身，它天然不是 trainer 的参数 | **0 额外**（cast 必须有落点，这块落点就是发布缓冲） | 与 optimizer 无冲突；**但 buffer slot 循环复用会与在飞读者冲突，见下** | **FSDP2 全部**；Megatron 的 fp8/fp4 rollout |
-| **同精度路径**（train dtype == rollout dtype，含 bf16→bf16、fp8→fp8） | trainer 参数本身（直读） | **0** | 有，需放行（见下） | **仅 Megatron** |
-| **布局转换产物**（§3.7.2.3） | `torch.cat` 的 QKV、`.float()` 的 fp32 副本 | 常驻，约 `0.15×M`（仅受影响的 key） | 无（与参数内存分离），但**必须在发布点前刷新** | 走 `ConcatenatedQKVMapping` 的模型，**与 dtype 无关** |
-
-**第三行是通读 converter 后补上的**，它不由 dtype 决定而由模型的 mapping 类型决定，
-所以它**横跨前两行**：同精度路径下也存在，cast 路径下也存在。
-初稿只分了前两类，把它漏掉了。详见 §3.7.2.3。
-
-**关键点：cast 路径不存在「额外」显存。** cast 这件事本身就必须有一个输出落点，
-无论是否用于发布。把这个落点注册给 NIXL 并当作发布缓冲，**成本是零**，
-顺带消除了冲突。所以「`2×chunk` 常驻缓冲」不是为解决冲突付的代价，
-而是 cast 路径本来就要付的代价，这里只是复用它。
-
-##### cast 路径「无冲突」只在单读者下成立，多读者下它靠的是另一条机制
-
-**这是第六轮发现的一处表述缺陷，不改会直接导致实现错误。**
-上表「cast 路径冲突 = 无」的依据是「发布缓冲不是 optimizer 要写的内存」。
-这对**optimizer 与读者之间**成立，但 wire buffer 只有 `2×chunk`、**是循环复用的**，
-于是出现第二个写者：
-
-```
-chunk i   cast 进 buffer A -> 读者 R1 开始读 A
-chunk i+1 cast 进 buffer B -> 读者 R1 还在读 A（它慢）
-chunk i+2 cast 进 buffer A  ← 覆盖 R1 正在读的字节
-```
-
-**第二个写者是 trainer 自己的下一轮 cast，不是 optimizer。**
-`2×chunk` 的深度 2 只够掩盖「一个读者、严格交替」的情形
-（§3.7.2.3 分析 verl 时算出的 1.6% 气泡正是这个前提下的数字）。
-直供下 **W 个并发读者各自进度不同**，最慢的那个决定 buffer 何时可复用。
-
-**所以 cast 路径真正的不变量是**：
-
-> **buffer slot 的复用必须等到「所有在飞读者都读完该 slot」，
-> 而不是「下一轮 cast 准备好了」。**
-
-这条机制 PSRL 已经有了——**就是 §3.4.2.1 的 per-chunk 在飞读者计数器**。
-差别在于语义：同精度路径下它保护的是「optimizer 不覆盖参数」，
-cast 路径下它保护的是「下一轮 cast 不覆盖 wire buffer」。
-**同一个计数器，两个用途，而上表把后者写成了「无冲突」。**
-
-##### 解法不是加深 buffer，而是让 chunk 的生命周期由 plan 决定（三个框架的对照）
-
-**加深 `D` 是错误答案**，理由不止是省显存：深度 `D` 能掩盖的是
-「最慢读者落后最快读者不超过 `D` 个 chunk」，而 W 个独立 instance 的进度差
-**没有上界**（一个 instance 可能因 KV cache 压力暂缓）。
-**用显存去赌一个无界的量，是把正确性问题伪装成容量问题。**
-查三个框架后发现它们都不这么做，而且三种解法互不相同：
-
-| | 谁驱动传输 | buffer 复用的放行条件 | 代价 |
+| 情形 | 发布缓冲是什么 | 额外显存 | 冲突 |
 |---|---|---|---|
-| **verl mooncake** | 接收方 RDMA read，但**发送方等 magic 信号** | 接收方读完后 `transfer_sync_write` 一个 4 字节 magic 到发送方的 `magic_recv` slot，发送方 `wait_for_complete` 轮询它（`mooncake_checkpoint_engine.py:149/202`） | **链式拓扑，每 slot 只有一个下游**，所以单个 magic 槽就够 |
-| **verl nccl** | 集合通信 | `broadcast_op.wait_for_complete()` 后 `send_buf, recv_buf = recv_buf, send_buf`（`:357-369`） | 集合通信天然同步所有参与方 |
-| **miles delta** | 发送方 push | **free-queue 阻塞**：`buf = self._free_q.get()` 取不到就阻塞，**反压 gather 本身**（`delta.py:133`） | 发送方主动限流，不需要知道有几个读者 |
+| **cast 路径**（fp32→bf16、bf16→block FP8 等） | **发布副本**：本 rank 每个 shard 在 rollout dtype 下的连续拷贝，发布点刷新 | 本 rank shard 的 wire 字节（block FP8 是参数的一半，另加 1/16384 的 scale） | 无。optimizer 写参数，读者读副本 |
+| **同精度且 shard 连续** | trainer 参数本身（直读） | **0** | 有，由 E1 版本级等待放行（§3.4.2.1） |
+| **同精度但被读方切得更细** | 发布副本（连续拷贝） | 被切 shard 的字节，由 `publish_copy_budget_mb` 封顶，超出部分退回 span 读 | 无 |
+| **布局转换产物**（§3.7.2.3） | `torch.cat` 的 QKV、`.float()` 的 fp32 副本 | 常驻，约 `0.15×M`（仅受影响的 key） | 无，但**必须在发布点前刷新** |
 
-**三者的共同点比差异更重要**：没有一个靠「把 buffer 加深到够用」，
-**全部是「显式的归还信号 + 取不到就阻塞」**。
-verl 的 magic 是归还信号的 RDMA 实现，miles 的 free-queue 是它的本地队列实现。
+**为什么 cast 产物必须常驻一个版本，而不是 `2×chunk` 流式复用。** 流式 slot 只有在所有读者
+跟随 trainer 的 cast 节拍读取时才可复用，这要求读者在一个有界窗口内同步拉取。
+而 pull 语义下 instance 在发布后的任意时刻拉取（§3.5.1：greedy sync 天然错峰），
+**版本 v 的读者可以一直到 v+1 发布前才出现**，所以 cast 产物的寿命就是一个版本。
+流式方案只能二选一：要么让 trainer 的 cast 等最慢的读者（训练被拖住），
+要么丢弃 slot 让迟到读者重拉（读不到 v）。常驻副本两者都不需要：
+**副本在推送锁内刷新，读者在锁外随时读，不需要 ack bitmap，也不需要在飞读者计数守 slot**。
 
-**但三者都不能直接照搬,因为 PSRL 的拓扑是「一对多 pull」**：
-verl mooncake 是链式(每 slot 一个下游,一个 magic 槽够用)，
-miles 是 push(发送方知道自己在写给谁)，
-而 PSRL 是 **W 个独立 instance 各自发起单边 READ,trainer 根本不在数据路径上**。
-这正是单边 RDMA 的代价:**没有任何一方天然知道「读完了」**。
+代价按 rank 计算，而不是按模型：每个 rank 只为自己的 shard 留副本。
+例如 1TB bf16 MoE 分布在 `TP8 × EP64` 的 512 卡上，每卡 shard 约 2GB，block FP8 副本约 1GB。
+它与 rollout 侧 KV cache 争的不是同一块显存（副本在 trainer 上），
+真正受约束的是 trainer 的激活显存，可以按需用 `publish_copy_budget_mb` 封顶。
 
-###### PSRL 的解法：把 chunk 的归还条件写进 plan，而不是靠计数器追踪
-
-关键观察:**W 个读者不是任意的,它们是 §3.5 的 plan 编译出来的。**
-plan 在握手期就确定了「chunk c 会被哪些 instance 读」——
-这是一个**编译期已知的集合**,不是运行期才发现的。于是:
-
-> **一个 wire buffer slot 的归还条件,不是「在飞读者计数归零」这个运行期量,
-> 而是「plan 为该 chunk 登记的读者集合已全部确认」这个编译期已知的集合被填满。**
-
-两者的差别不是实现细节:
-- **计数器**是「有人在读吗」——需要每个读者开始时 +1、结束时 -1,
-  两次控制面往返,且读者崩溃会让计数器永久泄漏。
-- **集合填满**是「该来的都来了吗」——**只需要一次完成通知**（读者本来就要发,
-  §3.2b 的「完成通知批量上报」已规划）,且集合有已知的上界,
-  **读者崩溃由 §3.5.7 的 holder 摘除顺带解决**（摘除即从期待集合中移除）。
-
-落到实现上是**一个 bitmap 而非一个整数**:
-
-```
-每个 slot 持有:  (chunk_id, version, expected_readers: Bitmap, acked: Bitmap)
-读者完成一个 chunk -> 在它本来就要发的完成通知里捎带 chunk_id
-trainer 收到 -> acked.set(reader_id)
-acked == expected -> slot 可复用
-holder 摘除一个 reader -> expected.clear(reader_id)  ← 崩溃自动收敛
-```
-
-**这比计数器更省而不是更贵**:bitmap 与 §3.2 已有的 holder 位图同构
-（每 instance 一位,64 instance = 8 字节/slot）,复用同一套上报通道,
-**不新增任何控制面往返**。
-
-###### 三条由此得到的收益，都不花显存
-
-**(1) slot 数由 plan 算得，不靠猜。** 既然 plan 知道每个 chunk 的读者集合,
-就能算出「同时处于未完成状态的 chunk 数」的上界。
-**深度不再是一个要调的旋钮,而是 plan 的一个输出。**
-
-**(2) 慢读者不再阻塞快读者,但这件事有一个必须算清的前提。**
-
-`D` 无论多大,都是「所有读者共享同一组 slot」。
-而 plan 已按 §3.5.2.3 给每个 instance **错开了起始 chunk**,
-同一时刻不同 instance 本来就在读不同的 chunk。
-**让 slot 跟着 chunk 走而不是跟着轮次走**,慢读者只占住它那个 chunk 的 slot。
-
-**但「slot 跟 chunk 走」与「只要 2 个 slot」是矛盾的,这一点必须说准。**
-W 个错开的读者在任意时刻命中 **W 个不同的 chunk**,
-若每个在读的 chunk 都要在 trainer 侧常驻一个 slot,
-**需要的就是 `W × chunk` 而不是 `2 × chunk`**——
-这正是我想避免的「显存随 W 增长」,只是换了个名字。
-
-**解开矛盾的是一个此前没说清的事实:cast 产物不必为每个读者各留一份。**
-chunk c 的 fp8 字节对所有读者是**同一份内容**（§3.5.2 的版本相等性保证了这点）。
-所以 slot 的生命周期不是「跟着某个读者」,而是:
-
-```
-slot 装入 chunk c  -> 所有 plan 登记的读者都 READ 同一块地址
-                   -> acked == expected 后才可复用
-```
-
-于是真正的约束是**「同时处于『已装入但未被全体 ack』状态的 chunk 数」**,
-而这个数**由 trainer 的装入节奏决定,不由 W 决定**——
-trainer 串行地 cast 并装入 slot,装满 2 个就停下等最早那个被 ack。
-
-**所以 §3.5.2.1 约束 3「W 个读者必须都读完 chunk i 才能装 i+1」是对的,
-而我上一轮说「深度 2 够用因为慢读者只占自己的 slot」是错的**:
-错开让读者在**不同时刻**命中同一个 chunk,不是让 slot 各自独立。
-
-**修正后的结论,三者必须一起看**:
-
-| | 取值 | 由谁决定 |
-|---|---|---|
-| slot 数 | **2**（不随 W 增长） | 固定 |
-| **W 的上限** | 受「2 个 slot 的周转」约束 | **这是 §3.5.2.1 约束 3 的量化形式** |
-| 慢读者的影响 | 由 `conflict_wait_budget_ms` + `CHUNK_STALE` 兜住 | §3.4.3 |
-
-**即:不是靠加 slot 来容纳大 W,而是让 W 受 slot 周转的约束。**
-W 本来就有 §3.5.2.1 的四条上限,这里只是补上第五条,
-**而它恰好与约束 ① (NIC 不超卖) 同向**——两者都指向「W 不宜过大」,
-所以不引入新的张力。
-
-错开带来的收益仍然成立,但要**改述**:它的价值在**扩散**
-（排队者能更早找到 peer,§3.5.2.3 的原文),
-**不在于让 slot 独立**。我上一轮把这两件事混为一谈了。
-
-**(3) 退路是降级而非 OOM。** 若某个 slot 迟迟等不到 ack
-（慢读者或网络问题）,`conflict_wait_budget_ms` 到期后
-**把该 chunk 对该读者标记为 `CHUNK_STALE`,让它重拉**——
-这与 §3.4.3 的超时取向、§3.7.3.0a 的两段校验完全一致,
-**不需要新机制,也不需要更多显存**。
-加深 `D` 则没有退路:`D` 用完了只能等或 OOM。
-
-###### 落地影响
-
-1. **在飞读者计数器的定位要改。** §3.2 的状态表写「仅 8c 启用时需要」是错的,
-   但正确的修法不是「cast 路径也要计数器」,而是
-   **「slot 归还用 plan 派生的 ack bitmap,同精度路径的写屏障用计数器」**——
-   两者服务不同的问题,不应合并成一个机制:
-   - **ack bitmap**:回答「这个 slot 的内容还有人要吗」,期待集合编译期已知
-   - **在飞读者计数**:回答「这段参数内存现在有人在读吗」,读者集合运行期才知道
-     （因为它保护的是参数本身,而参数不属于任何 chunk 的 plan）
-2. **`2×chunk` 保持不变,不改成 `D×chunk`。** 深度 2 在「slot 跟 chunk 走」
-   语义下是够的,§0 的显存表不动。**这是本节相对上一稿的主要修正。**
-3. **验证项 4 仍需分开计量两种等待**,判据是:
-   「等 slot ack」的 p99 **随 W 增长是预期行为**（2 个 slot 要等 W 个读者 ack),
-   它要测的是**拐点在哪**——即 W 取到多大时该等待开始主导端到端时长。
-   **这个拐点就是 §3.5.2.1 约束 ⑤ 的实测值**,应与约束 ① 的 NIC 饱和点对比,
-   取两者中更小的那个作为 W 的实际上限。
-
-**为什么这不改变架构结论**:ack 通道复用已规划的完成通知,
-bitmap 与 holder 位图同构,显存量级不变。
-但**把它写成「无冲突」会让实现者既不做 bitmap 也不做计数器**,
-后果是 rollout 读到半新半旧的 chunk——
-**静默数据损坏,且只在读者进度差异大时偶发,极难归因。**
+**副本还顺带消除了源端 strided。** 同精度下若读方切得比 trainer 细（gen TP 大于 train TP 的
+row-parallel 权重、EP 一侧与 TP 一侧的 expert），trainer 的 shard 对读方是逐行 strided 的，
+descriptor 数随行数或 expert 数线性增长。发布副本是连续的，读方任意切法都只需一个 descriptor。
+同一机制同时服务 cast 与重分片，**不是两套缓冲**。
 
 **最后一列是本节的实际分流依据。** FSDP2 的参数是 fp32 而 rollout 永远不是 fp32，
 所以 **FSDP2 的默认配置（`model_dtype=fp32`）只落在 cast 这一格**。
@@ -1328,6 +1151,18 @@ index 解析每个 (instance, chunk) 的源，候选集 = {trainer} ∪ {version
                                           （此时同节点或跨节点已出现合格 peer）
 ```
 
+> **peer 读的粒度是读方的本地张量，不是全局 finest-mesh cell。**
+> `make_unified_sharding` 把每个 key 切到 train ∪ gen 的 LCM mesh，这是**跨后端**重分片所需。
+> 同版本、同 gen TP rank 的两个 rollout 持有逐字节相同的本地张量，二者之间无需重分片：
+> 读方把两侧的连续段配对并合并，一个 key 只需一个 descriptor。
+> 若沿用 finest cell，row-parallel key 的每个 cell 是 `hidden_size` 行的 strided 视图，
+> 一个 Qwen3-8B gen client 的 peer 读需要约 59 万个 descriptor，提交开销压过传输本身。
+>
+> **去冗余按 key 分组，designate 按字节均衡轮转。** planner 为每个 `(节点, key, shard 集合)`
+> 给出一组 wanter，排序时让上游字节在组员间均摊，于是节点入口分散到每个 instance 的 NIC 上，
+> 而不是集中在一个代表的 NIC。每次 sync 只在**参与这次 sync 的 instance** 之间扩散，
+> 首个参与者读上游，其余读它。上游读分成若干波，follower 读第 `w` 波时 designate 正在读第 `w+1` 波。
+
 **阶段一只开 1、2、4，阶段二再开 3。** 架构上两者是同一条解析链路上的不同优先级,
 区别仅在候选集过滤条件（`same_node(peer, requester)`）与排序权重，
 **不是两套机制**。所以阶段二不需要改接口，只需放开一个开关并把节点身份
@@ -1358,7 +1193,6 @@ index 解析每个 (instance, chunk) 的源，候选集 = {trainer} ∪ {version
 | ② 扩散收益存在 | `W < R` | `W ≥ R` 意味着全体直读源，扩散退化为无 |
 | ③ 轮数可接受 | `W ≥ R^(1/k_max)` | 限制扩散轮数不超过 `k_max`，每轮都有同步与控制面开销 |
 | ④ **QP 预算** | `W × ranks_per_reader ≤ QP_budget` | 单边读仍需 NIC 维护 QP 状态。万卡下 W=8 × 2000 rank = 1.6 万 QP，**可能超出 NIC 的 QP 缓存导致性能悬崖** |
-| ⑤ **slot 周转**（cast 路径） | `W × T_read ≲ 2 × T_cast` | 2 个 wire buffer slot 要等 W 个读者全部 ack 才能复用（§3.4.2 末段）。**W 过大时 trainer 的 cast 会空等 ack**，此时瓶颈从 NIC 转到 slot 周转。与 ① 同向，取两者更小值 |
 
 **不要去测 QP_budget。** 不同 NIC 的 QP 缓存容量差异大，且难以静态确定。
 正确做法是**让它被 W 的反馈信号自动兜住**：QP 超限表现为单读带宽的悬崖式下降，
@@ -1400,11 +1234,6 @@ W_effective = max(1, floor(B_trainer_egress_available / B_per_reader_target))
 2. **初始值取 `W = 节点内 instance 数`**，即「每个 rollout 节点派一个代表去 trainer 读」。
    这个默认值有清晰的物理含义：跨节点流量恰好是每节点一份（WeightBridge 的第二原则），
    节点内其余 instance 走 NVLink 从代表那里扩散。**这同时自动满足了阶段一只用同节点 peer 的设定。**
-3. **W 的上限受传输窗口复用约束**（约束 ⑤，机制见 §3.4.2 末段）。cast 路径下
-   wire buffer 只有 2 个 slot，`W` 个读者必须都 ack 了 chunk i 才能装 i+2。
-   所以 W 过大反而会让 chunk 周转变慢。
-   **这条是「不靠加显存容纳大 W，而是让 W 受 slot 周转约束」的直接推论**——
-   方向与约束 ① 一致，所以两者不冲突，取更小值即可。
 
 **不应该用来决定 W 的东西**：rollout instance 总数（那是 R，不是 W）、
 GPU 数量、NIXL 线程数。这些与 trainer 的出口带宽没有直接关系。
@@ -1623,6 +1452,14 @@ Kimi-K2（1T，384 experts，61 层）量级：
 把 `experts.{i}.gate_proj.weight` 合并为 `experts.gate_proj.weight` 一个 key，
 expert 维度表达为 `NIXLSharding` 的一个分片维度（`shard_mesh` 是
 `OrderedDict[dim, count]`，本来就支持多维）。Kimi-K2 的 key 数从 14 万降到数百。
+
+> **分组只治元数据，不治 descriptor。** descriptor 数由「源端每个 cell 是否连续」决定。
+> 一侧按整 expert 持有（EP）、另一侧切 expert 内部的 projection（TP）时，finest mesh 是
+> `{0: E, 1|2: tp}`，源端每个 expert 的每个 cell 都是 strided，descriptor 数随 expert 数线性增长。
+> **源端发布副本**消除它：train rank 为「被读方切得比自己细」的 shard 保留一份连续副本，
+> 在发布点（推送锁内）刷新，读方任意切法都只需一个 descriptor。副本显存由
+> `publish_copy_budget_mb` 封顶，超出预算的 shard 改为读方 span 读整段再本地 scatter。
+> cast 路径与 block FP8 复用同一机制：发布副本本身就是 cast 产物（§3.4.2、§3.8）。
 
 这更贴近引擎真实布局：vLLM 的 fused loader 本来就要 `w13_weight` 这个 3D 张量，
 今天 PSRL 是主动把它拆开（`vllm_converter.py:400` 起的
@@ -1990,11 +1827,6 @@ cast 期间 NIC 在做 RDMA，两者天然并行，不需要额外调度。
 若 §3.5.5 已完成，判据是「端到端时间 ≈ T_rdma + T_fmt_per_chunk」（最后一轮无重叠），
 验证 overlap 是否真正生效。
 
-**constraint ⑤ 澄清（cast 不是 slot 周转瓶颈）：**
-cast 远快于 RDMA（9.8ms vs 92ms），一个 chunk 的 cast 在 RDMA 还剩 90ms 时已完成。
-这意味着 W 个读者对 2-slot buffer 周转的压力主要来自 RDMA 的读取速度，
-而不是 cast 的生产速度——slot 周转时间约等于 T_rdma_per_chunk，cast 已可完全隐藏。
-
 #### 3.6.3 实测：prepped descriptor 的收益成立，但有两个前提
 
 **落地项 0 的 micro-benchmark 已完成**
@@ -2155,7 +1987,10 @@ BW_HBM      : GPU HBM 带宽 [GB/s]  (H20 = 4800, H100 = 3350, A100 80G = 2000)
 NIC_count   : 节点 NIC 端口数       (自动探测: ibstat 中 Active 端口数)
 NIC_Gbps    : 单端口线速 [Gbps]     (200G RoCE 常见配置)
 NIC_eff     : RDMA 效率             (大包 0.85，推荐值来自 Kalia OSDI'16 Fig.5)
-BW_NIC      = NIC_count × NIC_Gbps × NIC_eff / 8   [GB/s]
+BW_NIC      = 实测节点聚合 READ 带宽 [GB/s]
+  按端口数推导会错：端口可能 bond 成更少的链路，单流只占一条。
+  探测方法：每张 GPU 起一个并发读者，取总字节 / 联合时间窗
+  （`tests/nixl/scripts/run_pair_bw.sh`）。同节点 NVLink 带宽用同一脚本测。
 
 ── T_fmt 模型（拟合自 miles Kimi-K2 884ms 实测值）─────────────────────
 T_fmt(N_keys, M_v)  =  N_keys × 12.5μs  +  2·M_v / BW_HBM
@@ -2174,11 +2009,9 @@ T_cast(M_v, dtype)  =  M_v × bytes_per_src / BW_HBM
   FP32→FP8: bytes_per_src = 4 + 1 + 1/128 ≈ 5.008B  → BW_eff ≈ BW_HBM/5
   H20 BF16→FP8: BW_eff ≈ 1596 GB/s → T_cast(15.6GB) ≈ 9.8ms (远小于 T_rdma)
 
-── W 上限（取以下三者最小）──────────────────────────────────────────────
+── W 上限（取以下两者较小）──────────────────────────────────────────────
 ① W ≤ BW_NIC / (chunk / T_rdma_budget)   (NIC 不超卖)
 ② W < R                                   (R = rollout instance 数)
-③ W × T_rdma_per_chunk ≲ 2 × T_cast_chunk (slot 周转，§3.4.2 末段)
-   → 由于 T_cast << T_rdma，约束③几乎总被①②先触达，不是实际瓶颈
 
 初始值: W_init = min(NIC_count, nodes_per_instance)
   物理含义: 每个 rollout 节点派一个代表去读 trainer，节点内其余走 NVLink 扩散
@@ -3399,7 +3232,7 @@ assert config.train_actor_rollout_ref.actor.strategy != "fsdp", (
 | Megatron | disagg | fp8 → fp8 | 是 | scale 转码，零额外字节 | 直供最优形态 |
 | Megatron | disagg | fp8 → fp4 | 是 | cast，源须为 fp32 master | §3.4.2 约束 1 |
 | Megatron | colocate | 全部五种 | 是 | **时序互斥** | fp8→fp8 下 `~0.5×M`，最省 |
-| **FSDP2** | disagg | fp32 → bf16/fp8/fp4 | 是 | cast 产物隔离 + **slot ack bitmap** | 与 optimizer 冲突恒为零；slot 复用由 plan 派生的 ack 守（§3.4.2 末段） |
+| **FSDP2** | disagg | fp32 → bf16/fp8/fp4 | 是 | 发布副本（cast 产物）隔离 | 与 optimizer 冲突恒为零，副本在推送锁内刷新（§3.4.2） |
 | **FSDP2** | disagg | **bf16 → bf16** | 是 | **版本级等待（必需）** | 唯一「等待非可选」的一格（§3.8.0a） |
 | **FSDP2** | disagg | bf16 → fp8/fp4 | 是 | cast 产物隔离 | **FSDP2 大模型推荐** |
 | **FSDP2** | colocate | 全部六种 | 是 | **时序互斥** | 峰值见 §3.7.3，fp32 下 `2.5~3×M` 偏高 |
@@ -3426,7 +3259,7 @@ assert config.train_actor_rollout_ref.actor.strategy != "fsdp", (
    **注意与「版本级等待」区分**：后者在 FSDP2 + bf16 同精度下是必需的（§3.8.0a），
    而 per-chunk 写屏障始终是优化。实现时不要把两者混为一个中间层。
 2. **FSDP2 是两种部署模式下冲突语义都更简单的后端**，代价是恒定的 cast 开销与
-   `2×chunk` wire buffer。这个权衡不是选择，是 fp32 参数的必然结果。
+   每 rank 一份 wire 格式的发布副本。这个权衡不是选择，是 fp32 参数的必然结果。
    它的难点不在冲突，而在 §3.9.2.1 的 shard 粒度。
 3. **colocate 的正确性与精度完全解耦**，所以 colocate 下的后端差异
    只剩「谁来产出 cast 产物」，而这本来就是 converter 的职责。
@@ -4117,9 +3950,7 @@ train step v 完成
             Megatron 同精度路径：trainer 在发布 v+1 前等待 v 的读者清零（通常已清零）
             超时则撤销租约并要求重拉，trainer 不被无限阻塞
             FSDP2 bf16 同精度：同上，但此处是正确性必需而非优化（§3.8.0a）
-            cast 路径：无「等 optimizer」这个点，但每次复用 wire buffer slot
-                      需等该 slot 的 ack bitmap 填满（plan 登记的读者全部确认）
-                      超时则对未确认的读者返回 CHUNK_STALE 让其重拉（§3.4.2 末段）
+            cast 路径：无等待。发布副本在推送锁内刷新，读者在锁外读（§3.4.2）
 ```
 
 ---
@@ -4133,7 +3964,7 @@ train step v 完成
 | 2 | colocate 走 CUDA IPC + stage 边界 offload（`discard(("kv_cache",))`） | 切换成本从「全量 PCIe 往返 + 重握手」降到「权重 D2H/H2D + KV cache 重分配」，**且 colocate 路径完全不碰 NIXL 注册**（§3.7.3），省掉大 MoE 下 14 万次 `register_memory` | 是 |
 | 3 | Nx5 strided 描述符 | 删掉非连续 shard 的中转缓冲（**GPU 上，不是 CPU**——见 §3.6 的更正）与槽位串行等待。**槽位串行等待是主要收益**，显存次之 | 是 |
 | 4 | 源头 FP8 wire | 传输字节减半，消掉 train/gen 双缓冲，且量化产物天然就是发布缓冲 | 是 |
-| 5 | round-based 三类重叠（cast / RDMA / 落地格式化）**+ slot 的 ack bitmap** | **§3.5.5 完成后 RDMA（92ms H20）是主导项**，三类重叠让 fmt（18.5ms）与 cast（9.8ms）完全隐藏（§3.6.0 cost model）。§3.5.5 之前 fmt 主导，overlap 本身没有意义——**两者必须按序**。**ack bitmap 是正确性而非优化**：`2×chunk` 循环复用下不守 slot 会让慢读者拿到被覆盖的字节；期待集合由 plan 派生、ack 捎带在已有完成通知里，零额外显存、零额外往返（§3.4.2 末段） | 是 |
+| 5 | 上游分波与 peer 读重叠 | follower 读第 `w` 波时 designate 读第 `w+1` 波，peer 阶段藏到上游后面。cast 不在拉取路径上，发生在发布点（§3.4.2） | 是 |
 | **5b** | **`merge_and_finish_cached_xfer` 拆 post / wait，完成检测改 `get_new_notifs`** | **第 5 项的前置**：现有实现提交后立刻进 1ms 轮询循环（`client.py:1519-1544`），**双 buffer 流水在实现层无处落脚**（§3.6.4）。拆 post/wait 是必需，换 notif 把 chunk 下界从 256MB 降到 RTT 级 | **是**，但 5 依赖它 |
 | 6 | **canonical MoE 分组**（key 数 14万 → 数百，§3.5.5） | 元数据从 56MB/client 降到几百 KB，**大 MoE 与 1TB 的前置阻塞项** | 是 |
 | 6b | **控制面下热路径**（plan 本地缓存 + 租约按 instance 聚合 + gRPC） | 消除 index 单点，**这是 7/8/9 的前置** | 是 |
@@ -4244,14 +4075,10 @@ PSRL 现有的 `pause_generation` + 直写 + `resume_after_sync` 才是正确的
 
 ## 6. 风险与边界
 
-- **读写冲突已收窄为一条规则，但「cast 路径无冲突」只对 optimizer 成立。** cast 路径
-  （train/rollout dtype 不同）用 cast 产物作发布缓冲，零额外显存、**与 optimizer 无冲突**；
-  **但 wire buffer 只有 `2×chunk` 且循环复用，下一轮 cast 会与在飞读者冲突**。
-  **解法是 plan 派生的 ack bitmap，不是加深 buffer**（§3.4.2 末段）——
-  W 个独立 instance 的进度差没有上界，用显存去赌一个无界的量是把正确性问题
-  伪装成容量问题。三个框架都用「显式归还信号 + 取不到就阻塞」
-  （verl 的 magic 槽、miles 的 free-queue），PSRL 的一对多 pull 拓扑下
-  对应物是「plan 登记的读者集合被填满」。
+- **读写冲突已收窄为一条规则。** cast 路径（train/rollout dtype 不同）读的是发布副本，
+  与 optimizer 无冲突，副本只在推送锁内刷新，所以也不与在飞读者冲突（§3.4.2）。
+  代价是副本常驻一个版本：W 个独立 instance 的进度差没有上界，
+  流式复用的 slot 要么让 trainer 等最慢的读者，要么让迟到读者读不到 v。
   **这条不能省：省掉的后果是 rollout 读到半新半旧的 chunk，且只在读者进度差异大时偶发。**
   同精度路径直读参数，用 per-chunk 在飞读者计数器加写屏障放行，需埋点统计等待时长 p50/p99。
   两条路径的选择由「源头是否产生新字节」决定，不由 dtype 枚举决定。
@@ -4420,6 +4247,16 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol):
 实现上建议用**小整数的位拼接**（如 `layer_idx * 2^k + row * 2^j + col`）
 并在 fp8 下只用低位，而不是浮点哈希。
 
+> **「值可精确表示」会让判据在 bf16 下失明。** bf16 只能精确表示 256 个整数，
+> 取 `flat_index mod 2^8` 时任何偏移 256 倍数的错位都通过，而 4096 宽权重的每一行都是 256 的倍数。
+> **传输只搬字节、不解释数值，所以判据不需要「可表示的数」**：把 `(key, version, 全局多维坐标)`
+> 的哈希写进元素的**原始位**，错位元素的漏检概率是 `2^-位宽`。
+> 全局坐标从**各方自己声明的** `NIXLSharding` 推出，与传输无关
+> （`tests/nixl/coord_judge.py::fill_by_layout / check_by_layout`）。
+> cast 路径下哈希取自目标 dtype，train 侧经精确的上转存储，下转后恰好还原。
+> block FP8 下 train 侧每个 tile 存 `fp8 值 × 2^-k`，并让一个元素取 FP8 最大值，
+> 于是 block 量化精确还原 FP8 位与 scale `2^-k`，两者都能逐位判定（`fill_fp8_exact / check_fp8_exact`）。
+
 **(b) 删除 `create_ps_worker_group`（`:649`），改为 trainer 直供。**
 `GenClientActor` 的 pull target 从 `ps_for_pull_name` 换成 train client，
 这与 §3.3 的改动一一对应。**PS worker 本来就要删，测试不应保留它。**
@@ -4492,16 +4329,9 @@ colocate 需要：同一组 GPU 上先跑 train client、再跑 gen client，
 4. **pause 窗口与冲突等待分布**：先测**每个 instance 的 `pause_for_sync` 到
    `resume_after_sync` 时长**（这是 8c 是否值得做的唯一依据，§3.7.2.4），
    再测同精度路径下写屏障等待的 p50/p99 及其随 staleness 与 replica 数的变化。
-   cast 路径下**必须把两种等待分开计量**（§3.4.2 末段）：
-   「等 optimizer」应恒为零（这是「发布缓冲确实隔离了 optimizer 写」的判据），
-   而「等 slot 的 ack bitmap 填满」会非零。
-   **把两者合成一个指标会让前者的零被后者掩盖，等于没测。**
-   **「等 slot ack」随 W 增长是预期行为**（2 个 slot 要等 W 个读者 ack），
-   要测的是**拐点**：扫 W ∈ {2, 4, 8, 16}，找出该等待开始主导端到端时长的那个 W。
-   **这个拐点就是 §3.5.2.1 约束 ⑤ 的实测值**，应与约束 ① 的 NIC 饱和点对比，
-   取更小者作为 W 的实际上限。
-   另需注入一个慢读者（人为延迟其 ack），确认 `conflict_wait_budget_ms` 到期后
-   **对它返回 `CHUNK_STALE` 而不是让整条流水停住**——这是慢读者不拖垮全局的判据。
+   cast 路径下「等 optimizer」应恒为零，这是「发布副本确实隔离了 optimizer 写」的判据。
+   另需注入一个不响应的 designate，确认 follower 在 `peer_timeout_s` 后改读上游，
+   而不是让同组卡住，这是慢读者不拖垮全局的判据（CPU 档已由 `test_pull_engine.py` 覆盖）。
    **同时记录各 instance 暂停时刻的分布，并特意构造「全部 instance 同时空闲」的场景**
    （长训练步 + staleness=0，§3.5.1 说明这是常态而非极端）。
    此时自然错开必然失效，**判据是 W 把并发读者数压在上限内**，

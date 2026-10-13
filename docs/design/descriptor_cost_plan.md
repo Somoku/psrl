@@ -1,7 +1,17 @@
 # 下一阶段实现规划：消除 descriptor 膨胀
 
-> 状态：**S1–S5 已完成并集群验证**。S5 的结论是「不实现」，依据是实测而非推演。
-> 依据是 D1 收尾时的实测，见 `weight_transport_implementation.md` 的 D1 条目。
+> 状态：**S1–S4 已完成并集群验证，S5（扩散）已由统一拉取引擎落地**（`psrl/utils/nixl/pull_engine.py`），
+> 实测见 `weight_transport_FINDINGS.md`。本文保留 S1–S4 的推导，以下三点是读它时需要的边界。
+>
+> 1. **扩散与 staging 不互斥。** 互斥只在 peer 读沿用全局 finest-mesh cell 时成立。
+>    designate 与 follower 的 gen TP rank 相同，本地张量逐字节相同，peer 读按**整张量**进行，
+>    每 key 一个 descriptor，designate 自己的上游读照常 staging。
+> 2. **扩散的收益在 trainer 出口，不在 rollout 入口。** 本集群同节点与跨节点的节点聚合带宽只差约 2×
+>    （793 vs 386 GB/s），而无扩散时 trainer 出口是 `R × M`，随 rollout 数线性增长。
+> 3. **P2 只消除读方的 strided，源端的 strided 由发布副本消除。** descriptor 数取两端最大值，
+>    读方切得比 trainer 细时，trainer 的 shard 对读方是逐行 strided 的。
+>    trainer 为这类 shard 在发布点刷新一份连续副本（`publish_copy_budget_mb` 封顶），
+>    读方任意切法都只需一个 descriptor。
 
 ---
 
@@ -39,7 +49,7 @@
 |---|---|---|---|---|
 | **P1** | 输入维对齐（gen TP 的输入维分片数 == train） | 589,824 → **144** | 配置校验 + 一处 planner 判定 | 仅当并行度可选 |
 | **P2** | 连续落地缓冲 + 本地 scatter | 589,824 → **144** | 执行层，需生命周期管理 | **通用，推荐** |
-| **P3** | 维持现状，关闭扩散 | 不变 | 已完成（`peer_diffusion=False`） | 兜底 |
+| **P3** | 维持现状，关闭扩散 | 不变 | `peer_diffusion=False` 仍可用 | 兜底 |
 
 P2 是真正的解，P1 是它的特例，P3 是在 P2 落地前的默认。
 
@@ -163,8 +173,9 @@ RDMA 永远只搬**连续块**，strided 的那一刀留在本地用一次 GPU �
 `i % max_pinned_temp_memory_slots` **复用**，所以缓冲里的内容是瞬态的——
 follower 去读时，designate 的那块槽位可能已经被另一个分片覆盖了。
 
-这把 P2 与扩散的关系从「互斥」改判为「需要生命周期管理」，
-而生命周期管理正是 §4.4 已经为 FP8 cast 产物设计过的机制。
+所以 follower 不读 designate 的槽位，而读 designate **落地后的引擎参数**：
+它是 gen 本地整张量，注册即可读、连续、在本次 sync 内不再改写，每 key 一个 descriptor。
+designate 的槽位只服务它自己的上游读，P2 与扩散因此互不干涉。
 
 ### 4.4 生命周期：复用 plan 已有的答案
 
@@ -211,12 +222,10 @@ P2 之后它重叠的是本地拷贝（真实工作），流水才第一次有�
 ### 5.1 能解决的（有实测依据）
 
 - **descriptor 膨胀**：589,824 → 144，这是算术而非估计。
-- **扩散净亏的根因**：亏损来自 designate 被迫原地注册（每分片 4096 个 descriptor）。
-  P2 通过让 rollout 成为纯目的地绕开了它 —— 注意是**绕开**而非「两者兼得」：
-  扩散与 staging 互斥，实测 staging 侧快 4.07×（§10.3）。
-- **一处必须更正的前提**：初稿据单 NIC 24.50 GB/s 推出「同节点快 14×」，
-  并以此论证扩散。**P2 的实测否证了它**：每节点聚合入口约 103 GB/s
-  （约 4 条 NIC 并行），所以真实差距是 **3.3×**，不是 14×（§10.3）。
+- **扩散净亏的根因**：peer 读沿用全局 finest-mesh cell，designate 的每个 cell 是 strided 视图。
+  peer 读改按 gen 本地整张量后，扩散与 staging 两者兼得（§10.3）。
+- **带宽比要用并发聚合测**：单 NIC 单流数字不适用于聚合场景。本集群节点聚合跨节点 386 GB/s、
+  同节点 793 GB/s，只差约 2×，扩散的收益在 trainer 出口而不在入口（§10.3）。
 
 ### 5.2 不确定的（必须实测，不能推演）
 
@@ -249,8 +258,8 @@ P2 之后它重叠的是本地拷贝（真实工作），流水才第一次有�
 - **这不改变 descriptor 成本本身**，只是让每次传输只用 1 个。
   若将来出现「必须 strided 传输」的场景（例如不能分配落地缓冲的极端显存压力），
   成本会回来。
-- **P2 不省字节，只省 descriptor。** 跨节点带宽仍是瓶颈（实测每节点聚合约
-  103 GB/s），所以 §3.5 的去冗余规划与 FP8 wire 仍然各自必要。
+- **P2 不省字节，只省 descriptor。** 跨节点字节由去冗余（trainer 出口从 `R × M` 降到每节点一份）
+  与 FP8 wire（字节减半）各自处理。
 
 ---
 
@@ -264,9 +273,9 @@ P2 之后它重叠的是本地拷贝（真实工作），流水才第一次有�
 | ~~**S0**~~ | ~~微基准：strided scatter 的真实带宽~~ | 单卡，分钟级 | ✅ **已通过，最差 148× 最好 379×**（§4.2） |
 | ~~S1~~ | ~~可见性：上报 descriptor 数与预估成本~~ | 纯 CPU | ✅ 日志出现 `589824 descriptor(s), worst shard 4096 rows, est. submit cost 1238.6ms` |
 | ~~S2~~ | ~~落地缓冲 + scatter + 生命周期~~ | 中 | ✅ **机制本已存在**（见下），只需让读侧选用 |
-| ~~S3~~ | ~~配置化 + 两侧一致~~ | 小 | ✅ `shards_must_be_readable` / `peer_diffusion`，server 与 client 读同一份 |
+| ~~S3~~ | ~~配置化 + 两侧一致~~ | 小 | ✅ `peer_diffusion`，server 与 client 读同一份 |
 | ~~S4~~ | ~~5 节点同轮 A/B~~ | 一轮 | ✅ **0.619s，3.68× 于最好基线**，16/16 × 399/399 |
-| ~~S5~~ | ~~扩散与 P2 共存~~ | 一轮（零代码） | ✅ **已量化并否决**：扩散 2.519s vs P2 0.619s = 慢 4.07×（§10.3） |
+| ~~S5~~ | ~~扩散与 P2 共存~~ | 中 | ✅ peer 读按 gen 本地整张量、分波藏到上游后面（§10.3），落在 `pull_engine.py` |
 
 **S2 的一处重要发现：落地 + scatter 的机制原本就完整存在。**
 `client.py` 的 staging 路径已经做了「连续落地缓冲 → 一个 descriptor → 本地
@@ -366,6 +375,9 @@ DeepSeek-V3 级（`hidden=7168`、61 层、256 experts），gen TP ≠ train TP�
 **descriptor 数由 `shard × row` 决定，分片数不变**，所以 C1 不改善这一项。
 **C1 治控制面（握手元数据），P2 治数据面（传输提交），两者必须都做。**
 
+> P2 只治读方。源端 strided（MoE 的 EP 一侧对 TP 一侧、FSDP2 对 gen TP4）由发布副本消除：
+> Qwen3-30B-A3B 上 Megatron EP4 → vLLM TP4 的稳态拉取从 66 s 降到 0.16 s（`weight_transport_FINDINGS.md` §3）。
+
 ### 10.2 万卡：P2 的收益与规模无关，这是它的关键性质
 
 descriptor 成本是**每 client 的本地量**：它只取决于该 client 自己持有多少
@@ -378,49 +390,26 @@ strided 分片、每个多少行。因此：
   `O(buckets × ranks)`，**在万卡下是主要的扩展性障碍**。
 
 **扩展性的真实瓶颈在别处，P2 不改变它们**（诚实边界）：
-跨节点字节仍受 NIC 限制（实测单 NIC 24.50 GB/s），
+跨节点字节仍受 NIC 限制（实测节点聚合 386 GB/s），
 所以 §3.5 的去冗余规划、§3.5.3 的 rail 感知选源、FP8 wire 仍然各自必要。
 P2 做的是**把一项与规模无关却曾经主导一切的本地成本消掉**，
 让那些真正的扩展性工作重新成为瓶颈——这才是它们能被测量和优化的前提。
 
-### 10.3 一处由 P2 实测反推出的带宽更正：扩散的收益比预估小得多
+### 10.3 扩散：收益在 trainer 出口，成本取决于 peer 读的粒度
 
-**P2 的实测结果否证了「同节点比跨节点快 14×」这条用于论证扩散的前提。**
+**扩散省的是 trainer 出口。** 无扩散时每个 rollout 各读一份，trainer 出口是 `R × M`，
+它是全局唯一、随 rollout 数线性增长的资源。扩散后每个 gen 节点每个 gen TP rank 只从上游读一份。
 
-实测：0.619s 搬完 gen 每节点 8 client × 8 GB = 64 GB，
-即**每节点聚合入口约 103 GB/s**。对比单 NIC 实测 24.50 GB/s，
-这意味着**约 4 条 NIC 已在并行工作** —— 单 NIC 的数字不适用于聚合场景。
+**它不省 rollout 入口时间。** 本集群节点聚合带宽跨节点 386 GB/s、同节点 793 GB/s，只差约 2×。
+单 NIC 单流（约 24–49 GB/s）不能用来推算这个比值，端口会 bond 成更少的链路，聚合要并发测。
 
-于是扩散要比较的是 **103 GB/s（跨节点聚合）vs 342.95 GB/s（同节点）= 3.3×**，
-而不是 14×。而扩散的成本是实打实的：designate 要多读、要发通知、
-要维护落地缓冲的生命周期以供 follower 读。
+**它的成本取决于 peer 读的粒度。** 沿用全局 finest-mesh cell 时，designate 的每个 cell 是
+`hidden_size` 行的 strided 视图，一个 Qwen3-8B gen client 的 peer 读约 59 万个 descriptor、2.4 s，
+扩散因此净亏，并迫使 designate 原地注册而与 staging 冲突。peer 读按 gen 本地整张量时
+每 key 一个 descriptor，同节点 8.19 GB 用 22.5 ms，designate 的上游读照常 staging。
 
-**这把 S5 从「应该做」改判为「要先证明值得做」**：
-P2 之后 653 次读只花 1.4 ms 提交，剩下的全是真实字节；
-把 61% 的字节从 103 GB/s 的链路移到 342.95 GB/s 的链路，
-理论上限约省 `64×0.61×(1/103 − 1/343) ≈ 0.27s`，
-而 designate 要替 follower 多搬这些字节、还要付通知与生命周期开销。
-**净收益可能是负的，和扩散在 descriptor 时代的遭遇同构。**
-
-因此 S5 的第一步不是实现，而是**用现有工具量化**。
-这条实验不需要写任何新代码，**已经跑完**：
-
-| 配置 | 基线（单相） | 流水 |
-|---|---|---|
-| **P2：staging + 无扩散** | **0.619 s** | — |
-| 扩散 + 原地 strided | 2.519 s | 4.711 s |
-
-**P2 比「扩散 + 原地」快 4.07×。** 两次运行都是 exit=0、16/16 × 399/399。
-
-**结论：S5 不该实现。** 扩散与 staging 互斥，而 staging 侧快 4 倍；
-要让扩散追上，它得先付清 descriptor 的账（designate 必须原地注册），
-再用 3.3× 的链路差去赢回来 —— 而那 3.3× 最多值 0.27 s，
-远不足以覆盖 1.24 s 的提交成本。**这不是实现质量问题，是算术。**
-
-**保留扩散的代码与开关**，因为前提可能变：若将来 gen 侧分片在注册时
-就是连续的（§3 的 P1，或 converter 层改造），designate 原地注册只需 1 个
-descriptor，扩散的成本项消失、收益项保留，届时 S5 的账会反过来。
-`peer_diffusion` 与 `shards_must_be_readable` 让这件事**可测而非可猜**。
+**再把 peer 读藏到上游后面。** designate 分波读上游，每波落地即通知，follower 读第 `w` 波时
+designate 正在读第 `w+1` 波。4 节点 16 个 rollout 的稳态 sync 实测见 `weight_transport_FINDINGS.md` §4。
 
 ### 10.4 一个由 P2 打开的新可能
 

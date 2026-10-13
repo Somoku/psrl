@@ -364,10 +364,9 @@ holder 摘除 reader  -> expected.clear(reader_id)   ← 崩溃自动收敛
 - **expected 集合由 plan 派生**，不是运行期计数器：
   断言 ack 通道不引入新的控制面往返（复用 §3.2b 的完成通知）
 
-**为什么 ack bitmap 是正确性**：`2×chunk` 循环复用下，
-下一轮 cast 会覆盖慢读者正在读的字节。三个框架都用「显式归还信号 + 取不到就阻塞」
-（verl 的 magic 槽、miles 的 free-queue），**没有一个靠加深 buffer**——
-W 个独立 instance 的进度差没有上界，用显存赌无界量是把正确性问题伪装成容量问题。
+**ack bitmap 已被常驻发布副本取代**（§9 B2）。循环复用的 slot 必须等最慢的读者归还，
+而 pull 语义下 W 个独立 instance 的进度差没有上界。副本活一个版本、在推送锁内刷新，
+读者在锁外随时读，不需要归还信号。
 
 **验证**：L2（重叠率、slot 等待分布）+ L3（慢读者注入）
 
@@ -558,8 +557,8 @@ role 维度：actor 与 critic 同时发布版本（v3 / c3），断言解析到
 **判据**：
 - 稳态下**无 PS worker 进程**，host 侧**无权重常驻**
 - CPU 侧权重副本 `N×M → **0**`
-- cast 显存上界为 `2×chunk` 而非 `O(M)`。
-  **判据是「换一个大一倍的模型，这个数字不变」**
+- cast 显存是每 rank 自己 shard 的 wire 字节（常驻发布副本），合计一份 wire 格式的模型。
+  **判据是「加 rollout 数，这个数字不变」**
 - 布局转换产物的常驻量**单独记录**（它确实随模型增长，约 `0.15×M`），
   两者不要混在一个指标里
 
@@ -888,36 +887,47 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 
 ## 9. 完成度检查表
 
-> **当前状态总览**（集群结论均带 `[PASS] all 5 nodes import this tree`）：
+> **当前状态总览**
 >
-> | 阶段 | 模块 + 单测 | 接线 + 集群验证 |
-> |---|---|---|
-> | A（A1–A9） | ✅ | ✅ |
-> | B1 / B3 | ✅ | ✅ |
-> | B2 | ✅ | ⏳ 随 D 的 wire buffer |
-> | C1 / C3 | ✅ | ✅ |
-> | C2 | ✅ | ⏳ 弹性期两项随 E3 |
-> | D1 / D2 / D5 / D6 / D7 / D8 | ✅ | ✅ **D1 性能判据已达成**（关扩散走 staging，0.66–0.90s vs PS 1.14s） |
-> | **D4** | ✅ | ✅ **连续两轮 eval，8/8 拉到新版本** |
-> | D3 / T2 | ✅ 生产侧 `nixl_direct` + `ps_mode` 判定集中化 | ⏳ 删除 PS 本体（前置已满足：功能完整、已稳定验证、性能优于 PS） |
-> | E1 | ✅ | ✅ **L2 判据已达成**（撕裂可复现，拦截消除它；7 passed） |
-> | E2 | ✅ | ✅ |
-> | E3 | ✅ 握手解复用 + `admit_joiners` 准入 | ✅ **L3 已达成**（真 NIXL agent，后到客户端被准入并重规划） |
-> | E4 | ✅ 上半实测 1054× | ⏳ 下半被 NIXL 缺绑定阻塞 |
-> | F1 | ✅ | ⏳ L4 跨 DC |
-> | T1 / **T3** | ✅ | ✅ |
-> | T4 | ✅ | ⏳ 两格待 cast 路径 / FSDP2 e2e |
+> 三列分开：**模块**（有实现 + 单测）、**生产接线**（被 `psrl/` 的生产路径 import 并调用，
+> 以 `grep` 生产代码的 import 为准）、**验证层级**（L1 单元 / L2 单节点 e2e / L3 多节点 / L4 规模）。
+> 实测数据见 `weight_transport_FINDINGS.md`。
 >
-> **单机 565 passed（`tests/nixl/`）。两种放置 + 两轮版本均已集群验证**：
->
-> | 场景 | 拉取 | 判据 |
-> |---|---|---|
-> | disaggregate（5 节点） | 0.589~0.726 s | 16/16 × 399/399 |
-> | **colocate（共卡）** | **0.039 s** | 8/8 × 399/399 |
-> | **colocate 第二轮（新版本）** | **0.112 s** | 8/8 × 399/399 **对新版本坐标** |
->
-> **剩余工作全部是「接线」或「环境/上游依赖」，无设计未定项。**
-
+> | 项 | 模块 | 生产接线 | 验证层级与结论 |
+> |---|---|---|---|
+> | A1 prepped descriptor | ✅ | ✅ `pull_engine.py` 每源每次 pull 一个 prepped handle | L2 ✅ |
+> | A2 strided descriptor | ✅ | ✅ `read_geometry.py` 两侧连续段配对合并 | L2 ✅ |
+> | A3 post/wait 拆分 | ✅ | ✅ | L1 ✅ |
+> | A4 xfer tag | ✅ | ✅ | L1 ✅ |
+> | A5 配置防御 | ✅ | ✅ `config.py` | L1 ✅ |
+> | A6 删 FSDP1 | ✅ | ✅ | L1 ✅ |
+> | A7 join 三级判定 | ✅ | ✅ `server.py` | L1 ✅ |
+> | A8 colocate IPC | ✅ 机制（`test_colocate_ipc_gpu.py`） | ❌ colocate 走 NIXL 同卡读 | L2 ✅（NIXL 路径，含扩散与 FP8） |
+> | **A9 FP8 wire** | ✅ `block_fp8.py` | ✅ trainer 发布 block FP8 副本与 scale | L1 量化器与 vLLM 逐位一致，L2 8 格 FP8 位与 scale 逐位判定，单 GPU 真实权重贪心 token 100% 一致 |
+> | B1 chunk/commit group | — | — | **已删除**：拉取引擎按源一次提交，不再需要 chunk 计划 |
+> | B2 slot ack | ✅ | ❌ 零 import | **不再需要**：cast 产物是常驻发布副本，在推送锁内刷新（主文档 §3.4.2） |
+> | B3 chunk 自适应 | — | — | **已删除**，同 B1 |
+> | C1 MoE 分组 | ✅ | ✅ | L2 ✅ |
+> | C2 控制面 | ✅ 计量 | ⚠️ 仅 meter | L2 ✅ 稳态零 RPC（`test_the_pull_path_makes_no_control_plane_calls`） |
+> | C3 发布边界 | ✅ | ✅ | L2 ✅ |
+> | **D1 去冗余** | ✅ | ✅ `pull_engine.py`，默认开 | L3 ✅ 4 节点 16 rollout：出口 131 → 32.8 GB，稳态 0.178 s |
+> | D1 选源 `source_resolution` | ✅ | ❌ 零 import | L1，选源由 planner 的 designate 次序承担 |
+> | D2 `holder_index` | ✅ | ❌ 零 import | L1 |
+> | D3 `nixl_direct` | ✅ | ✅ | L2 ✅ 19 格，L3 ✅，**PS 未删** |
+> | D4 单向标记 | ✅ | ✅ `ray_trainer.py` | L2 ✅ |
+> | D4 `holder_roles` / bootstrap | ✅ | ❌ 零 import | L1 |
+> | D5 `chunk_offset` | ✅ | ❌ 零 import | L1 |
+> | D6 降级继续生成 | ✅ | ✅ | L2 ✅ |
+> | D7/D8 `chunk_availability` | ✅ | ❌ 零 import | L1，生产无 DP 接管 |
+> | E1 版本级等待 | ✅ | ✅ `ps_manager` + `vllm_async_server` | L2 ✅ |
+> | E2 `staleness` | ✅ | ⚠️ 仅类型被引用 | L1 |
+> | E3 握手解复用 | ✅ | ✅ `server.py` / `client.py` | L2 ✅ |
+> | E3 `admit_joiners` | ✅ | ❌ 生产无调用者 | L3（测试直接调用） |
+> | E4 partial MD | ✅ 上半 | ❌ 零 import | L1，下半被 NIXL 缺绑定阻塞 |
+> | F1 delta | ✅ 决策函数 | ❌ | L1 |
+> | T1 判据 | ✅ layout 判据 + FP8 逐位判据 | — | 坐标哈希写入原始位，对整行 / 整块错位可见 |
+> | T3 colocate | ✅ | — | L2 ✅ |
+> | T4 矩阵 | ✅ | — | L2 19 格通过（`weight_transport_FINDINGS.md` §5） |
 
 实现期逐项打勾。**判据栏必须可执行**，不接受「已实现」这种描述。
 
@@ -960,10 +970,15 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
       跨进程别名双向可见、一块 uint8 bucket 承载 bf16/fp32/fp8/fp16、
       fp8 weight+scale 共存、buffer 不随模型增长、**`register_memory` 调用数 == 0**。
       **KV cache 对比与稳态切回需 vLLM engine，属 L2**
-- [x] **A9 fp8 量化已验证**（`test_fp8_wire_gpu.py` 19 passed）：
-      blockwise round-trip 在 fp8 误差内、**wire 字节 0.45~0.55× bf16**、
-      scale 网格覆盖完整、丢 scale 错 100× 以上、量化确定性。
-      **与 vLLM 原生 fp8 checkpoint 逐张量对账需 engine，属 L2**
+- [x] **A9 block FP8 已接入生产并验证**：`psrl/utils/nixl/block_fp8.py`。
+      rollout 声明 `quantization: fp8` 时 `validate_config` 打开 `publish_fp8_block`。
+      vLLM converter 在每个 FP8 权重的规范视图旁给出 `<key>_scale_inv`，取融合 scale 的对应视图，
+      于是 q/k/v、gate/up 与分组 expert 各自带 scale key，切法与权重一致。meta server 从 trainer
+      权重的切法推出 scale 的切法，trainer 分配 scale 张量、把这些权重发布为 FP8 副本，
+      发布时逐张量重量化，瞬时显存只有一个 key。
+      `quantize_blockwise` 与 vLLM 的 `per_block_cast_to_fp8` 逐位一致（`test_block_fp8.py`）。
+      L2 8 格 FP8 位与 scale 逐位判定通过。真实 Qwen3-8B 权重下贪心 token 与 bf16 rollout 100% 一致。
+      比一个 tile 更细的切法在注册时拒绝并报出 key 名（细化网格见 §11 W9）。
 
 **单机验证总计：510 passed, 23 skipped**（含全部 GPU 测试）。
 FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运行）。
@@ -974,43 +989,12 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 测试用 `importorskip` 跳过而非失败，以免掩盖真实回归。
 
 ### 阶段 B
-- [x] **B1 已落地并验证**：`psrl/utils/nixl/chunking.py` 分离 chunk 与 commit group。
-      11GB 单 key 切 22 个 chunk 且偏移正确；**group 全齐才可见，半个 group 抛错并点名缺哪些 chunk**；
-      **chunk 大小改变不影响 group 成员**（4 种 chunk size 验证）。`test_chunking.py` 22 passed
-- [ ] **B2 接线推迟到阶段 D**（模块已完成，见下）。
-      `slot_ack.py` 保护的是「`2×chunk` 循环复用时下一轮 cast 覆盖慢读者正在读的字节」，
-      而 **cast 产物作为发布缓冲是阶段 D（trainer 直供）才引入的东西**：
-      当前链路里 rollout 从 PS 的 pinned 缓冲读，不存在循环复用的 wire buffer
-      （grep `wire_buffer` 与 cast 路径在 `psrl/` 零命中，仅 `chunk_size.py` 的参数名）。
-      依赖图写的「B2 依赖 A3」在模块层面成立，但**实际的 wire buffer 由 D 创建**，
-      所以 B2 应与 D6/D7/D8 同批，而不是现在接到一个不存在的调用点上。
-- [x] **B2 模块已完成并验证**：`psrl/utils/nixl/slot_ack.py` 的 `SlotAckTable`。
-      **2 个 slot 服务 16 个 reader**（不随 W 增长);slot 耗尽时**抛错而非覆盖**,
-      错误点名在等哪个 reader;**`forget_reader` 让死掉的 reader 自动收敛**——
-      这正是选 bitmap 而非计数器的理由(计数器会永久泄漏)。`test_slot_ack.py` 20 passed
-- [x] **B3 已落地并验证**：`psrl/utils/nixl/chunk_size.py`，`test_chunk_size.py` 24 passed。
-
-      **修掉一处退化的目标函数。** 原评分是 `abs(rounds - ceil(T_fmt/t_chunk))`，
-      两项都随 chunk 增大而减小、且后者更快，于是评分单调下降，
-      **任何模型都返回候选网格的最大值 8GB**——16GB 与 1.3TB 的模型拿到同一个 chunk。
-      多个测试仍然通过，因为 `>= 512MB` 对 8GB 也成立。
-      现改为最小化流水 makespan `(rounds + D - 1) × max(t_chunk, T_fmt/rounds)`，
-      即一次拉取真正的耗时。
-
-      **一处必须如实记录的结论：B3 原判据「chunk 字节数随模型变化」在本成本模型下不成立。**
-      RDMA 时间与字节线性，所以 `rounds × t_chunk` 恒定，
-      只有 `D-1` 轮的填充项随 chunk 变化 —— 因此**最小的合法 chunk 永远最优**，
-      而 chunk 大小由**轮询下界**（§3.6.4）决定，不由模型规模决定。
-      这是成本模型的性质，不是调参问题；已用测试把这条单调性钉住，
-      并留下「若格式化成本 per chunk 超过传输成本则该结论反转」的回归点。
-
-      **另修一处测试前提错误**：`test_slow_nic_raises_the_floor` 断言慢 NIC 抬高下界，
-      实际相反——慢 NIC 下每个 chunk 传输更久，轮询占比**更低**，下界下降
-      （50 GB/s 时为 128MB）。该测试此前通过，只因旧实现恒返回 8GB。
-- [x] **B3 轮级决策本地化已验证**：plan 握手期一次编译，传输期**零跨进程往返**
-      （5 节点日志 `Making communication plan` 出现 1 次，拉取路径 `.remote(` / `ray.get` 零命中）。
-      用源码检查而非日志 grep 钉住 —— 日志为空也可能是代码路径没跑，
-      与「0 peer reads deferred」同类的陷阱。
+- **B1 / B3 已删除。** 拉取引擎为每个源规划一次读、每次 pull 提交一个 prepped handle，
+  chunk 计划与 chunk 自适应没有消费者。
+- **B2 不再需要。** `slot_ack.py` 保护「`2×chunk` 循环复用的 wire buffer 不被下一轮 cast 覆盖」。
+  pull 语义下版本 v 的读者可以在 v+1 发布前任意时刻到达，cast 产物必须活一个版本，
+  所以 cast 产物是常驻的发布副本，在推送锁内刷新，没有可复用的 slot（主文档 §3.4.2）。
+  模块与单测保留，零生产 import。
 
 ### 阶段 C
 - [x] **C1 已落地并验证**：`psrl/utils/nixl/moe_grouping.py` + `BaseConverter.maybe_group_experts`。
@@ -1066,349 +1050,29 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 
 ### 阶段 D（不可分割）
 
-> **当前状态**：D1/D2/D5/D6/D7/D8 的**逻辑层已落地并单测通过**；
-> **直供链路已在 5 节点集群端到端跑通**（无任何 PS 进程，16 个 gen client 全部 399/399）。
-> 代码层面的删除（`PSStorageWorker` 等）尚未执行 —— 先让直供跑通，删除才有可对照的基准。
+> **当前状态**：D1 与 D3 的直供路径在生产中运行，扩散默认开。D2/D5/D7/D8 只有逻辑层与单测。
+> PS 代码（`PSStorageWorker` 等）尚未删除。
 >
-> **一条必须先说的事实**：在 `6314bde` 之前，所有多节点 e2e 的 **Ray actor 导入的是
-> `psrl_main` 这个另一个 checkout，而非本工作树**。driver 跑本树、actor 跑那棵树，
-> 于是测试测的是工作树里并不存在的代码 —— 而且**会通过**。
-> 此前为 C1/C2/C3/D6 声称的集群验证因此作废，已全部重跑；
-> 单测与 driver 进程内的字节级测量（18867→579、interning 体积、跨节点带宽）不受影响。
-> 验证方法与复现见 memory 的 `psrl-ray-actors-import-other-checkout`。
+> **多节点验证必须先确认 actor 导入的是本工作树。** Ray actor 可能从另一个 checkout 导入同名包，
+> driver 跑本树、actor 跑那棵树，测试测的是不存在的代码且会通过。harness 启动时逐节点断言
+> `[PASS] all N nodes import this tree`，没有这一行的多节点结果不算数。
 
-- [ ] **D1 接线部分完成，性能判据未达成**。已完成：plan 侧的 peer 扩散
-      （`_make_peer_diffusion_plan`）、peer descriptor 扇出、拉取按 plan 迭代。
-      5 节点实测 **9,576 次探测 → 653 次读且全部产生传输**。
+- [x] **D1 已接入生产并验证**：`psrl/utils/nixl/pull_engine.py`，由 `nixl_pull_model_core` 驱动。
+      同节点需要同一 key 同一组 shard 的 rollout 组成一组，designate 次序按上游字节在组员间均摊。
+      每次 sync 由 coordinator 开一个 epoch 并给出参与者，组内首个参与者读上游，其余整张量读它。
+      判据「trainer 出口 == 每 gen 节点每 gen TP rank 一份」已达成：4 节点 16 rollout 下
+      131 GB → 32.8 GB，稳态 sync 0.178 s（无扩散 0.67–0.84 s）。数据见 `weight_transport_FINDINGS.md` §4。
 
-      **但探测次数从来不是瓶颈**：实测 plan 版 2.93s vs 探测版 2.59s vs PS 路径 1.14s。
-      废弃的探测很便宜（`client_read` 遇空 shard 列表提前返回），时间在传输本身。
-      直供的传输粒度结构性更差：24 个 train rank 在 TP=4×PP=2 下把 key 空间切碎
-      （653 次读对应 399 个 key，每 key 约 1.6 个源），而 2 个 PS worker 各持完整 shard。
-
-      **peer 扩散的收益已在 plan 层量化**：gen TP=2、每节点 8 个 client 时
-      `tp_rank = rank % 2` 让 4 个 client 需要**逐字节相同**的 shard，
-      上游读从每节点 8 次降为 2 次，且**不随每节点 client 数增长**。
-      `test_peer_diffusion_plan.py` 13 passed（含无链式、同节点、确定性、
-      「跳过 peer 读仍然正确」四条）。
-
-      **一个必须先解决的前置条件（设计文档未提）**：peer 读需要
-      **rollout actor 之间的屏障**。peer 只有在它自己的上游读完成后才持有这些字节，
-      提前读会**成功**——注册有效、传输格式正确——读到的是未填充的缓冲区，
-      结果是静默错误的权重。当前 harness 的 gen actor 之间没有 process group，
-      因此 peer 读被**显式推迟**而非执行，上游读保持完整。
-
-      **屏障已落地，peer 读已真实执行**：驱动本来就 `ray.get` 所有 gen actor，
-      把 pull 拆成 `upstream` / `peer` 两相即可，无需新的同步原语。
-      5 节点实测 exit=0、16/16 全部 399/399 ——
-      **这条只能靠真跑验证**，因为提前的 peer 读会「成功」地读到未填充缓冲区而非报错。
-
-      **但端到端更慢，这是如实结果**：
-      单相（全部上游）2.68s vs 两相（上游 2.03 + peer 3.50）= 5.53s。
-      上游读确实降到极少（follower 发 0 次上游读、399 次全走 peer），
-      61% 的读确实移离了 NIC —— 但 peer 相的开销超过它替掉的 NIC 读。
-
-      **已实测排除了「链路不够快」这一解释**：同节点 GPU 间 **342.95 GB/s**
-      （`bench_cross_node_bw.py` 两端同机，cuda:0 服务 / cuda:1 读取，2 GiB / 64 张量），
-      对比跨节点单 NIC 的 24.50 GB/s，**优势 14×**。
-      设计 §3.5.2「同节点 peer 在稀缺货币上几乎免费」的前提**成立**。
-      所以 3.50s 不是带宽问题：399 次读 / 3.50s = **每次 8.8ms**，
-      而 343 GB/s 下 40MB 分片只需 0.11ms —— 时间几乎全在**每次读的固定开销**上。
-
-      **chunk 流水已驱动，逐 chunk 完成通知已落地并集群验证。**
-      `psrl/utils/nixl/chunk_pipeline.py` 把读按 chunk 排成波次（单测 24 passed），
-      `psrl/utils/nixl/chunk_notify.py` 提供驱动它的通知通道（单测 11 passed）。
-
-      **为什么共享波次计数器不行（这条判断已被三次集群失败证实）**：每个 client 的波次表
-      由**它自己的 plan** 导出，于是 designate 可能提前用完上游读，而 follower 还在
-      peer-read 它本该正在填充的 chunk —— 计数器对所有人一起推进。
-      坐标判据每次都抓到「peer 读在 designate 拿到字节之前就读了」：
-      **逐 client 看顺序正确，全局看是错的**。
-
-      **为什么 driver 屏障也不行**：它正确但自毁 —— 屏障是全局的，
-      每个 chunk 上所有 client 都要等最慢的那个。这正是两相版本「开销超过收益」的根因。
-
-      **解法是逐 chunk、逐源的门控，走 NIXL notification，方向 designate → follower。**
-      注意这与数据流**相反**（字节是 follower ← designate）。
-      方向相反正是它保持 P2P 的原因：没有谁去问协调者「chunk i 好了吗」，
-      控制面不会多出逐 chunk 的往返——而那正是 C2 要消除的东西。
-
-      **5 节点实测（exit=0，16 个 gen client 全部 399/399，4.41s）**：
-      4 波次，designate 653 pairs / 28 notif 发布 / 0 等待，
-      follower 399 pairs / 0 发布 / 8 次源等待。
-      全局 80 次发布对 80 次等待 —— 驱动端断言这两者相等，
-      因为**不相等意味着通知图不对称**，而那会表现为挂住而非报错。
-
-      **过程中三个由集群暴露的真实缺陷**（都已修并有测试钉住）：
-      1. **握手过滤只给了读方向**。`server.py` 的 peer descriptor 扇出按
-         「我读谁」授予，而通知要「谁读我」。于是 designate 发不出通知，
-         报 `Target client ... not found in client infos` —— 而且报在
-         **自己所有读都能满足的那个 client 上**，极易误判为握手 bug。
-         修复：扇出同时包含 `followers_of`，两个方向都**按 plan 限定**，
-         否则每个 rollout 又要携带所有其他 rollout 的描述符。
-      2. **schedule 的单位是 shard，transport 的单位是 `(key, source)`**。
-         `client_read` 一次搬这一对的**全部** shard，于是 shard 跨波次的对会被
-         第一个提到它的波次整体搬完，后续波次重投一个仍在飞的 handle ——
-         集群返回 `NIXL_ERR_REPOST_ACTIVE`。
-         修复：`coalesce_to_transport_pairs`，每对只出现一次。
-         **且上游取最早波次、peer 取最晚波次**：上游无依赖，早发才有重叠窗口；
-         peer 必须等它要的**每个** shard 都填好，取最早会读到未填充缓冲区而**成功**。
-      3. 以及早先三条（按 chunk 成员寻址、重复读被扩散的 shard、peer 读与依赖同波次），
-         见下方记录。
-
-      **仍然诚实的部分：流水正确但更慢，同轮 A/B 已量化。**
-      `[MEASURE]` 行同轮测两者（`PSRL_E2E_BASELINE=0` 可关）。
-      跨轮比较不可信 —— 集群状态、模型加载顺序、NIC 争用都在动，
-      而流水的全部主张只是几秒的差。**必须同轮测两者。**
-
-      | 配置 | 耗时 | 对基线比 |
-      |---|---|---|
-      | 无扩散基线（全部上游，单批提交） | **2.16~2.28s** | 1.00× |
-      | 流水 + 波次屏障 | 4.54s | **1.99×** |
-      | 流水 + 上游不设屏障 | 5.58s | **2.59×** |
-
-      **两个假设都被实测否决了，都是从总量推出来的：**
-
-      1. **「链路不够快」** —— 已否决：同节点 GPU 间实测 342.95 GB/s，
-         对跨节点单 NIC 24.50 GB/s **优势 14×**（见下）。
-      2. **「波次屏障是开销」** —— 已否决，而且方向相反：
-         去掉上游屏障后从 1.99× **劣化到 2.59×**。
-         同轮 per-client 数据给出了理由：designate 做 653 次读用 2.06~2.18s，
-         而基线 client 做**同样的 653 次读**只用 0.77~0.90s。
-         差的不是扩散、也不是屏障，而是**每次读的固定开销**
-         （399 次 peer 读 / 3.5s ≈ 8.8ms 每次，而 343 GB/s 下 40MB 分片只需 0.11ms）。
-
-      **分解计时给出了确定的归因**（`post_upstream / wait_upstream / gate /
-      post_peer / wait_peer` 五段，由 `pull_pipelined` 返回）：
-
-      | 角色 | post_up | wait_up | gate | post_peer | wait_peer | 总 |
-      |---|---|---|---|---|---|---|
-      | designate（653 pairs） | 1.616 | 0.007 | 0.094 | 0.012 | 0.001 | 1.85s |
-      | follower（399 pairs） | 0.000 | 0.000 | **2.423** | **3.074** | **0.008** | 5.51s |
-
-      **结论：瓶颈是「每次提交的固定开销」，不是调度、不是链路、不是屏障。**
-      follower 的 `wait_peer = 0.008s` —— **真实传输近乎免费**（NVLink，
-      与实测 342.95 GB/s 一致）；而 `post_peer = 3.074s` 分摊到 399 次提交
-      是**每次约 7.7ms**。`gate = 2.423s` 是等 designate 的 `post_up = 1.616s`，
-      即 follower 在等对端**提交**而非等对端传输。
-      两项合计 5.5s 中有 5.497s 花在提交路径上。
-
-      **据此做了一处有效优化：上游读改为逐波次提交**（而非先提交全部波次再逐波等待）。
-      理由直接来自分解：follower 的 `gate` 在等 designate 的 `post_up`，
-      所以 designate 必须**尽早发布第一个 chunk**，而不是等 653 次提交全部完成。
-      实测 `gate` 从 **2.423s → 0.872s（−64%）**，整体 2.47× → **1.93×**。
-      这是本轮唯一被分解计时支持、且实测生效的改动。
-
-      **最终定位（`client_read` 内部四段计时 + 描述符数扫描）**：
-
-      | 角色 | deser | align | init | **xfer** | post_peer 外层 |
-      |---|---|---|---|---|---|
-      | designate | 0.013 | 0.095 | 0.014 | **1.528** | — |
-      | follower | 0.020 | 0.001 | 0.014 | **3.426** | 3.494 |
-
-      `post_peer` 的 98% 是 `nixl_agent.transfer()` 本身，
-      描述符反序列化、对齐、`initialize_xfer` 三项合计仅 0.035s。
-
-      **`postXferReq` 的成本是「每个 descriptor」而非「每次调用」，已实测。**
-      固定 2 GiB 载荷扫描描述符数（`bench_cross_node_bw.py --tensors`，新增
-      post 阶段单独计时）：
-
-      | descriptors | post | us/desc | 带宽 |
-      |---|---|---|---|
-      | 1 | 0.026 ms | 26.1 | **354 GB/s** |
-      | 64 | 0.241 ms | 3.8 | 361 GB/s |
-      | 512 | 1.813 ms | 3.5 | 290 GB/s |
-      | 4096 | 16.942 ms | 4.1 | **114 GB/s** |
-
-      同样的字节数，post 时间差 650 倍，带宽掉 3.1 倍。
-      **算术完全闭合**：follower 399 次读 × 4096 descriptor × 2.1us = **3.43s**，
-      对实测 `post_peer = 3.426s`、`wait_peer = 0.008s`。
-      **字节是免费的，descriptor 是全部成本。**
-      非连续分片以 strided range 注册、按行展开为每行一个 descriptor（A2），
-      这就是 gen 侧 144 个 strided 分片的来源（train 侧只有 54 个）。
-
-      **两条有效改动与两条失败改动，都已实测：**
-
-      | 改动 | 结果 |
-      |---|---|
-      | 上游读改逐波次提交（让 designate 尽早发布 chunk 0） | gate 2.423s → 0.872s，**2.47× → 1.93×** ✅ |
-      | 修 `post_cached_xfer` 的 `descCount()==1` 断言（允许多 descriptor 合并） | 解锁了合并路径，但见下 |
-      | 合并 peer 读的描述符 | post_peer 4.105s → **6.270s**（Python 端 materialise 399×4096 更贵）❌ |
-      | **按描述符成本门控扩散**（strided 分片不走 peer） | **1.93× → 2.25×** ❌ |
-
-      **最后那条的失败很有信息量，已写进 `_make_peer_diffusion_plan` 的注释钉住**：
-      descriptor 展开是**分片布局的属性，不是链路的属性** ——
-      strided 分片无论从 peer 读还是从上游读都付 4096 个 descriptor。
-      所以拒绝扩散它并不能消除成本，只是把成本从 `post_peer` 搬到 `post_up`
-      （实测 post_up 3.292s），同时白白丢掉 NIC 的节省。
-      **杠杆是「更少的 descriptor」，不是「换哪条链路付」。**
-
-      **也不要指望 Nx5 strided descriptor**：§3.6.3 的 GPU 实测已证伪 ——
-      一条 strided 行在 prepped handle 内部仍展开为 `count` 个可索引条目，
-      提交必须给 `count` 个索引，给少了会**返回 `DONE` 但大部分字节没动**。
-      strided 压缩买到的是元数据体积与 prep 时间，不含提交时间。
-
-      **当前状态（5 节点，同轮 A/B，`[PASS] all 5 nodes import this tree` 在日志中）**：
-      exit=0、16 个 gen client 全部 399/399、流水 5.00s vs 基线 2.59s = **1.93×**。
-      **正确性已验证；性能判据未达成，且根因已定量定位。**
-
-      **最后一次尝试暴露了一个结构性冲突，这是 D1 性能判据无法在本层达成的真正原因。**
-      既然 descriptor 数是全部成本，自然的解法是让 gen 侧不要以 strided 注册 ——
-      改走 staging（一个 descriptor + 一次本地拷贝）。账面上极为有利：
-
-      | 路径 | 成本 |
-      |---|---|
-      | strided 原地注册 | 399 × 4096 × 2.1us = **3.43s** |
-      | staging | 399 × 1 × 4us + 8GB 本地拷贝 ≈ **7ms** |
-
-      加了 `STRIDED_ROW_BUDGET`（64 行）后 gen 侧 strided 分片从 144 降到 0，
-      **但集群立刻报错**：
-
-      ```
-      RuntimeError: Remote descriptor must be contiguous for client read,
-      but found key model.layers.0.self_attn.o_proj.weight shard (0,0)
-      in NIXLGenClient_I0_R10 is non-contiguous
-      ```
-
-      **原因是 staging buffer 没有常驻的 remote descriptor** —— 它是传输的*目的地*，
-      不是可被寻址的*来源*。而 peer 扩散恰恰要求 designate 能被读：
-
-      - **要扩散** → designate 必须原地注册 → 每分片付 4096 个 descriptor；
-      - **要 staging** → 该 client 只能是纯目的地 → **不能有 follower 读它**。
-
-      两者互斥。`strided_is_cheaper_than_staging(..., must_be_readable=)` 现在把这条
-      作为**正确性约束**而非调优项固定下来（可读性永远压过行数预算），
-      测试 `TestReadabilityOverridesTheRowBudget` 钉住它。
-
-      **补充（CPU 实测量化了这条"结构性"论断）：读源数 = ceil(train_TP / gen_TP)。**
-      在 `test_direct_supply_plan.py::TestTheReadCountAgainstPsIsNowPinned` 里
-      用真实几何构造 24 train rank（TP=4）+ 8 rollout（gen TP=2）测出：
-
-      | | 每 key 读源数 | 总读次数 |
-      |---|---|---|
-      | 直供 TP=4 / gen_TP=1 | **4.00** | 12,768 |
-      | 直供 TP=4 / gen_TP=2 | 2.00 | 6,384 |
-      | 直供 TP=4 / gen_TP=4 | **1.00** | 3,192 |
-      | 有 PS | **1.00** | 3,192 |
-
-      **实跑验证 `GEN_TP=4`：公式被证实，但该配置在本集群跑不起来。**
-      run 39 `GEN_TP=4` 确实使 `n_rollout_instances` 从 4 降到 **1**（与预测一致），
-      但 vLLM 启动即失败：
-
-      | | 同节点 KV cache |
-      |---|---|
-      | run 38（`GEN_TP=1`） | **58.85 / 30.18 GiB** |
-      | run 39（`GEN_TP=4`） | 11.48 / **0.29 GiB** |
-
-      `ValueError: To serve at least one request with the model's max seq len (40960),
-      (5.62 GiB KV cache is required)`。
-
-      **原因是放置而非显存总量**：`GEN_TP=1` 时 4 个 rollout 实例各占 1 卡、
-      分散在 4 个节点；`GEN_TP=4` 时单个实例要 4 卡**落在同一个节点**，
-      与同节点其他负载相撞。所以 `GEN_TP` 不只是并发度权衡，
-      它**改变放置拓扑**，需要相应扩节点才能用。
-
-      **结论：公式成立（plan 层已由 CPU 测试钉住），但"匹配 TP"不是现成可用的解法。**
-
-      **D1 性能判据已达成** —— 而且是靠**关掉扩散、走 staging**得到的：
-      run 42 用 `peer_diffusion=False` + `shards_must_be_readable=False`：
-
-      | 配置 | rollout pull |
-      |---|---|
-      | 扩散开（run 38） | 1.25 / 1.56 / 1.69 s |
-      | **扩散关 + staging（run 42）** | **0.66 / 0.68 / 0.73 / 0.90 s** |
-      | PS 路径（设计记录） | 1.14 s |
-
-      同配置只差这两个开关，**约 1.9× 提升，且已优于 PS 的 1.14s**。
-      0 错误、0 条版本违例、6 次 pull 全部完成、2 个 step 跑完。
-
-      **这印证了设计里那条判断**：扩散省的是 NIC 字节（跨节点 24.50 GB/s vs
-      同节点 342.95 GB/s），但它逼迫 designate 原地注册、每分片付 4096 个 descriptor
-      （~2.1us 一个），而 descriptor 比字节贵得多。**关掉扩散后 gen 侧可以 staging，
-      一个 descriptor 搬完一个分片。**
-
-      因此直供的推荐配置是 **`peer_diffusion=False` + `shards_must_be_readable=False`**；
-      两者是一对（扩散要求可读），已由 `_validate_nixl_peer_diffusion` 强制。
-
-      **所以 2.93s vs 1.14s 里有一部分不是直供固有的，而是 TP 配置造成的**：
-      出脚本用 `TP=4 / GEN_TP=1`，每个 key 要跨 4 个 train rank 拼，
-      而 PS worker 一份就是完整 shard。`GEN_TP` 现已可覆盖（默认仍 1），
-      但**它不是免费的**：`GEN_INSTANCES` 会按同一比例缩小（TP=1 → 4 实例，TP=4 → 1），
-      并发度随之下降。因此这是个权衡，不是可以随手改的常数 ——
-      真正的出路仍然是让 gen 侧分片在注册时连续（消除 strided），
-      那样既不增加源数也不牺牲实例数。
-
-      **因此结论是：在当前的分片布局下，peer 扩散本身就是净亏的，而且无法靠调度或
-      传输参数挽回。** 无扩散基线之所以快（2.0~2.6s），正是因为它的 rollout 是纯目的地、
-      可以 staging，用一个 descriptor 搬完一个分片。
-      扩散要省的是 NIC 字节（实测跨节点 24.50 GB/s vs 同节点 342.95 GB/s），
-      但它逼迫 designate 付 4096 倍的 descriptor，而 descriptor 比字节贵得多。
-
-      **真正的出路是消除 strided 布局本身**（让 gen 侧分片在注册时就是连续的），
-      这触及 §3.9.2.1 的 vLLM 分片粒度与 converter 的 layout 变换，
-      属于 **A2/D4 的范围，不是 D1**。
-
-      **在那之前，配置项已就位**：`CommunicationPlanner(peer_diffusion=False)`
-      （默认 `True`）。默认保持开启，因为 plan 层的去冗余是真实的（61% 的读移到 NVLink）、
-      回归只针对 strided 布局；但在当前 Qwen3-8B + 直供配置下，
-      **实测关闭更快**，这是实测支持的配置建议而非设计缺陷。
-      `TestDiffusionCanBeTurnedOff` 钉住两种设置都产出正确的 plan。
-
-      **D1 最终状态**：
-      | 判据 | 结果 |
-      |---|---|
-      | 正确性（16 client × 399 key，坐标判据） | ✅ exit=0，多轮复现 |
-      | 通知图对称（发布数 == 等待数） | ✅ 80 / 80，驱动端断言 |
-      | plan 层去冗余（61% 读移到 NVLink） | ✅ |
-      | 端到端性能优于无扩散基线 | ❌ **1.42~1.93×（更慢）**，根因见上 |
-
-      **后续：根因已修，见 `descriptor_cost_plan.md`。**
-      那份文档把问题从「扩散不划算」推进到「descriptor 膨胀」，
-      并已落地选择性 staging（S1–S4 集群验证）：
-      **拉取 0.619s，3.68× 于此前最好的基线**，原地提交成本
-      1238.6ms → 0.2ms，`temp_desc_slice_map=144`。
-      D1 的性能判据要在扩散与 staging 共存（该文档的 S5）之后才能重测 ——
-      当前两者互斥，而 staging 侧已经比扩散侧快得多。
-
-      **实现过程中三个由实测暴露的设计错误**（都已修并有测试钉住）：
-      1. **按 chunk 成员而非按「已调度的读」寻址**。真实尺寸下一个 chunk 含约 100 个 key，
-         「这个 chunk 里的所有 key」与「放进这个 chunk 的读」是两个不同的集合 ——
-         于是既发出没人计划的读、又静默丢掉计划内的读（653 计划 vs 100+269 实发）。
-      2. **schedule 把每个被扩散的 shard 读了两遍**。comm plan 刻意保留完整的上游读，
-         好让无法跑 peer 相的调用方跳过它仍然正确；但流水调用方两相都跑，
-         这份余量就变成了重复读。schedule 现在是**划分**：peer plan 覆盖的归 peer，其余归上游。
-      3. **peer 读被放在它所依赖的上游读的同一个波次**。同一个屏障区间内两者并发，
-         peer 读可能读到 designate 尚未填充的缓冲区 —— 而且**会成功**。
-         现在 peer 读统一后移一个波次。
-
-      另一处**测量方法的更正**：`overlap_depth` 原先拿一个 client 的 peer 读
-      去比它自己后续的上游读，但**完整 follower 根本没有上游读**（它要的 shard 全被 peer 覆盖），
-      于是完美流水也会被报成「零重叠」。重叠是**跨 client** 的，现在要同时传入 designate 的波次表。
-
-      **因此下一步的方向是明确的**：两相版本里 peer 相完全串行在上游相之后
-      （屏障既保证了正确性，也排除了重叠）。要让扩散变成净收益，
-      必须让它**按 chunk 与上游波次重叠**——这正是 B1 的 chunk 流水存在的目的，
-      现已由 `chunk_notify.py` 驱动（见上）。改链路或改选源都不是问题所在。
-
-      **5 节点实测确认 plan 层确实找到了重复**：653 次计划读中
-      **399 次（61%）被判定为 peer 读并显式推迟**，254 次走上游。
-      即屏障到位后，**61% 的读会从 NIC 移到 NVLink**——
-      注意是「移走」而非「消除」：读的总次数不变，变的是走哪条链路。
-      本次运行 exit=0、16 个 gen client 全部 399/399。
-
-      **一个被自己的测量 bug 掩盖过的事实**：第一次实测报告「0 次 peer 读被推迟」，
-      当时结论差点写成「集群上没有重复可消除」。实际是 harness 先按
-      train client 名单过滤 work，再分离 peer 读 —— peer 源是 rollout client，
-      早就被过滤掉了，那个 0 **计数的是空集**而非证据。planner 一直是对的。
-      教训可一般化：**诊断里的 0 只有在「它本来可能非 0」时才有意义**。
-      已加测试钉住 harness 的分离顺序，且 peer 判定必须**按 key**
-      （同一 client 可能对某 key 是 peer、对另一 key 是上游源）。
-
-      由此定下一条设计约束：**上游读绝不按 peer plan 裁剪**。
-      裁剪会让两条路径互相依赖——没有屏障的调用方必须跳过 peer 读，
-      而裁剪过的上游读就会静默丢掉那些 shard。
-      代价对比很清楚：都发是一次重复读（扩散本想省掉的），
-      裁剪是错误权重且无报错。
+      **实现中钉住的四条规则**（都有 CPU 回归测试，`test_pull_engine.py`）：
+      1. **peer 读必须等 designate 的字节落地。** 提前的 peer 读会「成功」：注册有效、传输格式正确，
+         读到的是未填充的缓冲区。designate 每落地一波就向 follower 发一条 NIXL 通知，方向只有
+         designate → follower。全局屏障正确但会让整组等最慢的一个，共享波次计数器在各 client
+         波次表不同时全局乱序，两者都不可用。
+      2. **就绪信号按 sync epoch 区分，不按权重版本。** 两次 sync 可以拉同一版本，
+         复用版本号会让 follower 接受上一次 sync 的就绪信号，读到半旧的权重。
+      3. **peer 读按 gen 本地整张量。** `postXferReq` 的成本按 descriptor 计（约 2 µs 一个），
+         沿用全局 finest cell 时 descriptor 数随行数增长，扩散因此净亏。
+      4. **designate 不响应时 follower 在 `peer_timeout_s` 后改读上游**，不让同组卡住。
 
 - [x] **D1 选源模块已落地**：`psrl/utils/nixl/source_resolution.py`。
       trainer 出口 == 节点数（4 节点 × 8 reader 实测为 4 次而非 32 次）；
@@ -1722,7 +1386,7 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       从可 reshard 的 `torch_dist` 变成**不可 reshard 的逐 rank 文件**。
       这是一次对现有产出物格式的单向改变，**不是纯粹的代码删除**，
       应当由项目主人决定迁移节奏，而不是随手跟着删代码一起做掉。
-      判据（CPU 权重 == 0、cast 显存上界 `2×chunk`）需删除后实测。
+      判据（CPU 权重 == 0、cast 显存不随 rollout 数增长）需删除后实测。
       `test_direct_supply_mode.py` 留了一个**成功即失败**的闸门测试：
       `PSStorageWorker` 文件一旦消失它就报错，提示连同这组闸门一起退役。
 - [x] **D4 已落地并集群验证**：
@@ -2003,6 +1667,26 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       另有两条结构性断言：**每次 CI 档不得超过 4 格**（每格都是一次多节点运行，
       增长直接吃迭代速度）；**PS 版与直供版配置只能差 `direct_supply` 一个键**，
       否则两者之间的性能差异无法归因。
+
+---
+
+## 11. 剩余工作
+
+数据面（直供、去冗余、发布副本、cast、block FP8）已接入生产并通过 §9 所列验证，
+实测见 `weight_transport_FINDINGS.md`。以下按「解锁的能力 ÷ 改动面」排序，每项给判据与最轻验证档位。
+
+| # | 项 | 做什么 | 判据 | 档位 |
+|---|---|---|---|---|
+| W5 | cost model 对齐实测 | `BW_NIC` 取探测的节点聚合值，同节点带宽单列，descriptor 成本按约 2 µs 一个进入决策 | `test_cost_model.py` 按实测改写 | CPU |
+| W6 | 状态表与 import 图对齐 | §9 第三列由 CPU 测试按生产 import 图生成并断言 | 模块零生产 import 时测试要求表中标 ❌ | CPU |
+| W7 | D7/D8、E3 准入、E4 接入生产 | 现为纯模块 | 故障注入 | 多节点 |
+| W8 | 删 PS（D3/T2） | 需项目主人定迁移节奏 | — | — |
+| W9 | block FP8 的细化 scale 网格 | gen TP 每 rank 的 expert 行数不是 128 的整数倍时，vLLM 把 scale 网格细化（如 64 × 64）并无损上采样。trainer 按 rollout 声明的细化网格发布 scale（值不变，逐 tile 复制） | MoE Megatron TP2·EP2 → vLLM TP4（EP1）FP8 格通过 FP8 逐位判据 | 单节点 |
+| W11 | MoE 下 vLLM DP > 1 的 L2 覆盖 | harness 让 MoE 的 DP 组在 `external_launcher` 下建出 EP 通信器，或改为每 instance 独立进程组再另测 DP 耦合 | MoE Megatron EP4 → vLLM TP2 × DP2 两轮通过 layout 判据 | 单节点 |
+| W10 | 规模验证 | 1TB 级 MoE（真实权重，多节点 train 与多节点 rollout）的出口、稳态 sync 与发布副本显存 | 出口 == 每 gen 节点每 TP rank 一份，副本显存 ≤ 预算 | 多节点 |
+
+**顺序约束**：W5、W6 独立且便宜，W9 独立。W10 依赖足够的节点，W7 的故障注入最好在 W10 的规模上跑。
+**复现命令**见 `weight_transport_FINDINGS.md` §8。
 
 ---
 

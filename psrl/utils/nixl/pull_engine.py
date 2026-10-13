@@ -37,8 +37,8 @@ BYTES_PER_SECOND = 25e9
 DIRECT_DESCRIPTORS_PER_SHARD = 64
 # Staged items start on this alignment so every dtype view of the pool is legal.
 _ALIGN = 256
-# Signal chunks carried by the per pull notifications.
-_READY, _DONE = 0, 1
+# Signal chunks carried by the per pull notifications. Wave `w` is ready as chunk `_READY + w`.
+_DONE, _READY = 0, 1
 
 _NIXL_MEM = {"cuda": "VRAM", "cpu": "DRAM", "VRAM": "VRAM", "DRAM": "DRAM"}
 
@@ -118,10 +118,12 @@ class NIXLPullEngine:
         client (NIXLStorageClient): A PULL_SIDE client whose handshake has completed.
         staging_bytes (int): Size of the staging pool, split into two alternating slots.
         peer_timeout_s (float): How long a follower waits for its designate before reading upstream.
+        waves (int): Upstream waves per pull. Peer reads of one wave overlap the next wave's upstream.
     """
 
-    def __init__(self, client: NIXLStorageClient, staging_bytes: int, peer_timeout_s: float):
+    def __init__(self, client: NIXLStorageClient, staging_bytes: int, peer_timeout_s: float, waves: int = 4):
         self.client = client
+        self.waves = max(1, int(waves))
         self.agent = client.agent
         self.staging_bytes = int(staging_bytes)
         self.peer_timeout_s = float(peer_timeout_s)
@@ -368,6 +370,15 @@ class NIXLPullEngine:
                 item.local_view.copy_(source, non_blocking=True)
 
     def _run(self, phase: _Phase) -> None:
+        self._finish(self._start(phase))
+
+    def _finish(self, direct: list[_Handle]) -> None:
+        self._wait(direct)
+        if self._copy_stream is not None:
+            self._copy_stream.synchronize()
+
+    def _start(self, phase: _Phase) -> list[_Handle]:
+        """Post the direct reads, run the staged rounds to completion, and return the direct handles."""
         if self._copy_stream is None and self.client.device.type == "cuda":
             self._copy_stream = torch.cuda.Stream(device=self.client.device)
         direct = self._post(phase.direct)
@@ -392,9 +403,7 @@ class NIXLPullEngine:
             in_flight.append((index, self._post(handles)))
         while in_flight:
             finish_oldest()
-        self._wait(direct)
-        if self._copy_stream is not None:
-            self._copy_stream.synchronize()
+        return direct
 
     # ------------------------------------------------------------------ pull
 
@@ -419,9 +428,29 @@ class NIXLPullEngine:
     def _upstream_specs(self, keys: dict[str, dict[str, list]]) -> list[_Spec]:
         return [self._spec(src, key, shards) for key, per_source in keys.items() for src, shards in per_source.items()]
 
+    def _waves_of(self, keys: list[str]) -> dict[str, int]:
+        """
+        Wave of every key, cut in model order into byte balanced runs.
+
+        Group members hold identical keys, so a designate and its followers derive the same waves.
+        """
+        info = self.client.local_client_info.tensor_infos
+        sizes = [
+            (key, sum(info[key].get_shard_size_bytes(i) for i in range(info[key].num_local_shards))) for key in keys
+        ]
+        total = max(sum(n for _, n in sizes), 1)
+        waves, acc = {}, 0
+        for key, nbytes in sorted(sizes):
+            waves[key] = min(self.waves - 1, acc * self.waves // total)
+            acc += nbytes
+        return waves
+
     def pull(self, epoch: int, participants: set[str] | None = None) -> PullReport:
         """
         Read this client's weights for one sync.
+
+        Upstream reads go in waves. After wave `w` lands the client tells its followers, and
+        reads its own peer keys of wave `w - 1` over NVLink while wave `w` crosses the NIC.
 
         Args:
             epoch (int): Identifier of this sync, shared by every participant and never reused.
@@ -430,43 +459,72 @@ class NIXLPullEngine:
         start = time.time()
         upstream, peer, followers = self._assign(lambda c: participants is None or c in participants)
         publisher, waiter = self.client.chunk_completion_channel()
+        all_keys = list(upstream) + [key for keys in peer.values() for key in keys]
+        wave_of = self._waves_of(all_keys)
+        up_waves = [{k: v for k, v in upstream.items() if wave_of[k] == w} for w in range(self.waves)]
+        peer_waves = [
+            {d: [k for k in keys if wave_of[k] == w] for d, keys in peer.items() if any(wave_of[k] == w for k in keys)}
+            for w in range(self.waves)
+        ]
 
-        phase = self._phase(self._upstream_specs(upstream))
-        versions = set(phase.versions)
-        self._run(phase)
-        if self.client.device.type == "cuda":
-            torch.cuda.synchronize(self.client.device)
-        upstream_done = time.time()
-        if followers:
-            publisher.publish(epoch, _READY, sorted(followers))
+        versions: set[int] = set()
+        stats = {"upstream_bytes": 0, "peer_bytes": 0, "descriptors": 0, "staged": 0, "fallback": 0}
+        upstream_done = start
 
-        peer_bytes = peer_descriptors = fallback_keys = 0
-        if peer:
-            ready = self._await(waiter, epoch, _READY, set(peer))
-            late = set(peer) - ready
-            specs = []
-            for designate in sorted(ready):
-                for key in peer[designate]:
-                    shards = self.client.local_client_info.tensor_infos[key].sharding.shard_indices
-                    specs.append(self._spec(designate, key, list(shards)))
+        def peer_wave(w: int) -> list[_Handle]:
+            """Wait for this wave's designates, start reading them, and read any late designate's keys upstream."""
+            wanted = peer_waves[w]
+            if not wanted:
+                return []
+            ready = self._await(waiter, epoch, _READY + w, set(wanted))
+            specs = [
+                self._spec(d, key, list(self.client.local_client_info.tensor_infos[key].sharding.shard_indices))
+                for d in sorted(ready)
+                for key in wanted[d]
+            ]
+            handles = []
             if specs:
-                peer_phase = self._phase(specs)
-                self._run(peer_phase)
-                peer_bytes, peer_descriptors = peer_phase.nbytes, peer_phase.descriptors
+                phase = self._phase(specs)
+                stats["peer_bytes"] += phase.nbytes
+                stats["descriptors"] += phase.descriptors
+                handles = self._start(phase)
+            late = set(wanted) - ready
             if late:
                 psrl_logger.warning(
                     f"{self.client.client_name}: designates {sorted(late)} were not ready after "
                     f"{self.peer_timeout_s}s in epoch {epoch}, reading their keys upstream."
                 )
                 plan = self.client.comm_plan.rollout_pull_from_ps_plan[self.client.client_name]
-                keys = {key: plan[key] for designate in late for key in peer[designate]}
-                fallback_keys = len(keys)
+                keys = {key: plan[key] for d in late for key in wanted[d]}
+                stats["fallback"] += len(keys)
                 fallback = self._phase(self._upstream_specs(keys))
+                versions.update(fallback.versions)
                 self._run(fallback)
-                versions |= fallback.versions
+            return handles
+
+        pending_peer: list[_Handle] = []
+        for w in range(self.waves):
+            phase = self._phase(self._upstream_specs(up_waves[w])) if up_waves[w] else None
+            direct = self._start(phase) if phase is not None else []
+            if w > 0:
+                pending_peer += peer_wave(w - 1)
+            self._finish(direct)
+            if phase is not None:
+                versions.update(phase.versions)
+                stats["upstream_bytes"] += phase.nbytes
+                stats["descriptors"] += phase.descriptors
+                stats["staged"] += phase.staged_bytes
             if self.client.device.type == "cuda":
                 torch.cuda.synchronize(self.client.device)
-            publisher.publish(epoch, _DONE, sorted(ready))
+            if followers:
+                publisher.publish(epoch, _READY + w, sorted(followers))
+        upstream_done = time.time()
+        pending_peer += peer_wave(self.waves - 1)
+        self._finish(pending_peer)
+        if self.client.device.type == "cuda":
+            torch.cuda.synchronize(self.client.device)
+        if peer:
+            publisher.publish(epoch, _DONE, sorted(peer))
         if followers:
             done = self._await(waiter, epoch, _DONE, followers)
             if done != followers:
@@ -482,11 +540,11 @@ class NIXLPullEngine:
             peer_seconds=end - upstream_done,
             upstream_keys=len(upstream),
             peer_keys=sum(len(v) for v in peer.values()),
-            fallback_keys=fallback_keys,
-            upstream_bytes=phase.nbytes,
-            peer_bytes=peer_bytes,
-            descriptors=phase.descriptors + peer_descriptors,
-            staged_bytes=phase.staged_bytes,
+            fallback_keys=stats["fallback"],
+            upstream_bytes=stats["upstream_bytes"],
+            peer_bytes=stats["peer_bytes"],
+            descriptors=stats["descriptors"],
+            staged_bytes=stats["staged"],
             followers=len(followers),
             versions=versions,
         )

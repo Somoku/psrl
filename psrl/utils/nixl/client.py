@@ -198,6 +198,7 @@ class NIXLStorageClient:
         self._pull_engine = None
         self._pull_staging_bytes = int(getattr(nixl_config, "pull_staging_bytes", 256 << 20))
         self._peer_timeout_s = float(getattr(nixl_config, "peer_timeout_s", 120.0))
+        self._pull_waves = int(getattr(nixl_config, "pull_waves", 4))
 
         # Prepped dlists for the hot path (item A1). Holds raw addresses, so it must be
         # cleared whenever registered memory changes -- see deregister_all_local_tensors.
@@ -371,7 +372,7 @@ class NIXLStorageClient:
         if self._pull_engine is None:
             from psrl.utils.nixl.pull_engine import NIXLPullEngine
 
-            self._pull_engine = NIXLPullEngine(self, self._pull_staging_bytes, self._peer_timeout_s)
+            self._pull_engine = NIXLPullEngine(self, self._pull_staging_bytes, self._peer_timeout_s, self._pull_waves)
         return self._pull_engine
 
     def _drop_pull_engine(self) -> None:

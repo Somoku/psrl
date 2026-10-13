@@ -43,6 +43,9 @@ pull_staging_bytes: 268435456
 # How long a rollout waits for its designate before reading that designate's keys upstream.
 peer_timeout_s: 120
 
+# Upstream waves per pull. Followers read wave w over NVLink while wave w + 1 crosses the NIC.
+pull_waves: 4
+
 # MiB a train rank may spend on contiguous copies of shards that rollouts cut finer than it does.
 # Each copy turns a read of one descriptor per row into one descriptor. Past the budget rollouts
 # span read the shard instead, which moves more bytes. null is unbounded.

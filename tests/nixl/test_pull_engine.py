@@ -415,3 +415,14 @@ def test_a_new_fp8_version_requantises_at_publish():
         cluster.clients[name].publish_version(9)
     cluster.pull(epoch=2)
     _judge_fp8(cluster, version=9)
+
+
+@pytest.mark.parametrize("waves", [1, 2, 7])
+def test_any_wave_count_moves_the_same_bytes(waves):
+    cluster = Cluster(train_tp=4, gen_tp=2, instances=3, peer_diffusion=True)
+    for engine in cluster.engines.values():
+        engine.waves = waves
+    reports = cluster.pull(epoch=1)
+    cluster.judge(cluster.gen, version=7)
+    model_bytes = sum(torch.Size(s).numel() * 2 for s, _ in MODEL.values())
+    assert sum(r.upstream_bytes for r in reports.values()) == model_bytes

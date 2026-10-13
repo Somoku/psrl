@@ -5,8 +5,10 @@
 > pull 语义、去冗余规划、chunk 执行层、colocate 原地交接）不在此重复，引用其章节号。
 >
 > 状态：**BF16 / FP32 train → blockwise FP8 rollout 已落地**（`psrl/utils/nixl/block_fp8.py`，
-> 落地项 F2、F3、F6、F7，F4 只含 tile 切分的拒绝），实测见 `weight_transport_FINDINGS.md` §5–§6。FP8-native train、MXFP8 与
-> colocate 指针交接未做。
+> 落地项 F2、F3、F6、F7，F4 只含 tile 切分的拒绝），含 vLLM 细化的 MoE scale 网格（§3 例外 1）。
+> **Megatron FP8 train（TE `fp8_param`，per-tensor current scaling）→ blockwise FP8 rollout 已落地**，
+> 走发布副本重量化，不是零拷贝（§10 表中 tensorwise 一行）。实测见 `weight_transport_FINDINGS.md` §5–§6。
+> 零拷贝的 FP8-native、MXFP8 与 colocate 指针交接未做。
 
 ---
 
@@ -155,12 +157,16 @@ scale_indices = weight_indices                   # 同一个 rank 拿同一块
 
 **两处例外，必须显式处理而不是假装不存在：**
 
-1. **`weight_scale_refine` 路径绕过了校验。** MoE 侧当 `weight_scale_refine is not None` 时，
-   vLLM 跳过 `validate_fp8_block_shape_moe`，改用 refined block grid 并由 loader 做 upsample。
-   这条路径下 `ceil` 真的留着，可组合性不成立。**处理方式是配置校验拒绝**：
-   PSRL 的直写路径绕过 loader，upsample 不会发生，静默错。拒绝比支持便宜，
-   且这是 checkpoint 量化网格与引擎网格不一致时的兼容路径，RL 场景下量化由我们自己做，
-   不会出现不一致。
+1. **vLLM 会细化 MoE 的 scale 网格。** TP 切分使每 rank 的 expert 中间维不是 128 的整数倍时
+   （Qwen3-30B-A3B 在 TP4 下每 rank 192 行），vLLM 0.30 把 expert 的 scale 网格细化为
+   `gcd(128, 每 rank 中间维, hidden)`（这里是 64 × 64），量化仍按 checkpoint 的 128 × 128 tile，
+   loader 用 `repeat_interleave` 把每个 128 tile 的 scale 复制到它覆盖的 2 × 2 个细 tile，再按 rank 切。
+   FP8 字节不变。miles 与 verl 都把全量权重按 128 tile 量化后交给引擎的 `load_weights`，
+   所以它们自动拿到这一步。PSRL 直写参数，不经 loader，于是**在发布侧做同一件事**：
+   rollout 的 converter 在每个 scale key 的 sharding 上声明它的 scale tile（权重形状 / scale 形状），
+   meta server 把它带给推导出的 trainer scale sharding，trainer 仍按 128 tile 量化，
+   把 scale 按 `128 / scale tile` 复制后发布。结果与 vLLM 从 128 tile checkpoint 加载的逐位相同。
+   trainer 自己的 shard 必须含整 128 tile，否则注册时拒绝。
 2. **per-tensor scale 不可重分片。** per-tensor 下 scale 是整张矩阵一个标量
    （MoE 下是 `[E, w13_num_shards]`），trainer 的分片与 rollout 的分片若不同，
    两边的 amax 范围不同 → scale 不同 → 字节不可换。vLLM 的 loader 靠
@@ -462,13 +468,14 @@ PSRL 对 scale 做同一件事，且比 amax 更简单——§3 已证明 scale 
 |---|---|---|---|---|
 | Megatron | bf16 | blockwise | Hopper+ | 支持。**Hopper 上 BF16 训练的推荐配置** |
 | Megatron | bf16 | MXFP8 | SM100+ | 支持，wire 贵 3%，量化精度更好 |
-| Megatron | fp8 (TE `fp8_param`) | blockwise + FP32 scale | **Hopper only** | 支持。**Hopper 上的最优形态**，零转换零缓冲 |
+| Megatron | fp8 (TE `fp8_param`, blockwise recipe) | blockwise + FP32 scale | **Hopper，CUDA ≥ 12.9** | 设计上零转换零缓冲。**未落地**：本集群 CUDA 12.8，TE 的 `Float8BlockScaling` 不可用 |
+| Megatron | fp8 (TE `fp8_param`, tensorwise / delayed) | blockwise | Hopper+ | **已落地**。per-tensor 字节不能直接给 block FP8，trainer 从 FP8 字节反量化后按 128 tile 重量化进发布副本 |
 | Megatron | fp8 (TE) | blockwise + power-of-2 | — | **拒绝**：po2 与常驻 fp8 参数互斥（硬件约束，非本设计限制） |
 | Megatron | fp8 (TE) | MXFP8 | **SM100+** | 支持。**B300 级集群的目标形态**，colocate 零拷贝 |
 | FSDP2 | fp32 / bf16 | blockwise / MXFP8 | 按 wire | 支持（cast 路径，冲突恒为零） |
 | FSDP2 | fp8-native | — | — | **拒绝**：FSDP2 无 TE `fp8_param` 等价物（上游缺失） |
 | 任意 | 任意 | **per-tensor**，且该维 train/rollout 分片不一致 | — | **拒绝**：scale 不可重分片（§3 例外 2） |
-| 任意 | 任意 | blockwise + `weight_scale_refine` | — | **拒绝**：grid 不可组合，直写绕过 upsample（§3 例外 1） |
+| 任意 | 任意 | blockwise + `weight_scale_refine`（MoE） | — | 支持：trainer 按 rollout 声明的细网格复制 scale（§3 例外 1） |
 
 拒绝必须发生在**握手期的配置校验**，而不是传输期。理由与 §3 同一条：
 FP8 的错误不会在数值上暴露。校验要检查的恰好是 §3 与 §4 推导所依赖的前提：

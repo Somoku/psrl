@@ -81,6 +81,12 @@ Qwen3-8B，train TP4·PP2 × 24 rank，gen TP2，每 gen 节点 8 个 rollout：
 | 无扩散 | 131 GB | 869 | 0.67–0.84 s |
 | 扩散，上游读完再读 peer（5 节点） | 32.8 GB | 537 | 0.285 s |
 | **扩散，分波重叠（4 节点）** | **32.8 GB** | **537** | **0.178 s**（上游 0.136 s，peer 0.038 s） |
+| FP8 rollout，无扩散（bf16 train） | 75.5 GB | 5621 | 0.33–0.83 s |
+| FP8 rollout，扩散分波（bf16 train） | 18.9 GB | 4201 | 0.121 s（上游 0.095 s，peer 0.023 s） |
+| FP8 rollout，扩散分波（Megatron FP8 train） | 18.9 GB | 4201 | 0.113 s（上游 0.093 s，peer 0.016 s） |
+
+FP8 两行每个 train rank 的发布刷新（重量化进发布副本）为 22 ms（bf16 train）与 32 ms（FP8 train），
+发布副本 828 MiB / rank。
 
 - 四个 instance 轮流当 designate，节点入口分散到每个 instance 的 NIC 上。
 - 分波后 peer 阶段只剩最后一波的尾巴。
@@ -112,16 +118,26 @@ Qwen3-8B，train TP4·PP2 × 24 rank，gen TP2，每 gen 节点 8 个 rollout：
 | colocate Megatron TP2 → TP2，扩散 | bf16 → FP8 | ✅ | 2.403 / 0.037 s | 9.4 GB |
 | MoE Megatron TP2·EP2 → TP4·EP4 | bf16 → FP8 | ✅ 579 keys | 0.675 / 0.075 s | 31.3 GB |
 | MoE FSDP2 → TP4·EP4 | bf16 → FP8 | ✅ | 0.663 / 0.064 s | 31.3 GB |
+| MoE Megatron TP2·EP2 → TP4（EP1，细化 64×64 scale 网格） | bf16 → FP8 | ✅ | 1.108 / 0.383 s | 31.3 GB |
+| FSDP2 → TP2 | bf16 → FP8 | ✅ | 0.288 / 0.051 s | 18.9 GB |
+| colocate FSDP2 → TP2，扩散 | bf16 → bf16 | ✅ | 4.360 / 0.061 s | 16.4 GB |
+| colocate FSDP2 → TP2，扩散 | bf16 → FP8 | ✅ | 2.739 / 0.049 s | 9.4 GB |
+| Megatron FP8 train TP2 → TP2 | FP8 → FP8 | ✅ | 0.287 / 0.035 s | 18.9 GB |
+| Megatron FP8 train TP2·PP2 → TP4 | FP8 → FP8 | ✅ | 0.290 / 0.021 s | 9.4 GB |
+| Megatron FP8 train TP4 → TP2，扩散 | FP8 → FP8 | ✅ | 1.007 / 0.040 s | 9.4 GB |
+| colocate Megatron FP8 train TP2 → TP2，扩散 | FP8 → FP8 | ✅ | 2.260 / 0.036 s | 9.4 GB |
+| MoE Megatron EP4 → TP2 × DP2（vLLM 无 EP） | bf16 | ✅ | 0.618 / 0.169 s | 64.2 GB |
+| MoE Megatron EP4 → TP2 × DP2，EP4 跨 DP | bf16 | ✅ | 0.342 / 0.090 s | 64.2 GB |
+| MoE FSDP2 → TP1 × DP4，EP4 跨 DP | bf16 | ✅ | 1.661 / 0.098 s | 70.3 GB |
 
 - FP8 格的出口约为 bf16 的 0.58 倍：权重减半，加上 scale、norm 与 embedding 等不量化的 key。
 - 扩散格的出口是一份模型（16.4 GB / FP8 9.4 GB），与节点上的 rollout 数无关。
 
-**未支持的格，注册时拒绝：** MoE Megatron TP2·EP2 → vLLM TP4（EP1），bf16 → FP8。
-Qwen3-30B-A3B 的 `moe_intermediate_size = 768`，TP4 每 rank 192 行，不是 128 的整数倍。
-vLLM 0.30 此时把 expert 的 scale 网格细化到 64 × 64，把 128 × 128 的 scale 无损上采样过去。
-trainer 发布的是 128 × 128 网格的 scale，它在 192 行处切不开，所以注册时拒绝并报出 key 名。
-支持它需要 trainer 按 rollout 的细化网格发布 scale（值不变，逐 tile 复制），见实现规划 §11 的 W9。
-目前改用 gen EP 即可绕开。
+- Megatron FP8 train 指 TE `fp8_param` 加 per-tensor current scaling（`train_fp8=tensorwise`）。
+  trainer 从 FP8 字节反量化，再按 128 tile 重量化进发布副本，每 rank 发布刷新 64–118 ms（Qwen3-8B，TP2）。
+  TE 的 blockwise recipe 需要 CUDA ≥ 12.9，本集群是 12.8，所以零拷贝的 FP8-native 路径没有测。
+- 细化网格格的稳态 0.383 s 慢于其他 MoE FP8 格，是因为 EP1 下每个 expert 被 TP4 切开，
+  每 rollout 37,491 个 descriptor。block scale 改走发布副本之前是 228,675 个、1.23 s。
 
 ## 6. block FP8 的数值
 
@@ -136,11 +152,10 @@ trainer 发布的是 128 × 128 网格的 scale，它在 192 行处切不开，�
   两次失败的日志里 rank 0 报 `Config cache hit`，另一个 rank 进入 `Tuning trtllm::fused_moe`，
   随后 TP all-reduce 等满 600 s 超时。卡点在 vLLM 初始化，在任何传输发生之前。
   `ray start` 前把 `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR` 指向一个空目录，所有 rank 一起从头调优，该格即通过。
-- **MoE rollout 的 DP > 1 在 harness 下跑不起来。** harness 把一个节点上的全部 gen rank 起成
-  一个 vLLM DP 组（`external_launcher`）。MoE 层在 DP > 1 时跨 DP rank 分发 token
-  （`naive_dp_ep` → `all_gatherv`），该路径断言 `pynccl_comm` 存在而失败，与 gen 是否开 EP 无关。
-  所以 MoE 格只覆盖 4 张 gen 卡组成一个 rollout instance（gen TP = 4）的切法，
-  MoE 下 vLLM DP > 1 时 expert 跨 DP × TP 切分的布局尚无 L2 覆盖（实现规划 §11 W11）。
+- **共享 conda 的 NCCL 2.28.9 让 vLLM 静默禁用 pynccl。** vLLM 0.30 绑定 `ncclCommSuspend`（NCCL ≥ 2.29.7），
+  绑定失败时所有 group 的 pynccl 被禁用，TP all-reduce 退回 torch.distributed，MoE 在 DP > 1 时
+  于 `all_gatherv` 断言失败。`scripts/nixl_env.sh` 把 `VLLM_NCCL_SO_PATH` 指向单独安装的 2.29.7，
+  harness 在引擎启动前检查绑定。
 - **DeepGEMM 在 CUDA < 12.9 下不编译**（`build(vllm)` 提交），FP8 MoE 的性能数字需注意这一点。
 
 ## 8. 复现

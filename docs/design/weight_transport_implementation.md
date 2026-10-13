@@ -903,7 +903,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | A6 删 FSDP1 | ✅ | ✅ | L1 ✅ |
 > | A7 join 三级判定 | ✅ | ✅ `server.py` | L1 ✅ |
 > | A8 colocate IPC | ✅ 机制（`test_colocate_ipc_gpu.py`） | ❌ colocate 走 NIXL 同卡读 | L2 ✅（NIXL 路径，含扩散与 FP8） |
-> | **A9 FP8 wire** | ✅ `block_fp8.py` | ✅ trainer 发布 block FP8 副本与 scale | L1 量化器与 vLLM 逐位一致，L2 8 格 FP8 位与 scale 逐位判定，单 GPU 真实权重贪心 token 100% 一致 |
+> | **A9 FP8 wire** | ✅ `block_fp8.py` | ✅ trainer 发布 block FP8 副本与 scale | L1 量化器与 vLLM 逐位一致，L2 17 格 FP8 位与 scale 逐位判定（含 Megatron FP8 train 4 格），单 GPU 真实权重贪心 token 100% 一致 |
 > | B1 chunk/commit group | — | — | **已删除**：拉取引擎按源一次提交，不再需要 chunk 计划 |
 > | B2 slot ack | ✅ | ❌ 零 import | **不再需要**：cast 产物是常驻发布副本，在推送锁内刷新（主文档 §3.4.2） |
 > | B3 chunk 自适应 | — | — | **已删除**，同 B1 |
@@ -913,7 +913,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | **D1 去冗余** | ✅ | ✅ `pull_engine.py`，默认开 | L3 ✅ 4 节点 16 rollout：出口 131 → 32.8 GB，稳态 0.178 s |
 > | D1 选源 `source_resolution` | ✅ | ❌ 零 import | L1，选源由 planner 的 designate 次序承担 |
 > | D2 `holder_index` | ✅ | ❌ 零 import | L1 |
-> | D3 `nixl_direct` | ✅ | ✅ | L2 ✅ 19 格，L3 ✅，**PS 未删** |
+> | D3 `nixl_direct` | ✅ | ✅ | L2 ✅ 31 格，L3 ✅，**PS 未删** |
 > | D4 单向标记 | ✅ | ✅ `ray_trainer.py` | L2 ✅ |
 > | D4 `holder_roles` / bootstrap | ✅ | ❌ 零 import | L1 |
 > | D5 `chunk_offset` | ✅ | ❌ 零 import | L1 |
@@ -927,7 +927,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | F1 delta | ✅ 决策函数 | ❌ | L1 |
 > | T1 判据 | ✅ layout 判据 + FP8 逐位判据 | — | 坐标哈希写入原始位，对整行 / 整块错位可见 |
 > | T3 colocate | ✅ | — | L2 ✅ |
-> | T4 矩阵 | ✅ | — | L2 19 格通过（`weight_transport_FINDINGS.md` §5） |
+> | T4 矩阵 | ✅ | — | L2 31 格通过（`weight_transport_FINDINGS.md` §5） |
 
 实现期逐项打勾。**判据栏必须可执行**，不接受「已实现」这种描述。
 
@@ -1681,8 +1681,8 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 | W6 | 状态表与 import 图对齐 | §9 第三列由 CPU 测试按生产 import 图生成并断言 | 模块零生产 import 时测试要求表中标 ❌ | CPU |
 | W7 | D7/D8、E3 准入、E4 接入生产 | 现为纯模块 | 故障注入 | 多节点 |
 | W8 | 删 PS（D3/T2） | 需项目主人定迁移节奏 | — | — |
-| W9 | block FP8 的细化 scale 网格 | gen TP 每 rank 的 expert 行数不是 128 的整数倍时，vLLM 把 scale 网格细化（如 64 × 64）并无损上采样。trainer 按 rollout 声明的细化网格发布 scale（值不变，逐 tile 复制） | MoE Megatron TP2·EP2 → vLLM TP4（EP1）FP8 格通过 FP8 逐位判据 | 单节点 |
-| W11 | MoE 下 vLLM DP > 1 的 L2 覆盖 | harness 让 MoE 的 DP 组在 `external_launcher` 下建出 EP 通信器，或改为每 instance 独立进程组再另测 DP 耦合 | MoE Megatron EP4 → vLLM TP2 × DP2 两轮通过 layout 判据 | 单节点 |
+| W9 | ~~block FP8 的细化 scale 网格~~ | ✅ rollout 在 scale sharding 上声明 scale tile，trainer 按 128 tile 量化后复制 scale（与 vLLM loader 的 `repeat_interleave` 逐位相同） | MoE Megatron TP2·EP2 → vLLM TP4（EP1）FP8 格通过 | 已完成 |
+| W11 | ~~MoE 下 vLLM DP > 1 的 L2 覆盖~~ | ✅ 根因是 NCCL 2.28.9 让 vLLM 禁用 pynccl，改用 2.29.7，harness 的 EP 规则改为 EP = DP × TP | EP4 跨 DP 的三格通过 | 已完成 |
 | W10 | 规模验证 | 1TB 级 MoE（真实权重，多节点 train 与多节点 rollout）的出口、稳态 sync 与发布副本显存 | 出口 == 每 gen 节点每 TP rank 一份，副本显存 ≤ 预算 | 多节点 |
 
 **顺序约束**：W5、W6 独立且便宜，W9 独立。W10 依赖足够的节点，W7 的故障注入最好在 W10 的规模上跑。

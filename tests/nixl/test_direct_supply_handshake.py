@@ -164,79 +164,28 @@ class TestDispatchFollowsRegistration:
 
 
 class TestPeerDescriptorsAreIncluded:
-    """D1: a peer read needs that peer's descriptors, and a peer is PULL_SIDE.
-
-    None of the type rules grant a PULL_SIDE client another PULL_SIDE client, so without
-    this the peer read fails the same way the direct-supply read did -- "target client
-    not found in client infos".
-    """
+    """D1: a group member reads its designate and notifies its followers, so it needs every peer of its groups."""
 
     class _Plan:
-        def __init__(self, peer_pull_plan):
-            self.peer_pull_plan = peer_pull_plan
+        def __init__(self, groups):
+            self.peer_groups = {}
+            for key, wanters in groups.items():
+                for client in wanters:
+                    self.peer_groups.setdefault(client, {})[key] = wanters
 
-        def followers_of(self, designate):
-            return {
-                follower
-                for follower, per_key in self.peer_pull_plan.items()
-                for per_peer in per_key.values()
-                if designate in per_peer
-            }
-
-    def test_a_named_peer_is_included(self):
+    def test_every_group_member_is_included_in_both_directions(self):
         clients = {**DIRECT, "gen1": NIXLClientType.PULL_SIDE}
-        plan = self._Plan({"gen1": {"w": {"gen0": [(0,)]}}})
-        server = _Server(clients, comm_plan=plan)
-
+        server = _Server(clients, comm_plan=self._Plan({"w": ("gen0", "gen1")}))
         assert "gen0" in server.relevant_for("agent_gen1")
-
-    def test_unnamed_rollouts_are_not_included(self):
-        """Scoped to the plan: otherwise every rollout carries every other rollout."""
-        clients = {
-            **DIRECT,
-            "gen1": NIXLClientType.PULL_SIDE,
-            "gen2": NIXLClientType.PULL_SIDE,
-        }
-        plan = self._Plan({"gen1": {"w": {"gen0": [(0,)]}}})
-        server = _Server(clients, comm_plan=plan)
-
-        assert "gen2" not in server.relevant_for("agent_gen1")
-
-    def test_no_plan_means_no_extra_fan_out(self):
-        """Before a plan exists there are no peers to name."""
-        clients = {**DIRECT, "gen1": NIXLClientType.PULL_SIDE}
-        server = _Server(clients, comm_plan=None)
-
-        assert "gen0" not in server.relevant_for("agent_gen1")
-
-    def test_a_designate_gains_its_followers(self):
-        """Diffusion is one-directional for *data* and the other way for *signalling*.
-
-        Bytes move follower <- designate, but per-chunk completion notifications move
-        designate -> follower, so the designate must be able to address clients it never
-        reads from. Granting only the read direction made the designate fail on its own
-        publish with "Target client ... not found in client infos" -- on the client whose
-        reads were all satisfiable, which is a misleading place to look.
-        """
-        clients = {**DIRECT, "gen1": NIXLClientType.PULL_SIDE}
-        plan = self._Plan({"gen1": {"w": {"gen0": [(0,)]}}})
-        server = _Server(clients, comm_plan=plan)
-
         assert "gen1" in server.relevant_for("agent_gen0")
 
-    def test_the_fan_out_stays_scoped_in_both_directions(self):
-        """Adding the notification direction must not widen this to every rollout."""
-        clients = {
-            **DIRECT,
-            "gen1": NIXLClientType.PULL_SIDE,
-            "gen2": NIXLClientType.PULL_SIDE,
-            "gen3": NIXLClientType.PULL_SIDE,
-        }
-        # gen0 serves gen1 only; gen2 and gen3 are unrelated to it.
-        plan = self._Plan({"gen1": {"w": {"gen0": [(0,)]}}, "gen3": {"w": {"gen2": [(0,)]}}})
-        server = _Server(clients, comm_plan=plan)
+    def test_no_plan_means_no_extra_fan_out(self):
+        clients = {**DIRECT, "gen1": NIXLClientType.PULL_SIDE}
+        server = _Server(clients, comm_plan=None)
+        assert "gen0" not in server.relevant_for("agent_gen1")
 
+    def test_the_fan_out_stays_within_groups(self):
+        clients = {**DIRECT, **{f"gen{i}": NIXLClientType.PULL_SIDE for i in range(1, 4)}}
+        server = _Server(clients, comm_plan=self._Plan({"w": ("gen0", "gen1"), "v": ("gen2", "gen3")}))
         relevant = server.relevant_for("agent_gen0")
-        assert "gen1" in relevant
-        assert "gen2" not in relevant
-        assert "gen3" not in relevant
+        assert "gen1" in relevant and "gen2" not in relevant and "gen3" not in relevant

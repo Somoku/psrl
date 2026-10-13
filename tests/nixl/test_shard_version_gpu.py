@@ -165,6 +165,9 @@ class TestTheClientStampsEveryRegisteredShard:
         class _Stub:
             local_client_info = info
 
+            def refresh_publish_copies(self):
+                pass
+
         NIXLStorageClient.publish_version(_Stub(), 5)
 
         for tensor_info in info.tensor_infos.values():

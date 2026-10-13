@@ -150,6 +150,18 @@ def gen_client_name(instance_id: int, rank: int) -> str:
     return f"{NIXL_GEN_CLIENT_PREFIX}_I{instance_id}_R{rank}"
 
 
+def gen_client_instance(client_name: str) -> int:
+    """
+    Return the instance id encoded in a gen client name made by `gen_client_name`.
+
+    Args:
+        client_name (str): Gen client name, e.g. 'NIXLGenClient_I1_R0'.
+    """
+    prefix = f"{NIXL_GEN_CLIENT_PREFIX}_I"
+    assert client_name.startswith(prefix), f"{client_name!r} is not a gen client name."
+    return int(client_name[len(prefix) :].split("_R", 1)[0])
+
+
 def train_client_name(rank: int) -> str:
     """
     Return the NIXL client name for a train (actor) worker.

@@ -125,6 +125,17 @@ def resolve_train_model_dtype(config: DictConfig) -> str:
     return engine_cfg.get("model_dtype", "fp32")
 
 
+def _resolve_publish_cast(config: DictConfig) -> None:
+    """
+    Record which dtype the trainer stores and which the rollout loads, so the train side publishes a cast.
+
+    Written into the config so the cast a run used is visible in its dump.
+    """
+    nixl = config.psrl.nixl
+    nixl.publish_train_dtype = resolve_train_model_dtype(config)
+    nixl.publish_rollout_dtype = str(config.gen_actor_rollout_ref.rollout.dtype)
+
+
 def _validate_nixl_offload_flags(config: DictConfig) -> None:
     """Reject both FSDP2 parameter-offload switches (design doc 3.9.3c).
 
@@ -207,47 +218,6 @@ def _resolve_version_barrier(config: DictConfig) -> None:
         train_dtype="cast" if quantized else train_dtype,
         rollout_dtype=train_dtype,
         colocate=bool(config.psrl.colocate_validate_and_train),
-    )
-
-
-def _validate_nixl_peer_diffusion(config: DictConfig) -> None:
-    """Refuse peer diffusion without readable shards.
-
-    A designate serves its same-node followers by being *read from*, which requires its
-    shards to keep a permanent remote descriptor. A staged shard has none --
-    `client_read` rejects it with "Remote descriptor must be contiguous for client read"
-    -- so the two settings are a matched pair rather than independent knobs.
-
-    Checked here because the failure otherwise lands mid-transfer, on a follower, naming
-    a descriptor rather than the configuration that removed it.
-    """
-    nixl = config.psrl.get("nixl", {})
-    diffusion = bool(nixl.get("peer_diffusion", True))
-    readable = bool(nixl.get("shards_must_be_readable", True))
-
-    if diffusion:
-        # One advisory, next to the only function that is about these two knobs, rather
-        # than in the mode block where a caller validating the pair would not see it.
-        #
-        # Not refused: a deployment with spare NIC headroom and few same-node peers may
-        # still prefer diffusion. But the numbers belong in the message -- a warning
-        # without them reads as boilerplate, and the reader cannot tell whether it
-        # matters.
-        import logging
-
-        logging.getLogger("psrl").warning(
-            "peer_diffusion=True: measured 1.25-1.69s per rollout pull under direct "
-            "supply against 0.66-0.90s with it disabled (and 1.14s for the PS path). "
-            "Diffusion saves cross-node bytes but forces the designate to register in "
-            "place at one descriptor per row. Set psrl.nixl.peer_diffusion=False and "
-            "psrl.nixl.shards_must_be_readable=False unless you have measured otherwise."
-        )
-
-    assert not (diffusion and not readable), (
-        "psrl.nixl.peer_diffusion=True requires shards_must_be_readable=True: a "
-        "diffusion designate has to be readable by its followers, and a staged shard "
-        "has no remote descriptor to read. Set peer_diffusion=False to allow staging, "
-        "or shards_must_be_readable=True to allow diffusion."
     )
 
 
@@ -483,8 +453,8 @@ def validate_config(
         )
         _validate_nixl_offload_flags(config)
         _validate_nixl_lora(config)
-        _validate_nixl_peer_diffusion(config)
         _resolve_version_barrier(config)
+        _resolve_publish_cast(config)
         assert not config.psrl.get("lmcache", {}).get("enable_p2p", False), (
             "psrl.lmcache.enable_p2p requires a PS to route through; it cannot be used "
             "with ps_mode=nixl_direct, where rollouts read train ranks directly"
@@ -519,7 +489,6 @@ def validate_config(
         )
         _validate_nixl_offload_flags(config)
         _validate_nixl_lora(config)
-        _validate_nixl_peer_diffusion(config)
         _resolve_version_barrier(config)
         print(f"NOTICE: NIXL is enabled. Actor strategy used is {config.train_actor_rollout_ref.actor.strategy}")
 

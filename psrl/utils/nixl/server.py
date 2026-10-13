@@ -33,10 +33,7 @@ class NIXLMetaServer:
         self.server_name = server_name
         self.server_ip = nixl_config.server_ip
         self.server_port = nixl_config.server_port
-        # Whether the planner may redirect duplicate reads onto same-node peers. Paired
-        # with the clients' `shards_must_be_readable`: diffusion needs readable shards,
-        # staging needs unreadable ones, so a deployment picks one. Defaults on, matching
-        # the planner's own default.
+        # Whether the planner groups same node rollouts that need identical shards.
         self._peer_diffusion = bool(getattr(nixl_config, "peer_diffusion", True))
         # How long each handshake phase waits for its clients.
         #
@@ -380,11 +377,6 @@ class NIXLMetaServer:
         psrl_logger.info("Making communication plan...")
         start = time.time()
         try:
-            # Peer diffusion and contiguous staging are mutually exclusive: a diffusion
-            # designate is read from, so its shards must stay addressable and cannot be
-            # staged. Both halves therefore read the same config, so a deployment cannot
-            # end up asking for diffusion while its rollouts have staged their shards --
-            # which fails at the first peer read rather than degrading.
             self.comm_plan = CommunicationPlanner(
                 peer_diffusion=self._peer_diffusion
             ).make_comm_plan(self.client_infos)
@@ -452,26 +444,11 @@ class NIXLMetaServer:
             if client_info.type in needed_types:
                 relevant.add(client_name)
 
-        # D1: a rollout that reads from a same-node peer needs that peer's descriptors,
-        # and a peer is a PULL_SIDE client -- a type the rules above never grant. Scoped
-        # to the peers the plan actually names, and only once a plan exists, so the
-        # fan-out grows by the handful of clients sharing a node rather than by every
-        # rollout in the cluster.
-        #
-        # Both directions are required, and they are not the same set. Data flows
-        # follower <- designate, but per-chunk completion signalling flows
-        # designate -> follower, so a designate must be able to address clients it never
-        # reads from. Granting only the read direction leaves the designate unable to
-        # notify its own followers, which fails as
-        # "Target client NIXLGenClient_... not found in client infos" on the *designate*
-        # -- a confusing place, since that client's own reads were all satisfiable.
+        # D1: a group member reads its designate and notifies its followers, so it needs every peer of its groups.
         if self.comm_plan is not None:
             for client_name in my_clients:
-                # Peers this client reads from (data direction).
-                for per_peer in self.comm_plan.peer_pull_plan.get(client_name, {}).values():
-                    relevant.update(per_peer)
-                # Clients that read from this one (notification direction).
-                relevant.update(self.comm_plan.followers_of(client_name))
+                for wanters in self.comm_plan.peer_groups.get(client_name, {}).values():
+                    relevant.update(wanters)
 
         # Broadcast initialization uses direct PS writes, so include every PS
         # descriptor in the existing info exchange.

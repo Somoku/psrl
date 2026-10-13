@@ -9,8 +9,6 @@ PUSH_SIDE to PS and PULL_SIDE from PS communication plans.
 import pickle
 from dataclasses import dataclass, field
 
-from psrl.utils.nixl.chunk_size import choose_chunk_bytes
-from psrl.utils.nixl.chunking import CommitGroup, plan_chunks
 from psrl.utils.nixl.global_vars import GLOBAL_TOPOLOGY
 from psrl.utils.nixl.nixl_spec import NIXLClientInfo, NIXLClientType
 
@@ -31,32 +29,10 @@ class NIXLCommPlan:
     # {pull_client: {key: {ps_client: [shard_indices]}}
     train_pull_from_ps_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]]
 
-    # Per-pull-client chunk plan (implementation item B1).
-    # {pull_client: (chunks, commit_groups)}
-    #
-    # `chunk` and `commit_group` are deliberately separate concepts (design 3.6.1): a
-    # chunk is a fixed byte budget and may split one key, while a commit group is what
-    # the engine loader requires atomically and may span several chunks. They are
-    # many-to-many, so collapsing them into one unit makes either the pipeline or
-    # version visibility wrong.
-    #
-    # Empty when no size information was available at planning time; consumers must
-    # treat an absent entry as "no chunking", not as an error.
-    pull_chunk_plan: dict[str, tuple[list, list]] = field(default_factory=dict)
-
-    # Reads redirected to a same-node peer (implementation item D1).
-    # {pull_client: {key: {peer_client: [shard_indices]}}}
-    #
-    # Only the *redirected* reads appear. A client absent here reads upstream exactly as
-    # `rollout_pull_from_ps_plan` says, so this is additive: a consumer that ignores it
-    # still transfers the right bytes, just more of them.
-    #
-    # The peer is always same-node and always the client that read upstream, never one
-    # that was itself redirected -- so there are no chains to unwind, and the depth is
-    # one by construction rather than by convention.
-    peer_pull_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]] = field(
-        default_factory=dict
-    )
+    # Same node diffusion groups (D1). {pull_client: {key: wanters}} where the wanters hold
+    # byte identical shards of `key` and are ordered by designate preference. For a set of
+    # participants the first participating wanter reads upstream and the rest read it.
+    peer_groups: dict[str, dict[str, tuple[str, ...]]] = field(default_factory=dict)
 
     def serialize(self):
         """Serialize communication plan"""
@@ -75,81 +51,9 @@ class NIXLCommPlan:
         """Get read plan for specific PULL_SIDE client and key"""
         return self.rollout_pull_from_ps_plan.get(pull_client, {}).get(key, {})
 
-    def get_peer_pull_plan(self, pull_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
-        """Shards of ``key`` this client should take from a same-node peer (item D1)."""
-        return self.peer_pull_plan.get(pull_client, {}).get(key, {})
-
-    def followers_of(self, designate: str) -> set[str]:
-        """Clients that peer-read from ``designate`` -- the inverse of the peer plan (D1).
-
-        The plan is addressed from the reader's side, because that is who has to act on
-        it. Per-chunk completion signalling needs the opposite direction: a designate must
-        know whom to notify once a chunk has landed. Deriving it here rather than at the
-        call site keeps the one source of truth; a caller that rebuilt it from its own
-        view would be guessing about clients it never reads from.
-
-        Returns the empty set for a client nobody follows, which is the common case and
-        the reason publishing costs nothing for most clients.
-        """
-        return {
-            follower
-            for follower, per_key in self.peer_pull_plan.items()
-            for per_peer in per_key.values()
-            if designate in per_peer
-        }
-
-    def followers_by_chunk(self, designate: str, chunks: "list") -> dict[int, set[str]]:
-        """``{chunk: followers}`` for the followers that need each of ``designate``'s chunks.
-
-        Publishing every chunk to every follower would work but sends notifications that
-        no one waits on. More importantly the per-chunk set is what a *test* can check
-        against the schedule: if a chunk's follower set is empty, no follower is waiting
-        on it, and a publish there is a sign the schedule and the plan disagree.
-        """
-        wanted: dict[tuple[str, tuple[int, ...]], set[str]] = {}
-        for follower, per_key in self.peer_pull_plan.items():
-            for key, per_peer in per_key.items():
-                for shard in per_peer.get(designate, []):
-                    wanted.setdefault((key, shard), set()).add(follower)
-
-        by_chunk: dict[int, set[str]] = {}
-        for chunk in chunks:
-            for piece in chunk.pieces:
-                followers = wanted.get(piece.shard)
-                if followers:
-                    by_chunk.setdefault(chunk.index, set()).update(followers)
-        return by_chunk
-
-    def iter_rollout_pull_work(self, pull_client: str):
-        """Yield ``(key, source_client)`` pairs this client is actually scheduled to read.
-
-        The plan already records which source serves each key, so a caller can iterate
-        the work instead of probing every (key, source) combination and discarding the
-        empty ones (item D1).
-
-        That distinction is cosmetic against a PS -- a handful of PS workers each hold
-        every key -- and decisive under direct supply, where the sources are train ranks.
-        Measured on the 5-node config: 399 keys x 24 train ranks is 9,576 probes, against
-        the 399 reads the plan actually calls for.
-
-        Upstream reads come first, then peer reads. The order is what makes a single pass
-        correct: a peer only has the bytes once it has read them itself, so issuing the
-        peer reads first would read a buffer that is still empty -- and silently, since
-        the registration is valid and the transfer succeeds.
-
-        Upstream reads are yielded in full, never trimmed by what the peer plan covers.
-        A caller that cannot guarantee the peers have already read -- which needs a
-        barrier across rollout actors -- must be able to skip the peer reads and still be
-        correct. Trimming would turn them into a required step and lose those shards
-        silently. `peer_sources_for` lets a caller tell the two apart.
-        """
-        for key, per_source in self.rollout_pull_from_ps_plan.get(pull_client, {}).items():
-            for source_client in per_source:
-                yield key, source_client
-
-        for key, per_peer in self.peer_pull_plan.get(pull_client, {}).items():
-            for peer_client in per_peer:
-                yield key, peer_client
+    def get_peer_group(self, pull_client: str, key: str) -> tuple[str, ...]:
+        """Wanters of `key` on `pull_client`'s node in designate order, empty if it has no peers."""
+        return self.peer_groups.get(pull_client, {}).get(key, ())
 
     def get_train_pull_plan(self, pull_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
         """Get read plan for specific PUSH_SIDE client and key"""
@@ -171,15 +75,6 @@ class NIXLCommPlan:
                 result[pull_client] = key_plans[key][ps_client]
         return result
 
-    def get_pull_chunks(self, pull_client: str) -> tuple[list, list]:
-        """Chunks and commit groups this pull client should transfer, in order.
-
-        Returns empty lists when the client has no chunk plan -- the planner had no size
-        metadata for it. Callers fall back to per-key transfers, which is the behaviour
-        that predates B1.
-        """
-        return self.pull_chunk_plan.get(pull_client, ([], []))
-
     def get_train_ps_read_plan(self, ps_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
         """Get read plan for specific PS client and key (sending to PUSH_SIDE)"""
         result = {}
@@ -192,33 +87,14 @@ class NIXLCommPlan:
 class CommunicationPlanner:
     """Intelligent communication planning with load balancing"""
 
-    #: Default chunk budget. 512MB is the design's recommendation for a 170 GB/s node
-    #: (3.5.6): large enough that `check_xfer_state` polling is a small fraction of the
-    #: per-chunk transfer time, small enough to leave the pipeline several rounds.
-    #: B3 replaces this constant with the cost model.
-    DEFAULT_CHUNK_BYTES = 512 * 1024 * 1024
-
     def __init__(
         self,
         restrict_client_group_comm: bool = False,
-        chunk_bytes: int | None = None,
         peer_diffusion: bool = True,
     ):
         """Initialize the communication planner"""
         # NOTE(lhy): Restrict communication to matching client groups when enabled.
         self.restrict_client_group_comm = restrict_client_group_comm
-        # None means "ask the cost model per client" (B3). A value pins every client
-        # to that budget, which is what the chunk-size sweep needs.
-        self.chunk_bytes = chunk_bytes
-        # Peer diffusion trades NIC bytes for descriptors, and whether that is a win
-        # depends on the rollout's shard layout rather than on the topology. It pays off
-        # when a rollout's shards are contiguous (one descriptor per peer read) and loses
-        # when they are strided -- a designate must stay readable, so it cannot stage, and
-        # it then pays one descriptor per row. Measured on 5 nodes with Qwen3-8B, where
-        # gen registers 144 strided shards at 4096 rows each: 1.42-1.93x *slower* than no
-        # diffusion. Left on by default because the plan-level reduction is real (61% of
-        # reads move to NVLink) and the regression is specific to strided layouts; set
-        # False to measure or to run the configuration that is currently faster.
         self.peer_diffusion = peer_diffusion
 
     def make_comm_plan(self, clients: dict[str, NIXLClientInfo]) -> NIXLCommPlan:
@@ -309,216 +185,56 @@ class CommunicationPlanner:
         # D1: collapse duplicate reads of the same bytes into one upstream read plus
         # same-node peer reads. Done after the plan is built, because it rewrites which
         # source serves whom rather than which shards anyone needs.
-        peer_pull_plan = self._make_peer_diffusion_plan(clients, rollout_pull_from_ps_plan)
-
-        # B1: chunk plan for the rollout pull side, where the pipeline and the wire
-        # buffer live. The push side writes whole shards into PS buffers and has no
-        # chunk pipeline, so planning chunks for it would be dead metadata.
-        pull_chunk_plan = self._build_pull_chunk_plan(
-            clients, rollout_pull_from_ps_plan, self.chunk_bytes
-        )
+        peer_groups = self._make_peer_groups(clients, rollout_pull_from_ps_plan)
 
         return NIXLCommPlan(
             push_to_ps_plan=push_to_ps_plan,
             rollout_pull_from_ps_plan=rollout_pull_from_ps_plan,
             train_pull_from_ps_plan=train_pull_from_ps_plan,
-            pull_chunk_plan=pull_chunk_plan,
-            peer_pull_plan=peer_pull_plan,
+            peer_groups=peer_groups,
         )
 
-    def _make_peer_diffusion_plan(
+    def _make_peer_groups(
         self,
         clients: dict[str, NIXLClientInfo],
         pull_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]],
-    ) -> dict[str, dict[str, dict[str, list[tuple[int, ...]]]]]:
-        """Designate one reader per node for each shard, and route the rest to it (D1).
-
-        Parallelism makes rollout clients on a node want byte-identical shards: with
-        gen TP=2 and 8 clients per node, ``tp_rank = rank % 2`` gives four clients the
-        same tp_rank and therefore the same bytes. Every one of them reading upstream is
-        the ``N x M`` duplication this item exists to remove -- one reads upstream and
-        the others take it over NVLink.
-
-        Returns only the *redirected* reads, keyed by the client that should now read
-        from a peer. A client absent from the result reads upstream unchanged, so the
-        structure is additive and a consumer that ignores it still behaves correctly.
-
-        Two rules the correctness rests on:
-
-        * **Same node only.** A cross-node peer read costs the same NIC as reading
-          upstream, so it buys nothing in the currency that is scarce (design 3.5.2's
-          phase one).
-        * **Single hop.** The designated reader is always the one that read upstream,
-          never one that was itself redirected, so no chain forms. Picking the
-          lowest-named wanter deterministically is what guarantees this: the designated
-          reader is never in the redirected set.
-
-        **Descriptor cost does not enter this decision, and the reason is worth stating
-        because the opposite was tried and measured.** `postXferReq` costs per descriptor
-        (~3.5-4us; see `_peer_read_is_worth_it`), and a strided shard expands to one
-        descriptor per row, so a peer read of such a shard is expensive. But it is
-        *equally* expensive upstream -- the expansion is a property of the shard's layout,
-        not of the link -- so excluding strided shards from diffusion does not remove the
-        cost, it only gives up the NIC saving. Measured: gating them out moved the cost
-        from `post_peer` to `post_up` and made the total **worse** (1.93x -> 2.25x).
+    ) -> dict[str, dict[str, tuple[str, ...]]]:
         """
-        node_of = {name: info.node_ip for name, info in clients.items()}
+        Group same node pull clients that need byte identical shards of a key (D1).
+
+        Peers read each other's whole local tensors, so a group is keyed by the exact shard
+        set. The designate order spreads upstream bytes evenly over the group, which spreads
+        NIC ingress over every instance on the node instead of one instance's NICs.
+        """
         if not self.peer_diffusion:
             return {}
-
-        # (node, key, shard) -> clients on that node wanting exactly those bytes.
-        wanted: dict[tuple[str, str, tuple[int, ...]], list[str]] = {}
-        # (client, key, shard) -> the upstream source the plan chose, for the designate.
-        upstream_of: dict[tuple[str, str, tuple[int, ...]], str] = {}
-
-        for pull_client, key_plans in pull_plan.items():
-            node = node_of.get(pull_client)
-            if node is None:
-                continue
-            for key, per_source in key_plans.items():
-                for source, shard_indices in per_source.items():
-                    for shard_idx in shard_indices:
-                        wanted.setdefault((node, key, shard_idx), []).append(pull_client)
-                        upstream_of[(pull_client, key, shard_idx)] = source
-
-        peer_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]] = {}
-        for (_node, key, shard_idx), wanters in wanted.items():
-            if len(wanters) < 2:
-                continue
-            # Deterministic so the index can predict holders without communicating, and
-            # so the designate is stable across replans.
-            designate, *followers = sorted(wanters)
-            for follower in followers:
-                peer_plan.setdefault(follower, {}).setdefault(key, {}).setdefault(
-                    designate, []
-                ).append(shard_idx)
-
-        for key_plans in peer_plan.values():
-            for per_source in key_plans.values():
-                for shard_list in per_source.values():
-                    shard_list.sort()
-        return peer_plan
-
-    @staticmethod
-    def _peer_read_is_worth_it(
-        clients: dict[str, NIXLClientInfo],
-        designate: str,
-        key: str,
-        shard_idx: tuple[int, ...],
-    ) -> bool:
-        """Whether this shard is contiguous on the designate's side.
-
-        **Not currently used to gate diffusion**, and kept because the measurement behind
-        it is the one that explains the pull's cost.
-
-        `postXferReq` costs per *descriptor*, not per call. Sweeping descriptor count at a
-        fixed 2 GiB payload (`bench_cross_node_bw.py --tensors`) gave 0.026ms at one
-        descriptor against 16.942ms at 4096 -- a flat ~3.5-4us each -- with bandwidth
-        falling from 354 GB/s to 114 GB/s. A non-contiguous shard registers as a strided
-        range and expands to one descriptor per row (item A2), so the cluster arithmetic
-        closed exactly: 399 peer reads x 4096 descriptors x 2.1us = 3.43s, against a
-        measured `post_peer` of 3.426s and `wait_peer` of 0.008s.
-
-        **But gating diffusion on it made things worse (1.93x -> 2.25x), because the
-        expansion is a property of the layout rather than the link.** A strided shard pays
-        4096 descriptors whether it is read from a peer or from upstream; refusing to
-        diffuse it simply moved the cost from `post_peer` to `post_up` and discarded the
-        NIC saving. The lever is *fewer descriptors* -- i.e. making the shard contiguous
-        before registering it -- not *which link* pays for them.
-
-        Returns True when the layout is unknown, which keeps any future caller from
-        silently disabling diffusion on incomplete metadata.
-        """
-        info = clients.get(designate)
-        if info is None or key not in info.tensor_infos:
-            return True
-        tensor_info = info.tensor_infos[key]
-        sharding = tensor_info.sharding
-        try:
-            position = sharding.shard_indices.index(shard_idx)
-        except ValueError:
-            return True
-        metas = tensor_info.shard_meta_infos
-        if position >= len(metas):
-            return True
-        meta = metas[position]
-        if meta is None:
-            return True
-        return bool(getattr(meta, "is_contiguous", True))
-
-    def _build_pull_chunk_plan(
-        self,
-        clients: dict[str, NIXLClientInfo],
-        pull_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]],
-        chunk_bytes: int | None,
-    ) -> dict[str, tuple[list, list]]:
-        """Derive each pull client's chunk plan from what it is scheduled to read.
-
-        One commit group per key: that is the granularity the engine loader requires
-        atomically (weight and its scale, a fused QKV). Chunks are then cut across those
-        groups by byte budget, so a key larger than the budget spans several chunks and
-        several small keys share one -- the many-to-many relationship B1 exists to
-        express.
-
-        Sizes come from the *reader's* own metadata rather than the sender's: that is
-        what the reader will actually land, and it is the side whose buffer the chunk
-        budget is protecting. A key the reader has no metadata for is skipped rather
-        than guessed at, since a wrong size silently mis-cuts every later chunk.
-        """
-        chunk_plan: dict[str, tuple[list, list]] = {}
-
+        node_of = {name: info.node_ip for name, info in clients.items()}
+        wanted: dict[tuple[str, str, tuple[tuple[int, ...], ...]], list[str]] = {}
+        key_bytes: dict[tuple[str, str], int] = {}
         for pull_client, key_plans in pull_plan.items():
             info = clients.get(pull_client)
             if info is None:
                 continue
+            for key, per_source in key_plans.items():
+                shards = tuple(sorted(shard for shard_list in per_source.values() for shard in shard_list))
+                wanted.setdefault((node_of[pull_client], key, shards), []).append(pull_client)
+                tensor_info = info.tensor_infos[key]
+                positions = {s: i for i, s in enumerate(tensor_info.sharding.shard_indices)}
+                key_bytes[(pull_client, key)] = sum(tensor_info.get_shard_size_bytes(positions[s]) for s in shards)
 
-            groups: list[CommitGroup] = []
-            shard_bytes: dict[tuple[str, tuple[int, ...]], int] = {}
-
-            for key in sorted(key_plans):
-                tensor_info = info.tensor_infos.get(key)
-                if tensor_info is None:
-                    continue
-                shard_positions = {s: i for i, s in enumerate(tensor_info.sharding.shard_indices)}
-
-                shards: list[tuple[str, tuple[int, ...]]] = []
-                for shard_indices in key_plans[key].values():
-                    for shard_idx in shard_indices:
-                        local_pos = shard_positions.get(shard_idx)
-                        if local_pos is None:
-                            continue
-                        ref = (key, shard_idx)
-                        if ref in shard_bytes:
-                            continue
-                        shard_bytes[ref] = tensor_info.get_shard_size_bytes(local_pos)
-                        shards.append(ref)
-
-                if shards:
-                    groups.append(CommitGroup(name=key, shards=tuple(shards)))
-
-            if not groups:
+        upstream_load: dict[str, int] = {}
+        groups: dict[str, dict[str, tuple[str, ...]]] = {}
+        # Largest keys first so the greedy balance has small keys left to even out the tail.
+        for (_node, key, _shards), wanters in sorted(
+            wanted.items(), key=lambda item: (-key_bytes[(item[1][0], item[0][1])], item[0][1], item[0][0])
+        ):
+            if len(wanters) < 2:
                 continue
-
-            # B3: size the chunk from this client's actual payload rather than a
-            # constant. The cost model balances two opposing pressures -- enough rounds
-            # that format cost hides behind RDMA, chunks large enough that completion
-            # polling is not most of the per-chunk time -- and both depend on how many
-            # bytes and keys this particular reader has. A fixed budget is wrong in both
-            # directions as the model or the parallelism changes.
-            #
-            # An explicit chunk_bytes still wins: tests and the chunk-size sweep
-            # (verification item 15b) need to pin it.
-            effective = chunk_bytes
-            if effective is None:
-                total_bytes = sum(shard_bytes.values())
-                effective = choose_chunk_bytes(
-                    model_bytes=total_bytes, n_grouped_keys=len(groups)
-                ).chunk_bytes
-
-            chunks, resolved = plan_chunks(groups, shard_bytes, chunk_bytes=effective)
-            chunk_plan[pull_client] = (chunks, resolved)
-
-        return chunk_plan
+            ordered = tuple(sorted(wanters, key=lambda client: (upstream_load.get(client, 0), client)))
+            upstream_load[ordered[0]] = upstream_load.get(ordered[0], 0) + key_bytes[(ordered[0], key)]
+            for client in ordered:
+                groups.setdefault(client, {})[key] = ordered
+        return groups
 
     def _make_push_to_ps_plan(
         self,

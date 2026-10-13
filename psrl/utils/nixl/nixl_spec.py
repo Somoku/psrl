@@ -1,7 +1,7 @@
 import pickle
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 
@@ -506,6 +506,13 @@ class NIXLTensorInfo:
     temp_desc_bytes_list: list[bytes]  # Descriptors for temp tensor of non-contiguous shards
     sharding: NIXLSharding  # Sharding information
     shard_meta_infos: list[NIXLShardMetaInfo]  # Metadata for each shard
+    # Where a reader finds each shard's bytes and their element strides. None marks a shard no one may read.
+    read_addrs: list[int | None] = field(default_factory=list)
+    read_strides: list[tuple[int, ...] | None] = field(default_factory=list)
+    # Base of the registered allocation holding each shard's readable bytes. A descriptor may not cross one.
+    read_bases: list[int | None] = field(default_factory=list)
+    mem_type: str = "cuda"
+    device_id: int = 0
 
     def __repr__(self):
         # Only show the type and length of desc_bytes_list
@@ -581,6 +588,8 @@ class NIXLClientInfo:
     meta: bytes  # agent metadata
     client_group_id: int = -1  # -1 is the default client group
     is_registered: bool = False
+    # Name of the NIXL agent that serves this client, which several clients may share.
+    agent_name: str = ""
 
     def get_tensor_info(self, key):
         """Get tensor descriptor info for specific key"""

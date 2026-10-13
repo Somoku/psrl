@@ -63,7 +63,6 @@ nixl:
   enable_tms_for_temp_buffers: False
   # The recommended direct-supply pair: rollouts are pure destinations, so strided
   # shards stage into one descriptor each instead of one per row.
-  shards_must_be_readable: False
   peer_diffusion: False
 
 ps:

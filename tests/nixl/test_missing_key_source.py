@@ -73,9 +73,3 @@ class TestCallersTreatEmptyAsSkip:
 
         harness = (Path(tests_pkg.__file__).parent / "test_nixl_e2e.py").read_text()
         assert "if len(shards_to_transfer) > 0:" in harness
-
-    def test_the_production_pull_skips_empty_shard_lists(self):
-        import psrl.workers.gen as gen_pkg
-
-        extension = (Path(gen_pkg.__file__).parent / "vllm_extension.py").read_text()
-        assert "if len(shards_to_transfer) > 0:" in extension

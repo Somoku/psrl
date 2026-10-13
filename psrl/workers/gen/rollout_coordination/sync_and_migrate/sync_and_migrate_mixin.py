@@ -169,8 +169,11 @@ class SyncAndMigrateMixin:
                 ):
                     await self._wait_interrupted_partial_requests_loop_back(instance_ids)
 
+                epoch, participants = self._sync_round(replica_ids)
                 pull_futures = [
-                    self.server_handles[replica_id].pull_model_for_sync.remote(self.ps_model_version)
+                    self.server_handles[replica_id].pull_model_for_sync.remote(
+                        self.ps_model_version, epoch, participants
+                    )
                     for replica_id in replica_ids
                 ]
                 # D6: the version is published once the pull has landed, not before it.

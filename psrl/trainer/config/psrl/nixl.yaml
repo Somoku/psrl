@@ -32,29 +32,26 @@ enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
 # fails on its own, not by waiting longer.
 handshake_timeout_s: 1800
 
-# Whether a rollout's shards must stay addressable by other clients.
-#
-# Declared here rather than left to a `getattr` default, because the two settings below
-# are a matched pair and an undeclared default makes the pairing invisible: a reader of
-# this file could not tell that turning one on requires the other.
-#
-# True keeps every shard registered in place, which is what lets a same-node peer read
-# from this client (peer diffusion). False allows a strided shard to be staged instead --
-# one descriptor plus a local copy rather than one descriptor per row -- but then nothing
-# may read from it, because a staged shard has no permanent remote descriptor.
-#
-# `postXferReq` costs ~2.1us per descriptor, and a 4096-row strided shard needs one per
-# row, so the in-place path measured 3.43s where staging would be ~1.6ms. The two
-# therefore cannot both be had: see `strided_is_cheaper_than_staging`.
-shards_must_be_readable: True
-
-# Whether the planner may redirect duplicate reads onto a same-node peer.
-#
-# Requires `shards_must_be_readable: True` -- a designate that cannot be read from cannot
-# serve its followers. Measured on this cluster, diffusion was a net loss at the current
-# shard layout (2.93s against 2.59s without it), because it forces the designate onto the
-# per-row descriptor path to save NIC bytes that were not the bottleneck.
+# Whether same node rollouts with identical shards share one upstream read per key and
+# read the rest from each other over NVLink. Cuts trainer egress to one copy per node.
 peer_diffusion: True
+
+# Bytes of the rollout side staging pool, split into two alternating slots. Shards whose
+# local layout is fragmented are read into it and scattered locally.
+pull_staging_bytes: 268435456
+
+# How long a rollout waits for its designate before reading that designate's keys upstream.
+peer_timeout_s: 120
+
+# MiB a train rank may spend on contiguous copies of shards that rollouts cut finer than it does.
+# Each copy turns a read of one descriptor per row into one descriptor. Past the budget rollouts
+# span read the shard instead, which moves more bytes. null is unbounded.
+publish_copy_budget_mb: null
+
+# Resolved by `validate_config` under direct supply: the dtype the trainer stores and the one
+# the rollout loads. When they differ the trainer publishes contiguous copies cast to the latter.
+publish_train_dtype: null
+publish_rollout_dtype: null
 
 # Whether publishing waits for readers of the previous version to drain (item E1).
 #

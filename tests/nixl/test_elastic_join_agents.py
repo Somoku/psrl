@@ -53,7 +53,6 @@ def _config(port: int):
             "server_port": port,
             "max_pinned_temp_memory_slots": None,
             "enable_tms_for_temp_buffers": False,
-            "shards_must_be_readable": True,
             "peer_diffusion": False,
             "handshake_timeout_s": 60,
         }

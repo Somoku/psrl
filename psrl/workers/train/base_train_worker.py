@@ -327,6 +327,10 @@ class PSRL_BaseTrainWorker:
         """
         self.param_sync_plan.before_push(self.unified_state_dict)
 
+        assert dist.is_initialized(), "Pytorch distributed is not initialized."
+        # The representative rank enters holding the exclusive push lock, so after this barrier
+        # no rollout is reading and publish copies may be refreshed on every rank.
+        dist.barrier()
         # Stamp before the barrier, so that by the time rank 0 announces the version
         # every rank's shards already carry it. Stamping after would leave a window in
         # which a reader is told v is readable while some rank still reports v-1.
@@ -339,8 +343,6 @@ class PSRL_BaseTrainWorker:
             + 1
         )
         self.nixl_storage_client.publish_version(next_version)
-
-        assert dist.is_initialized(), "Pytorch distributed is not initialized."
         dist.barrier()
 
         if self.worker_rank == 0:

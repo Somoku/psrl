@@ -96,7 +96,6 @@ nixl:
   enable_tms_for_temp_buffers: False
   # Rollouts are pure destinations here as well, so a row-parallel shard may be staged
   # contiguously instead of registering one descriptor per row.
-  shards_must_be_readable: False
   # Diffusion needs readable shards, which staging precludes; and with train and gen on
   # the same card there is no NIC hop to save in the first place.
   peer_diffusion: False

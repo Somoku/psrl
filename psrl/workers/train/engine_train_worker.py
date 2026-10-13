@@ -19,6 +19,7 @@ from verl.utils.device import get_device_id, is_cuda_available
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.fs import copy_to_local
 from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.config import DistillationConfig, TrainingWorkerConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
@@ -246,6 +247,12 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         psrl_logger.info("nixl client protocol step 3: wait_for_server_sharding")
         unified_sharding_dict = self.nixl_storage_client.wait_for_server_sharding()
         psrl_logger.info("nixl client protocol step 4: register_local_tensors")
+        nixl_config = self.psrl_config.nixl
+        if nixl_config.get("publish_rollout_dtype") is not None:
+            self.nixl_storage_client.set_publish_cast(
+                PrecisionType.to_dtype(nixl_config.publish_train_dtype),
+                PrecisionType.to_dtype(nixl_config.publish_rollout_dtype),
+            )
         self.nixl_storage_client.register_local_tensors(
             self.unified_state_dict, unified_sharding_dict, meta_only=meta_only
         )

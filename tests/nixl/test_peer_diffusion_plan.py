@@ -1,13 +1,8 @@
-"""Collapsing duplicate reads onto same-node peers (implementation item D1).
+"""Same node diffusion groups (implementation item D1).
 
-Parallelism makes rollout clients on one node want byte-identical shards: with gen TP=2
-and 8 clients per node, `tp_rank = rank % 2` gives four clients the same tp_rank, so
-four of them read the same bytes from upstream. That fourfold duplication is the `N x M`
-this item exists to remove -- one client reads upstream, the other three take it over
-NVLink.
-
-The tests measure upstream read counts rather than checking that a peer plan exists,
-because a plan that redirected nothing would also "exist".
+Rollout clients on one node with the same parallel rank hold byte identical shards. The
+planner groups them per key so that one member reads upstream and the rest read it over
+NVLink. These tests pin the group invariants the pull engine relies on.
 """
 
 from __future__ import annotations
@@ -70,630 +65,69 @@ def _cluster(nodes: int, per_node: int, tp: int):
     return clients
 
 
-def _upstream_reads(plan, clients) -> int:
-    """Upstream reads a diffusion-capable caller would issue.
-
-    Counted as "upstream reads the plan does not cover by a peer", not as everything
-    `iter_rollout_pull_work` yields. The iterator deliberately keeps the upstream read
-    whole so a caller lacking a barrier can skip peer reads and stay correct, so the
-    saving does not show up there -- it shows up in what a caller *with* a barrier is
-    allowed to drop.
-    """
-    total = 0
+def _designates(plan, clients, participants=None) -> dict[str, int]:
+    """Upstream key count per client when everyone in `participants` pulls."""
+    counts: dict[str, int] = {}
     for name, info in clients.items():
         if info.type is not NIXLClientType.PULL_SIDE:
             continue
         for key in KEYS:
-            covered_by_peer = {
-                shard
-                for shard_list in plan.get_peer_pull_plan(name, key).values()
-                for shard in shard_list
-            }
-            for shard_list in plan.get_rollout_pull_plan(name, key).values():
-                total += sum(1 for shard in shard_list if shard not in covered_by_peer)
-    return total
+            group = [w for w in plan.get_peer_group(name, key) if participants is None or w in participants]
+            if not group or group[0] == name:
+                counts[name] = counts.get(name, 0) + 1
+    return counts
 
 
-def _peer_reads(plan, clients) -> int:
-    return sum(
-        len(shard_list)
-        for key_plans in plan.peer_pull_plan.values()
-        for per_peer in key_plans.values()
-        for shard_list in per_peer.values()
-    )
-
-
-class TestDuplicationIsRemoved:
-    def test_one_upstream_read_per_node_per_tp_rank(self):
-        """The measurable claim: 8 clients per node, TP=2 -> 2 upstream reads, not 8."""
+class TestGroups:
+    def test_members_share_node_and_bytes(self):
         clients = _cluster(nodes=2, per_node=8, tp=2)
         plan = CommunicationPlanner().make_comm_plan(clients)
+        for name, per_key in plan.peer_groups.items():
+            for key, wanters in per_key.items():
+                assert name in wanters and len(wanters) == len(set(wanters)) >= 2
+                assert len({clients[w].node_ip for w in wanters}) == 1
+                assert len({tuple(clients[w].tensor_infos[key].sharding.shard_indices) for w in wanters}) == 1
 
-        upstream = _upstream_reads(plan, clients)
-        expected = 2 * 2 * len(KEYS)  # nodes x tp_ranks x keys
-        assert upstream == expected, (
-            f"{upstream} upstream reads; one per (node, tp_rank, key) would be {expected}"
-        )
-
-    def test_the_followers_read_from_a_peer(self):
-        clients = _cluster(nodes=1, per_node=4, tp=2)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        assert _peer_reads(plan, clients) > 0
-
-    def test_upstream_reads_stay_flat_as_clients_per_node_grow(self):
-        """Without diffusion this scales with client count; with it, it does not."""
-        counts = {}
-        for per_node in (2, 4, 8):
-            clients = _cluster(nodes=2, per_node=per_node, tp=2)
-            plan = CommunicationPlanner().make_comm_plan(clients)
-            counts[per_node] = _upstream_reads(plan, clients)
-
-        assert len(set(counts.values())) == 1, f"upstream reads moved with client count: {counts}"
-
-    def test_nothing_is_redirected_when_no_two_clients_share_bytes(self):
-        """TP == clients per node means every client wants a different shard."""
-        clients = _cluster(nodes=1, per_node=4, tp=4)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        assert plan.peer_pull_plan == {}
-        assert _peer_reads(plan, clients) == 0
-
-
-class TestNoChainsAndNoCrossNode:
-    def test_a_peer_is_always_on_the_same_node(self):
-        """A cross-node peer costs the same NIC as upstream, so it buys nothing."""
-        clients = _cluster(nodes=3, per_node=4, tp=2)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        for follower, key_plans in plan.peer_pull_plan.items():
-            for per_peer in key_plans.values():
-                for peer in per_peer:
-                    assert clients[peer].node_ip == clients[follower].node_ip, (
-                        f"{follower} was pointed at off-node peer {peer}"
-                    )
-
-    def test_a_designated_reader_is_never_itself_redirected(self):
-        """This is what makes the depth one by construction rather than by convention."""
+    def test_upstream_reads_are_one_per_node_per_rank(self):
         clients = _cluster(nodes=2, per_node=8, tp=2)
         plan = CommunicationPlanner().make_comm_plan(clients)
+        assert sum(_designates(plan, clients).values()) == 2 * 2 * len(KEYS)
 
-        designates = {
-            peer
-            for key_plans in plan.peer_pull_plan.values()
-            for per_peer in key_plans.values()
-            for peer in per_peer
-        }
-        redirected = set(plan.peer_pull_plan)
+    @pytest.mark.parametrize("per_node", [2, 4, 8])
+    def test_upstream_reads_stay_flat_as_clients_per_node_grow(self, per_node):
+        clients = _cluster(nodes=1, per_node=per_node, tp=2)
+        plan = CommunicationPlanner().make_comm_plan(clients)
+        assert sum(_designates(plan, clients).values()) == 2 * len(KEYS)
 
-        assert designates.isdisjoint(redirected), (
-            f"these clients both serve and are served, forming a chain: "
-            f"{sorted(designates & redirected)}"
-        )
+    def test_designates_are_spread_over_members(self):
+        clients = _cluster(nodes=1, per_node=4, tp=1)
+        plan = CommunicationPlanner().make_comm_plan(clients)
+        assert len(_designates(plan, clients)) == len(KEYS)
 
-    def test_a_client_never_reads_from_itself(self):
+    def test_a_subset_still_has_exactly_one_designate_per_group(self):
+        clients = _cluster(nodes=1, per_node=8, tp=2)
+        plan = CommunicationPlanner().make_comm_plan(clients)
+        subset = {"gen1", "gen2", "gen5"}
+        counts = _designates(plan, clients, subset)
+        assert sum(counts[n] for n in subset) == 2 * len(KEYS)
+
+    def test_nothing_is_grouped_without_duplication(self):
+        clients = _cluster(nodes=2, per_node=2, tp=2)
+        assert CommunicationPlanner().make_comm_plan(clients).peer_groups == {}
+
+    def test_disabled_means_no_groups(self):
+        clients = _cluster(nodes=1, per_node=8, tp=2)
+        assert CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients).peer_groups == {}
+
+    def test_the_plan_is_deterministic_and_survives_serialisation(self):
         clients = _cluster(nodes=2, per_node=8, tp=2)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        for follower, key_plans in plan.peer_pull_plan.items():
-            for per_peer in key_plans.values():
-                assert follower not in per_peer
-
-
-class TestEveryByteStillArrives:
-    def test_each_client_still_covers_all_its_shards(self):
-        """Redirection must move a read, never drop it."""
-        clients = _cluster(nodes=2, per_node=8, tp=2)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        for name, info in clients.items():
-            if info.type is not NIXLClientType.PULL_SIDE:
-                continue
-            for key in KEYS:
-                wanted = set(info.tensor_infos[key].sharding.shard_indices)
-                upstream = {
-                    shard
-                    for shard_list in plan.get_rollout_pull_plan(name, key).values()
-                    for shard in shard_list
-                }
-                via_peer = {
-                    shard
-                    for shard_list in plan.get_peer_pull_plan(name, key).values()
-                    for shard in shard_list
-                }
-                assert wanted <= (upstream | via_peer), (
-                    f"{name} {key}: missing {sorted(wanted - (upstream | via_peer))}"
-                )
-
-    def test_the_upstream_read_alone_is_sufficient(self):
-        """A caller that skips every peer read must still land all its bytes.
-
-        Peer reads need a barrier -- a peer only holds the bytes after its own upstream
-        read finishes, and reading early succeeds against an unfilled buffer rather than
-        failing. So a caller without that barrier has to be able to skip them, which
-        means the upstream plan must remain complete on its own. Trimming it to what the
-        peer plan covers would make the peer read mandatory and lose those shards in
-        silence.
-        """
-        clients = _cluster(nodes=2, per_node=8, tp=2)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        for name, info in clients.items():
-            if info.type is not NIXLClientType.PULL_SIDE:
-                continue
-            for key in KEYS:
-                wanted = set(info.tensor_infos[key].sharding.shard_indices)
-                upstream = {
-                    shard
-                    for shard_list in plan.get_rollout_pull_plan(name, key).values()
-                    for shard in shard_list
-                }
-                assert wanted <= upstream, (
-                    f"{name} {key}: upstream alone misses {sorted(wanted - upstream)}, "
-                    "so skipping peer reads would silently lose bytes"
-                )
-
-    def test_peer_reads_are_distinguishable_from_upstream(self):
-        """A caller must be able to defer exactly the peer reads and nothing else."""
-        clients = _cluster(nodes=1, per_node=4, tp=2)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        for name, info in clients.items():
-            if info.type is not NIXLClientType.PULL_SIDE:
-                continue
-            for key in KEYS:
-                peers = set(plan.get_peer_pull_plan(name, key))
-                upstream = set(plan.get_rollout_pull_plan(name, key))
-                assert peers.isdisjoint(upstream), (
-                    f"{name} {key}: {sorted(peers & upstream)} is both peer and upstream, "
-                    "so a caller cannot tell which reads are safe to defer"
-                )
-
-
-class TestDeterminism:
-    def test_the_same_cluster_gives_the_same_designates(self):
-        """The index predicts holders without communicating, so this cannot vary."""
-        clients = _cluster(nodes=2, per_node=8, tp=2)
-        first = CommunicationPlanner().make_comm_plan(clients).peer_pull_plan
-        second = CommunicationPlanner().make_comm_plan(clients).peer_pull_plan
-
-        assert first == second
-
-
-class TestPSPathUnaffected:
-    def test_a_ps_cluster_also_benefits(self):
-        """The duplication is on the rollout side, so it exists with a PS too."""
-        clients = _cluster(nodes=1, per_node=4, tp=2)
-        clients["ps_pull"] = _client("ps_pull", NIXLClientType.PS_FOR_PULL, "10.0.9.1", 2, [0, 1])
-        clients["ps_push"] = _client("ps_push", NIXLClientType.PS_FOR_PUSH, "10.0.9.1", 2, [0, 1])
-
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        assert plan.peer_pull_plan, "same-node duplication exists regardless of the source"
-
-
-class TestSerialization:
-    def test_the_peer_plan_survives_the_round_trip(self):
-        from psrl.utils.nixl.comm_plan import NIXLCommPlan
-
-        clients = _cluster(nodes=2, per_node=4, tp=2)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-        restored = NIXLCommPlan.deserialize(plan.serialize())
-
-        assert restored.peer_pull_plan == plan.peer_pull_plan
-
-
-class TestTheHarnessPartitionsCorrectly:
-    """A measurement bug this file exists to prevent recurring.
-
-    The harness first filtered its work list to sources present in the train-client map,
-    then split off the peer reads. Peer sources are rollout clients, so they were already
-    gone -- and the run reported "0 peer reads deferred", which was a count of nothing
-    rather than evidence that diffusion had found no duplication. The planner was working
-    the whole time.
-
-    The lesson generalises: a zero in a diagnostic is only meaningful if the thing being
-    counted could have been non-zero at that point.
-    """
-
-    def test_peers_are_split_off_before_the_train_map_filter(self):
-        from pathlib import Path
-
-        import tests.nixl as tests_pkg
-
-        harness = (Path(tests_pkg.__file__).parent / "test_nixl_e2e.py").read_text()
-        start = harness.index("planned = list(self.client.iter_planned_pull_work())")
-        body = harness[start : start + 1800]
-
-        assert "work = list(planned)" in body, (
-            "the work list is narrowed before peers are split off, so the peer set is "
-            "computed from an already-filtered list"
-        )
-        # The ordering itself: peers are identified before the train-client filter runs.
-        assert body.index("peer_work = [") < body.index("src in agent_of"), (
-            "the train-client filter runs before peers are identified, so peer sources "
-            "-- which are rollout clients -- are gone before they can be counted"
-        )
-
-    def test_the_peer_check_is_per_key(self):
-        """A client can be a peer for one key and an upstream source for another."""
-        from pathlib import Path
-
-        import tests.nixl as tests_pkg
-
-        harness = (Path(tests_pkg.__file__).parent / "test_nixl_e2e.py").read_text()
-        assert "self.client.peer_sources_for(key)" in harness, (
-            "a cluster-wide peer-name set would misclassify a client that is a peer for "
-            "one key and an upstream source for another"
-        )
-
-
-class TestTwoPhaseExecution:
-    """The barrier that makes peer reads safe to issue (item D1).
-
-    A peer read against a peer that has not yet completed its own upstream read does not
-    fail -- the registration is valid and the transfer is well formed, so it succeeds
-    against an unfilled buffer. The error surfaces as wrong weights, with nothing to
-    attribute them to. So the ordering is a correctness requirement, and these tests pin
-    the mechanism rather than trusting a comment.
-    """
-
-    @staticmethod
-    def _harness() -> str:
-        from pathlib import Path
-
-        import tests.nixl as tests_pkg
-
-        return (Path(tests_pkg.__file__).parent / "test_nixl_e2e.py").read_text()
-
-    def test_the_pull_takes_a_phase(self):
-        assert 'def pull_from_ps(self, ps_agent_names, ps_client_names, phase="all")' in self._harness()
-
-    def test_an_unknown_phase_is_rejected(self):
-        """A typo must not silently fall through to reading everything."""
-        assert 'assert phase in ("all", "upstream", "peer")' in self._harness()
-
-    def test_the_driver_issues_one_pipelined_call_per_actor(self):
-        """No barrier between waves -- a global barrier is what made two-phase lose.
-
-        `pull_pipelined` returns only when that client is finished, so the driver has
-        nothing to sequence. The ordering peer reads need is carried per chunk and per
-        source by the notification channel instead.
-        """
-        harness = self._harness()
-        assert "g.pull_pipelined.remote(all_agent_names, all_client_names)" in harness
-        assert "def pull_pipelined(self, source_agent_names, source_client_names" in harness
-
-    def test_the_driver_refuses_a_run_with_no_waiting_in_it(self):
-        """A run where nobody waited has no pipeline in it, and must not pass quietly.
-
-        This is the assertion that separates a driven pipeline from the two-phase
-        fallback and from a silently broken channel: all three complete, and only this
-        distinguishes them.
-        """
-        harness = self._harness()
-        assert "assert total_waits > 0" in harness
-        assert "assert total_published == total_waits" in harness
-
-    def test_the_peer_wait_is_per_source_not_per_wave(self):
-        """A chunk can hold shards from several designates; the first report is not enough."""
-        harness = self._harness()
-        assert "sources = sorted({source for _key, source in peer_pairs})" in harness
-        assert "waiter.wait_for(version, depends_on, sources" in harness
-
-    def test_the_schedule_is_coalesced_before_posting(self):
-        """`client_read` is per (key, source); posting a pair twice reposts a live handle.
-
-        The cluster returned `NIXL_ERR_REPOST_ACTIVE` for exactly this: the schedule is
-        per shard, so a key with shards in two waves was posted twice.
-        """
-        harness = self._harness()
-        assert "coalesce_to_transport_pairs" in harness
-
-    def test_publication_follows_the_local_wait(self):
-        """Publishing before the local read completes is the one way to break ordering."""
-        harness = self._harness()
-        wait_at = harness.index(
-            'self.client.wait(key, tag, "READ", target_client=source_client)\n'
-            "                transfers += 1"
-        )
-        publish_at = harness.index("published += publisher.publish(version, wave_index")
-        assert wait_at < publish_at, (
-            "the designate publishes before its own read has landed, so a follower can "
-            "read a buffer that is still being filled -- and that read succeeds"
-        )
-
-    def test_upstream_reads_are_posted_without_a_barrier(self):
-        """An upstream read depends on nothing, so a wave boundary must not block it.
-
-        Measured: a designate doing 653 reads in 4 barriered waves took 2.18s; the same
-        653 reads posted as one batch took 0.899s. NIXL overlaps concurrently posted
-        transfers, and waiting at each wave boundary discards that. The waves still
-        exist -- they decide when to *wait and publish* -- but they no longer gate
-        posting.
-        """
-        harness = self._harness()
-        post_at = harness.index("posted_by_wave.setdefault(wave_index, []).append(")
-        wait_at = harness.index("for key, source_client, tag in posted_by_wave.get(wave_index, []):")
-        assert post_at < wait_at, (
-            "upstream reads are waited on in the same loop that posts them, so wave i+1 "
-            "cannot overlap wave i -- the barrier cost that diffusion was blamed for"
-        )
-
-    def test_the_waves_can_reach_both_source_kinds(self):
-        """A wave mixes upstream and peer reads, so both name sets must be passed."""
-        harness = self._harness()
-        assert "all_agent_names = source_agent_names + [a for a, _c in gen_names]" in harness
-
-    def test_the_ps_path_stays_single_phase(self):
-        """Nothing to diffuse there; a second driver round trip would be pure overhead."""
-        harness = self._harness()
-        assert "if direct_supply:" in harness
-        single = harness.index("futures.append(g.pull_from_ps.remote(source_agent_names, source_client_names))")
-        assert single > 0
-
-
-class TestUpstreamOmissionIsPerShard:
-    """Dropping a whole key's upstream read would lose partly-covered shards."""
-
-    def test_the_harness_excludes_by_shard_not_by_key(self):
-        from pathlib import Path
-
-        import tests.nixl as tests_pkg
-
-        harness = (Path(tests_pkg.__file__).parent / "test_nixl_e2e.py").read_text()
-        assert "skip_shards=" in harness, (
-            "the upstream read is not told which shards to skip, so coverage is being "
-            "decided at key granularity"
-        )
-        assert "_shards_fully_covered" in harness
-
-    def test_client_read_honours_skip_shards(self):
-        from pathlib import Path
-
-        import psrl.utils.nixl as nixl_pkg
-
-        client = (Path(nixl_pkg.__file__).parent / "client.py").read_text()
-        assert "if skip_shards:" in client
-        assert "s not in skip_shards" in client
-
-    def test_a_partly_covered_key_still_reads_upstream(self):
-        """The property itself: coverage of one shard must not drop the others."""
-        clients = {
-            "train0": _client("train0", NIXLClientType.PUSH_SIDE, "10.0.0.0", 4, [0, 1, 2, 3]),
-        }
-        # Two clients each wanting two shards, overlapping in one.
-        clients["gen0"] = _client("gen0", NIXLClientType.PULL_SIDE, "10.1.0.0", 4, [0, 1])
-        clients["gen1"] = _client("gen1", NIXLClientType.PULL_SIDE, "10.1.0.0", 4, [1, 2])
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        for name in ("gen0", "gen1"):
-            for key in KEYS:
-                wanted = set(clients[name].tensor_infos[key].sharding.shard_indices)
-                via_peer = {
-                    shard
-                    for shard_list in plan.get_peer_pull_plan(name, key).values()
-                    for shard in shard_list
-                }
-                upstream = {
-                    shard
-                    for shard_list in plan.get_rollout_pull_plan(name, key).values()
-                    for shard in shard_list
-                }
-                # Whatever the peer does not supply must be reachable upstream.
-                assert (wanted - via_peer) <= upstream, (
-                    f"{name} {key}: {sorted(wanted - via_peer - upstream)} is neither "
-                    "peer-covered nor upstream-readable"
-                )
-
-
-class TestFollowerInverse:
-    """The notification direction: who waits on *my* chunks (item D1).
-
-    The plan is addressed from the reader's side because that is who acts on it, but a
-    designate publishing per-chunk completion needs the opposite direction. These tests
-    pin the inverse against the forward plan rather than against a fixture, so the two
-    cannot drift apart.
-    """
-
-    def test_followers_of_is_the_exact_inverse_of_the_peer_plan(self):
-        clients = _cluster(nodes=2, per_node=8, tp=2)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        for designate in clients:
-            expected = {
-                follower
-                for follower, key_plans in plan.peer_pull_plan.items()
-                for per_peer in key_plans.values()
-                if designate in per_peer
-            }
-            assert plan.followers_of(designate) == expected
-
-    def test_a_client_nobody_follows_has_no_followers(self):
-        """The common case, and the reason publishing costs most clients nothing."""
-        clients = _cluster(nodes=1, per_node=4, tp=4)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        assert plan.peer_pull_plan == {}
-        for name in clients:
-            assert plan.followers_of(name) == set()
-
-    def test_every_follower_has_a_designate_that_knows_about_it(self):
-        """No follower may wait on a designate that would never publish to it.
-
-        This is the invariant that turns a missing notification edge from a hang into a
-        test failure: the follower set and the peer plan must cover each other exactly.
-        """
-        clients = _cluster(nodes=3, per_node=8, tp=2)
-        plan = CommunicationPlanner().make_comm_plan(clients)
-
-        for follower, key_plans in plan.peer_pull_plan.items():
-            for per_peer in key_plans.values():
-                for designate in per_peer:
-                    assert follower in plan.followers_of(designate), (
-                        f"{follower} peer-reads from {designate}, but {designate} would "
-                        f"never notify it"
-                    )
-
-    def test_followers_by_chunk_only_names_chunks_someone_wants(self):
-        """A chunk with no follower must not appear, or we publish signals nobody awaits."""
-
-        class _Piece:
-            def __init__(self, shard):
-                self.shard = shard
-
-        class _Chunk:
-            def __init__(self, index, pieces):
-                self.index = index
-                self.pieces = [_Piece(shard) for shard in pieces]
-
-        clients = {
-            "train0": _client("train0", NIXLClientType.PUSH_SIDE, "10.0.0.0", 2, [0, 1]),
-            "gen0": _client("gen0", NIXLClientType.PULL_SIDE, "10.1.0.0", 2, [0]),
-            "gen1": _client("gen1", NIXLClientType.PULL_SIDE, "10.1.0.0", 2, [0]),
-        }
-        plan = CommunicationPlanner().make_comm_plan(clients)
-        # Whichever of the two the planner chose as the reader; the other follows it.
-        designate = "gen0" if plan.followers_of("gen0") else "gen1"
-        followers = plan.followers_of(designate)
-        assert followers, "fixture produced no diffusion, so it tests nothing"
-
-        shared = (KEYS[0], (0,))
-        unwanted = ("not-in-any-plan", (0,))
-        by_chunk = plan.followers_by_chunk(
-            designate, [_Chunk(0, [shared]), _Chunk(1, [unwanted])]
-        )
-
-        assert by_chunk.get(0) == followers
-        assert 1 not in by_chunk
-
-
-class TestDescriptorCostIsMeasuredButNotGated:
-    """Why descriptor cost does not gate diffusion, though it dominates the pull (D1).
-
-    `postXferReq` costs per *descriptor*, not per call. Swept at a fixed 2 GiB payload
-    with `bench_cross_node_bw.py --tensors`:
-
-        1 desc    -> post 0.026 ms, 354 GB/s
-        4096 desc -> post 16.942 ms, 114 GB/s
-
-    A non-contiguous shard registers as a strided range and expands to one descriptor per
-    row, which is where the follower's time went: 399 peer reads x 4096 descriptors
-    x 2.1us = 3.43s, against a measured post_peer of 3.426s and wait_peer of 0.008s.
-
-    **Gating diffusion on this was tried and is worse (1.93x -> 2.25x).** The expansion
-    belongs to the shard's layout, not the link: a strided shard pays 4096 descriptors
-    read from anywhere, so refusing to diffuse it only moved the cost from `post_peer` to
-    `post_up` and threw away the NIC saving. These tests pin that reasoning so the gate is
-    not reintroduced as an "obvious" optimisation.
-    """
-
-    @staticmethod
-    def _client_with_contiguity(name, node_ip, shard_count, owned, is_contiguous):
-        info = _client(name, NIXLClientType.PULL_SIDE, node_ip, shard_count, owned)
-        for tensor_info in info.tensor_infos.values():
-            tensor_info.shard_meta_infos = [
-                NIXLShardMetaInfo(
-                    dtype=torch.bfloat16,
-                    device=torch.device("cuda:0"),
-                    shape=torch.Size((16, 16)),
-                    stride=(16, 1) if is_contiguous else (32, 1),
-                    is_contiguous=is_contiguous,
-                )
-                for _ in tensor_info.shard_meta_infos
-            ]
-        return info
-
-    def _clients(self, is_contiguous):
-        return {
-            "train0": _client("train0", NIXLClientType.PUSH_SIDE, "10.0.0.0", 2, [0, 1]),
-            "gen0": self._client_with_contiguity("gen0", "10.1.0.0", 2, [0], is_contiguous),
-            "gen1": self._client_with_contiguity("gen1", "10.1.0.0", 2, [0], is_contiguous),
-        }
-
-    def test_strided_shards_are_still_diffused(self):
-        """The gate is deliberately absent: excluding them measured worse, not better."""
-        plan = CommunicationPlanner().make_comm_plan(self._clients(is_contiguous=False))
-
-        assert plan.peer_pull_plan != {}, (
-            "strided shards were excluded from diffusion; that was measured at 2.25x "
-            "against 1.93x with them included, because the descriptor expansion is paid "
-            "upstream too"
-        )
-
-    def test_contiguous_shards_are_diffused(self):
-        plan = CommunicationPlanner().make_comm_plan(self._clients(is_contiguous=True))
-
-        assert plan.peer_pull_plan != {}
-
-    def test_the_contiguity_predicate_reports_the_layout(self):
-        """Kept as a measurement aid, so it must still answer correctly."""
-        planner = CommunicationPlanner()
-        strided = self._clients(is_contiguous=False)
-        contiguous = self._clients(is_contiguous=True)
-
-        assert not planner._peer_read_is_worth_it(strided, "gen0", KEYS[0], (0,))
-        assert planner._peer_read_is_worth_it(contiguous, "gen0", KEYS[0], (0,))
-
-    def test_an_unknown_shard_reports_true(self):
-        """Unknown layout must not read as "not worth it".
-
-        Probed via a shard the designate does not own rather than by nulling
-        `shard_meta_infos`: a real client always has metadata for its own shards (the
-        chunk planner calls `get_shard_size_bytes` on them), so a None there would test a
-        state that cannot occur.
-        """
-        clients = self._clients(is_contiguous=True)
-        planner = CommunicationPlanner()
-
-        assert planner._peer_read_is_worth_it(clients, "gen0", KEYS[0], (7,))
-        assert planner._peer_read_is_worth_it(clients, "gen0", "not-a-key", (0,))
-        assert planner._peer_read_is_worth_it(clients, "no-such-client", KEYS[0], (0,))
-
-
-class TestDiffusionCanBeTurnedOff:
-    """A toggle, because whether diffusion wins depends on the shard layout (D1).
-
-    Diffusion trades NIC bytes for descriptors. With contiguous rollout shards a peer
-    read is one descriptor and the trade is a win; with strided shards the designate must
-    stay readable (it cannot stage, or it would have no remote descriptor), so it pays one
-    descriptor per row. Measured on 5 nodes with Qwen3-8B -- gen registers 144 strided
-    shards of 4096 rows -- diffusion ran 1.42-1.93x *slower* than not diffusing at all.
-
-    So the configuration has to be expressible rather than implied, and both settings
-    must produce a correct plan.
-    """
-
-    def test_disabled_means_no_redirects(self):
-        clients = _cluster(nodes=2, per_node=8, tp=2)
-
-        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
-
-        assert plan.peer_pull_plan == {}
-
-    def test_disabled_still_covers_every_shard_upstream(self):
-        """Turning it off must fall back to reading upstream, not drop the bytes."""
-        clients = _cluster(nodes=2, per_node=8, tp=2)
-
-        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
-
-        for name, info in clients.items():
-            if info.type is not NIXLClientType.PULL_SIDE:
-                continue
-            for key in KEYS:
-                wanted = set(info.tensor_infos[key].sharding.shard_indices)
-                upstream = {
-                    shard
-                    for shard_list in plan.get_rollout_pull_plan(name, key).values()
-                    for shard in shard_list
-                }
-                assert wanted <= upstream, (
-                    f"{name} {key}: {sorted(wanted - upstream)} is unreachable with "
-                    f"diffusion disabled"
-                )
-
-    def test_enabled_is_the_default(self):
-        """The plan-level reduction is real, so the regression must not silently win."""
-        clients = _cluster(nodes=2, per_node=8, tp=2)
-
-        assert CommunicationPlanner().make_comm_plan(clients).peer_pull_plan != {}
+        first = CommunicationPlanner().make_comm_plan(clients)
+        second = CommunicationPlanner().make_comm_plan(clients)
+        assert first.peer_groups == second.peer_groups
+        assert type(first).deserialize(first.serialize()).peer_groups == first.peer_groups
+
+    def test_a_ps_cluster_also_groups(self):
+        clients = _cluster(nodes=1, per_node=8, tp=2)
+        for name in [n for n in clients if n.startswith("train")]:
+            clients[name].type = NIXLClientType.PS_FOR_PULL
+        assert CommunicationPlanner().make_comm_plan(clients).peer_groups

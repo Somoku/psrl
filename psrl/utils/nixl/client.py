@@ -30,6 +30,7 @@ from psrl.utils.nixl.nixl_spec import (
     NIXLTensorInfo,
 )
 from psrl.utils.nixl.prepped_xfer import PreppedXferCache
+from psrl.utils.nixl.read_geometry import contiguous_strides, run_count
 from psrl.utils.nixl.strided_desc import (
     STRIDED_ROW_BUDGET,
     STRIDED_US_PER_DESCRIPTOR,
@@ -128,22 +129,6 @@ class NIXLStorageClient:
         )  # None means no pinned temp memory
         self.client_group_id = client_group_id
         self.enable_tms_for_temp_buffers = nixl_config.enable_tms_for_temp_buffers and use_gpu
-        # Whether another client may read this one's shards, which decides if a strided
-        # shard has to be registered in place (readable, one descriptor per row) or may be
-        # staged contiguously (one descriptor, plus a local copy).
-        #
-        # Config rather than plan, because of an ordering fact: registration is protocol
-        # step 4 and the comm plan does not arrive until step 6. A client therefore cannot
-        # know at registration time whether the planner made it a diffusion designate, so
-        # the answer has to come from the deployment -- which does know, since peer
-        # diffusion is itself a configuration choice.
-        #
-        # Defaults to True for safety: staging a shard that something later reads leaves
-        # it with no remote descriptor, and the read fails rather than degrading.
-        self.shards_must_be_readable = bool(
-            getattr(nixl_config, "shards_must_be_readable", True)
-        )
-
         if self.enable_tms_for_temp_buffers:
             if torch_memory_saver is None:
                 raise ImportError("torch_memory_saver is required when nixl_config.enable_tms_for_temp_buffers=True")
@@ -197,6 +182,18 @@ class NIXLStorageClient:
 
         # Registry for all local registrations (desc_bytes -> desc object)
         self._registered_descs: dict[bytes, Any] = {}
+        # Source side contiguous copies of fragmented shards as `(view, copy)`, refreshed at every publish.
+        self._publish_copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.publish_copy_bytes = 0
+        # Train dtype to rollout dtype. Shards of a cast dtype are published as copies in the rollout dtype.
+        self._publish_casts: dict[torch.dtype, torch.dtype] = {}
+        # Bytes that copies of merely fragmented shards may take. Readers span read the rest. None is unbounded.
+        budget_mb = getattr(nixl_config, "publish_copy_budget_mb", None)
+        self._publish_copy_budget = None if budget_mb is None else int(budget_mb) << 20
+        # Built on first pull. Its prepared handles embed addresses, so registration changes drop it.
+        self._pull_engine = None
+        self._pull_staging_bytes = int(getattr(nixl_config, "pull_staging_bytes", 256 << 20))
+        self._peer_timeout_s = float(getattr(nixl_config, "peer_timeout_s", 120.0))
 
         # Prepped dlists for the hot path (item A1). Holds raw addresses, so it must be
         # cleared whenever registered memory changes -- see deregister_all_local_tensors.
@@ -301,75 +298,44 @@ class NIXLStorageClient:
         """Get temporary tensor mapping for non-contiguous shard"""
         return self._temp_tensor_mapping.get((key, shard_idx))
 
-    def iter_planned_pull_work(self):
-        """``(key, source_client)`` pairs this client is scheduled to read (item D1).
-
-        Empty when no plan has been received, which the caller must treat as "fall back
-        to probing" rather than "nothing to do" -- the two are indistinguishable from
-        the return value alone, and reading nothing would look like a very fast success.
+    def set_publish_cast(self, train_dtype: torch.dtype, rollout_dtype: torch.dtype) -> None:
         """
-        if self._comm_plan is None:
-            return iter(())
-        return self._comm_plan.iter_rollout_pull_work(self.client_name)
+        Publish shards held in `train_dtype` as copies in `rollout_dtype`. Call before registration.
 
-    def peer_sources_for(self, key: str) -> set[str]:
-        """Same-node peers this client is planned to read ``key`` from (item D1).
-
-        Exposed so a caller can tell a peer read from an upstream one. That distinction
-        is not cosmetic: a peer read is only valid after the peer's own upstream read has
-        completed, and issuing it early *succeeds* against an unfilled buffer rather than
-        failing. A caller without a cross-actor barrier must defer these.
+        Only the train dtype is cast, so tensors a model keeps in another precision, such as a
+        float32 router bias in a bfloat16 model, are published as they are.
         """
-        if self._comm_plan is None:
-            return set()
-        return set(self._comm_plan.get_peer_pull_plan(self.client_name, key))
+        assert self.client_type is NIXLClientType.PUSH_SIDE, "Only a train client publishes casts."
+        if train_dtype != rollout_dtype:
+            self._publish_casts[train_dtype] = rollout_dtype
 
-    def peer_shards_for(self, key: str) -> dict[str, list[tuple[int, ...]]]:
-        """``{peer: shards}`` this client should take from peers for ``key`` (item D1).
+    def pull_engine(self):
+        """The rollout pull engine for this client, built against the current registrations."""
+        if self._pull_engine is None:
+            from psrl.utils.nixl.pull_engine import NIXLPullEngine
 
-        Shard-level rather than key-level because a key can be partly peer-covered: the
-        client may want several of its shards with a peer holding only some. Dropping
-        the whole key's upstream read in that case loses the remainder silently.
-        """
-        if self._comm_plan is None:
-            return {}
-        return self._comm_plan.get_peer_pull_plan(self.client_name, key)
+            self._pull_engine = NIXLPullEngine(self, self._pull_staging_bytes, self._peer_timeout_s)
+        return self._pull_engine
 
-    def upstream_shards_for(self, key: str, source: str) -> list[tuple[int, ...]]:
-        """Shards ``source`` is planned to serve this client for ``key`` (item D1)."""
-        if self._comm_plan is None:
-            return []
-        return self._comm_plan.get_rollout_pull_plan(self.client_name, key).get(source, [])
+    def _drop_pull_engine(self) -> None:
+        if self._pull_engine is not None:
+            self._pull_engine.release()
+            self._pull_engine = None
 
-    def upstream_sources_for(self, key: str) -> dict[str, list[tuple[int, ...]]]:
-        """``{source: shards}`` this client reads upstream for ``key`` (item D1)."""
-        if self._comm_plan is None:
-            return {}
-        return self._comm_plan.get_rollout_pull_plan(self.client_name, key)
+    def agent_name_of(self, client: str) -> str:
+        """NIXL agent name that serves `client`, loading its metadata on first use."""
+        self._ensure_client_info_fetched(client)
+        name = self._all_client_infos[client].agent_name
+        assert name, f"{client} did not publish its NIXL agent name."
+        return name
 
-    def pull_chunks(self) -> tuple[list, list]:
-        """This client's chunk plan: ``(chunks, commit_groups)`` (items B1, D1).
+    @property
+    def comm_plan(self) -> NIXLCommPlan | None:
+        return self._comm_plan
 
-        Empty when the planner had no size metadata for this client, which callers must
-        read as "no chunking" rather than "no work" -- the same distinction
-        `iter_planned_pull_work` draws.
-        """
-        if self._comm_plan is None:
-            return [], []
-        return self._comm_plan.get_pull_chunks(self.client_name)
-
-    def peer_followers(self) -> set[str]:
-        """Clients that peer-read from this one, i.e. whom to notify per chunk (item D1)."""
-        if self._comm_plan is None:
-            return set()
-        return self._comm_plan.followers_of(self.client_name)
-
-    def peer_followers_by_chunk(self) -> dict[int, set[str]]:
-        """``{chunk: followers}`` waiting on each of this client's chunks (item D1)."""
-        if self._comm_plan is None:
-            return {}
-        chunks, _ = self.pull_chunks()
-        return self._comm_plan.followers_by_chunk(self.client_name, chunks)
+    @property
+    def all_client_infos(self) -> dict[str, NIXLClientInfo]:
+        return self._all_client_infos
 
     def chunk_completion_channel(self) -> tuple[ChunkCompletionPublisher, ChunkCompletionWaiter]:
         """Build the per-chunk signalling pair bound to this client's NIXL agent (item D1).
@@ -714,6 +680,7 @@ class NIXLStorageClient:
             meta_only: whether to skip registering real tensors
         """
 
+        self._drop_pull_engine()
         if (
             self.enable_tms_for_temp_buffers
             and self.local_client_info is not None
@@ -871,6 +838,11 @@ class NIXLStorageClient:
                         self._record_region_registration(buf)
 
             tensor_infos = {}
+            # Train shards change only at publish, so copies refreshed there stay exact. Others are read in place.
+            is_upstream_source = self.client_type is NIXLClientType.PUSH_SIDE
+            publish_requests: list[tuple[str, int, torch.Tensor, torch.dtype]] = []
+            self._publish_copies = []
+            self.publish_copy_bytes = 0
             for key, tensor in state_dict.items():
                 assert key in sharding_dict, f"Key {key} not found in sharding_dict."
                 if (
@@ -886,6 +858,10 @@ class NIXLStorageClient:
                 desc_bytes_list = []
                 temp_desc_bytes_list = []
                 shard_meta_info_list = []
+                read_addrs: list[int | None] = []
+                read_strides: list[tuple[int, ...] | None] = []
+                read_bases: list[int | None] = []
+                tensor_mem_type, tensor_device_id = "cuda" if self.device.type == "cuda" else "cpu", 0
 
                 # A grouped MoE key (item C1) has no single tensor to slice: its experts
                 # are separate storages, so the shards arrive pre-split.
@@ -924,31 +900,8 @@ class NIXLStorageClient:
                     # that out from shape and stride alone without repeating the
                     # analysis `describe_shard` already did.
                     strided_layout = None if is_contiguous else describe_shard(local_sharded_tensor)
-                    # Expressible as a strided range is not the same as worth transferring
-                    # as one. `postXferReq` charges per descriptor and a strided shard
-                    # needs one per row, so past a few dozen rows staging the shard --
-                    # one descriptor plus a local copy -- is cheaper by orders of
-                    # magnitude. Measured: the strided path spent 3.43s on 399 reads of
-                    # 4096-row shards where one descriptor each would be ~1.6ms.
-                    # A PULL_SIDE client can itself be read from: peer diffusion makes
-                    # one rollout the designate that its same-node followers read, so its
-                    # shards must stay addressable. A staged shard has no permanent remote
-                    # descriptor, and `client_read` rejects such a source outright
-                    # ("Remote descriptor must be contiguous for client read"). So the
-                    # row budget only applies where nothing reads from this client.
-                    # A client whose shards something else reads must keep them
-                    # addressable, however many descriptors that costs: a staged shard
-                    # has no remote descriptor and `client_read` rejects it as a source.
-                    # PUSH_SIDE and PS_FOR_PULL are always read from, by definition.
-                    # PULL_SIDE depends on deployment -- it is read from only when peer
-                    # diffusion designates it -- so that one is configurable.
-                    must_be_readable = self.client_type in (
-                        NIXLClientType.PUSH_SIDE,
-                        NIXLClientType.PS_FOR_PULL,
-                    ) or (
-                        self.client_type is NIXLClientType.PULL_SIDE
-                        and self.shards_must_be_readable
-                    )
+                    # Only shards that the train side writes into a PS may be staged. Everything else is read from.
+                    must_be_readable = self.client_type is not NIXLClientType.PS_FOR_PUSH
                     stage_despite_strided = strided_layout is not None and not (
                         strided_is_cheaper_than_staging(
                             strided_layout, must_be_readable=must_be_readable
@@ -962,9 +915,10 @@ class NIXLStorageClient:
                     # descriptor rather than here -- this is what turns the handshake
                     # saving from 2.5x into 10.7x (measured on Qwen3-30B-A3B). Equal-but-
                     # distinct objects would serialise 128 times over.
+                    publish_dtype = self._publish_casts.get(local_sharded_tensor.dtype, local_sharded_tensor.dtype)
                     meta_info = self._intern_shard_meta(
                         NIXLShardMetaInfo(
-                            dtype=local_sharded_tensor.dtype,
+                            dtype=publish_dtype,
                             device=local_sharded_tensor.device,
                             shape=local_sharded_tensor.shape,
                             stride=local_sharded_tensor.stride(),
@@ -973,6 +927,29 @@ class NIXLStorageClient:
                         )
                     )
                     shard_meta_info_list.append(meta_info)
+
+                    if meta_only:
+                        read_addrs.append(None)
+                        read_strides.append(None)
+                        read_bases.append(None)
+                    else:
+                        storage_key = self._record_region_registration(local_sharded_tensor)
+                        tensor_device_id, tensor_mem_type = storage_key[2], storage_key[3]
+                        fragmented = (
+                            run_count(tuple(local_sharded_tensor.shape), local_sharded_tensor.stride())
+                            > STRIDED_ROW_BUDGET
+                        )
+                        if is_upstream_source and (fragmented or publish_dtype != local_sharded_tensor.dtype):
+                            # Readers get a contiguous copy in their dtype, so any cut of it is one descriptor.
+                            publish_requests.append((key, local_pos, local_sharded_tensor, publish_dtype))
+                            # Filled by `_allocate_publish_copies`, or by `_within_copy_budget` past the budget.
+                            read_addrs.append(None)
+                            read_strides.append(contiguous_strides(tuple(local_sharded_tensor.shape)))
+                            read_bases.append(None)
+                        else:
+                            read_addrs.append(local_sharded_tensor.data_ptr())
+                            read_strides.append(tuple(local_sharded_tensor.stride()))
+                            read_bases.append(storage_key[0])
 
                     # Check if the shard is contiguous
                     if not meta_only:
@@ -1099,7 +1076,16 @@ class NIXLStorageClient:
                     temp_desc_bytes_list=temp_desc_bytes_list,
                     sharding=sharding,
                     shard_meta_infos=shard_meta_info_list,
+                    read_addrs=read_addrs,
+                    read_strides=read_strides,
+                    read_bases=read_bases,
+                    mem_type=tensor_mem_type,
+                    device_id=tensor_device_id,
                 )
+
+            if publish_requests:
+                publish_requests = self._within_copy_budget(publish_requests, tensor_infos)
+                self._allocate_publish_copies(publish_requests, tensor_infos)
 
             if binded_meta_tensor_mapping is not None:
                 assert self.temp_desc_slice_map == {}, (
@@ -1226,6 +1212,7 @@ class NIXLStorageClient:
                 meta=self.agent.get_agent_metadata(),
                 client_group_id=self.client_group_id,
                 is_registered=not meta_only,
+                agent_name=self.agent.name,
             )
             psrl_logger.debug(
                 f"Local client info is built, "
@@ -1241,9 +1228,83 @@ class NIXLStorageClient:
 
             psrl_logger.info(f"{self.client_name} all local tensors are registered.")
 
+    def _within_copy_budget(
+        self,
+        requests: list[tuple[str, int, torch.Tensor, torch.dtype]],
+        tensor_infos: dict[str, NIXLTensorInfo],
+    ) -> list[tuple[str, int, torch.Tensor, torch.dtype]]:
+        """
+        Keep cast copies, then fragmented copies in order of runs saved per byte until the budget is spent.
+
+        A shard left out stays readable in place, where a reader pays either one descriptor per run
+        or one span read of the shard's extent, whichever its cost model prefers.
+        """
+        if self._publish_copy_budget is None:
+            return requests
+        casts = [r for r in requests if r[3] != r[2].dtype]
+        fragmented = sorted(
+            (r for r in requests if r[3] == r[2].dtype),
+            key=lambda r: -run_count(tuple(r[2].shape), r[2].stride()) / max(r[2].numel(), 1),
+        )
+        kept, spent = list(casts), 0
+        for request in fragmented:
+            nbytes = request[2].numel() * request[2].element_size()
+            if spent + nbytes > self._publish_copy_budget:
+                key, local_pos, view, _ = request
+                info = tensor_infos[key]
+                info.read_addrs[local_pos] = view.data_ptr()
+                info.read_strides[local_pos] = tuple(view.stride())
+                info.read_bases[local_pos] = view.untyped_storage().data_ptr()
+                continue
+            spent += nbytes
+            kept.append(request)
+        return kept
+
+    def _allocate_publish_copies(
+        self,
+        requests: list[tuple[str, int, torch.Tensor, torch.dtype]],
+        tensor_infos: dict[str, NIXLTensorInfo],
+    ) -> None:
+        """
+        Give each requested source shard a contiguous copy, in its publish dtype, inside one flat buffer per dtype.
+
+        One buffer per dtype keeps registration to a handful of regions however many shards
+        need copies. The copies hold valid bytes only after `refresh_publish_copies`.
+        """
+        by_dtype: dict[torch.dtype, list[tuple[str, int, torch.Tensor]]] = defaultdict(list)
+        for key, local_pos, view, dtype in requests:
+            by_dtype[dtype].append((key, local_pos, view))
+        for dtype, entries in by_dtype.items():
+            flat = torch.empty(sum(view.numel() for _, _, view in entries), dtype=dtype, device=self.device)
+            self._record_region_registration(flat)
+            offset = 0
+            for key, local_pos, view in entries:
+                copy = flat[offset : offset + view.numel()].view(view.shape)
+                offset += view.numel()
+                tensor_infos[key].read_addrs[local_pos] = copy.data_ptr()
+                tensor_infos[key].read_bases[local_pos] = flat.data_ptr()
+                self._publish_copies.append((view, copy))
+            self.publish_copy_bytes += flat.numel() * flat.element_size()
+        casts = sum(1 for _, _, view, dtype in requests if view.dtype != dtype)
+        psrl_logger.info(
+            f"{self.client_name}: {len(requests)} shard(s) get publish copies ({casts} cast, "
+            f"{len(requests) - casts} fragmented), {self.publish_copy_bytes / 2**20:.1f} MiB resident."
+        )
+        self.refresh_publish_copies()
+
+    def refresh_publish_copies(self) -> None:
+        """Copy the live shards into their publish copies. Must run while no reader is in flight."""
+        if not self._publish_copies:
+            return
+        views, copies = zip(*self._publish_copies)
+        torch._foreach_copy_(list(copies), list(views))
+        if self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).synchronize()
+
     def deregister_local_tensors(self):
         """Deregister all local tensors"""
         assert self.local_client_info is not None, "Local client info not registered."
+        self._drop_pull_engine()
         # Prepped dlists embed the addresses they were built from, so they must go before
         # the memory they point at. Submitting a stale handle after deregistration would
         # read freed pages -- the same hazard registration_epoch guards remotely
@@ -1306,6 +1367,7 @@ class NIXLStorageClient:
         catches. Measured: stamping after the handshake leaves readers seeing `-1`, which
         is how this was found.
         """
+        self.refresh_publish_copies()
         for tensor_info in self.local_client_info.tensor_infos.values():
             for meta in tensor_info.shard_meta_infos:
                 if meta is not None:
@@ -1508,6 +1570,10 @@ class NIXLStorageClient:
                         self._all_client_infos[client_name] = NIXLClientInfo.deserialize(
                             info_and_temp_mapping["info"]
                         )
+                        # Re-registered memory carries new keys, so the remote metadata must be loaded again.
+                        if self._target_client_connected.pop(client_name, False):
+                            self.agent.remove_remote_agent(self._all_client_infos[client_name].agent_name)
+                        self._drop_pull_engine()
                         self._all_temp_mappings[client_name] = info_and_temp_mapping["temp_mapping"]
                     already_recved_agents.add(agent_name)
                     psrl_logger.info(
@@ -1556,7 +1622,6 @@ class NIXLStorageClient:
         tag: str,
         comm_plan: NIXLCommPlan | None = None,
         merge_and_cache_xfer: bool | None = False,
-        skip_shards: "set[tuple[int, ...]] | None" = None,
     ) -> list[tuple[int, ...]]:
         """Read from another client, supports shard alignment and communication plan.
 
@@ -1573,11 +1638,6 @@ class NIXLStorageClient:
                 internal cache for later bulk submission via
                 ``merge_and_finish_cached_xfer()`` instead of posting the
                 transfer immediately.
-            skip_shards: Shards a same-node peer will supply instead (item D1), so this
-                read must not fetch them over the NIC -- that omission is the traffic
-                reduction. The caller owns this decision because only it knows whether
-                the peer phase will actually run: passing shards that no peer read
-                follows loses those bytes with no error.
         """
         plan = comm_plan or self._comm_plan
         self._ensure_client_info_fetched(target_client)
@@ -1595,23 +1655,8 @@ class NIXLStorageClient:
         shards_to_transfer = []
         if plan and self.client_type == NIXLClientType.PULL_SIDE:
             pull_plan = plan.get_rollout_pull_plan(self.client_name, key)
-            # D1: a peer read's source is another rollout client, which never appears in
-            # the upstream plan, so the peer plan is consulted only when the upstream one
-            # does not name this target.
-            #
-            # The upstream read is deliberately *not* trimmed by what the peer plan
-            # covers. Trimming would make the two paths mutually dependent: a caller
-            # that defers peer reads -- which it must, absent a barrier guaranteeing the
-            # peer has already read the bytes -- would silently lose exactly those
-            # shards. Leaving the upstream read whole means peer reads are an
-            # optimisation a caller may skip, never a step it must take to be correct.
-            # The cost of issuing both is a duplicate read, which is what diffusion was
-            # meant to avoid; the cost of trimming is wrong weights with no error.
-            peer_plan = plan.get_peer_pull_plan(self.client_name, key)
             if target_client in pull_plan:
                 shards_to_transfer = pull_plan[target_client]
-            elif target_client in peer_plan:
-                shards_to_transfer = peer_plan[target_client]
         elif plan and self.client_type == NIXLClientType.PUSH_SIDE:
             push_plan = plan.get_train_pull_plan(self.client_name, key)
             if target_client in push_plan:
@@ -1622,9 +1667,6 @@ class NIXLStorageClient:
                 if shard_idx in remote_info.sharding.shard_indices:
                     shards_to_transfer.append(shard_idx)
 
-        if skip_shards:
-            # The caller has committed to a peer read covering these (item D1).
-            shards_to_transfer = [s for s in shards_to_transfer if s not in skip_shards]
         for shard_idx in shards_to_transfer:
             assert (
                 shard_idx in local_info.sharding.shard_indices and shard_idx in remote_info.sharding.shard_indices

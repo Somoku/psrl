@@ -1,6 +1,5 @@
 import logging
 import os
-import time
 
 import torch
 from omegaconf import DictConfig
@@ -13,7 +12,7 @@ from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 from vllm_patches.interfaces import supports_weight_layout
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
-from psrl.utils.common.worker_naming import gen_client_name
+from psrl.utils.common.worker_naming import gen_client_instance, gen_client_name
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import (
@@ -212,61 +211,34 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """Versions the last pull read, for the caller to compare against the announced one."""
         return set(getattr(self, "pulled_version", set()))
 
-    def nixl_pull_model_core(self, ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
-        """Pull the model parameters from PS workers via NIXL.
+    def nixl_pull_model_core(self, epoch: int, participant_instances: list[int] | None = None):
+        """
+        Pull the latest weights through the NIXL pull engine.
 
         Args:
-            ps_nixl_agent_names (list[str]): List of PS NIXL agent names
-            ps_nixl_train_storage_client_names (list[str]): List of PS NIXL train storage client names
+            epoch (int): Identifier of this sync, shared by every syncing replica and never reused.
+            participant_instances (list[int] | None): Replica indices syncing together. None means all.
         """
-        if not hasattr(self, "pull_times"):
-            self.pull_times = 0
-        self.pull_times += 1
-        wait_operations = []
-        # Record which versions this pull reads. A set insert per shard, so it stays on;
-        # the atomicity check below is what turns it into an invariant.
-        self.nixl_storage_client.begin_version_observation()
-        time_start = time.time()
-        for key in self.unified_state_dict:
-            for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
-                shards_to_transfer = self.nixl_storage_client.client_read(
-                    target_agent_name,
-                    target_client_name,
-                    key,
-                    f"gen_pull_{self.pull_times}",
-                )
-                if len(shards_to_transfer) > 0:
-                    wait_operations.append((key, target_client_name, shards_to_transfer))
-        # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
-        for key, target_client_name, shards_to_transfer in wait_operations:
-            self.nixl_storage_client.wait(
-                key,
-                f"gen_pull_{self.pull_times}",
-                "READ",
-                target_client=target_client_name,
-            )
-        self.nixl_storage_client.merge_and_finish_cached_xfer()
+        self.pull_times = getattr(self, "pull_times", 0) + 1
+        allowed = None if participant_instances is None else set(participant_instances)
+        participants = None
+        if allowed is not None:
+            plan = self.nixl_storage_client.comm_plan
+            peers = {w for groups in plan.peer_groups.values() for wanters in groups.values() for w in wanters}
+            participants = {name for name in peers if gen_client_instance(name) in allowed}
+            participants.add(self.nixl_storage_client.client_name)
+        report = self.nixl_storage_client.pull_engine().pull(epoch, participants)
         self.cuda_synchronize()
-        self.nixl_storage_client.clear_intermediate_cached_data()
-
-        # §3.4 "版本相等性" / atomic group completeness: every shard this pull read must
-        # belong to the same version. More than one means a torn read -- some sources had
-        # republished and some had not -- which otherwise succeeds silently and leaves the
-        # engine serving a model assembled from two versions.
-        #
-        # This does not catch a *uniformly* stale pull, where every source agrees on the
-        # wrong version; the caller compares `pulled_version` against the manager's for
-        # that, since only it knows which version was announced.
-        self.pulled_version = self.nixl_storage_client.observed_versions()
+        # Every shard of one pull must come from one version. More than one means some sources had republished.
+        self.pulled_version = report.versions
         assert len(self.pulled_version) <= 1, (
-            f"torn read: pull {self.pull_times} assembled shards from versions "
-            f"{sorted(self.pulled_version)}; the engine would serve a model mixing them"
+            f"Torn read: pull {self.pull_times} assembled shards from versions {sorted(self.pulled_version)}."
         )
-
-        time_end = time.time()
         psrl_logger.info(
-            f"{self.nixl_storage_client}: NIXL pull model core done ({self.pull_times} times). "
-            f"time: {time_end - time_start}s"
+            f"{self.nixl_storage_client.client_name}: pull {self.pull_times} (epoch {epoch}) took "
+            f"{report.seconds:.3f}s, upstream {report.upstream_bytes / 1e9:.2f} GB in {report.upstream_seconds:.3f}s, "
+            f"peer {report.peer_bytes / 1e9:.2f} GB, {report.descriptors} descriptors, "
+            f"{report.followers} follower(s), {report.fallback_keys} fallback key(s)."
         )
 
     def get_total_kv_cache_tokens(self) -> int:

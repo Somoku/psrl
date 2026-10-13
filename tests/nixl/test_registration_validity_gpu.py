@@ -68,6 +68,7 @@ def _client(agent, name: str):
     client.local_client_info = {}
     client.enable_tms_for_temp_buffers = True  # skips release_temp_memory()
     client._prepped_cache = None
+    client._pull_engine = None
     return client
 
 

@@ -155,3 +155,15 @@ def test_grouped_expert_keys_agree_across_ep_and_tp():
         shard_mesh=((0, 4), (1, 2)),
     )
     assert check_by_layout({key: present}, {key: sub}, [key]) == (1, None)
+
+
+@pytest.mark.parametrize("train,wire", [(torch.float32, torch.bfloat16), (torch.float32, torch.float16)])
+def test_a_cast_fill_survives_the_cast(train, wire):
+    """The train side fills through an exact upcast, so casting back yields the reader's expected bits."""
+    t = torch.empty(512, 256, dtype=train)
+    fill_by_layout({KEY: t}, {KEY: _col_sharding(4, 1)}, version=3, wire_dtype=wire)
+    received = t.to(wire)
+    assert check_by_layout({KEY: received}, {KEY: _col_sharding(4, 1)}, [KEY], version=3) == (1, None)
+    assert torch.isfinite(received.float()).all()
+    _, failure = check_by_layout({KEY: received}, {KEY: _col_sharding(4, 2)}, [KEY], version=3)
+    assert failure

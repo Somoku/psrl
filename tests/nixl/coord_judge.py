@@ -332,7 +332,28 @@ def _cells_with_origin(entry, sharding):
         yield cell, tuple(origin), tuple(global_shape)
 
 
-def _expected_bits(cell: torch.Tensor, origin, global_shape, key: str, version: int) -> torch.Tensor:
+# Exponent masks of floating dtypes, so a hashed pattern is never NaN or infinite and survives a cast.
+_EXPONENT = {
+    torch.bfloat16: (0x7F80, 0x4000),
+    torch.float16: (0x7C00, 0x4000),
+    torch.float32: (0x7F800000, 0x40000000),
+    torch.float8_e4m3fn: (0x7F, 0x01),
+}
+
+
+def _finite(h: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if dtype not in _EXPONENT:
+        return h
+    mask, flip = _EXPONENT[dtype]
+    return torch.where((h & mask) == mask, h ^ flip, h)
+
+
+def _expected_bits(
+    cell: torch.Tensor, origin, global_shape, key: str, version: int, hash_dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """Expected bits of `cell` in `hash_dtype`, the dtype the reader holds, which defaults to the cell's."""
+    hash_dtype = hash_dtype or cell.dtype
+    itemsize = torch.empty(0, dtype=hash_dtype).element_size()
     device = cell.device if cell.device.type != "meta" else "cpu"
     flat = torch.zeros(cell.shape, dtype=torch.int64, device=device)
     stride = 1
@@ -342,7 +363,8 @@ def _expected_bits(cell: torch.Tensor, origin, global_shape, key: str, version: 
         shape[dim] = cell.shape[dim]
         flat += coords.view(shape) * stride
         stride *= global_shape[dim]
-    return _coord_hash(flat, key, version, cell.element_size()).to(_BITS_DTYPE[cell.element_size()])
+    bits = _finite(_coord_hash(flat, key, version, itemsize), hash_dtype)
+    return bits.to(_BITS_DTYPE[itemsize])
 
 
 # Expectations are int64, so judge in blocks beside a vLLM engine that holds most of the card.
@@ -361,8 +383,15 @@ def _row_blocks(cell: torch.Tensor, origin):
         yield piece, (origin[0] + start, *origin[1:])
 
 
-def fill_by_layout(state_dict: dict, shardings: dict | None, version: int = 0) -> list[str]:
-    """Fill every declared cell in place with its coordinate hash and return the filled keys."""
+def fill_by_layout(
+    state_dict: dict, shardings: dict | None, version: int = 0, wire_dtype: torch.dtype | None = None
+) -> list[str]:
+    """
+    Fill every declared cell in place with its coordinate hash and return the filled keys.
+
+    With `wire_dtype` the hash is drawn in that dtype and stored through an exact upcast, so a
+    reader holding `wire_dtype` sees the hash bits after the transport casts back down.
+    """
     filled = []
     with torch.no_grad():
         for key in sorted(state_dict):
@@ -372,8 +401,12 @@ def fill_by_layout(state_dict: dict, shardings: dict | None, version: int = 0) -
                 if cell.numel() == 0:
                     continue
                 for piece, piece_origin in _row_blocks(cell, origin):
-                    bits = _expected_bits(piece, piece_origin, global_shape, key, version)
-                    piece.data.view(bits.dtype).copy_(bits)
+                    cast = wire_dtype is not None and wire_dtype != piece.dtype and piece.is_floating_point()
+                    bits = _expected_bits(piece, piece_origin, global_shape, key, version, wire_dtype if cast else None)
+                    if cast:
+                        piece.data.copy_(bits.view(wire_dtype).to(piece.dtype))
+                    else:
+                        piece.data.view(bits.dtype).copy_(bits)
             filled.append(key)
     return filled
 

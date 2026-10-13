@@ -127,7 +127,7 @@ class TestIntentIsDistinguishable:
     def test_pull_is_gated_on_nixl_not_on_the_data_plane(self):
         """A rollout pull works whether the source is a PS or a train rank."""
         source = (_REPO / "psrl/workers/gen/vllm_async_server.py").read_text()
-        at = source.index("await self.nixl_pull_model()")
+        at = source.index("await self.nixl_pull_model(epoch, participants)")
         preceding = source[max(0, at - 300) : at]
 
         assert "uses_nixl" in preceding

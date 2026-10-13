@@ -130,13 +130,15 @@ class CommandHandlerMixin:
                     else:
                         # Sync with PS (interrupt, pull model, and resume generation)
                         sync_futures = []
-
-                        for instance_id in instance_ids:
-                            # NOTE(linsh): Ignore DP rank for now.
-                            replica_id, _ = instance_id
+                        # NOTE(linsh): Ignore DP rank for now.
+                        replica_ids = sorted({replica_id for replica_id, _ in instance_ids})
+                        epoch, participants = self._sync_round(replica_ids)
+                        for replica_id in replica_ids:
                             sync_future = self.server_handles[replica_id].sync_with_ps.remote(
                                 curr_ps_model_version,
                                 pause_generation=True,
+                                epoch=epoch,
+                                participants=participants,
                             )
                             sync_futures.append(sync_future)
 

@@ -47,7 +47,6 @@ from vllm.v1.engine import PauseMode
 from vllm.v1.engine.async_llm import AsyncLLM
 
 import grpc
-from psrl.utils.ps_mode import uses_nixl
 from psrl.sandbox.config import SandboxManagerConfig
 from psrl.utils.kv_cache import KVCacheManager, LMCacheConfig
 from psrl.utils.logger import (
@@ -56,6 +55,7 @@ from psrl.utils.logger import (
     get_worker_info,
     log_dual_events,
 )
+from psrl.utils.ps_mode import uses_nixl
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
 from psrl.workers.gen.smg_adapter import build_worker_registration_payload, cfg_get, is_cache_aware_method
@@ -128,8 +128,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.unified_sharding_dict = None
 
         # NIXL cache
-        self._cached_ps_nixl_agent_names = None
-        self._cached_ps_nixl_gen_storage_client_names = None
         #: Version reported by the most recent pull, or None if that pull reported none
         #: (item C2). Cleared before every pull: a value left over from the previous
         #: sync would be recorded as this sync's version, which is worse than the round
@@ -1044,7 +1042,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     ###### Weights Update ######
 
-    async def pull_model_for_sync(self, ps_version: int) -> int:
+    async def pull_model_for_sync(
+        self,
+        ps_version: int,
+        epoch: int | None = None,
+        participants: list[int] | None = None,
+    ) -> int:
         data_parallel_ranks = range(self.get_instance_num())
         data_parallel_rank = 0  # take dp 0 as representative for the replica
 
@@ -1076,7 +1079,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             lock = shared_pull_model_context_async(self.gen_interface.ps_manager_handle)
             async with lock:
                 with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
-                    await self.pull_model()
+                    await self.pull_model(epoch, participants)
                 lock.commit_instance_ids = self._pull_commit_instance_ids
         finally:
             self._pull_commit_deferred = False
@@ -1125,22 +1128,28 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 )
         return curr_model_version
 
-    async def sync_with_ps(self, ps_version: int, pause_generation: bool = False):
+    async def sync_with_ps(
+        self,
+        ps_version: int,
+        pause_generation: bool = False,
+        epoch: int | None = None,
+        participants: list[int] | None = None,
+    ):
         if pause_generation:
             await self.pause_for_sync()
-        version = await self.pull_model_for_sync(ps_version)
+        version = await self.pull_model_for_sync(ps_version, epoch, participants)
         if pause_generation:
             await self.resume_after_sync()
         return version
 
-    async def pull_model(self):
+    async def pull_model(self, epoch: int | None = None, participants: list[int] | None = None):
         # C2: clear before the pull, not after. A version left over from the previous
         # sync would be silently attributed to this one.
         self._last_pulled_model_version = None
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             await self.ray_pull_model()
         elif uses_nixl(self.psrl_config.ps_mode):
-            await self.nixl_pull_model()
+            await self.nixl_pull_model(epoch, participants)
         else:
             raise NotImplementedError(f"PSRL does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         # Important: the prefix cache needs to be cleared after pulling the model
@@ -1149,29 +1158,26 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             await self.collective_rpc(method="lmcache_clear_all_from_backend")
             psrl_logger.debug("Cleared LMCache backend after model weight update.")
 
-    async def nixl_pull_model(self) -> None:
+    async def nixl_pull_model(self, epoch: int | None, participants: list[int] | None) -> None:
+        """
+        Pull through the engine on every worker of this replica.
+
+        Args:
+            epoch (int | None): Sync identifier from the coordinator. None pulls without peers.
+            participants (list[int] | None): Replica indices syncing together.
+        """
         assert self.gen_interface.ps_manager_handle is not None, "nixl_pull_model requires a PS manager handle"
         assert uses_nixl(self.psrl_config.ps_mode), (
             f"nixl_pull_model needs a NIXL transport, got "
             f"ps_mode={self.psrl_config.ps_mode!r}"
         )
         ps_manager_handle = self.gen_interface.ps_manager_handle
-        if self._cached_ps_nixl_agent_names is None:
-            GLOBAL_CONTROL_PLANE_METER.record("get_ps_nixl_agent_names")
-            self._cached_ps_nixl_agent_names = await ps_manager_handle.get_ps_nixl_agent_names.remote()
-        if self._cached_ps_nixl_gen_storage_client_names is None:
-            GLOBAL_CONTROL_PLANE_METER.record("get_ps_nixl_gen_storage_client_names")
-            self._cached_ps_nixl_gen_storage_client_names = (
-                await ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote()
-            )
+        if epoch is None:
+            # A pull outside a coordinated sync has no peers to wait for, so it reads everything upstream.
+            self._solo_pulls = getattr(self, "_solo_pulls", 0) + 1
+            epoch, participants = -self._solo_pulls, [self.get_replica_idx()]
         if not self.psrl_config.profile.fix_weight:
-            await self.engine.collective_rpc(
-                "nixl_pull_model_core",
-                args=(
-                    self._cached_ps_nixl_agent_names,
-                    self._cached_ps_nixl_gen_storage_client_names,
-                ),
-            )
+            await self.engine.collective_rpc("nixl_pull_model_core", args=(epoch, participants))
         # C2: the version commit is not made here. It rides on the shared-pull lock
         # release (`finish_shared_pull`), which has to happen anyway -- so the commit
         # costs no round trip of its own. `_pull_commit_instance_ids` tells the lock

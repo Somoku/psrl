@@ -16,7 +16,6 @@ from collections import OrderedDict
 
 import pytest
 import torch
-
 from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLClientInfo, NIXLClientType
 from psrl.utils.nixl.nixl_spec import NIXLSharding, NIXLShardMetaInfo, NIXLTensorInfo
 
@@ -108,13 +107,6 @@ class TestDirectSupply:
                 shards = [shard for shard_list in per_source.values() for shard in shard_list]
                 assert len(shards) == len(set(shards)), f"{key} has a duplicated shard"
                 assert set(shards) == {(0,), (1,)}
-
-    def test_the_chunk_plan_is_still_built(self):
-        """B1's pipeline must survive the change of source."""
-        plan = CommunicationPlanner().make_comm_plan(_direct_cluster())
-
-        chunks, groups = plan.get_pull_chunks("gen0")
-        assert chunks and groups
 
 
 class TestPSStillWins:
@@ -269,128 +261,3 @@ class TestTheReadCountAgainstPsIsNowPinned:
             f"contiguous this should drop toward the PS's {with_ps}, and this assertion "
             f"is where that improvement gets recorded"
         )
-
-
-class TestThePairedKnobsAreEnforced:
-    """`peer_diffusion` and `shards_must_be_readable` are one decision, not two.
-
-    A designate serves its followers by being read from, which needs a permanent remote
-    descriptor; a staged shard has none. So diffusion with staging is not a slower
-    configuration, it is a broken one -- and it broke late and far from its cause, as
-    "Remote descriptor must be contiguous for client read" on a follower.
-
-    Both keys were also undeclared in `nixl.yaml`, reaching the client only through
-    `getattr` defaults, which is what made the pairing invisible to a reader.
-    """
-
-    def _config(self, diffusion: bool, readable: bool):
-        from omegaconf import OmegaConf
-
-        return OmegaConf.create(
-            {"psrl": {"nixl": {"peer_diffusion": diffusion, "shards_must_be_readable": readable}}}
-        )
-
-    def test_diffusion_without_readable_shards_is_refused(self):
-        from psrl.utils.config import _validate_nixl_peer_diffusion
-
-        with pytest.raises(AssertionError, match="requires shards_must_be_readable"):
-            _validate_nixl_peer_diffusion(self._config(diffusion=True, readable=False))
-
-    @pytest.mark.parametrize(
-        ("diffusion", "readable"),
-        [(True, True), (False, True), (False, False)],
-    )
-    def test_the_other_three_combinations_are_allowed(self, diffusion, readable):
-        """Staging without diffusion is the whole point of having the knob."""
-        from psrl.utils.config import _validate_nixl_peer_diffusion
-
-        _validate_nixl_peer_diffusion(self._config(diffusion, readable))
-
-    def test_both_keys_are_declared_in_the_config_file(self):
-        """An undeclared key reaches the client as a `getattr` default, so a reader of the
-        YAML cannot see that the two are coupled -- or that they exist at all."""
-        from pathlib import Path
-
-        text = (
-            Path(__file__).resolve().parents[2] / "psrl/trainer/config/psrl/nixl.yaml"
-        ).read_text()
-
-        assert "shards_must_be_readable:" in text
-        assert "peer_diffusion:" in text
-
-    def test_the_validator_runs_for_direct_supply(self):
-        """Direct supply is the mode where diffusion is actually reachable."""
-        from pathlib import Path
-
-        source = (Path(__file__).resolve().parents[2] / "psrl/utils/config.py").read_text()
-        at = source.index('if config.psrl.ps_mode == "nixl_direct":')
-
-        assert "_validate_nixl_peer_diffusion(config)" in source[at : at + 2500]
-
-
-class TestTheSlowerConfigurationAnnouncesItself:
-    """The measured default is the fast one; choosing the slow path should be deliberate.
-
-    Diffusion on costs roughly 1.9x on rollout pulls under direct supply (1.25-1.69s
-    against 0.66-0.90s, against 1.14s for the PS path). It is not refused, because a
-    deployment with spare NIC headroom and few same-node peers may still prefer it -- but
-    a run should have to opt in rather than inherit it from a default nobody revisited.
-    """
-
-    def _messages(self, diffusion: bool) -> list[str]:
-        """Collect what the validator logged.
-
-        `caplog` cannot be used: `configure_verl_logging` sets `propagate = False` on the
-        `psrl` logger so that Ray and vLLM cannot reconfigure its output, which is
-        deliberate -- but it also means records never reach the root handler pytest
-        installs. Attaching a handler directly is the way to observe them.
-
-        The level and `disabled` flag are forced for the duration, and restored. A
-        handler only sees a record that already passed the *logger's* own level check, so
-        any earlier test that raised the `psrl` level -- anything in the suite that calls
-        `configure_verl_logging` -- silently empties this capture. That failed only in
-        the full run and passed when the file was run alone, which reads like a flaky
-        test rather than the ordering dependency it is.
-        """
-        import logging
-
-        from omegaconf import OmegaConf
-
-        from psrl.utils.config import _validate_nixl_peer_diffusion
-
-        config = OmegaConf.create(
-            {"psrl": {"nixl": {"peer_diffusion": diffusion, "shards_must_be_readable": diffusion}}}
-        )
-        captured: list[str] = []
-
-        class _Collect(logging.Handler):
-            def emit(self, record):
-                captured.append(record.getMessage())
-
-        logger = logging.getLogger("psrl")
-        handler = _Collect()
-        previous_level, previous_disabled = logger.level, logger.disabled
-        logger.setLevel(logging.DEBUG)
-        logger.disabled = False
-        logger.addHandler(handler)
-        try:
-            _validate_nixl_peer_diffusion(config)
-        finally:
-            logger.removeHandler(handler)
-            logger.setLevel(previous_level)
-            logger.disabled = previous_disabled
-        return captured
-
-    def test_diffusion_on_warns_with_the_measurement(self):
-        messages = self._messages(diffusion=True)
-
-        assert any("peer_diffusion" in message for message in messages)
-        # The numbers are the point: a warning without them is indistinguishable from
-        # boilerplate, and the reader cannot tell whether it matters.
-        assert any("0.66" in message for message in messages)
-
-    def test_diffusion_off_is_silent(self):
-        """The recommended configuration must not nag."""
-        messages = self._messages(diffusion=False)
-
-        assert not [m for m in messages if "peer_diffusion" in m]

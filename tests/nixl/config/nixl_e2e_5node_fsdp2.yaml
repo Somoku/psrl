@@ -86,7 +86,6 @@ nixl:
   #
   # Must be True wherever something does read this client, or the read fails: a staged
   # shard has no remote descriptor.
-  shards_must_be_readable: False
   # Off, and it has to be: a diffusion designate is read from, so it could not stage.
   # Measured on this config, diffusion was 1.42-1.93x *slower* than not diffusing,
   # because a designate pays one descriptor per strided row either way -- it only moves

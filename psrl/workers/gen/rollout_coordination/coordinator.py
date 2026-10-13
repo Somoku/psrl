@@ -125,6 +125,9 @@ class RolloutCoordinator(
         self.status_sink_endpoint = f"tcp://{status_host}:{status_port}"
         self.status_queue = ZMQPullQueue(endpoint=self.status_sink_endpoint)
         self.replica_idx_to_replica_id: dict[int, str] = {}
+        self.replica_id_to_replica_idx: dict[str, int] = {}
+        # Identifies one coordinated sync, so peers of different syncs never accept each other's signals.
+        self._sync_epoch = 0
 
         # Background event handler
         self.running_loop = None
@@ -226,6 +229,11 @@ class RolloutCoordinator(
         target_logger.addHandler(handler)
         return handler
 
+    def _sync_round(self, replica_ids: list[str]) -> tuple[int, list[int]]:
+        """Open a new sync epoch for `replica_ids` and return it with their replica indices."""
+        self._sync_epoch += 1
+        return self._sync_epoch, sorted(self.replica_id_to_replica_idx[r] for r in replica_ids)
+
     def add_worker(
         self,
         rollout_replica,
@@ -248,6 +256,7 @@ class RolloutCoordinator(
         self.replica_ids.add(replica_id)
         self.instance_ids.update([(replica_id, i) for i in range(dp_size)])
         self.replica_idx_to_replica_id[rollout_replica.replica_rank] = replica_id
+        self.replica_id_to_replica_idx[replica_id] = rollout_replica.replica_rank
 
         tag = "validate" if is_validate else "rollout"
         self.tag_to_replica_ids[tag].add(replica_id)

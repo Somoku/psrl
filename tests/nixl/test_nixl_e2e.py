@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import math
 import os
 import time
@@ -276,6 +277,7 @@ class TrainClientActor:
         self.model_config = model_config
         self.trust_remote_code = False
         self.train_dtype = resolve_torch_dtype(model_config.get("train_dtype", "bfloat16"))
+        self.gen_dtype = resolve_torch_dtype(model_config.get("gen_dtype", "bfloat16"))
         self.fsdp_hybrid_config = fsdp_hybrid_config
         self.megatron_config = megatron_config
         os.makedirs(log_dir, exist_ok=True)
@@ -449,7 +451,8 @@ class TrainClientActor:
         # The layout judge hashes each element's global coordinate into its raw bits. See `coord_judge.py`.
         self.judge_version = 0
         self.coord_offsets = {
-            key: 0 for key in fill_by_layout(state_dict, sharding, version=self.judge_version)
+            key: 0
+            for key in fill_by_layout(state_dict, sharding, version=self.judge_version, wire_dtype=self.gen_dtype)
         }
         # self.print(f"state_dict keys: {state_dict.keys()}")
         self.state_dict = state_dict
@@ -463,6 +466,7 @@ class TrainClientActor:
         self.print("step3: wait_for_server_sharding")
         self.unified_sharding = self.client.wait_for_server_sharding()
         self.print("step4: register_local_tensors")
+        self.client.set_publish_cast(self.train_dtype, self.gen_dtype)
         self.client.register_local_tensors(self.state_dict, self.unified_sharding)
         self.print("step5: send_local_info")
         self.client.send_local_info()
@@ -518,12 +522,12 @@ class TrainClientActor:
         """
         self.judge_version = base
         self.coord_offsets = {
-            key: base for key in fill_by_layout(self.state_dict, self.sharding, version=base)
+            key: base
+            for key in fill_by_layout(self.state_dict, self.sharding, version=base, wire_dtype=self.gen_dtype)
         }
-        # NIXL reads the registered tensors directly, so there is nothing to re-register:
-        # the addresses are unchanged and only their contents moved. Re-registering here
-        # would invalidate every remote descriptor for no reason.
         torch.cuda.synchronize()
+        # Publishing refreshes the contiguous copies readers take fragmented shards from.
+        self.client.publish_version(base)
         return self.coord_offsets
 
     def get_coord_offsets(self):
@@ -589,12 +593,7 @@ class GenClientActor:
         self.rank = rank
         self.tp_rank = rank % self.tp_size
         self.instance_world_size = self.tp_size * self.pp_size
-        #: Chunk-wave schedule and chunk->keys map (item D1). Built once and reused
-        #: across waves: the schedule derives from the plan, which does not change
-        #: between waves, and rebuilding per wave would make the pipeline's own cost
-        #: grow with the wave count -- the opposite of the point.
-        self._cached_waves = None
-        self._chunk_keys = None
+        self.engine = None
         assert world_size % (self.tp_size * self.pp_size) == 0, (
             f"TP*PP does not divide world_size. world_size={world_size!r}, product={self.tp_size * self.pp_size!r}."
         )
@@ -752,378 +751,13 @@ class GenClientActor:
         self.client.wait_for_server_temp_mappings()
         self.print("protocol done.")
 
-    def pull_from_ps(self, ps_agent_names, ps_client_names, phase="all"):
-        """Pull weights. ``phase`` selects which half of the plan to issue.
-
-        D1's peer reads are only valid once the peer has finished its own upstream read,
-        so the two need a barrier between them. The driver already supplies one -- it
-        `ray.get`s every gen actor -- so running this twice, as ``upstream`` then
-        ``peer``, is sufficient; no new synchronisation primitive is required.
-
-        ``all`` keeps the single-phase behaviour, which is what the PS path wants: there
-        is nothing to diffuse there and a second round trip through the driver would be
-        pure overhead.
-        """
-        assert phase in ("all", "upstream", "peer") or phase.startswith("wave:"), (
-            f"unknown pull phase {phase!r}"
-        )
-        wait_operations = []
-        total_start_time = time.time()
-        agent_of = dict(zip(ps_client_names, ps_agent_names))
-
-        # D1: iterate the work the plan assigns rather than probing every
-        # (key, source) pair. Against a PS the two are nearly the same -- a couple of
-        # workers, each holding every key. Under direct supply the sources are train
-        # ranks and pipeline parallelism gives each one a slice of the key space, so
-        # probing costs 399 x 24 = 9,576 calls to schedule 399 reads.
-        #
-        # Falling back to the probe when the plan has no entry keeps this honest: an
-        # empty plan means the planner did not cover this client, and silently reading
-        # nothing would look like a fast success.
-        planned = list(self.client.iter_planned_pull_work())
-        if planned:
-            work = list(planned)
-        else:
-            work = [(key, source) for key in self.state_dict_keys for source in ps_client_names]
-
-        # D1: a peer read is only valid once that peer has finished its own upstream
-        # read. Issuing it early does not fail -- the registration is valid and the
-        # transfer is well formed -- it succeeds against an unfilled buffer and yields
-        # silently wrong weights. So the two must be separated by a barrier, which the
-        # driver supplies by `ray.get`-ing every actor between the phases.
-        #
-        # Partition per key, not against a flat set of peer names: a client can be a
-        # peer for one key and an upstream source for another. Filtering on `agent_of`
-        # first -- the train-client map -- would drop peer reads before this point and
-        # report zero of them, a count of nothing rather than evidence that diffusion
-        # found no duplication.
-        peer_work = [
-            (key, src) for key, src in work if src in self.client.peer_sources_for(key)
-        ]
-        upstream_work = [
-            (key, src)
-            for key, src in work
-            if src not in self.client.peer_sources_for(key) and src in agent_of
-        ]
-        # Shards a peer will supply are not pulled over the NIC at all -- that omission
-        # *is* the traffic claim. Safe only because the peer phase follows the barrier;
-        # in single-phase mode the full upstream list is used instead.
-        #
-        # Exclusion is per *shard*, not per key. A key is only partly peer-covered when
-        # the client wants several of its shards and a peer holds some: excluding the
-        # whole key would drop the upstream read for the rest, losing those bytes with
-        # no error. `client_read` is told exactly which shards to skip.
-        peer_covered: dict[str, set] = {}
-        for key in {k for k, _ in peer_work}:
-            for shard_list in self.client.peer_shards_for(key).values():
-                peer_covered.setdefault(key, set()).update(shard_list)
-        upstream_without_peer_covered = [
-            (key, src)
-            for key, src in upstream_work
-            if not self._shards_fully_covered(key, src, peer_covered)
-        ]
-
-        if phase.startswith("wave:"):
-            # D1 chunk pipeline: issue only the reads belonging to one chunk, so a
-            # follower's peer read of chunk i overlaps the designate's work on chunk
-            # i+1. The driver advances the index and barriers between waves, which is
-            # what keeps the per-chunk dependency honest.
-            wave_index = int(phase.split(":", 1)[1])
-            work = self._wave_work(wave_index)
-        elif phase == "upstream":
-            work = upstream_without_peer_covered
-        elif phase == "peer":
-            work = peer_work
-        else:
-            work = upstream_work
-        deferred_peer_reads = peer_work if phase in ("all", "upstream") else []
-
-        # The tag must differ per wave. `wait` keys on (key, tag, op, target), so
-        # reusing one tag across waves makes wave i+1's read collide with wave i's
-        # already-completed handle for the same key and source -- the second wait would
-        # match the wrong transfer.
-        tag = f"gen_pull_{phase}"
-        # In wave mode the plan is already partitioned: `_wave_work` returns exactly the
-        # reads this wave should issue, and a shard appears either as an upstream read or
-        # as a peer read, never both. Applying the whole-model `peer_covered` set on top
-        # of that skipped shards whose peer read lives in a *different* wave -- 266
-        # scheduled reads produced only 101 transfers, and the coordinate judge caught
-        # the resulting gap. The wave partition is the authority; nothing is subtracted
-        # from it.
-        skip_upstream = phase == "upstream"
-        for key, source_client in work:
-            # Outside wave mode the two lists overlap by construction (the upstream read
-            # is kept whole so a caller may skip peer reads), so a peer-covered shard
-            # must be excluded from the upstream read -- but never from the peer read
-            # itself, which exists precisely to fetch it.
-            is_peer_read = source_client in self.client.peer_sources_for(key)
-            shards_to_transfer = self.client.client_read(
-                agent_of[source_client],
-                source_client,
-                key,
-                tag,
-                merge_and_cache_xfer=False,
-                skip_shards=(
-                    peer_covered.get(key) if (skip_upstream and not is_peer_read) else None
-                ),
-            )
-            if len(shards_to_transfer) > 0:
-                wait_operations.append((key, source_client, shards_to_transfer))
-        for key, source_client, shards_to_transfer in wait_operations:
-            self.client.wait(key, tag, "READ", target_client=source_client)
-        self.client.merge_and_finish_cached_xfer()
-        total_end_time = time.time()
-        # torch.cuda.synchronize()
-        self.print(
-            f"Total pull from ps done: {total_end_time - total_start_time}s "
-            f"({len(work)} scheduled reads, {len(wait_operations)} transfers, "
-            f"{len(deferred_peer_reads)} peer reads deferred)"
-        )
-
-    def chunk_wave_count(self) -> int:
-        """Number of chunk waves this client's plan implies (item D1).
-
-        The driver takes the max across clients so every client is asked for every wave
-        index; a client with fewer waves returns no work for the surplus ones rather
-        than erroring, which keeps the loop uniform.
-        """
-        self._wave_work(0)  # builds the cache
-        return len(self._cached_waves or [])
-
-    def pull_pipelined(self, source_agent_names, source_client_names, version=1):
-        """Run this client's whole pull as one pipelined pass (item D1).
-
-        Unlike `pull_from_ps(phase=...)` this returns only when the client is done, so
-        the driver issues one call per actor and no barrier between waves. That is the
-        point: a driver barrier is global, and a global barrier makes every client wait
-        for the slowest one at every chunk, which is what made the two-phase version add
-        cost instead of hiding it.
-
-        The dependency that replaces the barrier is per-chunk and per-source: before
-        peer-reading chunk ``i`` this client waits for exactly the designates that serve
-        it, and nothing else. A designate publishes chunk ``i`` the moment its own read
-        of ``i`` has completed, so a follower proceeds as soon as *its* data is ready
-        rather than when everyone's is.
-
-        Both roles run in the same loop because a client is typically both -- designate
-        for the shards it reads upstream, follower for the ones it does not. Splitting
-        them into two passes would reintroduce the barrier through the back door.
-        """
-        total_start_time = time.time()
-        agent_of = dict(zip(source_client_names, source_agent_names))
-        publisher, waiter = self.client.chunk_completion_channel()
-        followers_by_chunk = self.client.peer_followers_by_chunk()
-
-        if self._cached_waves is None:
-            self._wave_work(0)
-        waves = self._cached_waves or []
-
-        # The schedule is per shard; the transport is per (key, source). Coalescing is
-        # what keeps a pair from being posted twice -- `client_read` moves all of a
-        # pair's shards at once, so a pair spanning waves would repost a live handle.
-        from psrl.utils.nixl.chunk_pipeline import coalesce_to_transport_pairs
-
-        wave_pairs = coalesce_to_transport_pairs(waves)
-        ready_after = {wave.index: wave.ready_after for wave in waves}
-
-        issued = 0
-        transfers = 0
-        published = 0
-        waited_on = 0
-        # Where the time goes, split by cause. Two hypotheses have already been wrong
-        # here -- "the wave barrier costs it" (removing the barrier made it *worse*:
-        # 2.59x vs 1.99x) and before that "peer reads are slow because of the link"
-        # (same-node is 14x faster per byte than cross-node). Both were reasoned from
-        # totals. These counters make the next conclusion come from the breakdown.
-        t_post_upstream = 0.0
-        t_wait_upstream = 0.0
-        t_gate = 0.0
-        t_post_peer = 0.0
-        t_wait_peer = 0.0
-
-        # Posting is separated from waiting. An upstream read depends on nothing, so a
-        # wave boundary must not block it; only *peer* reads have a dependency.
-        #
-        # But posting *all* waves before waiting on any delays the first publish until
-        # every read is submitted, and submission is not free: the designate's
-        # post_up=1.62s for 653 reads is time its followers spend gated (measured
-        # gate=2.42s). So posting is done wave by wave, interleaved with the waiting and
-        # publishing below -- wave i's reads are submitted, waited on, and published
-        # before wave i+1 is submitted. That keeps the first publish early, which is the
-        # only thing a follower actually needs.
-        posted_by_wave: dict[int, list[tuple[str, str, str]]] = {}
-
-        def post_upstream_wave(wave_index, pairs):
-            nonlocal issued, t_post_upstream
-            post_start = time.time()
-            for key, source, peer in pairs:
-                if peer:
-                    continue
-                issued += 1
-                tag = f"gen_pipelined_up_w{wave_index}"
-                shards = self.client.client_read(
-                    agent_of.get(source, source),
-                    source,
-                    key,
-                    tag,
-                    merge_and_cache_xfer=False,
-                )
-                if len(shards) > 0:
-                    posted_by_wave.setdefault(wave_index, []).append((key, source, tag))
-            t_post_upstream += time.time() - post_start
-
-        for wave_index, pairs in wave_pairs:
-            post_upstream_wave(wave_index, pairs)
-            peer_pairs = [(key, source) for key, source, peer in pairs if peer]
-
-            # Wait for this wave's own upstream transfers before publishing it. Waiting
-            # per wave rather than for everything is what keeps the publish points
-            # early: a follower gets chunk 0 while chunks 1..n are still in flight.
-            wait_start = time.time()
-            for key, source_client, tag in posted_by_wave.get(wave_index, []):
-                self.client.wait(key, tag, "READ", target_client=source_client)
-                transfers += 1
-            t_wait_upstream += time.time() - wait_start
-
-            # Publish only after this wave's reads have landed. Publishing earlier is
-            # the one way to break ordering: a follower would read a buffer still being
-            # filled, and that read succeeds.
-            followers = followers_by_chunk.get(wave_index)
-            if followers:
-                published += publisher.publish(version, wave_index, sorted(followers))
-
-            if peer_pairs:
-                # Wait per source, not for "the wave": a chunk can hold shards from
-                # several designates, and proceeding once the first reports would read
-                # the others' buffers before they are filled -- successfully, which is
-                # why this cannot be left to a retry.
-                sources = sorted({source for _key, source in peer_pairs})
-                depends_on = ready_after.get(wave_index)
-                if depends_on is None:
-                    depends_on = wave_index - 1
-                gate_start = time.time()
-                waiter.wait_for(version, depends_on, sources, timeout=600.0)
-                t_gate += time.time() - gate_start
-                waited_on += len(sources)
-
-                peer_tag = f"gen_pipelined_peer_w{wave_index}"
-                peer_waits = []
-                peer_post_start = time.time()
-                # Peer reads are posted individually. Merging them was tried and is
-                # **measurably worse**: post_peer went 4.105s -> 6.270s, because the
-                # merge path materialises every descriptor into a Python list and these
-                # shards are strided at 4096 descriptors each (399 x 4096 is 1.6M
-                # element accesses). The prepped path did engage -- no fallback warning --
-                # so the regression is the descriptor marshalling ahead of it, not NIXL.
-                #
-                # Which means `post_peer` is **not** submission cost, and that is now a
-                # measured fact rather than an inference: three attempts to reduce it as
-                # if it were (remove the barrier, merge, pre-post all waves) each made it
-                # the same or worse. What it is instead has to come from instrumenting
-                # inside `client_read`, which is the next step. Leaving it unmerged is
-                # the configuration with the best measured number so far (1.93x).
-                for key, source in peer_pairs:
-                    issued += 1
-                    shards = self.client.client_read(
-                        agent_of.get(source, source),
-                        source,
-                        key,
-                        peer_tag,
-                        merge_and_cache_xfer=False,
-                    )
-                    if len(shards) > 0:
-                        peer_waits.append((key, source))
-                t_post_peer += time.time() - peer_post_start
-                peer_wait_start = time.time()
-                for key, source_client in peer_waits:
-                    self.client.wait(key, peer_tag, "READ", target_client=source_client)
-                t_wait_peer += time.time() - peer_wait_start
-                transfers += len(peer_waits)
-
-        self.client.merge_and_finish_cached_xfer()
-        total_end_time = time.time()
-        phases = self.client.read_phase_us()
-        self.print(
-            f"Pipelined pull done: {total_end_time - total_start_time}s "
-            f"({len(waves)} waves, {len(wave_pairs)} posting waves, {issued} pairs, "
-            f"{transfers} transfers, {published} notifs published, "
-            f"{waited_on} source-waits, {waiter.drains} drains) "
-            f"[breakdown post_up={t_post_upstream:.3f} wait_up={t_wait_upstream:.3f} "
-            f"gate={t_gate:.3f} post_peer={t_post_peer:.3f} wait_peer={t_wait_peer:.3f}] "
-            f"[inside client_read, seconds: "
-            f"deser={phases['deserialize'] / 1e6:.3f} align={phases['align'] / 1e6:.3f} "
-            f"init={phases['initialize'] / 1e6:.3f} xfer={phases['transfer'] / 1e6:.3f}]"
-        )
-        return {
-            "waves": len(waves),
-            "posting_waves": len(wave_pairs),
-            "issued": issued,
-            "transfers": transfers,
-            "published": published,
-            "waited_on": waited_on,
-            "drains": waiter.drains,
-            "seconds": total_end_time - total_start_time,
-            "post_upstream": t_post_upstream,
-            "wait_upstream": t_wait_upstream,
-            "gate": t_gate,
-            "post_peer": t_post_peer,
-            "wait_peer": t_wait_peer,
-        }
-
-    def _wave_work(self, wave_index: int) -> list:
-        """``(key, source)`` pairs belonging to chunk ``wave_index`` (item D1).
-
-        Derived from the chunk plan rather than recomputed here: the plan already
-        decides which shards a chunk carries, and a second definition of that boundary
-        is how the two would drift apart.
-
-        An out-of-range index returns nothing rather than raising, so the driver can
-        advance past the end without knowing the wave count in advance.
-        """
-        from psrl.utils.nixl.chunk_pipeline import schedule_pipelined_reads
-
-        if self._cached_waves is None:
-            chunks, _groups = self.client.pull_chunks()
-            upstream = {
-                key: self.client.upstream_sources_for(key) for key in self.state_dict_keys
-            }
-            peer = {key: self.client.peer_shards_for(key) for key in self.state_dict_keys}
-            self._cached_waves = schedule_pipelined_reads(
-                chunks,
-                {k: v for k, v in upstream.items() if v},
-                {k: v for k, v in peer.items() if v},
-                self.client_name,
-            )
-        if wave_index >= len(self._cached_waves):
-            return []
-        # Take the (key, source) pairs the schedule recorded. Deriving them from chunk
-        # membership instead emitted reads nobody planned and dropped planned ones: a
-        # chunk holds ~100 keys at this model size, so "every key in this chunk" is not
-        # the same set as "the reads placed in this chunk". That mistake produced wrong
-        # weights that the coordinate judge caught -- 100 + 269 reads issued against 653
-        # planned.
-        seen, pairs = set(), []
-        for read in self._cached_waves[wave_index].reads:
-            pair = (read.key, read.source)
-            if pair in seen:
-                continue
-            seen.add(pair)
-            pairs.append(pair)
-        return pairs
-
-    def _shards_fully_covered(self, key, source, peer_covered) -> bool:
-        """Whether every shard ``source`` would serve is already covered by a peer.
-
-        Only then is dropping the upstream read safe. Partial coverage keeps the read
-        and excludes just the covered shards, which is why this returns a verdict rather
-        than the caller assuming key-level coverage: a key with several shards can be
-        half-covered, and dropping it whole would lose the remainder silently.
-        """
-        covered = peer_covered.get(key)
-        if not covered:
-            return False
-        planned = self.client.upstream_shards_for(key, source)
-        return bool(planned) and all(shard in covered for shard in planned)
+    def pull(self, epoch, participants=None):
+        """Pull through the production engine and return its report."""
+        if self.engine is None:
+            self.engine = self.client.pull_engine()
+        report = self.engine.pull(epoch, set(participants) if participants is not None else None)
+        torch.cuda.synchronize()
+        return dataclasses.asdict(report)
 
     def shutdown(self):
         self.client.shutdown()
@@ -1201,6 +835,33 @@ def _assert_actors_run_this_tree() -> None:
         "The run would pass while measuring code this tree does not contain."
     )
     print(f"[PASS] all {len(seen)} nodes import this tree: {expected}")
+
+
+def _timed_pull(gen_actors, *, epoch: int, label: str, expect_peers: bool, alone=None) -> list[dict]:
+    """Run one pull on every gen actor and print what it moved."""
+    start = time.time()
+    if alone is None:
+        reports = ray.get([g.pull.remote(epoch) for g in gen_actors])
+    else:
+        reports = ray.get([g.pull.remote(epoch, [name]) for g, name in zip(gen_actors, alone)])
+    elapsed = time.time() - start
+    upstream = sum(r["upstream_bytes"] for r in reports)
+    peer = sum(r["peer_bytes"] for r in reports)
+    fallback = sum(r["fallback_keys"] for r in reports)
+    slowest = max(reports, key=lambda r: r["seconds"])
+    print(
+        f"[PASS] {label} done. time: {elapsed:.3f}s (slowest client {slowest['seconds']:.3f}s, "
+        f"upstream {slowest['upstream_seconds']:.3f}s, peer {slowest['peer_seconds']:.3f}s) "
+        f"trainer egress {upstream / 1e9:.2f} GB, peer {peer / 1e9:.2f} GB, "
+        f"descriptors max {max(r['descriptors'] for r in reports)}, "
+        f"staged {max(r['staged_bytes'] for r in reports) / 2**20:.0f} MiB, fallback keys {fallback}"
+    )
+    assert fallback == 0, f"{fallback} keys fell back to upstream reads because a designate did not answer."
+    if expect_peers:
+        assert peer > 0, "Diffusion was planned but no client read from a peer."
+    else:
+        assert peer == 0, f"{peer} bytes were read from peers with diffusion off."
+    return reports
 
 
 def _judge_all_gen(gen_actors, filled: dict, *, version: int, label: str) -> None:
@@ -1496,119 +1157,12 @@ def test_nixl_e2e(cfg: DictConfig):
         end_time = time.time()
         print(f"[PASS] gen {gen_idx} pull from all ps done. time: {end_time - start_time}s")
     """
-    if direct_supply:
-        # The pull takes an (agent, client) pair either way, so direct supply needs a
-        # different pair rather than a different read path.
-        train_names = ray.get([t.get_nixl_names.remote() for t in train_actors])
-        source_agent_names = [agent for agent, _client in train_names]
-        source_client_names = [client for _agent, client in train_names]
-        label = "train clients"
-    else:
-        source_agent_names = ps_agent_names
-        source_client_names = ps_for_pull_names
-        label = "all ps"
-
-    start_time = time.time()
-    if direct_supply:
-        # D1: two phases with the driver's own `ray.get` as the barrier between them.
-        # A peer read is only valid once that peer has completed its upstream read, and
-        # reading early *succeeds* against an unfilled buffer rather than failing -- so
-        # the ordering is a correctness requirement, not a scheduling preference.
-        # Peer reads need the designate's chunk to have landed first, so each wave is
-        # separated by a barrier. Driving the loop here keeps the barrier where it has
-        # to be while letting wave i+1's upstream read overlap wave i's peer read --
-        # which is the whole difference from the two-phase arrangement that measured
-        # slower than not diffusing at all.
-        gen_names = ray.get([g.get_nixl_names.remote() for g in gen_actors])
-        all_agent_names = source_agent_names + [a for a, _c in gen_names]
-        all_client_names = source_client_names + [c for _a, c in gen_names]
-
-        # The chunk pipeline is driven by per-chunk completion signalling
-        # (`chunk_notify.py`), not by a driver barrier. The difference matters:
-        #
-        # A shared wave counter cannot express this dependency. Each client's wave list
-        # comes from *its own* plan, so a designate with fewer chunks than a follower
-        # expects runs out of upstream work while followers are still peer-reading chunks
-        # it was supposed to be filling -- the counter advances for everyone regardless.
-        # Three cluster runs failed that way, each caught by the coordinate judge: the
-        # ordering looks right per client and is wrong globally.
-        #
-        # A driver barrier per wave would be correct but self-defeating: it is global, so
-        # every client waits for the slowest at every chunk. That is what made the
-        # two-phase version cost more than not diffusing at all.
-        #
-        # So the gate is per-chunk and per-source, carried over NIXL notifications
-        # designate -> follower. One call per actor, no barrier in between.
-        results = ray.get(
-            [
-                g.pull_pipelined.remote(all_agent_names, all_client_names)
-                for g in gen_actors
-            ]
-        )
-        end_time = time.time()
-        total_published = sum(r["published"] for r in results)
-        total_waits = sum(r["waited_on"] for r in results)
-        print(
-            f"[PASS] gen pipelined pull done. time: {end_time - start_time}s "
-            f"({total_published} notifs published, {total_waits} source-waits across "
-            f"{len(results)} clients)"
-        )
-        # A run where nobody waited is a run with no pipeline in it -- the two-phase
-        # fallback and a broken channel both look like this, so it must not pass quietly.
-        # With diffusion enabled, a run where nobody waited has no pipeline in it -- the
-        # two-phase fallback and a broken channel both look like this, so it must not
-        # pass quietly. With diffusion disabled there is deliberately nothing to wait on,
-        # and the plan says so, so the assertion follows the plan rather than a constant.
-        diffusion_planned = cfg.nixl.get("peer_diffusion", True)
-        if diffusion_planned:
-            assert total_waits > 0, (
-                "no client waited on a peer chunk: diffusion was planned but the pipeline "
-                "did not run"
-            )
-        else:
-            assert total_waits == 0, (
-                f"{total_waits} peer-chunk waits with diffusion disabled: a staged shard "
-                f"has no remote descriptor, so these reads cannot be valid"
-            )
-        assert total_published == total_waits, (
-            f"notification graph is asymmetric: {total_published} published against "
-            f"{total_waits} waited on"
-        )
-        print(f"[PASS] gen pull from {label} done. time: {end_time - start_time}s")
-
-        # Baseline in the *same* run: every client reads everything upstream, no
-        # diffusion and no pipeline. Comparing against a number from an earlier run is
-        # not comparing like with like -- cluster state, model load order and NIC
-        # contention all move between runs, and the pipeline's whole claim is a
-        # difference of a few seconds. Measuring both here makes the difference
-        # attributable to the code rather than to the day.
-        #
-        # Runs second so it cannot be credited with warming anything the pipeline then
-        # benefits from. It rereads bytes already in place, which is wasteful but
-        # harmless: the same shards, from the same sources, into the same buffers.
-        if os.environ.get("PSRL_E2E_BASELINE", "1") == "1":
-            baseline_start = time.time()
-            ray.get(
-                [
-                    g.pull_from_ps.remote(source_agent_names, source_client_names, phase="all")
-                    for g in gen_actors
-                ]
-            )
-            baseline_end = time.time()
-            pipelined_seconds = end_time - start_time
-            baseline_seconds = baseline_end - baseline_start
-            print(
-                f"[MEASURE] pipelined {pipelined_seconds:.3f}s vs no-diffusion baseline "
-                f"{baseline_seconds:.3f}s "
-                f"(ratio {pipelined_seconds / baseline_seconds:.3f})"
-            )
-    else:
-        futures = []
-        for g in gen_actors:
-            futures.append(g.pull_from_ps.remote(source_agent_names, source_client_names))
-        ray.get(futures)
-        end_time = time.time()
-        print(f"[PASS] gen pull from {label} done. time: {end_time - start_time}s")
+    diffusion_planned = bool(cfg.nixl.get("peer_diffusion", True))
+    gen_names = [c for _a, c in ray.get([g.get_nixl_names.remote() for g in gen_actors])]
+    _timed_pull(gen_actors, epoch=1, label="gen pull", expect_peers=diffusion_planned)
+    if diffusion_planned and os.environ.get("PSRL_E2E_BASELINE", "1") == "1":
+        # Same run A/B. A client that is its only participant has no peers and reads everything upstream.
+        _timed_pull(gen_actors, epoch=2, label="no-diffusion baseline", alone=gen_names, expect_peers=False)
 
     # Fetch and verify gen client state_dicts against the coordinate function.
     print("[CHECK] Verifying GenClientActor state_dicts encode their global coordinates...")
@@ -1652,23 +1206,7 @@ def test_nixl_e2e(cfg: DictConfig):
             "cannot tell a fresh pull from a stale one"
         )
 
-        round2_start = time.time()
-        if direct_supply:
-            # Chunk readiness is keyed by version, so reusing round one's version would admit stale peer reads.
-            ray.get(
-                [
-                    g.pull_pipelined.remote(all_agent_names, all_client_names, version=2)
-                    for g in gen_actors
-                ]
-            )
-        else:
-            ray.get(
-                [
-                    g.pull_from_ps.remote(source_agent_names, source_client_names)
-                    for g in gen_actors
-                ]
-            )
-        print(f"[PASS] round 2 pull done. time: {time.time() - round2_start}s")
+        _timed_pull(gen_actors, epoch=3, label="round 2 pull", expect_peers=diffusion_planned)
 
         _judge_all_gen(gen_actors, coord_offsets_v2, version=version_shift, label=" (round 2)")
         print("[PASS] Round 2: every rollout picked up the new version, not a cached one.")

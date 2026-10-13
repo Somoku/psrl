@@ -15,10 +15,8 @@ not running at all:
 from __future__ import annotations
 
 import threading
-import time
 
 import pytest
-
 from psrl.utils.nixl.chunk_notify import (
     ChunkCompletionPublisher,
     ChunkCompletionWaiter,
@@ -26,7 +24,6 @@ from psrl.utils.nixl.chunk_notify import (
     decode_chunk_done,
     encode_chunk_done,
 )
-from psrl.utils.nixl.chunk_pipeline import schedule_pipelined_reads
 
 
 class FakeFabric:
@@ -193,106 +190,6 @@ def test_forget_versions_before_prunes_only_older():
     assert dropped == 2
     assert waiter.seen(5, 0, "designate")
     assert not waiter.seen(4, 0, "designate")
-
-
-# --- Driving the schedule ------------------------------------------------------------
-
-
-class Chunk:
-    def __init__(self, index: int, pieces):
-        self.index = index
-        self.pieces = pieces
-
-
-class Piece:
-    def __init__(self, shard):
-        self.shard = shard
-
-
-def _chunks(layout):
-    """Build chunks from ``[[(key, shard), ...], ...]``.
-
-    ``ShardPiece.shard`` is a `ShardRef` -- ``(key, shard_indices)`` -- not a bare shard
-    tuple. Passing the bare tuple makes every lookup in `schedule_pipelined_reads` miss,
-    so all reads land in the unplaced tail wave and the schedule silently stops being a
-    pipeline.
-    """
-    return [Chunk(i, [Piece(shard) for shard in shards]) for i, shards in enumerate(layout)]
-
-
-def test_pipeline_runs_against_the_channel():
-    """End-to-end: a follower's schedule executes only as its designate publishes.
-
-    This is the test the module exists for. It asserts the *interleaving*, not just the
-    outcome: at the moment the follower reads chunk ``i``, the designate must already have
-    moved past it. A two-phase run satisfies the outcome and fails the interleaving, which
-    is precisely the distinction that timing a cluster cannot make reliably.
-
-    The designate's read carries a small sleep because **overlap is only defined while the
-    designate is still busy.** With instant reads it finishes every chunk before the
-    follower thread is first scheduled, and the trace is indistinguishable from two-phase
-    -- not because the pipeline failed but because there was nothing left to hide behind.
-    The sleep stands in for the transfer cost that is always present in a real run.
-    """
-    fabric = FakeFabric()
-    keys = ["k0", "k1", "k2"]
-    chunks = _chunks([[(key, (i,))] for i, key in enumerate(keys)])
-
-    designate_plan = {key: {"trainer": [(i,)]} for i, key in enumerate(keys)}
-    designate_waves = schedule_pipelined_reads(chunks, designate_plan, {}, "designate")
-    follower_plan = {key: {"designate": [(i,)]} for i, key in enumerate(keys)}
-    follower_waves = schedule_pipelined_reads(chunks, {}, follower_plan, "follower")
-
-    publisher = ChunkCompletionPublisher("designate", lambda dst, p: fabric.send(dst, p, "designate"))
-    waiter, _ = make_waiter(fabric, "follower")
-
-    trace: list[tuple[str, int]] = []
-    trace_lock = threading.Lock()
-    designate_progress = {"chunk": -1}
-    read_cost = 0.05
-
-    def run_designate():
-        for wave in designate_waves:
-            for read in wave.upstream_reads:
-                time.sleep(read_cost)  # stands in for the RDMA this is hiding behind
-                with trace_lock:
-                    trace.append(("designate-read", read.chunk))
-                    designate_progress["chunk"] = read.chunk
-                publisher.publish(1, read.chunk, ["follower"])
-
-    def run_follower():
-        for wave in follower_waves:
-            peer_reads = wave.peer_reads
-            if not peer_reads:
-                continue
-            sources = {read.source for read in peer_reads}
-            waiter.wait_for(1, wave.ready_after, sorted(sources), timeout=10.0)
-            for read in peer_reads:
-                with trace_lock:
-                    # The designate must already be past this chunk. Equivalently: the
-                    # follower is never reading a buffer its designate has not filled.
-                    assert designate_progress["chunk"] >= read.chunk, (
-                        f"follower read chunk {read.chunk} while designate was at "
-                        f"{designate_progress['chunk']}"
-                    )
-                    trace.append(("follower-read", read.chunk))
-
-    threads = [threading.Thread(target=run_designate), threading.Thread(target=run_follower)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=20.0)
-        assert not thread.is_alive(), "pipeline deadlocked"
-
-    assert [chunk for kind, chunk in trace if kind == "follower-read"] == [0, 1, 2]
-    assert [chunk for kind, chunk in trace if kind == "designate-read"] == [0, 1, 2]
-
-    # Overlap: the follower's read of chunk 0 must land before the designate's final read.
-    # If every follower read sat after all designate reads, this would be a two-phase run
-    # wearing a pipeline's clothes.
-    first_follower = next(i for i, (kind, _) in enumerate(trace) if kind == "follower-read")
-    last_designate = max(i for i, (kind, _) in enumerate(trace) if kind == "designate-read")
-    assert first_follower < last_designate, f"no overlap; trace was {trace}"
 
 
 def test_pipeline_deadlocks_are_reported_not_hung():

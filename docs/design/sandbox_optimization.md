@@ -70,18 +70,18 @@ p3b 服务于长程 Agentic RL。这个场景的成本结构与短 FaaS 不同�
 | 入口 | 当前行为 | 设计要求 |
 | --- | --- | --- |
 | `p3b/internal/node/lifecycle.go` | 显式 Release 已按先销毁再归还处理（`Release` 在 `backend.Release` 失败时保留 grant） | 保留该顺序，消除旁路 |
-| `p3b/internal/node/lifecycle.go` | 独立 TTL 路径绕过该顺序：`Start` 的 ticker 在 `Sweep` 后无条件 `admission.Expire()`，而 `expireLocked` 仅凭 owner 静默就释放 grant。容器销毁失败时 grant 仍被归还 | 销毁确认与预算归还收敛到同一状态机 |
+| `p3b/internal/node/lifecycle.go` | **已修**：独立 TTL 路径已删除，`Sweep` 不再无条件 `admission.Expire()`，预算只在销毁确认后归还 | 已收敛到同一状态机 |
 | `p3b/internal/node/lifecycle.go` | idle pause 与 idle reap 已移除，停滞判定只余 owner 存活与 lifetime。pause 只走控制面，无 generation 协调 | 生命周期动作按 generation 串行确认 |
-| `p3b/internal/node/admission.go` | `Renew` **已修**：`control.RenewOwner` 经 `FleetNodeClient`/`LocalNodeClient` 到 `Node.RenewOwner`，并有 JSON-RPC 入口。`SetDraining` 仍只有定义与读取，**无任何生产调用链** | 补齐 drain 触发链 |
+| `p3b/internal/node/admission.go` | **已修**：`Renew` 经 `control.RenewOwner` 到 `Node.RenewOwner`。`SetDraining` 现由 `cleanup_failed` 置位与清除，有生产调用链 | 保留 |
 | `p3b/internal/node/admission.go` | owner 存活检查**已修**：`main.go` 在生产路径安装 `gate.OwnerAlive` | 保留，补齐死亡检测与重启对账 |
-| `p3b/internal/pressure/` | 读取进程自身 cgroup（`/proc/self/cgroup`）。读失败在 `Read()` 里静默返回零，而 `effectiveEnvelopeLocked` 把零当「未超售」 | 明确 sandbox 子树、节点和服务自身的观测范围，失效值不得当作空闲 |
+| `p3b/internal/pressure/` | 读的是外层部署 cgroup 而非 sandbox 子树（5.2 有实测）。读失败在 `Read()` 里静默返回零，而 `effectiveEnvelopeLocked` 把零当「未超售」 | 采样域与 sandbox 子域对齐，失效值不得当作空闲 |
 | `p3b/internal/server/nodeserver.go` | `view()` 重复采样（两次 `pressure()`），`ImageDigests`/`ImageReferences` 写成空 map，`localityScore` 永远为 0 | 单一采样器发布带时间戳快照，补齐镜像与准备制品库存 |
 | `p3b/internal/backend/dockerbackend/docker.go` | 创建设置静态内存和 CPU 限额，未设置 `CgroupParent`。镜像准备发生在 create 并发控制之前 | 补齐资源域，分开限制拉取、创建、执行和清理 |
-| `p3b/internal/backend/dockerbackend/docker.go` | 缺少拉取请求合并，`callRaw` 整块缓冲响应。`Backend.Sweep` 不在 `Backend` 接口内，是死代码，无重启对账 | 请求合并、有界输出、周期性对账与重启恢复 |
+| `p3b/internal/backend/dockerbackend/docker.go` | `Backend.Sweep` **已修**：改为可选接口 `backend.Reconciler`，节点启动时按标签重建账本。仍缺拉取请求合并，`callRaw` 仍整块缓冲响应 | 请求合并与有界输出仍待做 |
 | `p3b/internal/backend/dockerbackend/warmpool.go` | 预热匹配只比 image、memory、cpu，不含 env、workdir、runtime、network。接管不更新实际限额。补充仅受数量约束，销毁失败被吞 | 规格正确、实际资源可核对、压力感知的预热池 |
 | `p3b/internal/placement/` | 已有镜像局部性评分，但库存输入为空。控制面重试不排除已拒绝节点 | 可解释的库存评分、拒绝节点排除和退避 |
 | `p3b/internal/server/convert.go` 与 `p3b/internal/quota/` | fleet 与节点预算均由同一静态规格转换，等待依赖轮询 | 拆分租户公平性与物理准入，支持有界事件唤醒 |
-| Python p3b adapter 与 SDK | 已关闭 Python 节点容量重复计费。但 `_to_service_spec` 未转发 workdir、exec_mode、required_features，并显式拒绝 mounts、volumes、egress、credentials | 显式传递或拒绝能力，禁止静默忽略 |
+| Python p3b adapter 与 SDK | **已修**：`_to_service_spec` 现转发 workdir、exec_mode、required_features、required_resume_level 与 backend pin，并把全部 PSRL 字段登记为转发、拒绝或明确不转发（新增字段会被用例挡住）。拒绝集不变 | 保留：新增字段必须在此边界做决定，禁止静默忽略 |
 | `p3b/sdk/sandboxd/` | 连接池默认大小 32，池槽等待在请求超时之外 | 总截止时间覆盖连接池排队 |
 | 所有 backend 的 `image_on_demand` | 能力字符串，仅用于路由匹配。OpenSandbox 已核实：Docker runtime 完整拉取，无按需路径 | opensandbox backend 不声明该能力，其交付为块级。AgentEnv 与 CubeSandbox 待核实后再定 |
 
@@ -122,9 +122,13 @@ owner heartbeat、租约和节点 drain 接入真实调用链。epoch 用于拒�
 
 为 sandbox 建立明确的 cgroup 子树，Docker 创建时设置对应 `CgroupParent`。节点服务放在独立叶节点，避免 cgroup v2 的内部进程约束。节点预算同时受 sandbox 子树、祖先限制、cpuset 与宿主机安全余量约束。
 
-只运行一个采样器。CPU 分母使用实际有效容量，内存观测区分 sandbox 子树与宿主机。采样错误、过期和不可用必须显式表示，不能把零当成空闲。当前 `pressure.Reader` 读的是服务自身 cgroup，而容器不在该子树下，因此 `overcommit` 实际是对着错误读数放大。观测不可用时停止弹性扩容，保留可解释的保守准入模式。
+只运行一个采样器。CPU 分母使用实际有效容量，内存观测区分 sandbox 子树与宿主机。采样错误、过期和不可用必须显式表示，不能把零当成空闲。观测不可用时停止弹性扩容，保留可解释的保守准入模式。
 
-需要在实际 Docker systemd/cgroupfs 配置下核对容器是否属于目标子树。当前 self-cgroup 观测是否错误取决于部署拓扑，不能只根据源码断言线上已漏计。
+已在两个部署节点上按实际 Docker 与 cgroup 配置实测（`go test -tags integration ./internal/pressure/`，用例让容器申请固定内存并要求该域读数同步上升）。结论与源码推断不同：cgroup v1 部署上进程自身的 cgroup 路径在挂载下不存在，采样器回退到挂载根，读到的是**外层部署 cgroup**，而**容器确实在该域内**。实测容器自身计费 4.31 GB 时该域读数上升 4.29 GB，因此「容器不在该子树下」在本部署不成立。
+
+真正的偏差是域过粗。该域 usage 1.14 TB、limit 2.36 TB，其中 `docker` 子树（全部容器）仅约 106 GB，其余是该部署内与 sandbox 无关的内存。`LocalMemCeiling` 与 `UtilizationTarget` 因而表示的是部署整体比例，分母也是外层 cgroup 的 limit 而不是节点声明的包络：一个因无关原因接近 85% 的部署会让节点开始拒绝 sandbox。
+
+需要的是把 sandbox 子树与采样域对齐，即由 `CgroupParent` 建立子树并让采样器指向它，使这两个阈值作用于 sandbox 域。读数失效的显式表示仍待补，本部署未触发它，因为回退总能读到可读文件。
 
 ### 5.3 避免重复工作与控制面拥塞
 
@@ -152,7 +156,7 @@ owner heartbeat、租约和节点 drain 接入真实调用链。epoch 用于拒�
 | owner/agent 重启 | 存量容器被完整重建到账本，旧 epoch 请求不能修改新分配 |
 | pause 与 exec 竞争 | 有效执行不被陈旧暂停动作冻结，Resume 后状态一致 |
 | 预热规格与 refill 洪峰 | 不错误复用 env/workdir/限额，闲置池和失败清理不超预算 |
-| cgroup 拓扑与读数失效 | 容器占用计入目标域，过期读数不触发扩容 |
+| cgroup 拓扑与读数失效 | 容器占用计入目标域（现有 integration 用例覆盖这一半），过期读数不触发扩容 |
 | 大输出和文件 | 内存有界，完整性或截断状态明确，取消后无遗留进程 |
 
 P1 内部分开测量请求合并、预热策略与库存放置。正确性修复作为统一基线，不提供生产开关重新启用账本泄漏等错误行为。

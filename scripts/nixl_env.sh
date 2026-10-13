@@ -63,4 +63,14 @@ export NIXL_PLUGIN_DIR="${_PSRL_NIXL_PLUGINS}"
 export UCX_NET_DEVICES="${PSRL_UCX_NET_DEVICES:-bond1,bond2,bond3,bond4,bond5,bond6,bond7,bond8,mlx5_bond_1:1,mlx5_bond_4:1,mlx5_bond_3:1,mlx5_bond_2:1,mlx5_bond_7:1,mlx5_bond_6:1,mlx5_bond_8:1,mlx5_bond_5:1}"
 export UCX_IB_ROCE_REACHABILITY_MODE="${PSRL_UCX_ROCE_REACHABILITY:-all}"
 
-unset _PSRL_CONDA_LIB _PSRL_NIXL_PLUGINS _PSRL_CLUSTER_ENV
+# vLLM 0.30 binds `ncclCommSuspend`, which NCCL exports from 2.29.7 on. The shared conda
+# ships torch's NCCL 2.28.9, so the binding fails and vLLM silently disables pynccl for
+# every group. TP all-reduce then falls back to torch.distributed, and MoE with
+# data_parallel_size > 1 asserts in `all_gatherv`. Point pynccl at a staged 2.29.7
+# (`pip install --target <dir> nvidia-nccl-cu12==2.29.7`); torch keeps its own NCCL.
+_PSRL_NCCL_SO="${PSRL_NCCL_SO:-/apdcephfs_zwfy10_303541817/share_303541817/ls/psrl-wip/.pydeps_nccl/nvidia/nccl/lib/libnccl.so.2}"
+if [ -z "${VLLM_NCCL_SO_PATH:-}" ] && [ -f "${_PSRL_NCCL_SO}" ]; then
+    export VLLM_NCCL_SO_PATH="${_PSRL_NCCL_SO}"
+fi
+
+unset _PSRL_CONDA_LIB _PSRL_NIXL_PLUGINS _PSRL_CLUSTER_ENV _PSRL_NCCL_SO

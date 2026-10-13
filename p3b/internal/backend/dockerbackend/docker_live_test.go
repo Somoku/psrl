@@ -4,6 +4,7 @@ package dockerbackend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -445,5 +446,141 @@ func TestConcurrentCreatesAndReleasesAllSucceed(t *testing.T) {
 	}
 	if len(left) != 0 {
 		t.Fatalf("%d sandboxes survived the burst", len(left))
+	}
+}
+
+// -- the persistent shell's contract -------------------------------------------
+//
+// A caller builds state in the session shell across turns: a working directory,
+// an activated venv, exported variables. That state is only worth anything if the
+// session outlives every command sent to it, so these pin the two ways a shell
+// used to end early and take that state with it.
+
+// persistentOne creates a sandbox whose commands share one shell, which is the
+// mode a multi-turn harness uses.
+func persistentOne(t *testing.T, b *Backend) backend.Created {
+	t.Helper()
+	request := spec()
+	request.ExecMode = "persistent"
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	created, err := b.Create(ctx, "test-node", request, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer releaseCancel()
+		if err := b.Release(releaseCtx, created.Handle); err != nil {
+			t.Errorf("cleanup release: %v", err)
+		}
+	})
+	return created
+}
+
+func execIn(t *testing.T, b *Backend, handle backend.Handle, command string) (int, string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return b.ExecWithMode(ctx, handle, "persistent", command, "", nil)
+}
+
+// setUpSessionState builds the state whose loss these tests are about.
+func setUpSessionState(t *testing.T, b *Backend, handle backend.Handle) {
+	t.Helper()
+	if code, out, err := execIn(t, b, handle, "cd /tmp && export PSRL_MARK=kept"); err != nil || code != 0 {
+		t.Fatalf("setting session state failed: code=%d err=%v out=%q", code, err, out)
+	}
+}
+
+func assertSessionSurvived(t *testing.T, b *Backend, handle backend.Handle) {
+	t.Helper()
+	code, out, err := execIn(t, b, handle, "pwd")
+	if err != nil || code != 0 {
+		t.Fatalf("pwd after the command failed: code=%d err=%v", code, err)
+	}
+	if strings.TrimSpace(out) != "/tmp" {
+		t.Errorf("the working directory is %q, so the session was replaced", strings.TrimSpace(out))
+	}
+	code, out, err = execIn(t, b, handle, "echo $PSRL_MARK")
+	if err != nil || code != 0 {
+		t.Fatalf("reading the exported variable failed: code=%d err=%v", code, err)
+	}
+	if strings.TrimSpace(out) != "kept" {
+		t.Errorf("the exported variable is %q, so the session was replaced", strings.TrimSpace(out))
+	}
+}
+
+func TestAnExitCommandReportsItsOwnStatusAndTheShellSurvives(t *testing.T) {
+	// The status of a command is data the caller reads, and a session that a
+	// command can end is not a session: `exit 3` has to report 3 and leave the
+	// shell it ran in standing.
+	b := liveBackend(t)
+	created := persistentOne(t, b)
+	setUpSessionState(t, b, created.Handle)
+
+	code, _, err := execIn(t, b, created.Handle, "exit 3")
+	if err != nil {
+		t.Fatalf("exit 3 was reported as a failure rather than as a status: %v", err)
+	}
+	if code != 3 {
+		t.Fatalf("exit 3 reported %d, want 3", code)
+	}
+	assertSessionSurvived(t, b, created.Handle)
+}
+
+func TestACallerErrexitDoesNotReplaceTheSession(t *testing.T) {
+	// A caller that runs `set -e` gets errexit in this shell, because the command
+	// runs in it. Without the group in the wrapper, the next failing command ends
+	// the shell before the status is written, and the caller's state is silently
+	// gone -- the failure it asked about looks like an ordinary non-zero exit.
+	b := liveBackend(t)
+	created := persistentOne(t, b)
+	setUpSessionState(t, b, created.Handle)
+
+	if code, _, err := execIn(t, b, created.Handle, "set -e"); err != nil || code != 0 {
+		t.Fatalf("set -e failed: code=%d err=%v", code, err)
+	}
+	code, _, err := execIn(t, b, created.Handle, "false")
+	if err != nil {
+		t.Fatalf("a failing command under errexit reported an error: %v", err)
+	}
+	if code != 1 {
+		t.Fatalf("false under errexit reported %d, want 1", code)
+	}
+	assertSessionSurvived(t, b, created.Handle)
+}
+
+func TestADeadShellIsReportedAndItsCommandIsNotRepeated(t *testing.T) {
+	// A shell can still be killed outright, and then the caller's state is gone
+	// whether or not anyone likes it. What must not happen is silence: the command
+	// is not re-run on a fresh shell, because nobody said it was safe to repeat,
+	// and the caller is told its session is lost rather than that the node failed.
+	b := liveBackend(t)
+	created := persistentOne(t, b)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if _, _, err := b.ExecWithMode(ctx, created.Handle, "persistent",
+		"echo ran >> /tmp/psrl-attempts && kill -9 $$", "", nil); err == nil {
+		t.Fatal("a command that killed its shell must be reported as a failure")
+	} else if !errors.Is(err, backend.ErrSessionLost) {
+		t.Fatalf("a dead shell must be reported as a lost session, got: %v", err)
+	}
+
+	// One line means one execution. A retry on a fresh shell would append twice.
+	data, err := b.ReadFile(ctx, created.Handle, "/tmp/psrl-attempts")
+	if err != nil {
+		t.Fatalf("reading the attempt log: %v", err)
+	}
+	if attempts := strings.Count(string(data), "ran"); attempts != 1 {
+		t.Fatalf("the command ran %d times, want exactly one: a lost session must not be retried", attempts)
+	}
+
+	// The dead session is replaced rather than left poisoned, so the next command
+	// works -- in a new shell, which is what "the state is gone" means.
+	if code, out, err := execIn(t, b, created.Handle, "echo after"); err != nil || code != 0 ||
+		!strings.Contains(out, "after") {
+		t.Fatalf("the session was not replaced: code=%d err=%v out=%q", code, err, out)
 	}
 }

@@ -15,9 +15,20 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
+
+// ErrSessionLost marks a failure that is a fact about the caller's session
+// rather than a fault of the runtime: the session a command was sent to is gone,
+// so state the caller built in it is gone too.
+//
+// It is a sentinel rather than a status code so this package stays free of the
+// wire's vocabulary. The service maps it to the classification a caller acts on,
+// and the distinction is what lets a caller tell "the node did not answer" from
+// "my session is gone and an infrastructure retry will not bring it back".
+var ErrSessionLost = errors.New("sandbox session lost")
 
 // SchedulingMode says who chooses the node a sandbox lands on.
 //

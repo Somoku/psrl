@@ -9,7 +9,7 @@
 // of the sandbox. Commands are written to its stdin and completed by a sentinel
 // that carries the exit status. The shell is the container's init; keeping it
 // open keeps the container alive, and the sandbox's filesystem survives even
-// when the last command timed out or the shell had to be restarted.
+// when a command overran its budget or the shell exited.
 //
 // The protocol matches the Python exec.py layer exactly, so a harness built
 // against either one sees the same behaviour. The sentinel is a random token
@@ -29,6 +29,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -182,10 +183,33 @@ func newShellSession(ctx context.Context, b *Backend, sandboxID string) (*shellS
 		s.close()
 		return nil, fmt.Errorf("persistent shell did not become ready: %v (output: %q)", err, out)
 	}
+	// Install the exit shim once, so that for the life of this session `exit N`
+	// ends the command rather than the shell.
+	//
+	// A session is not a terminal: it outlives every command sent to it, and the
+	// operation that ends a sandbox is release, not a shell builtin. Read the
+	// other way, a caller whose script ends in `exit` would lose the working
+	// directory and every exported variable it had built, and would never be told.
+	// The shim returns instead, so the sentinel still carries the status. A
+	// caller that redefines exit itself overrides this, which is its own choice.
+	if _, _, err := s.runInner(startCtx, exitShim, "", nil); err != nil {
+		s.close()
+		return nil, fmt.Errorf("persistent shell could not install its exit handling: %w", err)
+	}
 	return s, nil
 }
 
-// alive reports whether the shell process is still running.
+// exitShim makes a shell `exit` end the command it is in rather than the shell.
+//
+// The status is the argument when one is given and the previous command's status
+// otherwise, which is what the builtin does. `local` is used to read the status
+// before the guard overwrites it, and is available in every shell these sandboxes
+// run (dash, bash, and busybox ash).
+const exitShim = `exit() { local code=$?; [ $# -gt 0 ] && code=$1; return $code; }`
+
+// alive reports whether this session is still usable. A session is abandoned
+// when the shell exited, and also when a command overran its budget, so this
+// says "do not send another command here" rather than "the process is running".
 func (s *shellSession) alive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -194,10 +218,14 @@ func (s *shellSession) alive() bool {
 
 // run executes one command and returns its stdout and exit code.
 //
-// The command is wrapped in a subshell that redirects stdin to /dev/null and
-// appends the sentinel with the exit status. The sentinel is what tells the
-// read loop that this command is done; without it the loop would block until
-// the next command's sentinel arrived, merging two commands' outputs.
+// The command is written into the session's own shell and followed by the
+// sentinel, which the read loop uses to tell this command's output from the
+// next one's. It is deliberately not a subshell: `cd`, `export` and an
+// activated venv all mutate the shell they run in, and a subshell discards
+// those mutations on exit.
+//
+// The status is captured rather than left to the shell's own exit, so a caller's
+// `set -e` cannot end the session before the sentinel is written. See wrap.
 func (s *shellSession) run(
 	ctx context.Context,
 	command, workdir string,
@@ -267,6 +295,13 @@ func (s *shellSession) runInner(
 				continue
 			}
 			s.closed = true
+			if errors.Is(readErr, io.EOF) {
+				// The stream ended, which for this session means the shell is gone.
+				// That is a fact about the caller's session rather than a fault of
+				// the runtime, so it is marked as one.
+				return buf.String(), 1, fmt.Errorf(
+					"persistent shell exited before the command finished: %w", backend.ErrSessionLost)
+			}
 			return buf.String(), 1, fmt.Errorf("persistent shell read: %w", readErr)
 		}
 	}
@@ -316,8 +351,17 @@ func (s *shellSession) wrap(command, workdir string, env map[string]string) stri
 	// input rather than failing inside a disposable subshell. That surfaces as the
 	// silence timeout, and the session is then rebuilt -- which is the correct
 	// outcome for a caller that sent a syntactically incomplete command.
+	//
+	// The command and the status capture sit in a group that is the left operand
+	// of `||`, which is what makes a caller's `set -e` harmless here. Without it a
+	// failing command under errexit ends the shell before the sentinel is written,
+	// so the caller's next command silently runs in a fresh shell with its working
+	// directory and exported variables gone. A group is not a subshell, so `cd`
+	// and `export` still reach the session, and the group's own status is the
+	// assignment's, which is why `|| true` never has anything to swallow.
+	b.WriteString("{ ")
 	b.WriteString(command)
-	b.WriteString(" </dev/null; _exit=$?; printf '%s%d%s\\n' ")
+	b.WriteString(" </dev/null; _exit=$?; } || true; printf '%s%d%s\\n' ")
 	b.WriteString(shellQuote(sentinelPrefix))
 	b.WriteString(" $_exit ")
 	b.WriteString(shellQuote(sentinelSuffix))
@@ -453,14 +497,20 @@ func (b *Backend) execPersistent(
 		return 1, "", fmt.Errorf("persistent shell: %w", err)
 	}
 	stdout, code, err := s.run(ctx, command, workdir, env)
-	if err != nil && !s.alive() {
-		// The shell died. Drop it and retry once with a fresh one.
+	if errors.Is(err, backend.ErrSessionLost) {
+		// The shell exited while this command was running, so the session is gone
+		// and part of the command may already have run.
+		//
+		// The command is deliberately not re-run on a fresh shell. Doing that
+		// would be a second execution of a command nobody said was safe to repeat,
+		// and it would hide that the caller's working directory and exported
+		// variables went with the shell. The dead session is dropped so the next
+		// command gets a new one, and the caller is told: it is the only one that
+		// knows whether re-running duplicates work.
 		b.shells.drop(handle.SandboxID)
-		s2, err2 := b.shells.acquire(ctx, b, handle.SandboxID)
-		if err2 != nil {
-			return 1, stdout, fmt.Errorf("persistent shell restart: %w", err2)
-		}
-		stdout, code, err = s2.run(ctx, command, workdir, env)
+		return code, demultiplex([]byte(stdout)), fmt.Errorf(
+			"the persistent shell exited while this command was running, so the session was replaced "+
+				"and any state built in it is gone: %w", err)
 	}
 	// Strip the frame headers the Engine multiplexer adds: the persistent shell
 	// stream uses the same framing as the one-shot exec.

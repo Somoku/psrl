@@ -93,10 +93,17 @@ class TestTheSpecSurvivesTheConversion:
 
         assert converted.workflow_id == "group-3"
 
-    def test_the_owner_is_carried_as_metadata_for_correlation(self):
+    def test_the_owner_the_service_reclaims_by_travels_with_the_spec(self):
+        """The owner id is the name the node reclaims this sandbox by.
+
+        The service reads it from the spec's metadata, and this worker's renewal
+        heartbeat names the same string. A rename on one side alone leaves every
+        sandbox owned by an owner nothing renews, and a node then reclaims them
+        while the worker is still using them.
+        """
         converted = convert(spec(), owner="worker-2")
 
-        assert converted.metadata["psrl_owner_id"] == "worker-2"
+        assert converted.metadata["owner_id"] == "worker-2"
 
 
 class TestWhatTheServiceCannotCarryIsRefused:

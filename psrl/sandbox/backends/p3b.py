@@ -568,7 +568,11 @@ def _to_service_spec(
 
     metadata = dict(spec.metadata)
     if owner_id:
-        metadata.setdefault("psrl_owner_id", owner_id)
+        # The name the node reclaims this sandbox by: it holds that owner's
+        # sandboxes only while the owner keeps renewing, and the renewal names
+        # the same string. It travels as metadata because it is an opaque caller
+        # identity the service only compares for equality.
+        metadata.setdefault("owner_id", owner_id)
 
     return ServiceSpec(
         source=ServiceSource(

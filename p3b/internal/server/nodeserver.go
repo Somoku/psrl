@@ -372,9 +372,27 @@ func (n *Node) forgetLease(leaseID string) {
 	delete(n.leases, leaseID)
 }
 
+// ownerOf names the caller whose liveness decides when a sandbox is an orphan.
+//
+// The caller states it in the spec's metadata, because that is the identity the
+// reclaimer is keyed on and nothing else on the spec carries it: `workflow_id`
+// reserves a scheduling phase, which a caller may share across sandboxes or not
+// set at all, and reading ownership out of it left every sandbox owned by
+// "anonymous" — an owner that never renews, so a silence budget would reclaim
+// live work. `workflow_id` stays a fallback for a caller that has no separate
+// owner and means its workflow to be one.
 func ownerOf(spec backend.Spec) string {
+	if owner := spec.Metadata[OwnerMetadataKey]; owner != "" {
+		return owner
+	}
 	if spec.WorkflowID != "" {
 		return spec.WorkflowID
 	}
 	return "anonymous"
 }
+
+// OwnerMetadataKey is where a caller states the owner its sandboxes belong to,
+// for the liveness a node reclaims by. It is metadata rather than a field on
+// purpose: the value is an opaque caller identity, and the node only compares it
+// for equality.
+const OwnerMetadataKey = "owner_id"

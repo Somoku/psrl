@@ -43,6 +43,15 @@ from psrl.utils.nixl.nixl_spec import NIXLSharding
 QKV_SHARD_ID_MAP: dict[str, int] = {"q": 0, "k": 1, "v": 2}
 
 
+# vLLM nests FusedMoE weights under `routed_experts`. Every other side names them `experts.<i>`.
+_VLLM_ROUTED_EXPERTS_SEGMENT = ".experts.routed_experts."
+
+
+def canonical_vllm_name(name: str) -> str:
+    """Map a vLLM-emitted unified name onto the canonical HF namespace."""
+    return name.replace(_VLLM_ROUTED_EXPERTS_SEGMENT, ".experts.")
+
+
 @dataclass
 class ParamMappingEntry:
     mapping_type: MappingType
@@ -165,7 +174,7 @@ class VllmConverter(BaseConverter):
                     sharding = converted.sharding
                     if sharding is None:
                         sharding = self.get_sharding_for_param(module, param_name, full_name)
-                    converted_name = converted.name
+                    converted_name = canonical_vllm_name(converted.name)
                     converted_param = converted.param
                     if "visual.blocks" in converted_name and "qkv" in converted_name:
                         converted_param = reshape_visual_block_qkv(
@@ -199,9 +208,10 @@ class VllmConverter(BaseConverter):
                             shard_mesh=OrderedDict([(0, 1)]),
                             shard_indices=[(0,)],
                         )
-                    converted_param, sharding = self.maybe_reshape_qkv_to_3d(converted.name, converted.param, sharding)
-                    converted_state_dict[converted.name] = converted_param
-                    sharding_dict[converted.name] = sharding
+                    converted_name = canonical_vllm_name(converted.name)
+                    converted_param, sharding = self.maybe_reshape_qkv_to_3d(converted_name, converted.param, sharding)
+                    converted_state_dict[converted_name] = converted_param
+                    sharding_dict[converted_name] = sharding
 
         return self.maybe_group_experts(converted_state_dict, sharding_dict)
 

@@ -101,6 +101,8 @@ class GroupedShards:
 
     shards: tuple[torch.Tensor, ...]
     shard_indices: tuple[tuple[int, ...], ...]
+    # Mesh of `shard_indices`, expert axis first. A finer server mesh is cut relative to it.
+    shard_mesh: tuple[tuple[int, int], ...]
 
     def __post_init__(self) -> None:
         if len(self.shards) != len(self.shard_indices):
@@ -169,9 +171,7 @@ def group_expert_keys(keys: list[str]) -> tuple[list[ExpertGroup], list[str]]:
         members.sort(key=lambda item: item[0])
         expert_ids = tuple(expert_id for expert_id, _key in members)
         if len(set(expert_ids)) != len(expert_ids):
-            raise ValueError(
-                f"{prefix}.experts.*.{projection} has duplicate expert ids: {expert_ids}"
-            )
+            raise ValueError(f"{prefix}.experts.*.{projection} has duplicate expert ids: {expert_ids}")
         groups.append(
             ExpertGroup(
                 grouped_key=f"{prefix}.experts.{projection}",
@@ -219,13 +219,56 @@ def local_shards_of(entry: object, sharding: NIXLSharding) -> list[torch.Tensor]
     only need the shards can stay unaware of which case they have.
     """
     if isinstance(entry, GroupedShards):
-        if len(entry.shards) != len(sharding.shard_indices):
+        if len(entry.shards) == len(sharding.shard_indices):
+            return list(entry.shards)
+        if len(sharding.shard_indices) < len(entry.shards):
             raise ValueError(
                 f"grouped entry carries {len(entry.shards)} shards but its sharding "
                 f"declares {len(sharding.shard_indices)}; the two are paired positionally."
             )
-        return list(entry.shards)
+        return _refine_grouped_shards(entry, sharding)
     return sharding.get_local_sharded_tensors(entry)
+
+
+def _refine_grouped_shards(entry: GroupedShards, sharding: NIXLSharding) -> list[torch.Tensor]:
+    """
+    Cut each stored per expert shard into the cells of a finer mesh.
+
+    One side holding whole experts (EP) while the other splits inside them (TP) makes the
+    finest mesh cut inside a stored shard. The expert axis itself never gets finer.
+    """
+    coarse = OrderedDict(entry.shard_mesh)
+    fine = sharding.shard_mesh
+    fine_dims = list(fine)
+    for dim, count in coarse.items():
+        if fine.get(dim, 1) % count:
+            raise ValueError(f"Finer mesh {dict(fine)} does not refine {dict(coarse)} at dim {dim}.")
+    if fine.get(0, 1) != coarse.get(0, 1):
+        raise ValueError(
+            f"Expert axis changed from {coarse.get(0)} to {fine.get(0)}, which a stored shard cannot follow."
+        )
+    scale = {dim: fine[dim] // coarse.get(dim, 1) for dim in fine_dims}
+    # dims cut inside one stored shard, numbered on the per expert tensor
+    inner = [dim for dim in fine_dims if dim != 0 and scale[dim] > 1]
+
+    def split(fine_index: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        by_dim = dict(zip(fine_dims, fine_index))
+        outer = tuple(by_dim.get(dim, 0) // scale.get(dim, 1) for dim in coarse)
+        return outer, tuple(by_dim[dim] % scale[dim] for dim in inner)
+
+    stored = dict(zip((tuple(i) for i in entry.shard_indices), entry.shards))
+    cells = []
+    for fine_index in sharding.shard_indices:
+        outer, within = split(tuple(fine_index))
+        if outer not in stored:
+            raise ValueError(f"No stored shard covers fine index {tuple(fine_index)} of a grouped key.")
+        shard = stored[outer]
+        for dim, pos in zip(inner, within):
+            if shard.shape[dim - 1] % scale[dim]:
+                raise ValueError(f"Dim {dim} of extent {shard.shape[dim - 1]} does not split into {scale[dim]} cells.")
+            shard = shard.chunk(scale[dim], dim=dim - 1)[pos]
+        cells.append(shard)
+    return cells
 
 
 def entry_is_empty(entry: object) -> bool:
@@ -236,10 +279,7 @@ def entry_is_empty(entry: object) -> bool:
     empty because one expert is would drop the rest silently.
     """
     if isinstance(entry, GroupedShards):
-        return all(
-            shard.device.type == "meta" or shard.untyped_storage().nbytes() == 0
-            for shard in entry.shards
-        )
+        return all(shard.device.type == "meta" or shard.untyped_storage().nbytes() == 0 for shard in entry.shards)
     return entry.device.type == "meta" or entry.untyped_storage().nbytes() == 0
 
 
@@ -299,8 +339,9 @@ def group_expert_tensors(
         # index.
         kept_dims = [dim for dim, count in reference.items() if count > 1]
         mesh: OrderedDict[int, int] = OrderedDict([(0, num_experts)])
-        for position, dim in enumerate(kept_dims):
-            mesh[position + 1] = reference[dim]
+        # The mesh names tensor dims, so a per expert dim keeps its number shifted past the expert axis.
+        for dim in kept_dims:
+            mesh[dim + 1] = reference[dim]
 
         reference_dims = list(reference.keys())
         keep_positions = [reference_dims.index(dim) for dim in kept_dims]
@@ -331,6 +372,7 @@ def group_expert_tensors(
         grouped_state[group.grouped_key] = GroupedShards(
             shards=tuple(shards[i] for i in order),
             shard_indices=tuple(indices[i] for i in order),
+            shard_mesh=tuple(mesh.items()),
         )
         grouped_sharding[group.grouped_key] = NIXLSharding(
             shard_mesh=mesh,

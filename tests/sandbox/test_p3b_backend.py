@@ -13,14 +13,15 @@ The service itself is covered by the Go suite and by
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 
 import pytest
-
 from psrl.sandbox.backends import p3b as p3b_backend
 from psrl.sandbox.backends.p3b import P3bBackend, _to_service_spec
 from psrl.sandbox.core import (
     CredentialRef,
     EgressPolicy,
+    ExecMode,
     MountSpec,
     ResourceSpec,
     ResumeLevel,
@@ -104,6 +105,83 @@ class TestTheSpecSurvivesTheConversion:
         converted = convert(spec(), owner="worker-2")
 
         assert converted.metadata["owner_id"] == "worker-2"
+
+    def test_the_starting_directory_carries_over(self):
+        # The service applies this to the container, so a command that names no
+        # directory still starts there.
+        converted = convert(spec(workdir="/workspace/repo"))
+
+        assert converted.workdir == "/workspace/repo"
+
+    def test_the_exec_mode_carries_over_unchanged(self):
+        """The exec mode cannot be chosen later, only at creation.
+
+        The service fixes a sandbox's strategy when it is created and the exec
+        interface carries no mode, so a dropped mode is not a deferred decision --
+        every harness that declared a persistent shell would be served one-shot,
+        and would lose `cd`, `source` and its exported variables between turns.
+        """
+        for mode in ExecMode:
+            assert convert(spec(exec_mode=mode)).exec_mode.value == mode.value
+
+    def test_the_required_features_carry_over(self):
+        # A feature left behind here is not merely unrequested, it is dropped, and
+        # the sandbox lands somewhere that cannot honour it.
+        converted = convert(
+            spec(
+                required_features=frozenset({SandboxFeature.FREEZE, SandboxFeature.RESUME_ANYWHERE}),
+                required_resume_level=ResumeLevel.FULL_STATE,
+            )
+        )
+
+        assert {feature.value for feature in converted.required_features} == {
+            "freeze",
+            "resume_anywhere",
+        }
+        assert converted.required_resume_level.value == "full_state"
+
+    def test_the_backend_pin_carries_over(self):
+        # The service validates the requirements against the pinned backend, so
+        # forwarding the pin cannot weaken a check.
+        converted = convert(spec(backend="docker"))
+
+        assert converted.backend == "docker"
+
+    def test_a_spec_that_states_nothing_stays_unset(self):
+        # Forwarding must not invent a value: an unset mode, level or pin has to
+        # arrive unset, or the service takes a decision the caller left to it.
+        converted = convert(spec())
+
+        assert converted.exec_mode is None
+        assert converted.required_resume_level is None
+        assert converted.backend is None
+        assert converted.workdir is None
+        assert not converted.required_features
+
+
+class TestEverySpecFieldIsAccountedFor:
+    """A field that reaches neither set is dropped without anyone deciding.
+
+    That is how workdir, the exec mode, the required features, the resume level
+    and the backend pin were all lost -- the service grew a field for each and the
+    conversion was never revisited. Failing on a new PSRL field forces the decision
+    to be made here, rather than discovered as a workload that quietly ran differently.
+    """
+
+    def test_the_three_sets_cover_the_whole_spec(self):
+        declared = p3b_backend._FORWARDED_FIELDS | p3b_backend._OUT_OF_SCOPE_FIELDS
+        actual = {field.name for field in dataclasses.fields(SandboxSpec)}
+
+        assert declared == actual, (
+            "a PSRL SandboxSpec field is not accounted for by the p3b conversion: "
+            f"undecided {sorted(actual - declared)}, stale {sorted(declared - actual)}"
+        )
+
+    def test_the_forwarded_and_refused_sets_do_not_overlap(self):
+        # A field in both sets is a contradiction that the exhaustiveness check
+        # above cannot see on its own.
+        assert not (p3b_backend._FORWARDED_FIELDS & p3b_backend._REFUSED_FIELDS)
+        assert not (p3b_backend._FORWARDED_FIELDS & frozenset(p3b_backend._NOT_FORWARDED_FIELDS))
 
 
 class TestWhatTheServiceCannotCarryIsRefused:

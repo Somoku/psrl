@@ -35,14 +35,27 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+from sandboxd import (
+    ExecMode as ServiceExecMode,
+)
+from sandboxd import (
+    Feature as ServiceFeature,
+)
+from sandboxd import (
+    Resources as ServiceResources,
+)
+from sandboxd import (
+    ResumeLevel as ServiceResumeLevel,
+)
+from sandboxd import Sandbox as ServiceSandbox
 from sandboxd import SandboxClient
 from sandboxd import SandboxSpec as ServiceSpec
 from sandboxd import (
-    Resources as ServiceResources,
     SnapshotRef as ServiceSnapshotRef,
+)
+from sandboxd import (
     Source as ServiceSource,
 )
-from sandboxd import Sandbox as ServiceSandbox
 from sandboxd import errors as service_errors
 
 from psrl.sandbox.core import (
@@ -525,6 +538,51 @@ class P3bBackend(SandboxBackend):
 # -- Module-level helpers (no PSRL sandbox state, pure conversion) -------------
 
 
+# Which of a PSRL spec's fields this conversion carries, and which it does not.
+# They make the boundary auditable, and the exhaustiveness test below enforces it.
+_FORWARDED_FIELDS = frozenset(
+    {
+        "source",
+        "resources",
+        "resource_class",
+        "workflow_id",
+        "idempotency_key",
+        "env",
+        "metadata",
+        "workdir",
+        "exec_mode",
+        "required_features",
+        "required_resume_level",
+        "backend",
+        "lifetime_timeout_s",
+    }
+)
+
+# Refused, because a sandbox that quietly lost one would run and produce a wrong result.
+_REFUSED_FIELDS = frozenset(
+    {
+        "mounts",
+        "volumes",
+        "egress",
+        "credentials",
+        "credential_bindings",
+        "assigned_gpus",
+    }
+)
+
+# Dropped, with the reason. None of them changes what the service does.
+_NOT_FORWARDED_FIELDS = {
+    "idle_timeout_s": (
+        "the service bounds a sandbox by its lifetime and its owner's silence and has no "
+        "idle concept, and the in-process Docker backend ignores this field too"
+    ),
+    "policy_profile": "a backend-specific profile, consumed only by the e2b backend",
+    "state_policy": "PSRL's session layer decides what a snapshot means, not the service",
+}
+
+_OUT_OF_SCOPE_FIELDS = _REFUSED_FIELDS | frozenset(_NOT_FORWARDED_FIELDS)
+
+
 def _to_service_spec(
     spec: SandboxSpec,
     owner_id: str,
@@ -532,10 +590,17 @@ def _to_service_spec(
 ) -> ServiceSpec:
     """Convert a PSRL SandboxSpec into the service's.
 
-    Anything the service has no field for is refused here rather than dropped.
-    A sandbox that quietly lost a bind mount, an egress policy, or injected
-    credentials would run and produce a wrong result; one that was refused
-    costs a configuration fix.
+    Every field of a PSRL spec is forwarded, refused, or named as deliberately
+    not forwarded; `_FORWARDED_FIELDS`, `_REFUSED_FIELDS` and
+    `_NOT_FORWARDED_FIELDS` say which, and the exhaustiveness test fails when
+    PSRL gains a field that none of them accounts for.
+
+    Refused rather than dropped, because a sandbox that quietly lost a bind
+    mount, an egress policy, or injected credentials would run and produce a
+    wrong result, while one that was refused costs a configuration fix. The same
+    reasoning is why the exec mode and the required features are forwarded: this
+    backend silently served one-shot commands and unchecked features for a
+    workload that had declared it needed otherwise.
     """
     if spec.mounts:
         raise ValueError(
@@ -590,9 +655,23 @@ def _to_service_spec(
         idempotency_key=spec.idempotency_key,
         env=dict(spec.env),
         metadata=metadata,
-        # The sandbox's own lifetime, so the service reclaims it without the
-        # worker. It is the one thing the caller knows and the node cannot infer:
-        # how long this sandbox is meant to work.
+        # The container's starting directory, so a command that names none works where
+        # the workload said it works.
+        workdir=spec.workdir,
+        # Fixed at creation and not selectable per command, so a dropped mode serves
+        # every persistent-shell workload one-shot instead.
+        exec_mode=ServiceExecMode(spec.exec_mode.value) if spec.exec_mode is not None else None,
+        # The service refuses a backend that cannot provide one, which is the point of
+        # declaring them. Passing them on is what makes that refusal possible.
+        required_features=frozenset(ServiceFeature(feature.value) for feature in spec.required_features),
+        required_resume_level=(
+            ServiceResumeLevel(spec.required_resume_level.value) if spec.required_resume_level is not None else None
+        ),
+        # A recipe's pin, forwarded because the service validates the requirements
+        # against the pinned backend rather than trusting it.
+        backend=spec.backend,
+        # How long this sandbox is meant to work, which the caller knows and the node
+        # cannot infer.
         lifetime_s=int(spec.lifetime_timeout_s) if spec.lifetime_timeout_s else None,
     )
 

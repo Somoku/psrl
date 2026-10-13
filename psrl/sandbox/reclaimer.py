@@ -226,6 +226,15 @@ class NodeReclaimer:
         doomed = [
             item.container_id for item in containers if item.owner_id in stale_owners or item.container_id in abandoned
         ]
+        if doomed:
+            # Say who is destroying what and why, before it is gone: this is the only
+            # record of a removal that no session observes, and an operator chasing a
+            # sandbox that vanished mid-episode has nothing else to read.
+            psrl_logger.warning(
+                f"Reclaiming {len(doomed)} sandbox container(s) whose owner lease is gone or that stayed "
+                f"stopped past their grace: stale_owners={sorted(stale_owners)}, "
+                f"stopped_past_grace={sorted(abandoned)}, containers={doomed}."
+            )
         removed, unremovable = self._remove(doomed)
         if removed:
             self._stopped.forget(removed)
@@ -261,7 +270,13 @@ class NodeReclaimer:
         return reclaimed
 
     def _stale_owners(self, containers: Sequence[OwnedContainer], now: float) -> set[str]:
-        """Read each lease once, because a filesystem error is not evidence of death."""
+        """Read each lease once, because a filesystem error is not evidence of death.
+
+        An owner with no readable lease is treated as gone, so a heartbeat that stops
+        while its worker is alive costs that worker every sandbox it holds. That is why
+        the age and the budget are named here rather than summarised: this line is the
+        only evidence that a removal was a missed lease and not a failed sandbox.
+        """
         stale: set[str] = set()
         for owner_id in {item.owner_id for item in containers}:
             try:
@@ -270,6 +285,10 @@ class NodeReclaimer:
                 psrl_logger.warning(f"Could not inspect sandbox owner lease {owner_id!r}: {exc}.")
                 continue
             if age is None or age > self.lease_ttl_s:
+                psrl_logger.warning(
+                    f"Sandbox owner {owner_id!r} lease is stale: "
+                    f"age={('missing' if age is None else f'{age:.0f}s')}, budget={self.lease_ttl_s:.0f}s."
+                )
                 stale.add(owner_id)
         return stale
 

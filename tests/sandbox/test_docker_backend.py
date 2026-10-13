@@ -612,3 +612,18 @@ def test_an_unowned_backend_labels_nothing_to_attribute_it_by(monkeypatch) -> No
     # The lease store label still identifies the deployment, which is what lets
     # `list_owned` find such a container and report it as unowned rather than miss it.
     assert config["Labels"]["psrl.lease_store"]
+
+
+def test_a_container_that_vanished_is_not_an_unexplained_stop():
+    """A container the session did not stop and that is now gone was destroyed.
+
+    The runtime answers "removed" when its record for the container is gone, and the
+    node reclaimer is what destroys a container whose owner lease went stale. Calling
+    that `UNKNOWN` says nothing happened, which is how a sandbox reaped out from under
+    a running episode read as a mystery. `RELEASED` would be worse: it would claim
+    this session ended the container, which is exactly what did not happen.
+    """
+    from psrl.sandbox.backends.docker.session import _STOP_REASONS
+    from psrl.sandbox.core import SandboxExitReason
+
+    assert _STOP_REASONS["removed"] is SandboxExitReason.RECLAIMED_ORPHAN

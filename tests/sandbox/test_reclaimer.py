@@ -374,3 +374,57 @@ def test_an_unowned_container_cannot_be_rescued_by_a_live_lease(tmp_path) -> Non
 
     assert outcome.removed == ("unclaimed",), "A live lease must not vouch for an unowned container."
     assert outcome.remaining == 1
+
+
+class TestARemovalSaysWhoAndWhy:
+    """A reclaimer's removal is the only one no session observes.
+
+    The container disappears and the episode that was using it dies at its next
+    command. Nothing else in the run records what happened, so the reclaimer has to
+    say which owner it judged gone, on what budget, and what it destroyed.
+    """
+
+    def test_a_stale_owner_is_reported_with_its_age_and_budget(self, tmp_path, caplog):
+        owner = "worker-1"
+        _write_heartbeat(str(tmp_path / "hb"), owner, age_s=5000)
+        reclaimer, _ = _reclaimer(tmp_path, [OwnedContainer("c1", owner, "running")], ttl_s=120)
+
+        with caplog.at_level("WARNING"):
+            reclaimer.sweep()
+
+        lines = [record.getMessage() for record in caplog.records]
+        assert any("worker-1" in line and "stale" in line and "5000s" in line and "120s" in line for line in lines), (
+            lines
+        )
+
+    def test_an_owner_with_no_lease_at_all_is_reported_as_missing(self, tmp_path, caplog):
+        reclaimer, _ = _reclaimer(tmp_path, [OwnedContainer("c1", "never-wrote", "running")], ttl_s=120)
+
+        with caplog.at_level("WARNING"):
+            reclaimer.sweep()
+
+        lines = [record.getMessage() for record in caplog.records]
+        assert any("never-wrote" in line and "missing" in line for line in lines), lines
+
+    def test_the_destruction_names_the_containers_and_the_owner(self, tmp_path, caplog):
+        owner = "worker-2"
+        _write_heartbeat(str(tmp_path / "hb"), owner, age_s=5000)
+        reclaimer, runtime = _reclaimer(tmp_path, [OwnedContainer("c9", owner, "running")], ttl_s=120)
+
+        with caplog.at_level("WARNING"):
+            reclaimer.sweep()
+
+        lines = [record.getMessage() for record in caplog.records]
+        assert any("worker-2" in line and "c9" in line for line in lines), lines
+        assert runtime.removed == ["c9"]
+
+    def test_a_live_owner_is_not_reported_and_not_touched(self, tmp_path, caplog):
+        owner = "worker-3"
+        _write_heartbeat(str(tmp_path / "hb"), owner, age_s=1)
+        reclaimer, runtime = _reclaimer(tmp_path, [OwnedContainer("c1", owner, "running")], ttl_s=120)
+
+        with caplog.at_level("WARNING"):
+            reclaimer.sweep()
+
+        assert not [r for r in caplog.records if "stale" in r.getMessage()]
+        assert runtime.removed == []

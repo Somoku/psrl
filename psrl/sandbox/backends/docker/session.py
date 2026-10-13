@@ -53,7 +53,14 @@ _LIFETIME_RETRY_MAX_S = 30.0
 # code path noticed the stop.
 _STOP_REASONS = {
     "oom_killed": SandboxExitReason.OOM,
-    "removed": SandboxExitReason.UNKNOWN,
+    # The container is gone from the runtime and this session never stopped it, so
+    # something outside the session destroyed it. The node reclaimer is what does
+    # that — it reclaims a sandbox once its owner lease goes stale — and a removal
+    # by hand is indistinguishable from here. Either way the container did not
+    # vanish: it was destroyed deliberately, which `RECLAIMED_ORPHAN` says and
+    # `UNKNOWN` did not. The alternatives are worse: `RELEASED` would claim this
+    # session ended it, which is exactly what did not happen.
+    "removed": SandboxExitReason.RECLAIMED_ORPHAN,
     "exited": SandboxExitReason.FAILED,
 }
 

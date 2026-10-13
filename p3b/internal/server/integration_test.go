@@ -220,11 +220,11 @@ func TestAFleetWithoutRoomRefusesRatherThanOversubscribing(t *testing.T) {
 		handles = append(handles, created.GetHandle())
 	}
 
-	// A full class queues rather than refusing, so an immediate refusal is not
-	// what the caller gets; what must hold is that no release ever makes room for
-	// a third 64MB sandbox on a fleet of two, so a caller that gives up fails and
-	// the ledger is unchanged. Bounding that wait on the server side is a later
-	// increment.
+	// A full class queues rather than refusing, by design: the share clears as
+	// sandboxes are released, and the server does not guess when. So an immediate
+	// refusal is not what the caller gets. What must hold is that no release ever
+	// makes room for a third 64MB sandbox on a fleet of two, so a caller that
+	// gives up fails and the ledger is unchanged.
 	giveUp, cancelGiveUp := context.WithTimeout(context.Background(), heldOnAFullFleet)
 	defer cancelGiveUp()
 	if _, err := s.control.Create(giveUp, &v1.CreateRequest{Spec: createSpec(64)}); err == nil {

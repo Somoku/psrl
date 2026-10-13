@@ -57,6 +57,15 @@ def parse_args():
         "the link; many small ones measure per-descriptor cost. Must match both sides.",
     )
     p.add_argument("--reps", type=int, default=3, help="repetitions; the best is reported")
+    p.add_argument(
+        "--start-at",
+        type=float,
+        default=None,
+        help="epoch seconds to begin the first repetition. Lets several initiators on one "
+        "node start together, so their reps overlap and the sum measures the node's "
+        "aggregate rather than one NIC at a time.",
+    )
+    p.add_argument("--serve-s", type=float, default=120.0, help="target: how long to stay up")
     return p.parse_args()
 
 
@@ -90,7 +99,7 @@ def main() -> None:
         print("target: descriptors published, waiting for reads", flush=True)
         # A READ is one-sided: the target sees no completion, so it just stays alive
         # long enough for every repetition to finish.
-        time.sleep(120)
+        time.sleep(args.serve_s)
         print("target: done", flush=True)
         return
 
@@ -113,6 +122,10 @@ def main() -> None:
 
     best = None
     best_post_ms = None
+    if args.start_at is not None:
+        delay = args.start_at - time.time()
+        assert delay > 0, f"--start-at is {-delay:.1f}s in the past because agent setup overran it."
+        time.sleep(delay)
     for rep in range(args.reps):
         handle = agent.initialize_xfer("READ", local_descs, remote_descs, "target", b"bw")
         assert handle, "initialize_xfer failed"
@@ -136,7 +149,8 @@ def main() -> None:
 
         gbps = payload_bytes / elapsed / 1e9
         print(
-            f"  rep {rep}: {elapsed:.4f} s -> {gbps:.2f} GB/s "
+            f"  rep {rep}: start={start + time.time() - time.perf_counter():.4f} "
+            f"{elapsed:.4f} s -> {gbps:.2f} GB/s "
             f"(post {post_ms:.3f} ms, {post_ms * 1e3 / args.tensors:.2f} us/desc)",
             flush=True,
         )

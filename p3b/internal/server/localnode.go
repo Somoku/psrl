@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"time"
 
 	v1 "psrl.dev/sandboxd/api/v1"
 	"psrl.dev/sandboxd/internal/backend"
@@ -168,6 +169,12 @@ func specToProto(spec backend.Spec) *v1.SandboxSpec {
 	if spec.Resources.GPUCount > 0 {
 		gpus := spec.Resources.GPUCount
 		out.Resources.GpuCount = &gpus
+	}
+	// The lifetime is how long the node will let the sandbox live, so dropping it
+	// here would leave the node enforcing its own default instead of the one the
+	// caller stated.
+	if spec.Lifetime > 0 {
+		out.LifetimeS = int64(spec.Lifetime / time.Second)
 	}
 	for _, feature := range spec.RequiredFeatures {
 		out.RequiredFeatures = append(out.RequiredFeatures, featureValue(feature))

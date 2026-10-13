@@ -70,9 +70,8 @@ type Control struct {
 	// sandbox to a node this one is still about to occupy.
 	reservationRenewInterval time.Duration
 
-	mu       sync.Mutex
-	sandbox  map[string]sandboxRecord
-	ownerSeq uint64
+	mu      sync.Mutex
+	sandbox map[string]sandboxRecord
 	// provisions is what a create with an idempotency key is doing, so a caller
 	// that has no response yet can tell "still working" from "lost the request".
 	provisions map[string]*provisionRecord
@@ -178,7 +177,9 @@ func (c *Control) create(ctx context.Context, req *v1.CreateRequest) (*v1.Create
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
 
-	owner := c.ownerFor(req.GetCallbackTarget())
+	// The ledger and the node must key on the same owner, because that is the
+	// identity the caller heartbeats. ownerOf reads it the way the node does.
+	owner := ownerOf(spec)
 	grantID := fmt.Sprintf("grant-%d", time.Now().UnixNano())
 	amount := quotaAmount(spec)
 	if err := c.admit(ctx, grantID, spec.ResourceClass, owner, amount); err != nil {
@@ -348,6 +349,10 @@ func (c *Control) place(ctx context.Context, selected backend.Backend, spec back
 		lastRefusal)
 }
 
+// groupCleanupTimeout bounds releasing the members of a group that failed part
+// way, so a cleanup cannot outlive the request that triggered it.
+const groupCleanupTimeout = 30 * time.Second
+
 // CreateGroup provisions one group.
 //
 // Members are admitted independently, because a group is a completion unit
@@ -364,10 +369,16 @@ func (c *Control) CreateGroup(ctx context.Context, req *v1.CreateGroupRequest) (
 	for _, spec := range specs {
 		member, err := c.Create(ctx, &v1.CreateRequest{Spec: spec, CallbackTarget: req.GetCallbackTarget()})
 		if err != nil {
-			// A failed group leaves nothing charged.
+			// A failed group leaves nothing charged. The cleanup cannot run on the
+			// caller's context: the usual reason a member fails is that context's
+			// own deadline, and releasing under a cancelled context would leave
+			// every member already made charged, with no handle a caller could
+			// retry from.
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), groupCleanupTimeout)
 			for _, handle := range created {
-				_, _ = c.Release(ctx, handle)
+				_, _ = c.Release(cleanupCtx, handle)
 			}
+			cancel()
 			return nil, err
 		}
 		created = append(created, member.GetHandle())
@@ -380,8 +391,7 @@ func (c *Control) CreateGroup(ctx context.Context, req *v1.CreateGroupRequest) (
 func (c *Control) Release(ctx context.Context, handle *v1.SandboxHandle) (*v1.Empty, error) {
 	record, known := c.forget(handle.GetSandboxId())
 	if !known {
-		// Already gone is the outcome the caller wanted.
-		return &v1.Empty{}, nil
+		return c.releaseUnrecorded(ctx, handle)
 	}
 	var err error
 	if record.backend.Mode() == backend.SchedulingProvider {
@@ -399,6 +409,37 @@ func (c *Control) Release(ctx context.Context, handle *v1.SandboxHandle) (*v1.Em
 		c.placement.Release(record.reservationID)
 	}
 	c.ledger.Release(record.grantID)
+	return &v1.Empty{}, nil
+}
+
+// releaseUnrecorded destroys a sandbox this control plane holds no record of,
+// which is what a restarted control plane has for every sandbox the fleet is
+// still running. Returning success without asking would leak the container, so
+// the handle's node and backend are used to reach the runtime that owns it.
+//
+// There is no grant to return here. The record and the ledger were both in
+// memory and came back empty, so nothing is charged for this sandbox.
+func (c *Control) releaseUnrecorded(ctx context.Context, handle *v1.SandboxHandle) (*v1.Empty, error) {
+	if nodeID := handle.GetNodeId(); nodeID != "" {
+		err := c.nodes.ReleaseOn(ctx, backend.Handle{
+			Backend: handle.GetBackend(), SandboxID: handle.GetSandboxId(), NodeID: nodeID,
+		})
+		if err != nil {
+			// The sandbox may still exist, so the caller has to be able to retry.
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
+		return &v1.Empty{}, nil
+	}
+	selected, err := c.registry.Get(handle.GetBackend())
+	if err != nil || selected.Mode() != backend.SchedulingProvider {
+		// No runtime to ask, so there is nothing left to do about it.
+		return &v1.Empty{}, nil
+	}
+	if err := selected.Release(ctx, backend.Handle{
+		Backend: handle.GetBackend(), SandboxID: handle.GetSandboxId(),
+	}); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
 	return &v1.Empty{}, nil
 }
 
@@ -531,16 +572,6 @@ func (c *Control) Quota(context.Context, *v1.Empty) (*v1.QuotaReport, error) {
 		}
 	}
 	return out, nil
-}
-
-func (c *Control) ownerFor(callback string) string {
-	if callback != "" {
-		return callback
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.ownerSeq++
-	return fmt.Sprintf("anonymous-%d", c.ownerSeq)
 }
 
 func (c *Control) remember(id string, record sandboxRecord) {

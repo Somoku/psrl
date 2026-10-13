@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +38,20 @@ const (
 	labelOwner   = "psrl.owner"
 	labelClass   = "psrl.resource_class"
 	labelNode    = "psrl.node"
+	// These carry what a restart cannot otherwise recover: how the sandbox is
+	// executed, how long it may live, and which create produced it.
+	labelExecMode    = "psrl.exec_mode"
+	labelLifetime    = "psrl.lifetime_s"
+	labelIdempotency = "psrl.idempotency_key"
+	// Disk is charged by the node but not enforced by the Engine, so unlike
+	// memory and CPU it cannot be read back from the container's limits.
+	labelDisk = "psrl.disk_mb"
 )
+
+// DefaultPullTimeout is the image pull budget a node uses when its configuration
+// states none. It is exported because a control plane that bounds a create over
+// the node plane has to allow for the same pull before it gives up.
+const DefaultPullTimeout = 10 * time.Minute
 
 // Config is one node's Docker settings.
 type Config struct {
@@ -113,7 +127,7 @@ func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 		cfg.RequestTimeout = 30 * time.Second
 	}
 	if cfg.PullTimeout <= 0 {
-		cfg.PullTimeout = 10 * time.Minute
+		cfg.PullTimeout = DefaultPullTimeout
 	}
 	if !mode.Valid() {
 		return nil, fmt.Errorf("docker backend scheduling mode %q is not direct or provider", mode)
@@ -263,6 +277,18 @@ func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
 		labelOwner:   b.cfg.OwnerID,
 		labelClass:   spec.ResourceClass,
 		labelNode:    nodeID,
+	}
+	if spec.ExecMode != "" {
+		labels[labelExecMode] = spec.ExecMode
+	}
+	if spec.Lifetime > 0 {
+		labels[labelLifetime] = strconv.FormatInt(int64(spec.Lifetime/time.Second), 10)
+	}
+	if spec.Resources.DiskMB > 0 {
+		labels[labelDisk] = strconv.FormatInt(spec.Resources.DiskMB, 10)
+	}
+	if spec.IdempotencyKey != "" {
+		labels[labelIdempotency] = spec.IdempotencyKey
 	}
 	for key, value := range spec.Metadata {
 		labels[key] = value
@@ -695,32 +721,192 @@ func demultiplex(raw []byte) string {
 	return out.String()
 }
 
-// Sweep returns the sandboxes this service owns on the node, from the daemon
-// rather than from a local record.
+// Reconcile returns every sandbox this service owns on this node, with the facts
+// a restarted node needs to charge for it.
 //
 // The daemon is the source of truth: a service that trusted its own list would
-// leak every container it forgot across a restart.
-func (b *Backend) Sweep(ctx context.Context) ([]backend.Handle, error) {
+// leak every container it forgot across a restart. A warm pool entry is the one
+// exception, for the reason on refuseRunningPoolEntries.
+func (b *Backend) Reconcile(ctx context.Context) ([]backend.Reconciled, error) {
+	listed, err := b.listOwned(ctx, labelSandbox+"=true", labelOwner+"="+b.cfg.OwnerID)
+	if err != nil {
+		return nil, err
+	}
+	found, err := b.inspectAll(ctx, listed)
+	if err != nil {
+		return nil, err
+	}
+	if err := refuseRunningPoolEntries(found); err != nil {
+		return nil, err
+	}
+	return found, nil
+}
+
+// refuseRunningPoolEntries refuses to reconcile while a warm pool entry is running.
+//
+// A pool entry's class label is written at create and a container's labels are
+// immutable, so a claimed entry still reads as pool inventory, and the claim
+// itself was recorded only in the memory of the process that is gone. A running
+// entry is therefore unattributable: charging it would be wrong, and destroying
+// it could destroy a caller's live sandbox. An entry that has exited holds
+// nothing and passes through, for the node to reclaim.
+func refuseRunningPoolEntries(found []backend.Reconciled) error {
+	running := 0
+	for _, rec := range found {
+		if rec.Class == warmPoolClass && rec.Running {
+			running++
+		}
+	}
+	if running == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"%d running warm pool containers cannot be attributed to a caller after a restart: "+
+			"drain the pool before restarting, or keep it disabled", running)
+}
+
+// FindByIdempotencyKey returns the sandbox a create with this key already made.
+//
+// A create whose response was lost leaves a container the caller never learned
+// the id of, so a retry has to find it rather than make a second one.
+func (b *Backend) FindByIdempotencyKey(
+	ctx context.Context, key string,
+) (backend.Reconciled, bool, error) {
+	if key == "" {
+		return backend.Reconciled{}, false, nil
+	}
+	listed, err := b.listOwned(ctx,
+		labelSandbox+"=true", labelOwner+"="+b.cfg.OwnerID, labelIdempotency+"="+key)
+	if err != nil {
+		return backend.Reconciled{}, false, err
+	}
+	if len(listed) == 0 {
+		return backend.Reconciled{}, false, nil
+	}
+	found, err := b.inspectOne(ctx, listed[0])
+	if err != nil {
+		return backend.Reconciled{}, false, err
+	}
+	return found, true, nil
+}
+
+// listOwned lists the container ids this service owns that match every label.
+func (b *Backend) listOwned(ctx context.Context, labels ...string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
-	filters := fmt.Sprintf(`{"label":["%s=true","%s=%s"]}`, labelSandbox, labelOwner, b.cfg.OwnerID)
-	var listed []struct {
-		ID     string            `json:"Id"`
-		Labels map[string]string `json:"Labels"`
+	filter, err := json.Marshal(map[string][]string{"label": labels})
+	if err != nil {
+		return nil, err
 	}
-	path := "/containers/json?all=true&filters=" + urlEncode(filters)
+	var listed []struct {
+		ID string `json:"Id"`
+	}
+	path := "/containers/json?all=true&filters=" + urlEncode(string(filter))
 	if err := b.call(ctx, http.MethodGet, path, nil, &listed); err != nil {
 		return nil, err
 	}
-	out := make([]backend.Handle, 0, len(listed))
+	out := make([]string, 0, len(listed))
 	for _, container := range listed {
-		out = append(out, backend.Handle{
-			Backend:   b.Name(),
-			SandboxID: container.ID,
-			NodeID:    container.Labels[labelNode],
-		})
+		out = append(out, container.ID)
 	}
 	return out, nil
+}
+
+// inspectAll reads every id back, bounded so a node holding many containers does
+// not serialize the work into a slow startup.
+func (b *Backend) inspectAll(ctx context.Context, ids []string) ([]backend.Reconciled, error) {
+	const inspectors = 8
+	out := make([]backend.Reconciled, len(ids))
+	errs := make([]error, len(ids))
+	sem := make(chan struct{}, inspectors)
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			out[i], errs[i] = b.inspectOne(ctx, id)
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			return nil, fmt.Errorf("inspect %s: %w", ids[i], err)
+		}
+	}
+	return out, nil
+}
+
+// inspectOne rebuilds what one container holds from the daemon's own view of it.
+func (b *Backend) inspectOne(ctx context.Context, id string) (backend.Reconciled, error) {
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	var inspected struct {
+		ID      string `json:"Id"`
+		Created string `json:"Created"`
+		State   struct {
+			Running bool `json:"Running"`
+		} `json:"State"`
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+			Env    []string          `json:"Env"`
+		} `json:"Config"`
+		HostConfig struct {
+			Memory    int64 `json:"Memory"`
+			CpuQuota  int64 `json:"CpuQuota"`
+			CpuPeriod int64 `json:"CpuPeriod"`
+		} `json:"HostConfig"`
+	}
+	if err := b.call(ctx, http.MethodGet, "/containers/"+id+"/json", nil, &inspected); err != nil {
+		return backend.Reconciled{}, err
+	}
+	labels := inspected.Config.Labels
+	rec := backend.Reconciled{
+		Handle:   backend.Handle{Backend: b.Name(), SandboxID: id, NodeID: labels[labelNode]},
+		Owner:    labels[backend.OwnerMetadataKey],
+		Class:    labels[labelClass],
+		ExecMode: labels[labelExecMode],
+		Running:  inspected.State.Running,
+		Resources: backend.Resources{
+			MemoryMB: inspected.HostConfig.Memory / (1024 * 1024),
+		},
+	}
+	// CPU is charged in millis and written as a quota against a fixed period, so
+	// reading it back is the same division the create made.
+	if inspected.HostConfig.CpuPeriod > 0 {
+		rec.Resources.CPUCount = float64(inspected.HostConfig.CpuQuota) /
+			float64(inspected.HostConfig.CpuPeriod)
+	}
+	if seconds, err := strconv.ParseInt(labels[labelLifetime], 10, 64); err == nil {
+		rec.Lifetime = time.Duration(seconds) * time.Second
+	}
+	if diskMB, err := strconv.ParseInt(labels[labelDisk], 10, 64); err == nil {
+		rec.Resources.DiskMB = diskMB
+	}
+	if created, err := time.Parse(time.RFC3339Nano, inspected.Created); err == nil {
+		rec.CreatedAt = created
+	}
+	for _, entry := range inspected.Config.Env {
+		if value, found := strings.CutPrefix(entry, "CUDA_VISIBLE_DEVICES="); found {
+			rec.GPUIndices = parseDeviceList(value)
+		}
+	}
+	return rec, nil
+}
+
+// parseDeviceList reads the comma-separated device indices a create wrote.
+func parseDeviceList(value string) []int32 {
+	if value == "" {
+		return nil
+	}
+	out := make([]int32, 0, 1)
+	for _, part := range strings.Split(value, ",") {
+		if index, err := strconv.ParseInt(strings.TrimSpace(part), 10, 32); err == nil {
+			out = append(out, int32(index))
+		}
+	}
+	return out
 }
 
 // Preflight refuses a node whose daemon this service cannot drive.
@@ -974,7 +1160,8 @@ func urlEncode(value string) string {
 	var out strings.Builder
 	for _, r := range value {
 		switch {
-		case r == '{' || r == '}' || r == '[' || r == ']' || r == '"' || r == ',' || r == ':' || r == '=' || r == ' ':
+		case r == '{' || r == '}' || r == '[' || r == ']' || r == '"' || r == ',' ||
+			r == ':' || r == '=' || r == ' ' || r == '\\' || r == '%':
 			fmt.Fprintf(&out, "%%%02X", r)
 		default:
 			out.WriteRune(r)

@@ -206,11 +206,11 @@ func TestOvercommitAdmitsWhatTheDeclaredEnvelopeWouldRefuse(t *testing.T) {
 	gate.SetPressure(Pressure{MemUsedPct: 0.1})
 
 	// Fill the declared envelope exactly.
-	if _, _, ok := gate.Admit("default", "owner-a", Resources{MemoryMB: 1000}); !ok {
+	if _, _, ok := gate.Reserve("default", "owner-a", Resources{MemoryMB: 1000}); !ok {
 		t.Fatal("the first request must fit the declared envelope")
 	}
 	// This one only fits because of the expansion.
-	if _, refusal, ok := gate.Admit("default", "owner-b", Resources{MemoryMB: 500}); !ok {
+	if _, refusal, ok := gate.Reserve("default", "owner-b", Resources{MemoryMB: 500}); !ok {
 		t.Fatalf("a request beyond the declared envelope was refused (%s) while the node measured 10%% used; "+
 			"this is exactly the density overcommit exists to recover", refusal)
 	}
@@ -221,7 +221,7 @@ func TestOvercommitStillRefusesBeyondTheExpandedEnvelope(t *testing.T) {
 	gate := newOvercommitGate(t, overcommitConfig())
 	gate.SetPressure(Pressure{MemUsedPct: 0.1})
 
-	if _, refusal, ok := gate.Admit("default", "owner", Resources{MemoryMB: 5000}); ok {
+	if _, refusal, ok := gate.Reserve("default", "owner", Resources{MemoryMB: 5000}); ok {
 		t.Fatalf("a request of 5000 MB was admitted against a ~1987 MB expanded envelope (refusal %q)", refusal)
 	}
 }
@@ -233,7 +233,7 @@ func TestThePressureCeilingStillRefusesAnOvercommittedNode(t *testing.T) {
 	gate := newOvercommitGate(t, overcommitConfig())
 	gate.SetPressure(Pressure{MemUsedPct: 0.95}) // above LocalMemCeiling of 0.9
 
-	if _, refusal, ok := gate.Admit("default", "owner", Resources{MemoryMB: 1}); ok {
+	if _, refusal, ok := gate.Reserve("default", "owner", Resources{MemoryMB: 1}); ok {
 		t.Fatal("a node above its memory pressure ceiling must refuse even under overcommit")
 	} else if refusal != RefusedPressure {
 		t.Errorf("refusal is %q, want %q", refusal, RefusedPressure)

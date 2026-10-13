@@ -32,17 +32,32 @@ var _ NodeClient = (*FleetNodeClient)(nil)
 type RemoteNodeClient struct {
 	address string
 	timeout time.Duration
+	// createTimeout bounds a create_on round trip, which legitimately outlasts one
+	// RPC budget because the node may pull an image before it can answer.
+	createTimeout time.Duration
 }
 
 // NewRemoteNodeClient returns a client for a node at the given address.
 //
 // Addresses follow the same "unix://..." / "host:port" convention as the SDK's
-// own listen address.
-func NewRemoteNodeClient(address string, timeout time.Duration) *RemoteNodeClient {
+// own listen address. A non-positive create timeout falls back to the ordinary
+// one, so a caller that has no image-pull budget to state still gets a bound.
+func NewRemoteNodeClient(address string, timeout, createTimeout time.Duration) *RemoteNodeClient {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	return &RemoteNodeClient{address: address, timeout: timeout}
+	if createTimeout <= 0 {
+		createTimeout = timeout
+	}
+	return &RemoteNodeClient{address: address, timeout: timeout, createTimeout: createTimeout}
+}
+
+// budgetFor is how long one method's round trip may take.
+func (r *RemoteNodeClient) budgetFor(method string) time.Duration {
+	if method == "create_on" {
+		return r.createTimeout
+	}
+	return r.timeout
 }
 
 // call dials the node, sends one request, reads one reply, and closes.
@@ -52,6 +67,26 @@ func (r *RemoteNodeClient) call(ctx context.Context, method string, payload any)
 		return nil, status.Errorf(codes.Unavailable, "node at %s: %v", r.address, err)
 	}
 	defer conn.Close()
+
+	// A peer that accepts the connection and then stalls must not hold this
+	// goroutine, so the whole exchange is bounded rather than only the dial. A
+	// caller's own deadline, when it is earlier, wins.
+	deadline := time.Now().Add(r.budgetFor(method))
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = conn.SetDeadline(deadline)
+	// A cancel without a deadline would otherwise leave the read blocked until
+	// the budget expires, so closing the connection is what unblocks it.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stop:
+		}
+	}()
 
 	raw, err := json.Marshal(request{Method: method, Payload: mustMarshal(payload)})
 	if err != nil {

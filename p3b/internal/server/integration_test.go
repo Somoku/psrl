@@ -52,8 +52,10 @@ func newStack(t *testing.T, fleetMemoryMB int64) *stack {
 	t.Helper()
 	socket := dockerSocket(t)
 
-	// Short spans, so a reclamation test does not wait an episode.
-	spans, err := timing.New(8*time.Second, 5*time.Second)
+	// The node TTL has to outlast the reservation TTL or placement refuses the
+	// configuration. It is not what makes these tests fast: reclamation here is
+	// driven per sandbox by the lifetime its create states, and by the sweep.
+	spans, err := timing.New(timing.DefaultNodeTTL, 5*time.Second)
 	if err != nil {
 		t.Fatalf("timing: %v", err)
 	}
@@ -218,10 +220,25 @@ func TestAFleetWithoutRoomRefusesRatherThanOversubscribing(t *testing.T) {
 		handles = append(handles, created.GetHandle())
 	}
 
-	if _, err := s.control.Create(ctx, &v1.CreateRequest{Spec: createSpec(64)}); err == nil {
-		t.Fatal("a third sandbox must be refused on a full fleet")
+	// A full class queues rather than refusing, so an immediate refusal is not
+	// what the caller gets; what must hold is that no release ever makes room for
+	// a third 64MB sandbox on a fleet of two, so a caller that gives up fails and
+	// the ledger is unchanged. Bounding that wait on the server side is a later
+	// increment.
+	giveUp, cancelGiveUp := context.WithTimeout(context.Background(), heldOnAFullFleet)
+	defer cancelGiveUp()
+	if _, err := s.control.Create(giveUp, &v1.CreateRequest{Spec: createSpec(64)}); err == nil {
+		t.Fatal("a third sandbox must not be admitted to a full fleet")
+	}
+	if granted := s.ledger.Report()["rollout"].Granted.MemoryMB; granted != 128 {
+		t.Fatalf("the ledger accounts %dMB, want the two admitted 64MB sandboxes", granted)
 	}
 }
+
+// heldOnAFullFleet bounds a create this test expects to fail. It is a bound on
+// the test rather than a behaviour under test: the fleet must never oversubscribe
+// whether the caller waits a second or a minute.
+const heldOnAFullFleet = 3 * time.Second
 
 func TestASpecNoBackendCanServeIsRefusedAtAdmission(t *testing.T) {
 	// Refused rather than degraded: a workspace restore must never be handed to a
@@ -268,9 +285,36 @@ func mustPressureGate(t *testing.T) *node.Admission {
 	return gate
 }
 
-func TestAnIdleSandboxIsPausedAndThenReclaimedByTheNode(t *testing.T) {
+func TestASandboxPastItsLifetimeIsReclaimedByTheNode(t *testing.T) {
 	// Reclamation is the node's, so this runs without the control plane doing
-	// anything: a caller that walked away must not leave the sandbox resident.
+	// anything: a sandbox that outlives the lifetime its create stated must not
+	// stay resident, because its caller may be gone.
+	s := newStack(t, 4096)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	request := createSpec(64)
+	request.LifetimeS = 1
+	created, err := s.control.Create(ctx, &v1.CreateRequest{Spec: request})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer s.control.Release(context.Background(), created.GetHandle())
+
+	// Past the lifetime the create stated.
+	time.Sleep(2 * time.Second)
+	reaped, err := s.node.Sweep(ctx, &v1.Empty{})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(reaped.GetReapedLifetime()) != 1 {
+		t.Fatalf("the sandbox past its lifetime was not reclaimed: %+v", reaped)
+	}
+}
+
+func TestANodeAdoptsTheSandboxesItFindsAfterARestart(t *testing.T) {
+	// The daemon outlives the process, so a restarted node does not start on an
+	// empty machine. Adoption is what stops it handing out memory a live sandbox
+	// is already holding, and what lets it reclaim work whose caller is gone.
 	s := newStack(t, 4096)
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
@@ -279,33 +323,79 @@ func TestAnIdleSandboxIsPausedAndThenReclaimedByTheNode(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	defer s.control.Release(context.Background(), created.GetHandle())
+	sandboxID := created.GetHandle().GetSandboxId()
 
-	// Past the 4s pause window derived from a 2s episode deadline.
-	time.Sleep(5 * time.Second)
-	paused, err := s.node.Sweep(ctx, &v1.Empty{})
+	// A fresh node over the same daemon is what a restart leaves: an empty
+	// ledger and the containers the previous process made.
+	restarted, restartedGate, restartedLife := nodeOverTheSameDaemon(t, s)
+	report, err := restartedLife.Reconcile(ctx, []backend.Backend{s.backend})
 	if err != nil {
-		t.Fatalf("sweep: %v", err)
-	}
-	if len(paused.GetPaused()) != 1 {
-		t.Fatalf("the idle sandbox was not paused: %+v", paused)
+		t.Fatalf("reconcile: %v", err)
 	}
 
-	// Past the 12s reap window.
-	time.Sleep(9 * time.Second)
-	reaped, err := s.node.Sweep(ctx, &v1.Empty{})
-	if err != nil {
-		t.Fatalf("sweep: %v", err)
+	if report.Adopted != 1 || report.Reclaimed != 0 {
+		t.Fatalf("reconcile %+v, want the one sandbox the daemon still holds", report)
 	}
-	if len(reaped.GetReapedIdle()) != 1 {
-		t.Fatalf("the idle sandbox was not reclaimed: %+v", reaped)
+	if granted := restartedGate.Snapshot().Granted.MemoryMB; granted != 64 {
+		t.Fatalf("the adopted sandbox was charged %dMB, want its own 64MB", granted)
+	}
+	if live := restarted.View().LiveSandboxes; live != 1 {
+		t.Fatalf("the restarted node reports %d live sandboxes, want 1", live)
+	}
+	// Owning it is what lets the restarted node destroy it, which is the path a
+	// caller's release takes after a restart.
+	if err := restartedLife.Release(ctx, sandboxID, node.ExitReleased); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	status, err := s.backend.Status(ctx, backend.Handle{Backend: "docker", SandboxID: sandboxID})
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status != "terminated" {
+		t.Fatalf("the container survived its release: status %q", status)
 	}
 }
+
+// nodeOverTheSameDaemon returns a node, gate and lifecycle that share the
+// daemon with s but know nothing of what s created, which is the state a
+// process restart leaves behind.
+func nodeOverTheSameDaemon(t *testing.T, s *stack) (*Node, *node.Admission, *node.Lifecycle) {
+	t.Helper()
+	gate, err := node.NewAdmission(node.Config{
+		Envelope: node.Resources{MemoryMB: 4096, CPUMillis: 100000},
+		Classes:  map[string]node.ClassShare{"rollout": {Guaranteed: 0.7}, "grader": {Guaranteed: 0.2}},
+		LeaseTTL: timing.OwnerLease,
+	})
+	if err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	life, err := node.NewLifecycle("node-a", gate, timing.SweepInterval)
+	if err != nil {
+		t.Fatalf("lifecycle: %v", err)
+	}
+	life.SetOwnerLiveness(gate.OwnerAlive)
+	agent, err := NewNode(NodeConfig{
+		NodeID: "node-a", Admission: gate, Lifecycle: life, Backends: []backend.Backend{s.backend},
+	})
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	return agent, gate, life
+}
+
+// burstGiveUp bounds the concurrent burst below. Eight of the twenty-four fit
+// at once and the rest queue, so the bound is what makes the test finish rather
+// than a statement about admission.
+const burstGiveUp = 20 * time.Second
 
 func TestABurstOfCreatesStaysInsideTheFleet(t *testing.T) {
 	// Creates arrive in bursts, so the invariant that matters is that concurrency
 	// never admits past the fleet, whatever the interleaving.
 	s := newStack(t, 512)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// A full class queues, so the creates that cannot fit wait for the caller's
+	// deadline rather than failing at once. The bound is on the test: the
+	// invariant below has to hold whatever the wait.
+	ctx, cancel := context.WithTimeout(context.Background(), burstGiveUp)
 	defer cancel()
 
 	var mu sync.Mutex
@@ -388,9 +478,11 @@ func TestAGroupIsAdmittedMemberByMember(t *testing.T) {
 }
 
 func TestAFailedGroupLeavesNothingCharged(t *testing.T) {
-	// 128MB takes two members; the third fails and the first two must be returned.
+	// 128MB takes two members; the third cannot fit and the first two must be
+	// returned. The third queues rather than failing at once, so the bound is on
+	// the test.
 	s := newStack(t, 128)
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), heldOnAFullFleet)
 	defer cancel()
 	before := s.ledger.Headroom("rollout").MemoryMB
 

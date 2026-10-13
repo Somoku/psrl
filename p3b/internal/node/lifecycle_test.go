@@ -19,6 +19,17 @@ type fakeBackend struct {
 	features   []string
 	released   []string
 	releaseErr error
+	// releaseErrs injects a failure for one sandbox id, so a test can leave one
+	// destroy stuck while the rest succeed.
+	releaseErrs map[string]error
+	// releaseBlock, when set, holds every release until it is closed, so a test
+	// can observe that a caller did not wait for one.
+	releaseBlock chan struct{}
+	// attempts counts the releases per sandbox, so a test can see a retry.
+	attempts map[string]int
+	// found is what Reconcile reports as already present on this node.
+	found        []backend.Reconciled
+	reconcileErr error
 }
 
 func (f *fakeBackend) Name() string                 { return "fake" }
@@ -33,12 +44,63 @@ func (f *fakeBackend) Create(context.Context, string, backend.Spec, string) (bac
 
 func (f *fakeBackend) Release(_ context.Context, handle backend.Handle) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.releaseErr != nil {
-		return f.releaseErr
+	if f.attempts == nil {
+		f.attempts = map[string]int{}
 	}
+	f.attempts[handle.SandboxID]++
+	block := f.releaseBlock
+	err, injected := f.releaseErrs[handle.SandboxID]
+	fallback := f.releaseErr
+	f.mu.Unlock()
+
+	if block != nil {
+		<-block
+	}
+	if injected {
+		return err
+	}
+	if fallback != nil {
+		return fallback
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.released = append(f.released, handle.SandboxID)
 	return nil
+}
+
+// failRelease makes the backend refuse to remove one sandbox.
+func (f *fakeBackend) failRelease(sandboxID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.releaseErrs == nil {
+		f.releaseErrs = map[string]error{}
+	}
+	f.releaseErrs[sandboxID] = fmt.Errorf("daemon refused to remove %s", sandboxID)
+}
+
+// allowRelease undoes failRelease.
+func (f *fakeBackend) allowRelease(sandboxID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.releaseErrs, sandboxID)
+}
+
+// attemptsOn reports how many times the backend was asked to remove a sandbox.
+func (f *fakeBackend) attemptsOn(sandboxID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attempts[sandboxID]
+}
+
+func (f *fakeBackend) Reconcile(context.Context) ([]backend.Reconciled, error) {
+	if f.reconcileErr != nil {
+		return nil, f.reconcileErr
+	}
+	return f.found, nil
+}
+
+func (f *fakeBackend) FindByIdempotencyKey(context.Context, string) (backend.Reconciled, bool, error) {
+	return backend.Reconciled{}, false, nil
 }
 
 func (f *fakeBackend) Status(context.Context, backend.Handle) (string, error) { return "running", nil }
@@ -56,11 +118,19 @@ func adopt(t *testing.T, life *Lifecycle, gate *Admission, b backend.Backend, id
 
 func adoptWithLifetime(t *testing.T, life *Lifecycle, gate *Admission, b backend.Backend, id string, lifetime time.Duration) {
 	t.Helper()
-	grant, refusal, ok := gate.Admit("rollout", "worker", Resources{MemoryMB: 10})
+	grant, refusal, ok := gate.Reserve("rollout", "worker", Resources{MemoryMB: 10})
 	if !ok {
-		t.Fatalf("admit %s: %q", id, refusal)
+		t.Fatalf("reserve %s: %q", id, refusal)
 	}
-	life.Adopt(backend.Handle{Backend: "fake", SandboxID: id, NodeID: "node-a"}, b, grant.LeaseID, "worker", "", lifetime)
+	// The same three steps a create takes, so a test states one intent.
+	life.Reserve(grant, "worker", "", lifetime)
+	if _, ok := life.Claim(grant.LeaseID); !ok {
+		t.Fatalf("claim %s: the grant was already spent", id)
+	}
+	handle := backend.Handle{Backend: b.Name(), SandboxID: id, NodeID: "node-a"}
+	if !life.AdoptCreated(grant.LeaseID, handle, b) {
+		t.Fatalf("adopt %s: the record was reclaimed before it was adopted", id)
+	}
 }
 
 func TestAZeroSweepIntervalIsRefused(t *testing.T) {
@@ -160,6 +230,7 @@ func TestEachSandboxIsReclaimedForExactlyOneReason(t *testing.T) {
 	// Past the lifetime.
 	clock = clock.Add(testLifetime + time.Second)
 	report := life.Sweep(context.Background())
+	life.WaitCleanup()
 
 	if report.Released() != 1 {
 		t.Fatalf("released %d times for one sandbox: %+v", report.Released(), report)
@@ -264,6 +335,7 @@ func TestConcurrentSweepsDecideEachSandboxOnce(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	life.WaitCleanup()
 
 	if got := len(b.releasedIDs()); got != 50 {
 		t.Fatalf("the backend saw %d releases for 50 sandboxes", got)
@@ -291,8 +363,11 @@ func BenchmarkSweep(b *testing.B) {
 	fake := &fakeBackend{}
 	// A production node density, so the sweep is measured where it runs.
 	for i := 0; i < 3200; i++ {
-		grant, _, _ := gate.Admit("rollout", "w", Resources{MemoryMB: 1})
-		life.Adopt(backend.Handle{SandboxID: fmt.Sprintf("sb-%04d", i)}, fake, grant.LeaseID, "w", "", testLifetime)
+		grant, _, _ := gate.Reserve("rollout", "w", Resources{MemoryMB: 1})
+		id := fmt.Sprintf("sb-%04d", i)
+		life.Reserve(grant, "w", "", testLifetime)
+		life.Claim(grant.LeaseID)
+		life.AdoptCreated(grant.LeaseID, backend.Handle{Backend: "fake", SandboxID: id}, fake)
 	}
 	ctx := context.Background()
 	b.ReportAllocs()

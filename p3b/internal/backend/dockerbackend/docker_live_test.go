@@ -266,28 +266,119 @@ func TestStatusOfAReleasedSandboxIsTerminatedRatherThanAnError(t *testing.T) {
 	}
 }
 
-func TestASweepFindsThisServiceOwnSandboxesFromTheDaemon(t *testing.T) {
+func TestAReconcileRebuildsWhatThisServiceHoldsFromTheDaemon(t *testing.T) {
 	// The daemon is the source of truth: a service that trusted its own list would
 	// leak every container it forgot across a restart.
 	b := liveBackend(t)
 	created := createOne(t, b)
 
-	found, err := b.Sweep(context.Background())
+	found, err := b.Reconcile(context.Background())
 	if err != nil {
-		t.Fatalf("sweep: %v", err)
+		t.Fatalf("reconcile: %v", err)
 	}
 
 	var matched bool
-	for _, handle := range found {
-		if handle.SandboxID == created.Handle.SandboxID {
-			matched = true
-			if handle.NodeID != "test-node" {
-				t.Fatalf("swept handle carries node %q, want test-node", handle.NodeID)
-			}
+	for _, rec := range found {
+		if rec.Handle.SandboxID != created.Handle.SandboxID {
+			continue
+		}
+		matched = true
+		if rec.Handle.NodeID != "test-node" {
+			t.Errorf("reconciled handle carries node %q, want test-node", rec.Handle.NodeID)
+		}
+		if !rec.Running {
+			t.Error("a live sandbox must reconcile as running")
+		}
+		if rec.Class != "rollout" {
+			t.Errorf("class: got %q, want rollout", rec.Class)
+		}
+		// The charge has to round-trip, or a restart rebuilds a different envelope.
+		if rec.Resources.MemoryMB != 64 || rec.Resources.CPUCount != 0.5 {
+			t.Errorf("resources: got %+v, want 64MB and 0.5 cores", rec.Resources)
 		}
 	}
 	if !matched {
-		t.Fatalf("sweep returned %d handles, none of them the live sandbox", len(found))
+		t.Fatalf("reconcile returned %d records, none of them the live sandbox", len(found))
+	}
+}
+
+func TestAReconcileRecoversTheFactsOnlyALabelCarries(t *testing.T) {
+	// How a sandbox is executed, how long it may live, how much disk it was
+	// charged and who owns it cannot be read off the container's limits, so the
+	// labels are the only place a restart can recover them from.
+	b := liveBackend(t)
+	request := spec()
+	request.ExecMode = "persistent"
+	request.Lifetime = 90 * time.Minute
+	request.Resources.DiskMB = 512
+	request.Metadata = map[string]string{backend.OwnerMetadataKey: "worker-7"}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	created, err := b.Create(ctx, "test-node", request, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer releaseCancel()
+		_ = b.Release(releaseCtx, created.Handle)
+	})
+
+	found, err := b.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	for _, rec := range found {
+		if rec.Handle.SandboxID != created.Handle.SandboxID {
+			continue
+		}
+		if rec.Owner != "worker-7" {
+			t.Errorf("owner: got %q, want worker-7", rec.Owner)
+		}
+		if rec.ExecMode != "persistent" {
+			t.Errorf("exec mode: got %q, want persistent", rec.ExecMode)
+		}
+		if rec.Lifetime != 90*time.Minute {
+			t.Errorf("lifetime: got %s, want 90m", rec.Lifetime)
+		}
+		if rec.Resources.DiskMB != 512 {
+			t.Errorf("disk: got %dMB, want 512MB", rec.Resources.DiskMB)
+		}
+		if rec.CreatedAt.IsZero() {
+			t.Error("created at: a reconciled sandbox needs its start time to age out on")
+		}
+		return
+	}
+	t.Fatalf("reconcile returned %d records, none of them the live sandbox", len(found))
+}
+
+func TestACreateIsFoundByItsIdempotencyKey(t *testing.T) {
+	// A create whose response was lost leaves a container the caller never learned
+	// the id of, so a retry has to find it rather than make a second one.
+	b := liveBackend(t)
+	request := spec()
+	request.IdempotencyKey = "ticket-lost-response"
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	created, err := b.Create(ctx, "test-node", request, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer releaseCancel()
+		_ = b.Release(releaseCtx, created.Handle)
+	})
+
+	found, ok, err := b.FindByIdempotencyKey(context.Background(), "ticket-lost-response")
+	if err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	if !ok || found.Handle.SandboxID != created.Handle.SandboxID {
+		t.Fatalf("the lost create must be found by its key, got %+v ok=%v", found, ok)
+	}
+	if _, ok, err := b.FindByIdempotencyKey(context.Background(), "no-such-ticket"); err != nil || ok {
+		t.Errorf("an unknown key must miss, got ok=%v err=%v", ok, err)
 	}
 }
 
@@ -348,9 +439,9 @@ func TestConcurrentCreatesAndReleasesAllSucceed(t *testing.T) {
 	}
 
 	// Nothing of this run's may be left behind.
-	left, err := b.Sweep(ctx)
+	left, err := b.Reconcile(ctx)
 	if err != nil {
-		t.Fatalf("sweep: %v", err)
+		t.Fatalf("reconcile: %v", err)
 	}
 	if len(left) != 0 {
 		t.Fatalf("%d sandboxes survived the burst", len(left))

@@ -197,13 +197,12 @@ type Grant struct {
 	GPUIndices []int32
 }
 
-type lease struct {
-	grant     Grant
-	owner     string
-	renewedAt time.Time
-}
-
 // Admission is this node's accounting. Safe for concurrent use.
+//
+// It holds aggregates and no per-grant table: the lifecycle owns the record for
+// each sandbox, and this only knows how much of the envelope is spoken for. Two
+// copies of one fact drift, and that drift is what let a grant be returned while
+// its container still held memory.
 type Admission struct {
 	mu   sync.Mutex
 	cfg  Config
@@ -212,7 +211,6 @@ type Admission struct {
 	// while it is actually waiting. Reserving against an idle class leaves the
 	// node idle and full at once.
 	queued   map[string]int
-	leases   map[string]*lease
 	owners   map[string]time.Time
 	freeGPUs []int32
 	pressure Pressure
@@ -238,7 +236,6 @@ func NewAdmission(cfg Config) (*Admission, error) {
 		cfg:      cfg,
 		used:     map[string]Resources{},
 		queued:   map[string]int{},
-		leases:   map[string]*lease{},
 		owners:   map[string]time.Time{},
 		freeGPUs: free,
 		refusals: map[Refusal]int64{},
@@ -296,11 +293,13 @@ func (a *Admission) Dequeue(class string) {
 	}
 }
 
-// Admit accepts or refuses one request against this node's live state.
-func (a *Admission) Admit(class, owner string, want Resources) (Grant, Refusal, bool) {
+// Reserve charges one request against this node's live state.
+//
+// The caller owns the grant it returns. Budget comes back only through Return,
+// which the lifecycle calls once it has confirmed the runtime object is gone.
+func (a *Admission) Reserve(class, owner string, want Resources) (Grant, Refusal, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.expireLocked()
 
 	if a.draining {
 		a.refuse(RefusedDraining)
@@ -336,12 +335,12 @@ func (a *Admission) Admit(class, owner string, want Resources) (Grant, Refusal, 
 
 	devices := a.takeGPUsLocked(want.GPUCount)
 	a.nextID++
-	id := fmt.Sprintf("lease-%d", a.nextID)
-	grant := Grant{LeaseID: id, Class: class, Resources: want, GPUIndices: devices}
-	now := a.now()
-	a.leases[id] = &lease{grant: grant, owner: owner, renewedAt: now}
+	grant := Grant{
+		LeaseID: fmt.Sprintf("lease-%d", a.nextID), Class: class,
+		Resources: want, GPUIndices: devices,
+	}
 	a.used[class] = a.used[class].Add(want)
-	a.owners[owner] = now
+	a.owners[owner] = a.now()
 	a.admitted++
 	return grant, "", true
 }
@@ -497,25 +496,71 @@ func (a *Admission) takeGPUsLocked(count int32) []int32 {
 	return taken
 }
 
-// Release returns one grant and the devices it held.
-func (a *Admission) Release(leaseID string) {
+// Return gives one grant's budget back, once its runtime object is gone.
+//
+// It is keyed on the grant rather than on an id because this gate keeps no
+// per-grant table: the lifecycle owns the record, and this is arithmetic over
+// the envelope.
+func (a *Admission) Return(grant Grant) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.releaseLocked(leaseID)
+	a.used[grant.Class] = a.used[grant.Class].Sub(grant.Resources)
+	if (a.used[grant.Class] == Resources{}) {
+		delete(a.used, grant.Class)
+	}
+	a.freeGPUs = append(a.freeGPUs, grant.GPUIndices...)
+	sort.Slice(a.freeGPUs, func(i, j int) bool { return a.freeGPUs[i] < a.freeGPUs[j] })
 }
 
-func (a *Admission) releaseLocked(leaseID string) {
-	held, ok := a.leases[leaseID]
-	if !ok {
-		return
+// Recharge charges a grant this process did not reserve, which is what a node
+// does for a container that outlived a restart.
+//
+// It deliberately skips the headroom check: the container exists, so its memory
+// is already spent whether the envelope has room or not. A device index that is
+// not free means two records claim one device, which is a fault worth refusing.
+func (a *Admission) Recharge(grant Grant, owner string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if missing := a.takeIndicesLocked(grant.GPUIndices); len(missing) > 0 {
+		return fmt.Errorf("device indices %v are already granted", missing)
 	}
-	delete(a.leases, leaseID)
-	a.used[held.grant.Class] = a.used[held.grant.Class].Sub(held.grant.Resources)
-	if (a.used[held.grant.Class] == Resources{}) {
-		delete(a.used, held.grant.Class)
+	a.used[grant.Class] = a.used[grant.Class].Add(grant.Resources)
+	a.owners[owner] = a.now()
+	a.admitted++
+	return nil
+}
+
+// RetainOwners forgets the heartbeats of owners that no longer hold anything, so
+// a long run does not accumulate one entry per caller that ever existed.
+func (a *Admission) RetainOwners(live map[string]struct{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for owner := range a.owners {
+		if _, held := live[owner]; !held {
+			delete(a.owners, owner)
+		}
 	}
-	a.freeGPUs = append(a.freeGPUs, held.grant.GPUIndices...)
-	sort.Slice(a.freeGPUs, func(i, j int) bool { return a.freeGPUs[i] < a.freeGPUs[j] })
+}
+
+// takeIndicesLocked removes named devices from the free list and reports the ones
+// that were not free.
+func (a *Admission) takeIndicesLocked(indices []int32) []int32 {
+	var missing []int32
+	for _, index := range indices {
+		found := -1
+		for i, free := range a.freeGPUs {
+			if free == index {
+				found = i
+				break
+			}
+		}
+		if found < 0 {
+			missing = append(missing, index)
+			continue
+		}
+		a.freeGPUs = append(a.freeGPUs[:found], a.freeGPUs[found+1:]...)
+	}
+	return missing
 }
 
 // Renew records that an owner still holds its grants.
@@ -543,53 +588,11 @@ func (a *Admission) OwnerAlive(owner string) bool {
 	return a.now().Sub(seen) <= a.cfg.LeaseTTL
 }
 
-// ReleaseOwner returns everything one owner held.
-func (a *Admission) ReleaseOwner(owner string) int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.releaseOwnerLocked(owner)
-}
-
-func (a *Admission) releaseOwnerLocked(owner string) int {
-	var ids []string
-	for id, held := range a.leases {
-		if held.owner == owner {
-			ids = append(ids, id)
-		}
-	}
-	for _, id := range ids {
-		a.releaseLocked(id)
-	}
-	delete(a.owners, owner)
-	return len(ids)
-}
-
-// expireLocked reclaims the grants of owners that stopped renewing.
-//
-// Owner silence is the only evidence the node has. Grant age is not: a
-// long-lived sandbox is indistinguishable from an abandoned one by age alone.
-func (a *Admission) expireLocked() {
-	now := a.now()
-	for owner, seen := range a.owners {
-		if now.Sub(seen) > a.cfg.LeaseTTL {
-			a.releaseOwnerLocked(owner)
-		}
-	}
-}
-
-// Expire runs lease reclamation, for a caller driving the gate from a sweep.
-func (a *Admission) Expire() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.expireLocked()
-}
-
 // Report is the gate's accounting for the node's own report and metric hook.
 type Report struct {
 	Envelope      Resources
 	ClassHeadroom map[string]Resources
 	Granted       Resources
-	Leases        int
 	FreeGPUs      int
 	Draining      bool
 	Admitted      int64
@@ -632,7 +635,6 @@ func (a *Admission) Snapshot() Report {
 		Overcommit:        overcommit,
 		ClassHeadroom:     headroom,
 		Granted:           a.totalUsedLocked(),
-		Leases:            len(a.leases),
 		FreeGPUs:          len(a.freeGPUs),
 		Draining:          a.draining,
 		Admitted:          a.admitted,

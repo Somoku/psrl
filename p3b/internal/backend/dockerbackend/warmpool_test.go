@@ -474,3 +474,40 @@ func TestANonMatchingClaimLeavesThePoolIntact(t *testing.T) {
 		t.Errorf("claims after a non-matching spec: %d, want 0", report.Claims)
 	}
 }
+
+// -- a pool entry cannot be reconciled across a restart ------------------------
+
+func TestAReconcileRefusesWhileAPoolEntryIsRunning(t *testing.T) {
+	// A claimed entry keeps the pool's class label, because labels are immutable
+	// and the claim lived only in memory. After a restart a running pool entry
+	// cannot be told from a caller's sandbox, so the node must not guess: it
+	// refuses to start rather than charge one wrongly or destroy live work.
+	found := []backend.Reconciled{
+		{Handle: backend.Handle{SandboxID: "a"}, Class: "rollout", Running: true},
+		{Handle: backend.Handle{SandboxID: "b"}, Class: warmPoolClass, Running: true},
+	}
+	if err := refuseRunningPoolEntries(found); err == nil {
+		t.Fatal("a running pool entry must stop the reconcile")
+	}
+}
+
+func TestAReconcilePassesAnExitedPoolEntryThroughForReclaim(t *testing.T) {
+	// An entry that has exited holds no memory, so there is nothing ambiguous
+	// about it: the node reclaims it like any other dead container.
+	found := []backend.Reconciled{
+		{Handle: backend.Handle{SandboxID: "a"}, Class: warmPoolClass, Running: false},
+	}
+	if err := refuseRunningPoolEntries(found); err != nil {
+		t.Fatalf("an exited pool entry must not stop the reconcile: %v", err)
+	}
+}
+
+func TestAReconcileIgnoresOrdinarySandboxes(t *testing.T) {
+	found := []backend.Reconciled{
+		{Handle: backend.Handle{SandboxID: "a"}, Class: "rollout", Running: true},
+		{Handle: backend.Handle{SandboxID: "b"}, Class: "grader", Running: true},
+	}
+	if err := refuseRunningPoolEntries(found); err != nil {
+		t.Fatalf("ordinary sandboxes must reconcile: %v", err)
+	}
+}

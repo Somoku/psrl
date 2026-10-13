@@ -333,6 +333,17 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	if err != nil {
 		return err
 	}
+	// Rebuild this node's ledger from the daemon before it serves. A node that
+	// cannot enumerate what it already runs does not know how much of its
+	// envelope is spent, and admitting against that would hand out memory a live
+	// sandbox is using.
+	reconciled, err := life.Reconcile(ctx, local)
+	if err != nil {
+		return fmt.Errorf("node %q cannot account for its own runtime: %w", cfg.NodeID, err)
+	}
+	log.Info("node reconciled its runtime at startup",
+		"node", cfg.NodeID, "adopted", reconciled.Adopted,
+		"reclaimed", reconciled.Reclaimed, "failures", reconciled.Failures)
 	life.Start(ctx)
 	defer life.Stop()
 	startBackends(ctx, local, log)
@@ -372,12 +383,15 @@ func runControl(ctx context.Context, cfg Config, spans timing.Contract, log *slo
 	fleet := monitor.New(spans.NodeTTL)
 
 	rpcTimeout := spans.RPCTimeout
+	// A create can outlast one RPC budget because the node may pull an image
+	// before it answers, so the node-plane create bound carries the pull budget.
+	createTimeout := dockerbackend.DefaultPullTimeout
 	remotes := make(map[string]*server.RemoteNodeClient, len(cfg.FleetNodes))
 	for _, n := range cfg.FleetNodes {
 		if n.NodeID == "" || n.Address == "" {
 			return fmt.Errorf("each fleet_nodes entry needs both node_id and address")
 		}
-		remotes[n.NodeID] = server.NewRemoteNodeClient(n.Address, rpcTimeout)
+		remotes[n.NodeID] = server.NewRemoteNodeClient(n.Address, rpcTimeout, createTimeout)
 		log.Info("fleet node registered", "node", n.NodeID, "address", n.Address)
 	}
 	fleetClient := server.NewFleetNodeClient(remotes)
@@ -478,6 +492,16 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		if err != nil {
 			return err
 		}
+		// Rebuild the ledger from the daemon before anything reads the node's
+		// view or it starts admitting, so a restart does not report an empty node
+		// while its containers are still holding memory.
+		reconciled, err := life.Reconcile(ctx, local)
+		if err != nil {
+			return fmt.Errorf("node %q cannot account for its own runtime: %w", cfg.NodeID, err)
+		}
+		log.Info("node reconciled its runtime at startup",
+			"node", cfg.NodeID, "adopted", reconciled.Adopted,
+			"reclaimed", reconciled.Reclaimed, "failures", reconciled.Failures)
 		fleet.Report(agent.View())
 		nodes = server.NewLocalNodeClient(agent)
 	}

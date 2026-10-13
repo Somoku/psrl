@@ -132,7 +132,7 @@ func TestTwoPlaneCreateExecRelease(t *testing.T) {
 	n := buildNodeForTest(t, "node-1", b)
 	addr := startNodeListener(t, n)
 
-	remote := server.NewRemoteNodeClient(addr, 10*time.Second)
+	remote := server.NewRemoteNodeClient(addr, 10*time.Second, 10*time.Second)
 	fleet := server.NewFleetNodeClient(map[string]*server.RemoteNodeClient{
 		"node-1": remote,
 	})
@@ -219,8 +219,8 @@ func TestTwoPlaneMultiNodeRouting(t *testing.T) {
 	addr2 := startNodeListener(t, n2)
 
 	fleet := server.NewFleetNodeClient(map[string]*server.RemoteNodeClient{
-		"node-a": server.NewRemoteNodeClient(addr1, 5*time.Second),
-		"node-b": server.NewRemoteNodeClient(addr2, 5*time.Second),
+		"node-a": server.NewRemoteNodeClient(addr1, 5*time.Second, 5*time.Second),
+		"node-b": server.NewRemoteNodeClient(addr2, 5*time.Second, 5*time.Second),
 	})
 
 	ctx := context.Background()
@@ -263,7 +263,7 @@ func TestTwoPlaneMultiNodeRouting(t *testing.T) {
 // node not in the fleet returns an error rather than panicking or timing out.
 func TestTwoPlaneExecOnUnknownNodeReturnsError(t *testing.T) {
 	fleet := server.NewFleetNodeClient(map[string]*server.RemoteNodeClient{
-		"node-a": server.NewRemoteNodeClient("127.0.0.1:1", 1*time.Second),
+		"node-a": server.NewRemoteNodeClient("127.0.0.1:1", 1*time.Second, 1*time.Second),
 	})
 	handle := backend.Handle{Backend: "fake", SandboxID: "sb-1", NodeID: "node-missing"}
 	_, _, err := fleet.ExecOn(context.Background(), handle, "echo hi", "", nil)
@@ -393,7 +393,7 @@ func TestRenewOwnerCrossesTheNodePlane(t *testing.T) {
 	}
 	addr := startNodeListener(t, n)
 	fleet := server.NewFleetNodeClient(map[string]*server.RemoteNodeClient{
-		"node-r": server.NewRemoteNodeClient(addr, 10*time.Second),
+		"node-r": server.NewRemoteNodeClient(addr, 10*time.Second, 10*time.Second),
 	})
 
 	ctx := context.Background()

@@ -92,7 +92,10 @@ func newMixedStack(t *testing.T, fleetMemoryMB int64) *mixedStack {
 		t.Fatalf("agentenv backend: %v", err)
 	}
 
-	spans, err := timing.New(8*time.Second, 5*time.Second)
+	// The node TTL has to outlast the reservation TTL or placement refuses the
+	// configuration. It is not what makes these tests fast: reclamation here is
+	// driven per sandbox by the lifetime its create states, and by the sweep.
+	spans, err := timing.New(timing.DefaultNodeTTL, 5*time.Second)
 	if err != nil {
 		t.Fatalf("timing: %v", err)
 	}
@@ -143,7 +146,6 @@ func dockerNodeFor(t *testing.T, memoryMB int64) (*dockerbackend.Backend, *Node)
 	if err := docker.Preflight(context.Background()); err != nil {
 		t.Skipf("daemon not usable: %v", err)
 	}
-	spans, _ := timing.New(8*time.Second, 5*time.Second)
 	gate, err := node.NewAdmission(node.Config{
 		Envelope: node.Resources{MemoryMB: memoryMB, CPUMillis: 100000},
 		Classes:  map[string]node.ClassShare{"rollout": {Guaranteed: 0.7}, "grader": {Guaranteed: 0.2}},
@@ -263,7 +265,13 @@ func TestReleasingOnOneBackendReturnsQuotaTheOtherCanUse(t *testing.T) {
 		t.Fatalf("microvm create: %v", err)
 	}
 
-	if _, err := s.control.Create(ctx, &v1.CreateRequest{Spec: createSpec(64)}); err == nil {
+	// The fleet is spent on the microVM, so Docker must not be admitted. A full
+	// class queues rather than refusing, so the refusal the caller sees is its own
+	// deadline; the bound is on the test, and the rest of it needs the long
+	// context still alive.
+	giveUp, cancelGiveUp := context.WithTimeout(ctx, heldOnAFullFleet)
+	defer cancelGiveUp()
+	if _, err := s.control.Create(giveUp, &v1.CreateRequest{Spec: createSpec(64)}); err == nil {
 		t.Fatal("the fleet is spent on the microVM, so Docker must be refused")
 	}
 
@@ -296,7 +304,9 @@ func TestASpecNoBackendCanServeNamesWhatWasMissing(t *testing.T) {
 func TestAMixedBurstKeepsBothBackendsInsideOneFleet(t *testing.T) {
 	// 512MB of 64MB sandboxes is eight, whichever backend serves them.
 	s := newMixedStack(t, 512)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// The creates that cannot fit queue for the caller's deadline rather than
+	// failing at once, so the bound is what makes the test finish.
+	ctx, cancel := context.WithTimeout(context.Background(), burstGiveUp)
 	defer cancel()
 
 	var mu sync.Mutex

@@ -50,7 +50,7 @@ func TestAPressureCeilingOutsideZeroToOneIsRefused(t *testing.T) {
 func TestARequestInsideTheEnvelopeIsAdmitted(t *testing.T) {
 	gate := mustGate(t, envelope())
 
-	grant, refusal, ok := gate.Admit("rollout", "w", Resources{MemoryMB: 100})
+	grant, refusal, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 100})
 
 	if !ok {
 		t.Fatalf("refused with %q", refusal)
@@ -66,7 +66,7 @@ func TestMeasuredPressureRefusesEvenWhenTheEnvelopeWouldAllowIt(t *testing.T) {
 	gate := mustGate(t, envelope())
 	gate.SetPressure(Pressure{MemUsedPct: 0.97})
 
-	_, refusal, ok := gate.Admit("rollout", "w", Resources{MemoryMB: 1})
+	_, refusal, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1})
 
 	if ok {
 		t.Fatal("a node under memory pressure must refuse")
@@ -81,7 +81,7 @@ func TestADrainingNodeRefusesEverything(t *testing.T) {
 	gate := mustGate(t, envelope())
 	gate.SetDraining(true)
 
-	_, refusal, ok := gate.Admit("rollout", "w", Resources{MemoryMB: 1})
+	_, refusal, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1})
 
 	if ok || refusal != RefusedDraining {
 		t.Fatalf("a draining node admitted work: ok=%v refusal=%q", ok, refusal)
@@ -120,11 +120,11 @@ func TestAClassAtItsCeilingIsRefusedDistinctly(t *testing.T) {
 	cfg := envelope()
 	cfg.Classes["grader"] = ClassShare{Guaranteed: 0.2, Max: 0.25}
 	gate := mustGate(t, cfg)
-	if _, _, ok := gate.Admit("grader", "w", Resources{MemoryMB: 250}); !ok {
+	if _, _, ok := gate.Reserve("grader", "w", Resources{MemoryMB: 250}); !ok {
 		t.Fatal("the first request fits the ceiling")
 	}
 
-	_, refusal, ok := gate.Admit("grader", "w", Resources{MemoryMB: 10})
+	_, refusal, ok := gate.Reserve("grader", "w", Resources{MemoryMB: 10})
 
 	if ok || refusal != RefusedClassCeiling {
 		t.Fatalf("ok=%v refusal=%q, want %q", ok, refusal, RefusedClassCeiling)
@@ -137,7 +137,7 @@ func TestDevicesAreHandedOutAsDistinctIndices(t *testing.T) {
 
 	seen := map[int32]bool{}
 	for i := 0; i < 4; i++ {
-		grant, refusal, ok := gate.Admit("rollout", "w", Resources{MemoryMB: 1, GPUCount: 1})
+		grant, refusal, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1, GPUCount: 1})
 		if !ok {
 			t.Fatalf("grant %d refused with %q", i, refusal)
 		}
@@ -149,96 +149,111 @@ func TestDevicesAreHandedOutAsDistinctIndices(t *testing.T) {
 		}
 	}
 
-	if _, refusal, ok := gate.Admit("rollout", "w", Resources{MemoryMB: 1, GPUCount: 1}); ok {
+	if _, refusal, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1, GPUCount: 1}); ok {
 		t.Fatal("a fifth device request must be refused on a four-device node")
 	} else if refusal != RefusedDevices {
 		t.Fatalf("refusal is %q, want %q", refusal, RefusedDevices)
 	}
 }
 
-func TestReleasingAGrantReturnsItsDevices(t *testing.T) {
+func TestReturningAGrantReturnsItsDevices(t *testing.T) {
 	gate := mustGate(t, envelope())
-	grant, _, ok := gate.Admit("rollout", "w", Resources{MemoryMB: 1, GPUCount: 4})
+	grant, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1, GPUCount: 4})
 	if !ok {
 		t.Fatal("the first request takes every device")
 	}
 
-	gate.Release(grant.LeaseID)
+	gate.Return(grant)
 
-	if _, _, ok := gate.Admit("rollout", "w", Resources{MemoryMB: 1, GPUCount: 4}); !ok {
-		t.Fatal("released devices must be reusable")
+	if _, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1, GPUCount: 4}); !ok {
+		t.Fatal("returned devices must be reusable")
 	}
 }
 
-func TestReleasingTwiceDoesNotInflateTheEnvelope(t *testing.T) {
+func TestAGrantIsReturnedExactlyOnceByItsOwner(t *testing.T) {
+	// Return is not idempotent by itself: the guarantee that a grant comes back
+	// once is the lifecycle's, which removes a record once and returns its budget
+	// there. This pins what a single Return does.
 	gate := mustGate(t, envelope())
-	grant, _, _ := gate.Admit("rollout", "w", Resources{MemoryMB: 400, GPUCount: 2})
+	grant, _, _ := gate.Reserve("rollout", "w", Resources{MemoryMB: 400, GPUCount: 2})
 
-	gate.Release(grant.LeaseID)
-	gate.Release(grant.LeaseID)
+	gate.Return(grant)
 
 	report := gate.Snapshot()
 	if report.FreeGPUs != 4 {
-		t.Fatalf("free devices %d, want 4; a repeated release must be a no-op", report.FreeGPUs)
+		t.Fatalf("free devices %d, want 4", report.FreeGPUs)
 	}
 	if headroom := gate.Headroom("rollout"); headroom.MemoryMB != 1000 {
 		t.Fatalf("headroom %dMB, want 1000MB", headroom.MemoryMB)
 	}
 }
 
-func TestAnOwnerThatStopsRenewingLosesItsGrants(t *testing.T) {
+func TestASilentOwnerDoesNotFreeItsOwnBudget(t *testing.T) {
+	// Physical budget comes back only through Return, after the lifecycle has
+	// confirmed the runtime object is gone. An owner going silent is not that: the
+	// container it holds is still consuming memory.
 	gate := mustGate(t, envelope())
 	clock := time.Now()
 	gate.SetClock(func() time.Time { return clock })
-	if _, _, ok := gate.Admit("rollout", "dead", Resources{MemoryMB: 500, GPUCount: 2}); !ok {
-		t.Fatal("admit")
+	grant, _, ok := gate.Reserve("rollout", "dead", Resources{MemoryMB: 500, GPUCount: 2})
+	if !ok {
+		t.Fatal("reserve")
 	}
 
 	clock = clock.Add(2 * time.Minute)
-	gate.Expire()
 
 	report := gate.Snapshot()
-	if report.Leases != 0 || report.FreeGPUs != 4 {
-		t.Fatalf("a dead owner's grant must be reclaimed: %+v", report)
+	if report.Granted.MemoryMB != 500 || report.FreeGPUs != 2 {
+		t.Fatalf("a silent owner must not free budget by itself: %+v", report)
+	}
+	if gate.OwnerAlive("dead") {
+		t.Fatal("a silent owner must read as gone, so the lifecycle reclaims it")
+	}
+
+	gate.Return(grant)
+	if after := gate.Snapshot(); after.Granted.MemoryMB != 0 || after.FreeGPUs != 4 {
+		t.Fatalf("Return must free the grant: %+v", after)
 	}
 }
 
-func TestARenewingOwnerKeepsItsGrants(t *testing.T) {
+func TestARenewedOwnerStaysAliveAndCharged(t *testing.T) {
 	gate := mustGate(t, envelope())
 	clock := time.Now()
 	gate.SetClock(func() time.Time { return clock })
-	if _, _, ok := gate.Admit("rollout", "live", Resources{MemoryMB: 500}); !ok {
-		t.Fatal("admit")
+	if _, _, ok := gate.Reserve("rollout", "live", Resources{MemoryMB: 500}); !ok {
+		t.Fatal("reserve")
 	}
 
 	for i := 0; i < 5; i++ {
 		clock = clock.Add(30 * time.Second)
 		gate.Renew("live")
 	}
-	gate.Expire()
 
-	if gate.Snapshot().Leases != 1 {
-		t.Fatal("a renewed grant must be held")
+	if !gate.OwnerAlive("live") {
+		t.Fatal("a renewed owner must read as alive")
+	}
+	if gate.Snapshot().Granted.MemoryMB != 500 {
+		t.Fatal("a renewed owner's grant must stay charged")
 	}
 }
 
-func TestOwnerAliveTracksAdmissionAndRenewal(t *testing.T) {
+func TestOwnerAliveTracksReservationAndRenewal(t *testing.T) {
 	gate := mustGate(t, envelope())
 	clock := time.Now()
 	gate.SetClock(func() time.Time { return clock })
 
 	if gate.OwnerAlive("worker") {
-		t.Fatal("an owner this node never admitted is not its business")
+		t.Fatal("an owner this node never reserved for is not its business")
 	}
-	if _, _, ok := gate.Admit("rollout", "worker", Resources{MemoryMB: 100}); !ok {
-		t.Fatal("admit")
+	if _, _, ok := gate.Reserve("rollout", "worker", Resources{MemoryMB: 100}); !ok {
+		t.Fatal("reserve")
 	}
 	if !gate.OwnerAlive("worker") {
-		t.Fatal("an owner that just admitted must read as alive")
+		t.Fatal("an owner that just reserved must read as alive")
 	}
 
-	// Silence past the lease TTL: a node has to treat the owner as gone even
-	// before the next sweep expires the grants.
+	// Silence past the lease TTL: the node has to treat the owner as gone even
+	// before the next sweep reclaims its records.
 	clock = clock.Add(2 * time.Minute)
 	if gate.OwnerAlive("worker") {
 		t.Fatal("an owner silent past the lease TTL must read as gone")
@@ -250,23 +265,22 @@ func TestOwnerAliveTracksAdmissionAndRenewal(t *testing.T) {
 	}
 }
 
-func TestARenewalCannotResurrectAnExpiredOwner(t *testing.T) {
-	// The sweep expires a silent owner by deleting it. A heartbeat that arrives
-	// afterwards belongs to a caller the node already decided has stopped, and a
-	// renewal must not put its accounting back.
+func TestARenewalCannotResurrectAnOwnerWithNothingLeft(t *testing.T) {
+	// RetainOwners forgets the heartbeats of owners with no records left. A
+	// heartbeat that arrives afterwards belongs to a caller whose work the node
+	// already reclaimed, and it must not put that accounting back.
 	gate := mustGate(t, envelope())
 	clock := time.Now()
 	gate.SetClock(func() time.Time { return clock })
-	if _, _, ok := gate.Admit("rollout", "dead", Resources{MemoryMB: 100}); !ok {
-		t.Fatal("admit")
+	if _, _, ok := gate.Reserve("rollout", "gone", Resources{MemoryMB: 100}); !ok {
+		t.Fatal("reserve")
 	}
 
-	clock = clock.Add(2 * time.Minute)
-	gate.Expire()
-	gate.Renew("dead")
+	gate.RetainOwners(map[string]struct{}{})
+	gate.Renew("gone")
 
-	if gate.OwnerAlive("dead") {
-		t.Fatal("a renewal must not resurrect an owner the node already expired")
+	if gate.OwnerAlive("gone") {
+		t.Fatal("a renewal must not resurrect an owner with nothing left")
 	}
 }
 
@@ -287,7 +301,7 @@ func TestEveryClassAppearsInTheReportIncludingDefault(t *testing.T) {
 func TestAZeroDimensionIsNotComparedAgainstTheEnvelope(t *testing.T) {
 	gate := mustGate(t, envelope())
 
-	if _, refusal, ok := gate.Admit("rollout", "w", Resources{MemoryMB: 10}); !ok {
+	if _, refusal, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 10}); !ok {
 		t.Fatalf("a request naming only memory was refused with %q", refusal)
 	}
 }
@@ -311,7 +325,7 @@ func TestConcurrentAdmitNeverOverfillsTheNode(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			grant, _, ok := gate.Admit("rollout", "w", Resources{MemoryMB: 10, GPUCount: 1})
+			grant, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 10, GPUCount: 1})
 			if !ok {
 				return
 			}
@@ -349,8 +363,8 @@ func BenchmarkAdmitRelease(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if grant, _, ok := gate.Admit("rollout", "w", Resources{MemoryMB: 1}); ok {
-				gate.Release(grant.LeaseID)
+			if grant, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1}); ok {
+				gate.Return(grant)
 			}
 		}
 	})

@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -40,9 +39,6 @@ type Node struct {
 	// would only know its own accounting, which is a record of reservations
 	// rather than of load.
 	pressure func() node.Pressure
-
-	mu     sync.Mutex
-	leases map[string]node.Grant
 }
 
 // NodeConfig is what a node agent needs to run.
@@ -80,7 +76,6 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		backends:  backends,
 		order:     order,
 		pressure:  cfg.Pressure,
-		leases:    map[string]node.Grant{},
 	}, nil
 }
 
@@ -91,13 +86,14 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 func (n *Node) Admit(ctx context.Context, req *v1.AdmitRequest) (*v1.AdmitResponse, error) {
 	spec := specFromProto(req.GetSpec())
 	n.admission.SetPressure(n.pressure())
-	grant, refusal, ok := n.admission.Admit(spec.ResourceClass, ownerOf(spec), nodeResources(spec))
+	owner := ownerOf(spec)
+	grant, refusal, ok := n.admission.Reserve(spec.ResourceClass, owner, nodeResources(spec))
 	if !ok {
 		return &v1.AdmitResponse{Admitted: false, Refusal: string(refusal)}, nil
 	}
-	n.mu.Lock()
-	n.leases[grant.LeaseID] = grant
-	n.mu.Unlock()
+	// The record is created from the grant, so a grant that never becomes a
+	// container is still swept rather than held until the next restart.
+	n.lifecycle.Reserve(grant, owner, spec.ExecMode, lifetimeOf(spec))
 	return &v1.AdmitResponse{Admitted: true, LeaseId: grant.LeaseID, GpuIndices: grant.GPUIndices}, nil
 }
 
@@ -108,39 +104,123 @@ func (n *Node) Admit(ctx context.Context, req *v1.AdmitRequest) (*v1.AdmitRespon
 // rather than chosen here, because routing already matched the spec's
 // requirements against one and a second choice could disagree with it.
 func (n *Node) CreateOn(ctx context.Context, req *v1.CreateOnRequest) (*v1.CreateResponse, error) {
-	n.mu.Lock()
-	grant, granted := n.leases[req.GetLeaseId()]
-	n.mu.Unlock()
-	if !granted {
+	leaseID := req.GetLeaseId()
+	grant, claimed := n.lifecycle.Claim(leaseID)
+	if !claimed {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"lease %q was not granted by this node, so a sandbox created against it would not be charged",
-			req.GetLeaseId())
+			"lease %q was not granted by this node or has already been used, "+
+				"so a sandbox created against it would not be charged", leaseID)
 	}
 	hosted, hosts := n.hosted(req.GetBackend())
 	if !hosts {
-		// The admission is released rather than held: no sandbox exists, and a
-		// misrouted request must not cost the node a slot.
-		n.admission.Release(grant.LeaseID)
-		n.forgetLease(grant.LeaseID)
+		// No sandbox exists, so the reserved budget must not stay held.
+		n.lifecycle.FailCreate(leaseID)
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"node %q does not host backend %q (hosts: %v)", n.nodeID, req.GetBackend(), n.order)
 	}
 	spec := specFromProto(req.GetSpec())
 	spec.AssignedGPUs = grant.GPUIndices
-	lifetime := spec.Lifetime
-	if lifetime <= 0 {
-		lifetime = node.DefaultLifetime
+	spec.Lifetime = lifetimeOf(spec)
+	// The container carries the owner as a label, so a restarted node recovers it
+	// from the daemon alone.
+	owner := ownerOf(spec)
+	if spec.Metadata == nil {
+		spec.Metadata = map[string]string{}
 	}
+	spec.Metadata[backend.OwnerMetadataKey] = owner
+
+	if handled, found, err := n.adoptByIdempotencyKey(ctx, hosted, leaseID, spec.IdempotencyKey); found {
+		return handled, err
+	}
+
 	created, err := hosted.Create(ctx, n.nodeID, spec, req.GetCallbackTarget())
 	if err != nil {
 		// The sandbox does not exist, so its admission must not stay charged.
-		n.admission.Release(grant.LeaseID)
-		n.forgetLease(grant.LeaseID)
+		n.lifecycle.FailCreate(leaseID)
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	n.lifecycle.Adopt(created.Handle, hosted, grant.LeaseID, ownerOf(spec), spec.ExecMode, lifetime)
-	n.forgetLease(grant.LeaseID)
+	if !n.lifecycle.AdoptCreated(leaseID, created.Handle, hosted) {
+		// The record was reclaimed while the create was in flight, so this
+		// container has no owner to charge it to. Destroy it on a budget of its
+		// own rather than leak it or release capacity it still holds.
+		return nil, destroyReclaimed(hosted, created.Handle)
+	}
 	return createdToProto(created), nil
+}
+
+// adoptByIdempotencyKey resolves a create whose key names a container that
+// already exists. The second result is whether this retry is resolved by the
+// answer, which is true both when a container was found and when asking failed:
+// either way the caller must not go on to create one.
+//
+// A create whose response was lost leaves a container the caller never got a
+// handle for, and its key is on the container. So the recovery is to ask the
+// runtime rather than to build a second container, which would double the
+// memory a single logical sandbox holds.
+//
+// The reservation is the thing that has to be unwound. When the node still owns
+// the container, the record from the first attempt is the authority and this
+// retry's grant is returned, so one container stays charged once. When it does
+// not, the container outlived a restart and this retry is its first record.
+func (n *Node) adoptByIdempotencyKey(
+	ctx context.Context, hosted backend.Backend, leaseID, key string,
+) (*v1.CreateResponse, bool, error) {
+	if key == "" {
+		return nil, false, nil
+	}
+	finder, canFind := hosted.(backend.Reconciler)
+	if !canFind {
+		// A runtime that cannot look an object up by its key cannot be asked, and
+		// a missed retry is a smaller fault than a create that never happens.
+		return nil, false, nil
+	}
+	found, exists, err := finder.FindByIdempotencyKey(ctx, key)
+	if err != nil {
+		n.lifecycle.FailCreate(leaseID)
+		return nil, true, status.Error(codes.Unavailable, err.Error())
+	}
+	if !exists {
+		return nil, false, nil
+	}
+	if owned, hostedBy, held := n.lifecycle.Lookup(found.Handle.SandboxID); held {
+		n.lifecycle.FailCreate(leaseID)
+		return createdToProto(backend.Created{
+			Handle: owned, Capabilities: hostedBy.Capabilities(),
+		}), true, nil
+	}
+	if !n.lifecycle.AdoptCreated(leaseID, found.Handle, hosted) {
+		return nil, true, destroyReclaimed(hosted, found.Handle)
+	}
+	return createdToProto(backend.Created{
+		Handle: found.Handle, Capabilities: hosted.Capabilities(),
+	}), true, nil
+}
+
+// destroyReclaimed destroys a container whose record was reclaimed while the
+// create was in flight, so a create that lost its race leaks nothing and
+// returns no capacity the container still holds.
+func destroyReclaimed(hosted backend.Backend, handle backend.Handle) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), createCleanupTimeout)
+	defer cancel()
+	if err := hosted.Release(cleanupCtx, handle); err != nil {
+		return status.Errorf(codes.Internal,
+			"sandbox %s was reclaimed while its create was in flight and could not be destroyed: %v",
+			handle.SandboxID, err)
+	}
+	return status.Errorf(codes.Aborted,
+		"sandbox %s was reclaimed while its create was in flight", handle.SandboxID)
+}
+
+// createCleanupTimeout bounds destroying a sandbox whose create lost its record.
+const createCleanupTimeout = 30 * time.Second
+
+// lifetimeOf is how long a sandbox may exist, defaulting a spec that states none
+// so a caller cannot create an unbounded one.
+func lifetimeOf(spec backend.Spec) time.Duration {
+	if spec.Lifetime > 0 {
+		return spec.Lifetime
+	}
+	return node.DefaultLifetime
 }
 
 // hosted returns one runtime by name. An empty name takes the first declared,
@@ -258,7 +338,6 @@ func (n *Node) View() placement.NodeView {
 // node also sweeps on its own cadence.
 func (n *Node) Sweep(ctx context.Context, _ *v1.Empty) (*v1.SweepReport, error) {
 	report := n.lifecycle.Sweep(ctx)
-	n.admission.Expire()
 	return &v1.SweepReport{
 		ReapedLifetime:  report.ReapedLifetime,
 		ReclaimedOrphan: report.ReclaimedOrphan,
@@ -366,23 +445,17 @@ func (n *Node) StatusOn(ctx context.Context, handle backend.Handle) (string, err
 	return held.Status(ctx, stored)
 }
 
-func (n *Node) forgetLease(leaseID string) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	delete(n.leases, leaseID)
-}
-
 // ownerOf names the caller whose liveness decides when a sandbox is an orphan.
 //
 // The caller states it in the spec's metadata, because that is the identity the
 // reclaimer is keyed on and nothing else on the spec carries it: `workflow_id`
 // reserves a scheduling phase, which a caller may share across sandboxes or not
 // set at all, and reading ownership out of it left every sandbox owned by
-// "anonymous" — an owner that never renews, so a silence budget would reclaim
+// "anonymous", an owner that never renews, so a silence budget would reclaim
 // live work. `workflow_id` stays a fallback for a caller that has no separate
 // owner and means its workflow to be one.
 func ownerOf(spec backend.Spec) string {
-	if owner := spec.Metadata[OwnerMetadataKey]; owner != "" {
+	if owner := spec.Metadata[backend.OwnerMetadataKey]; owner != "" {
 		return owner
 	}
 	if spec.WorkflowID != "" {
@@ -390,9 +463,3 @@ func ownerOf(spec backend.Spec) string {
 	}
 	return "anonymous"
 }
-
-// OwnerMetadataKey is where a caller states the owner its sandboxes belong to,
-// for the liveness a node reclaims by. It is metadata rather than a field on
-// purpose: the value is an opaque caller identity, and the node only compares it
-// for equality.
-const OwnerMetadataKey = "owner_id"

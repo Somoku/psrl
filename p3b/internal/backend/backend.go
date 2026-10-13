@@ -109,6 +109,14 @@ type Spec struct {
 	BackendOptions map[string]map[string]string
 }
 
+// OwnerMetadataKey is where a caller states the owner its sandboxes belong to.
+//
+// It is metadata rather than a field because the value is an opaque caller
+// identity that the service only compares for equality. It lives here because
+// the runtime copies spec metadata into its own labels, so this key is also how
+// a restarted node recovers the owner of a container it no longer remembers.
+const OwnerMetadataKey = "owner_id"
+
 // Options returns this backend's own options from a spec, and whether the spec
 // named any.
 func (s Spec) Options(backend string) (map[string]string, bool) {
@@ -241,6 +249,36 @@ type Stateful interface {
 // the refusal.
 type Preflighter interface {
 	Preflight(ctx context.Context) error
+}
+
+// Reconciled is one runtime object a backend found already present on this node,
+// carrying the facts a restarted node needs to charge for it exactly as the
+// create did.
+type Reconciled struct {
+	Handle     Handle
+	Owner      string
+	Class      string
+	ExecMode   string
+	Resources  Resources
+	GPUIndices []int32
+	Lifetime   time.Duration
+	CreatedAt  time.Time
+	Running    bool
+}
+
+// Reconciler is implemented by a backend that can read back what it already
+// holds on this node.
+//
+// The runtime is the source of truth, so a restarted node rebuilds its
+// accounting from the daemon rather than from a second record that can disagree
+// with it. Without this a restart leaks every container the node had adopted,
+// because the ledger came back empty and nothing re-adopts them.
+type Reconciler interface {
+	// Reconcile returns every object this node holds, running or not.
+	Reconcile(ctx context.Context) ([]Reconciled, error)
+	// FindByIdempotencyKey returns the object a create with this key already
+	// made, so a create whose response was lost is adopted rather than repeated.
+	FindByIdempotencyKey(ctx context.Context, key string) (Reconciled, bool, error)
 }
 
 // Registry resolves a spec to the backend that will serve it.

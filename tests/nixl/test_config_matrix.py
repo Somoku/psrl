@@ -231,3 +231,17 @@ class TestTheFsdpAliasIsHandledAtEveryBranch:
             names = set(re.findall(r'"([a-z0-9_]+)"', group))
             if "fsdp" in names:
                 assert "fsdp2" in names, f"branch {group!r} names fsdp but not fsdp2"
+
+
+class TestEveryHarnessConfigHasATopLevelNixlSection:
+    """
+    The harness reads `cfg.nixl` whole, so a lost `nixl:` header silently moves every option under `network:`.
+    """
+
+    @pytest.mark.parametrize("path", sorted(CONFIG_DIR.glob("nixl_e2e*.yaml")), ids=lambda p: p.name)
+    def test_nixl_options_live_under_nixl(self, path):
+        cfg = OmegaConf.load(path)
+        assert "nixl" in cfg, f"{path.name} has no top level nixl section."
+        assert "server_mode" in cfg.nixl, f"{path.name} is missing nixl.server_mode."
+        stray = {"handshake_timeout_s", "server_mode", "peer_diffusion"} & set(cfg.get("network", {}))
+        assert not stray, f"{path.name} parses NIXL options {sorted(stray)} under network."

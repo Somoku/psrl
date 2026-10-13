@@ -117,9 +117,7 @@ def fill_by_global_coord(
     else:
         modulus = exact_int_limit(tensor.dtype)
 
-    indices = torch.arange(
-        global_offset, global_offset + numel, dtype=torch.int64, device=tensor.device
-    )
+    indices = torch.arange(global_offset, global_offset + numel, dtype=torch.int64, device=tensor.device)
     values = encode_coord(indices, tensor.dtype, modulus=modulus)
     # `no_grad` + `.data`: the e2e harness fills real model parameters, which are leaf
     # Variables requiring grad, and autograd rejects an in-place write through a view of
@@ -208,11 +206,7 @@ def fill_state_dict_by_coord(
         # zero all produce identical bytes, so the check passes whatever the transport
         # did -- which is exactly the failure the FSDP2 cell reported.
         offsets[key] = cursor
-        start = (
-            shard_global_offset(tensor, shardings.get(key))
-            if shardings and key in shardings
-            else 0
-        )
+        start = shard_global_offset(tensor, shardings.get(key)) if shardings and key in shardings else 0
         fill_by_global_coord(tensor, cursor + start, strict=strict)
         cursor += tensor.numel()
     return offsets
@@ -281,3 +275,135 @@ def assert_state_dict_matches_coord(
         if key not in offsets:
             raise AssertionError(f"{key}: no recorded global offset; was it added after fill?")
         assert_matches_global_coord(tensor, offsets[key], key=key, strict=strict, rtol=rtol)
+
+
+# Layout judge. The transport copies bytes without interpreting them, so each element's raw bits carry
+# a hash of (key, version, global coordinate). The value judge above keeps only `flat mod 256` under bf16.
+_BITS_DTYPE = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _key_salt(key: str) -> int:
+    import zlib
+
+    return zlib.crc32(key.encode()) & 0xFFFFFFFF
+
+
+def _coord_hash(global_flat: torch.Tensor, key: str, version: int, itemsize: int) -> torch.Tensor:
+    """Mix (key, version, global flat index) into ``8 * itemsize`` bits."""
+    salt = (_key_salt(key) ^ (version * 0x9E3779B1)) & 0xFFFFFFFF
+    h = (global_flat * 0x9E3779B1 + salt) & 0xFFFFFFFF
+    h = h ^ (h >> 15)
+    h = (h * 0x85EBCA77) & 0xFFFFFFFF
+    h = h ^ (h >> 13)
+    bits = 8 * min(itemsize, 4)
+    h = h & ((1 << bits) - 1)
+    if itemsize == 2:
+        h = torch.where(h >= 1 << 15, h - (1 << 16), h)  # into int16 range
+    elif itemsize == 4:
+        h = torch.where(h >= 1 << 31, h - (1 << 32), h)
+    return h
+
+
+def _cells_with_origin(entry, sharding):
+    """
+    Yield `(cell, origin, global_shape)` for every declared cell of `entry`, with origin `index * extent`.
+    """
+    from psrl.utils.nixl.moe_grouping import local_shards_of
+
+    if sharding is None or not sharding.shard_indices:
+        if isinstance(entry, torch.Tensor):
+            yield entry, (0,) * entry.dim(), tuple(entry.shape)
+        return
+    from psrl.utils.nixl.moe_grouping import GroupedShards
+
+    mesh = list(sharding.shard_mesh.items())
+    cells = local_shards_of(entry, sharding)
+    # Grouped cells lack the expert axis that the mesh numbers as dim 0.
+    if isinstance(entry, GroupedShards):
+        cells = [cell.unsqueeze(0) for cell in cells]
+    for index, cell in zip(sharding.shard_indices, cells):
+        origin = [0] * cell.dim()
+        global_shape = list(cell.shape)
+        for pos, (dim, count) in enumerate(mesh):
+            if dim >= cell.dim():
+                continue
+            origin[dim] = index[pos] * cell.shape[dim]
+            global_shape[dim] = count * cell.shape[dim]
+        yield cell, tuple(origin), tuple(global_shape)
+
+
+def _expected_bits(cell: torch.Tensor, origin, global_shape, key: str, version: int) -> torch.Tensor:
+    device = cell.device if cell.device.type != "meta" else "cpu"
+    flat = torch.zeros(cell.shape, dtype=torch.int64, device=device)
+    stride = 1
+    for dim in reversed(range(cell.dim())):
+        coords = torch.arange(origin[dim], origin[dim] + cell.shape[dim], dtype=torch.int64, device=device)
+        shape = [1] * cell.dim()
+        shape[dim] = cell.shape[dim]
+        flat += coords.view(shape) * stride
+        stride *= global_shape[dim]
+    return _coord_hash(flat, key, version, cell.element_size()).to(_BITS_DTYPE[cell.element_size()])
+
+
+# Expectations are int64, so judge in blocks beside a vLLM engine that holds most of the card.
+_JUDGE_BLOCK_ELEMS = 1 << 24
+
+
+def _row_blocks(cell: torch.Tensor, origin):
+    """Split ``cell`` along dim 0 into views of at most ``_JUDGE_BLOCK_ELEMS``."""
+    if cell.dim() == 0 or cell.numel() <= _JUDGE_BLOCK_ELEMS:
+        yield cell, origin
+        return
+    per_row = max(cell.numel() // cell.shape[0], 1)
+    rows = max(_JUDGE_BLOCK_ELEMS // per_row, 1)
+    for start in range(0, cell.shape[0], rows):
+        piece = cell[start : start + rows]
+        yield piece, (origin[0] + start, *origin[1:])
+
+
+def fill_by_layout(state_dict: dict, shardings: dict | None, version: int = 0) -> list[str]:
+    """Fill every declared cell in place with its coordinate hash and return the filled keys."""
+    filled = []
+    with torch.no_grad():
+        for key in sorted(state_dict):
+            entry = state_dict[key]
+            sharding = (shardings or {}).get(key)
+            for cell, origin, global_shape in _cells_with_origin(entry, sharding):
+                if cell.numel() == 0:
+                    continue
+                for piece, piece_origin in _row_blocks(cell, origin):
+                    bits = _expected_bits(piece, piece_origin, global_shape, key, version)
+                    piece.data.view(bits.dtype).copy_(bits)
+            filled.append(key)
+    return filled
+
+
+def check_by_layout(state_dict: dict, shardings: dict | None, keys, version: int = 0) -> tuple[int, str | None]:
+    """
+    Judge `keys` of a pulled state dict and return `(judged, first_failure)`.
+    """
+    judged = 0
+    for key in sorted(set(keys) & set(state_dict)):
+        entry = state_dict[key]
+        sharding = (shardings or {}).get(key)
+        for cell, origin, global_shape in _cells_with_origin(entry, sharding):
+            if cell.numel() == 0:
+                continue
+            n_bad, first = 0, None
+            for piece, piece_origin in _row_blocks(cell, origin):
+                expected = _expected_bits(piece, piece_origin, global_shape, key, version)
+                actual = piece.detach().view(expected.dtype)
+                if actual.device != expected.device:
+                    actual = actual.to(expected.device)
+                bad = (actual != expected).nonzero()
+                if bad.numel():
+                    n_bad += bad.shape[0]
+                    if first is None:
+                        first = tuple(o + int(c) for o, c in zip(piece_origin, bad[0]))
+            if n_bad:
+                return judged, (
+                    f"{key}: {n_bad} of {cell.numel()} elements of the cell at "
+                    f"origin {origin} differ, first at global coordinate {first}."
+                )
+        judged += 1
+    return judged, None

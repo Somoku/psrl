@@ -1,0 +1,70 @@
+# @package _global_
+#
+# Single-node base for the configuration matrix: 4 train + 4 gen GPUs on one 8-GPU node
+# (or 8 + 8 sharing GPUs under `test.colocate=true`). Every matrix cell is this file plus
+# Hydra overrides, so two cells differ exactly in what their overrides say.
+#
+# Single node is the lightest tier that exercises the whole handshake, the shard algebra
+# and a real NIXL transfer with the coordinate judge. Cross-node bandwidth and placement
+# belong to the 5-node configs; nothing judged here depends on them.
+defaults:
+  - _self_
+
+test:
+  num_train: 4
+  num_gen: 4
+  train_engine_type: megatron
+  direct_supply: true
+  # Two rounds with a shifted coordinate base, so round two can only pass on fresh bytes.
+  rounds: 2
+
+  fsdp_hybrid:
+    ddp_size: 2
+    fsdp_size: 2
+
+  megatron:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+
+  gen:
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
+
+model:
+  path: ${oc.env:PSRL_REPO}/models/Qwen3-8B
+  trust_remote_code: false
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
+
+logging:
+  path: ${oc.env:PSRL_REPO}/tests/nixl/log/1node
+  level: INFO
+
+network:
+  listen_ip: ${oc.env:LOCAL_IP}
+  listen_port: 23471
+  torch_port_train: 29514
+  torch_port_gen: 29515
+  backend: nccl
+
+nixl:
+  # Startup budget, not transfer budget (see nixl_e2e_5node_fsdp2.yaml).
+  handshake_timeout_s: 1800
+  server_mode: meta_server
+  server_ip: ${network.listen_ip}
+  server_port: ${network.listen_port}
+  max_pinned_temp_memory_slots: 4
+  enable_tms_for_temp_buffers: False
+  # The recommended direct-supply pair: rollouts are pure destinations, so strided
+  # shards stage into one descriptor each instead of one per row.
+  shards_must_be_readable: False
+  peer_diffusion: False
+
+ps:
+  mode: nixl_cpu

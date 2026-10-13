@@ -14,6 +14,7 @@ from collections import OrderedDict
 
 import pytest
 
+from psrl.utils.nixl.handshake_notif import NotifKind
 from psrl.utils.nixl.join_admission import JoinVerdict
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 from psrl.utils.nixl.server import NIXLMetaServer, _mesh_total
@@ -25,7 +26,9 @@ def _server(client_shardings: dict[str, dict[str, NIXLSharding]]) -> NIXLMetaSer
     server.client_sharding_dicts = client_shardings
     server.client_unified_sharding_dicts = {}
     server.finest_shard_meshes = {}
-    server._is_all_client_shardings_recved = True
+    # `make_unified_sharding` asserts the SHARDING roster is non empty.
+    server._agents_reported = {kind: set() for kind in NotifKind}
+    server._agents_reported[NotifKind.SHARDING] = set(client_shardings)
     return server
 
 

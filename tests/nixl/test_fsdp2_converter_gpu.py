@@ -23,6 +23,7 @@ a single `pytest tests/nixl/test_fsdp2_converter_gpu.py` exercises both world si
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -172,13 +173,18 @@ def test_fsdp2_conversion_preserves_coordinates(world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs, found {torch.cuda.device_count()}")
 
+    # The static rendezvous passes `--master_port=0` to workers literally, so they would wait forever.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        master_port = probe.getsockname()[1]
+
     result = subprocess.run(
         [
             sys.executable,
             "-m",
             "torch.distributed.run",
             f"--nproc_per_node={world_size}",
-            "--master_port=0",
+            f"--master_port={master_port}",
             str(Path(__file__).resolve()),
         ],
         capture_output=True,

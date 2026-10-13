@@ -73,6 +73,8 @@ def llm():
         # this memory fraction, so cap it rather than raising the fraction -- this
         # test is about the sleep/wake API, not about throughput.
         max_num_seqs=16,
+        # Matches production. Without the CuMem allocator `sleep(level=1)` frees nothing.
+        enable_sleep_mode=True,
     )
     # Warm up so lazy allocations don't pollute the memory measurements below.
     engine.generate([_PROMPT], SamplingParams(max_tokens=4))
@@ -101,7 +103,10 @@ class TestSleepWakeSemantics:
         import pynvml
 
         pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        # NVML ignores CUDA_VISIBLE_DEVICES, so resolve the device under test by PCI bus id.
+        props = torch.cuda.get_device_properties(0)
+        bus_id = f"{props.pci_domain_id:08x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+        handle = pynvml.nvmlDeviceGetHandleByPciBusId(bus_id)
 
         before_bytes = pynvml.nvmlDeviceGetMemoryInfo(handle).used
         llm.sleep(level=1)

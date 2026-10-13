@@ -43,8 +43,8 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 try:
     from tests.nixl.coord_judge import (
-        assert_state_dict_matches_coord,
-        fill_state_dict_by_coord,
+        check_by_layout,
+        fill_by_layout,
     )
 except ModuleNotFoundError:
     # Loaded by file path rather than by package name. Run as a script
@@ -61,12 +61,11 @@ except ModuleNotFoundError:
     )
     _coord_judge = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_coord_judge)
-    assert_state_dict_matches_coord = _coord_judge.assert_state_dict_matches_coord
-    fill_state_dict_by_coord = _coord_judge.fill_state_dict_by_coord
+    fill_by_layout = _coord_judge.fill_by_layout
+    check_by_layout = _coord_judge.check_by_layout
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from transformers import AutoConfig, AutoModelForCausalLM
-from verl.models.mcore import hf_to_mcore_config
 from verl.utils.fs import copy_to_local
 from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.engine.megatron.utils import set_random_seed
@@ -149,42 +148,6 @@ def validate_parallel_config(cfg: DictConfig) -> None:
         assert num_train % model_parallel_size == 0, (
             f"Megatron TP*PP*CP does not divide num_train. num_train={num_train!r}, product={model_parallel_size!r}."
         )
-
-
-def assert_state_dict_matches_coords(
-    state_dict: dict[str, torch.Tensor],
-    offsets: dict[str, int],
-    actor_label: str,
-) -> None:
-    """Judge a pulled state dict against the coordinate function it was filled with.
-
-    Replaces the previous all-ones judge (item T1). Filling with 1.0 detects "no data
-    arrived" and nothing else: a transposed tensor of ones is still ones, any slice of
-    ones is ones, and ones cast to fp8 is still 1.0. Layout errors, shard misplacement,
-    precision-conversion errors and MoE expert mix-ups -- the four things this design's
-    format conversions can get wrong -- are all invisible to it.
-
-    `assert_state_dict_matches_coord` reports the first offending global coordinate,
-    which localises the fault to a dimension rather than just flagging the key.
-    """
-    assert state_dict, f"{actor_label} state_dict is empty."
-
-    # Only keys the train side actually filled can be judged by coordinate. The two
-    # sides do not share a key space: Megatron fuses attention into `linear_qkv` while
-    # vLLM exposes `q_proj`/`k_proj`/`v_proj`, and the converters map between them. A
-    # key present only on the gen side was produced by that mapping, not copied
-    # verbatim, so its elements legitimately do not carry the sender's coordinates.
-    shared = {k: v for k, v in state_dict.items() if k in offsets}
-    assert shared, (
-        f"{actor_label}: none of its {len(state_dict)} keys overlap the "
-        f"{len(offsets)} keys the train side filled -- the two sides share no key "
-        "space at all, which would make the whole judgement vacuous"
-    )
-    try:
-        assert_state_dict_matches_coord(shared, offsets)
-    except AssertionError as exc:
-        raise AssertionError(f"{actor_label}: {exc}") from exc
-    return len(shared), len(state_dict)
 
 
 def make_dual_print(log_path, prefix=None):
@@ -425,45 +388,35 @@ class TrainClientActor:
         dtype = PrecisionType.to_dtype(self.train_dtype)
         self.print(f"[Rank {self.rank}] Config loaded: {hf_config.model_type}")
 
-        use_mbridge = True
+        from megatron.bridge import AutoBridge
 
-        if use_mbridge:
-            from megatron.bridge import AutoBridge
-
-            bridge = AutoBridge.from_hf_config(hf_config)
-            provider = bridge.to_megatron_provider(load_weights=False)
-            virtual_pipeline_model_parallel_size = self.megatron_config.get("virtual_pipeline_model_parallel_size", 1)
-            if virtual_pipeline_model_parallel_size == 1:
-                virtual_pipeline_model_parallel_size = None
-            provider_overrides = {
-                "tensor_model_parallel_size": self.megatron_config.get("tensor_model_parallel_size", 4),
-                "pipeline_model_parallel_size": self.megatron_config.get("pipeline_model_parallel_size", 2),
-                "expert_model_parallel_size": self.megatron_config.get("expert_model_parallel_size", 1),
-                "expert_tensor_parallel_size": self.megatron_config.get("expert_tensor_parallel_size", 1),
-                "virtual_pipeline_model_parallel_size": virtual_pipeline_model_parallel_size,
-                "context_parallel_size": self.megatron_config.get("context_parallel_size", 1),
-                "sequence_parallel": self.megatron_config.get("sequence_parallel", False),
-            }
-            provider.apply_overrides_and_finalize(
-                dtype=dtype,
-                overrides=provider_overrides,
-            )
-            tf_config = None
-        else:
-            tf_config = hf_to_mcore_config(hf_config, dtype)
+        bridge = AutoBridge.from_hf_config(hf_config)
+        provider = bridge.to_megatron_provider(load_weights=False)
+        virtual_pipeline_model_parallel_size = self.megatron_config.get("virtual_pipeline_model_parallel_size", 1)
+        if virtual_pipeline_model_parallel_size == 1:
+            virtual_pipeline_model_parallel_size = None
+        provider_overrides = {
+            "tensor_model_parallel_size": self.megatron_config.get("tensor_model_parallel_size", 4),
+            "pipeline_model_parallel_size": self.megatron_config.get("pipeline_model_parallel_size", 2),
+            "expert_model_parallel_size": self.megatron_config.get("expert_model_parallel_size", 1),
+            "expert_tensor_parallel_size": self.megatron_config.get("expert_tensor_parallel_size", 1),
+            "virtual_pipeline_model_parallel_size": virtual_pipeline_model_parallel_size,
+            "context_parallel_size": self.megatron_config.get("context_parallel_size", 1),
+            "sequence_parallel": self.megatron_config.get("sequence_parallel", False),
+        }
+        provider.apply_overrides_and_finalize(
+            dtype=dtype,
+            overrides=provider_overrides,
+        )
 
         from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
 
-        wrap_config = McoreModuleWrapperConfig()
-        actor_module, updated_tf_config = make_megatron_module(
-            wrap_config,
-            tf_config,
-            hf_config,
-            bridge=bridge if use_mbridge else None,
+        actor_module, _ = make_megatron_module(
+            wrap_config=McoreModuleWrapperConfig(),
+            hf_config=hf_config,
+            bridge=bridge,
             provider=provider,
         )
-        if use_mbridge:
-            tf_config = updated_tf_config
         self.model = actor_module
 
         for name, param in self.model[0].named_parameters():
@@ -493,17 +446,11 @@ class TrainClientActor:
             conversion_result = convert_megatron_inplace(parameter_mapping, self.model)
             state_dict = conversion_result.state_dict
             sharding = conversion_result.sharding_dict
-        # Fill with a function of each element's global coordinate rather than with 1.0
-        # (item T1). The all-ones fill cannot distinguish a correct transfer from a
-        # transposed, misplaced, or wrongly-cast one -- see assert_state_dict_matches_coords.
-        # The offsets are keyed by state-dict key and must reach the gen side verbatim,
-        # which is why they are returned rather than recomputed there.
-        # `shardings` is what makes the judgement non-vacuous under a sharded backend:
-        # every rank fills its *own* range of the global coordinate space, so a shard
-        # that arrives in the wrong place no longer looks identical to a correct one.
-        self.coord_offsets = fill_state_dict_by_coord(
-            state_dict, strict=False, shardings=sharding
-        )
+        # The layout judge hashes each element's global coordinate into its raw bits. See `coord_judge.py`.
+        self.judge_version = 0
+        self.coord_offsets = {
+            key: 0 for key in fill_by_layout(state_dict, sharding, version=self.judge_version)
+        }
         # self.print(f"state_dict keys: {state_dict.keys()}")
         self.state_dict = state_dict
         self.sharding = sharding
@@ -569,7 +516,10 @@ class TrainClientActor:
         Returns the new offsets because they are what the judge compares against; the
         gen side cannot derive them, since the shift is this call's argument.
         """
-        self.coord_offsets = fill_state_dict_by_coord(self.state_dict, strict=False, base=base)
+        self.judge_version = base
+        self.coord_offsets = {
+            key: base for key in fill_by_layout(self.state_dict, self.sharding, version=base)
+        }
         # NIXL reads the registered tensors directly, so there is nothing to re-register:
         # the addresses are unchanged and only their contents moved. Re-registering here
         # would invalidate every remote descriptor for no reason.
@@ -741,6 +691,13 @@ class GenClientActor:
 
     def get_state_dict(self):
         return {k: v.cpu() for k, v in self.state_dict.items()}
+
+    def judge_layout(self, keys, version):
+        """
+        Judge the pulled weights in place against this client's own declared sharding.
+        """
+        torch.cuda.synchronize()
+        return check_by_layout(self.state_dict, self.sharding, keys, version=version)
 
     def get_nixl_names(self):
         """This client's (agent, client) names, for peers reading it (item D1).
@@ -1246,6 +1203,16 @@ def _assert_actors_run_this_tree() -> None:
     print(f"[PASS] all {len(seen)} nodes import this tree: {expected}")
 
 
+def _judge_all_gen(gen_actors, filled: dict, *, version: int, label: str) -> None:
+    """Run the layout judge on every gen actor and fail on the first bad client."""
+    keys = sorted(filled)
+    verdicts = ray.get([g.judge_layout.remote(keys, version) for g in gen_actors])
+    for gen_idx, (judged, failure) in enumerate(verdicts):
+        assert failure is None, f"Gen client {gen_idx}{label}: {failure}"
+        assert judged > 0, f"Gen client {gen_idx}{label} holds none of the filled keys."
+        print(f"[PASS] Gen client {gen_idx}{label}: {judged}/{len(keys)} filled keys match their layout.")
+
+
 @hydra.main(config_path="config", config_name="nixl_e2e", version_base=None)
 def test_nixl_e2e(cfg: DictConfig):
     validate_parallel_config(cfg)
@@ -1655,12 +1622,7 @@ def test_nixl_e2e(cfg: DictConfig):
         coord_offsets.update(rank_offsets)
     print(f"[CHECK] train side filled {len(coord_offsets)} distinct keys")
 
-    gen_state_dicts = ray.get([g.get_state_dict.remote() for g in gen_actors])
-    for gen_idx, state_dict in enumerate(gen_state_dicts):
-        judged, total = assert_state_dict_matches_coords(
-            state_dict, coord_offsets, f"Gen client {gen_idx}"
-        )
-        print(f"[PASS] Gen client {gen_idx}: {judged}/{total} keys match their coordinates.")
+    _judge_all_gen(gen_actors, coord_offsets, version=0, label="")
     print("[PASS] All GenClientActor parameters match the coordinate function.")
 
     # Second round: a new version must actually arrive (item D4).
@@ -1692,9 +1654,10 @@ def test_nixl_e2e(cfg: DictConfig):
 
         round2_start = time.time()
         if direct_supply:
+            # Chunk readiness is keyed by version, so reusing round one's version would admit stale peer reads.
             ray.get(
                 [
-                    g.pull_pipelined.remote(all_agent_names, all_client_names)
+                    g.pull_pipelined.remote(all_agent_names, all_client_names, version=2)
                     for g in gen_actors
                 ]
             )
@@ -1707,15 +1670,7 @@ def test_nixl_e2e(cfg: DictConfig):
             )
         print(f"[PASS] round 2 pull done. time: {time.time() - round2_start}s")
 
-        gen_state_dicts_v2 = ray.get([g.get_state_dict.remote() for g in gen_actors])
-        for gen_idx, state_dict in enumerate(gen_state_dicts_v2):
-            judged, total = assert_state_dict_matches_coords(
-                state_dict, coord_offsets_v2, f"Gen client {gen_idx} (round 2)"
-            )
-            print(
-                f"[PASS] Gen client {gen_idx}: {judged}/{total} keys match the "
-                f"*new* version's coordinates."
-            )
+        _judge_all_gen(gen_actors, coord_offsets_v2, version=version_shift, label=" (round 2)")
         print("[PASS] Round 2: every rollout picked up the new version, not a cached one.")
 
     # Shutdown all actors and Ray

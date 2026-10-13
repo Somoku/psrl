@@ -241,11 +241,11 @@ func (r *directRuntime) features() []string {
 		"background_command",
 		"code_interpreter",
 		"pty",
-		// The runtime's.
+		// The runtime's. No image_on_demand: this service drives a plain container
+		// runtime, which materializes the whole image before the sandbox starts.
 		"freeze",
 		"filesystem_snapshot",
 		"restore",
-		"image_on_demand",
 		"credential_injection",
 		"host_mount",
 	}

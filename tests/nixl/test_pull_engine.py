@@ -16,12 +16,13 @@ from collections import OrderedDict
 import pytest
 import torch
 from omegaconf import OmegaConf
+from psrl.utils.nixl.block_fp8 import scale_shape
 from psrl.utils.nixl.client import NIXLStorageClient
 from psrl.utils.nixl.comm_plan import CommunicationPlanner
 from psrl.utils.nixl.nixl_spec import NIXLClientType, NIXLSharding
 from psrl.utils.nixl.pull_engine import NIXLPullEngine
 
-from tests.nixl.coord_judge import check_by_layout, fill_by_layout
+from tests.nixl.coord_judge import check_by_layout, check_fp8_exact, fill_by_layout, fill_fp8_exact
 from tests.nixl.memcpy_agent import MemcpyAgent, NotifBus
 
 pytestmark = pytest.mark.cpu_test
@@ -302,3 +303,115 @@ def test_the_pull_path_makes_no_control_plane_calls():
     source = inspect.getsource(pull_engine) + inspect.getsource(NIXLStorageClient.client_read)
     assert ".remote(" not in source and "ray.get" not in source
     assert "comm_plan" in inspect.getsource(NIXLStorageClient.wait_for_server_info)
+
+
+BLOCK = (32, 32)
+FP8_KEYS = ["layers.0.q_proj.weight", "layers.0.o_proj.weight", "layers.0.down_proj.weight"]
+
+
+def _fp8_cluster(train_tp, gen_tp, instances, peer_diffusion, train_dtype=torch.bfloat16):
+    """Build a cluster whose rollouts are FP8, reusing `Cluster` with the gen state swapped before registration."""
+    cluster = Cluster.__new__(Cluster)
+    cluster.bus = NotifBus()
+    cluster.declared, cluster.states = {}, {}
+    kinds = {}
+    for r in range(train_tp):
+        name = f"NIXLTrainClient_{r}"
+        kinds[name] = NIXLClientType.PUSH_SIDE
+        cluster.states[name] = _locals(MODEL, train_tp, train_dtype)
+        cluster.declared[name] = {k: _sharding(d, train_tp, r) for k, (s, d) in MODEL.items()}
+    for i in range(instances):
+        for r in range(gen_tp):
+            name = f"NIXLGenClient_I{i}_R{r}"
+            kinds[name] = NIXLClientType.PULL_SIDE
+            state = _locals(MODEL, gen_tp)
+            declared = {k: _sharding(d, gen_tp, r) for k, (s, d) in MODEL.items()}
+            for key in FP8_KEYS:
+                state[key] = torch.zeros(state[key].shape, dtype=torch.float8_e4m3fn)
+                state[key + "_scale_inv"] = torch.zeros(scale_shape(state[key].shape, BLOCK), dtype=torch.float32)
+                declared[key + "_scale_inv"] = copy.deepcopy(declared[key])
+            cluster.states[name], cluster.declared[name] = state, declared
+
+    def tile_of(t):
+        return (1,) * (t.dim() - 2) + BLOCK
+
+    for r in range(train_tp):
+        name = f"NIXLTrainClient_{r}"
+        fill_fp8_exact(cluster.states[name], cluster.declared[name], FP8_KEYS, tile_of, version=7)
+        rest = {k: v for k, v in cluster.states[name].items() if k not in FP8_KEYS}
+        fill_by_layout(rest, cluster.declared[name], version=7, wire_dtype=torch.bfloat16)
+
+    # The server derives the trainer's scale shardings, so run its unification rather than a copy of it.
+    from psrl.utils.nixl.server import NIXLMetaServer
+
+    server = NIXLMetaServer.__new__(NIXLMetaServer)
+    server.client_sharding_dicts = {n: copy.deepcopy(d) for n, d in cluster.declared.items()}
+    server.client_unified_sharding_dicts, server.finest_shard_meshes = {}, {}
+    from psrl.utils.nixl.handshake_notif import NotifKind
+
+    server._agents_reported = {kind: set() for kind in NotifKind}
+    server._agents_reported[NotifKind.SHARDING] = set(cluster.declared)
+    server.make_unified_sharding()
+    unified = server.client_unified_sharding_dicts
+
+    cluster.clients = {}
+    for name, kind in kinds.items():
+        client = NIXLStorageClient(
+            client_name=name,
+            server_name="server",
+            use_gpu=False,
+            client_type=kind,
+            nixl_config=CONFIG,
+            binded_agent=MemcpyAgent(name, cluster.bus),
+        )
+        if kind is NIXLClientType.PUSH_SIDE:
+            client.set_publish_cast(train_dtype, torch.bfloat16)
+            client.set_publish_fp8(BLOCK)
+        client.register_local_tensors(cluster.states[name], unified[name])
+        cluster.clients[name] = client
+    infos = {name: c.local_client_info for name, c in cluster.clients.items()}
+    plan = CommunicationPlanner(peer_diffusion=peer_diffusion).make_comm_plan(infos)
+    for client in cluster.clients.values():
+        client._all_client_infos = dict(infos)
+        client._comm_plan = plan
+    cluster.plan = plan
+    cluster.gen = [n for n in cluster.clients if n.startswith("NIXLGenClient")]
+    cluster.engines = {
+        n: NIXLPullEngine(cluster.clients[n], staging_bytes=1 << 16, peer_timeout_s=5.0) for n in cluster.gen
+    }
+    return cluster
+
+
+def _judge_fp8(cluster, version):
+    for name in cluster.gen:
+        judged, failure = check_fp8_exact(cluster.states[name], cluster.declared[name], FP8_KEYS, BLOCK, version)
+        assert failure is None, f"{name}: {failure}"
+        assert judged == len(FP8_KEYS)
+        rest = [k for k in MODEL if k not in FP8_KEYS]
+        judged, failure = check_by_layout(cluster.states[name], cluster.declared[name], rest, version=version)
+        assert failure is None and judged == len(rest), (name, failure)
+
+
+@pytest.mark.parametrize("train_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("train_tp,gen_tp", [(2, 2), (4, 2), (2, 4), (1, 2)])
+def test_a_trainer_publishes_block_fp8_with_scales(train_dtype, train_tp, gen_tp):
+    cluster = _fp8_cluster(train_tp, gen_tp, instances=2, peer_diffusion=True, train_dtype=train_dtype)
+    cluster.pull(epoch=1)
+    _judge_fp8(cluster, version=7)
+
+
+def test_a_new_fp8_version_requantises_at_publish():
+    cluster = _fp8_cluster(4, 2, instances=2, peer_diffusion=True)
+    cluster.pull(epoch=1)
+
+    def tile_of(t):
+        return (1,) * (t.dim() - 2) + BLOCK
+
+    for r in range(4):
+        name = f"NIXLTrainClient_{r}"
+        fill_fp8_exact(cluster.states[name], cluster.declared[name], FP8_KEYS, tile_of, version=9)
+        rest = {k: v for k, v in cluster.states[name].items() if k not in FP8_KEYS}
+        fill_by_layout(rest, cluster.declared[name], version=9, wire_dtype=torch.bfloat16)
+        cluster.clients[name].publish_version(9)
+    cluster.pull(epoch=2)
+    _judge_fp8(cluster, version=9)

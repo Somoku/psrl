@@ -402,7 +402,9 @@ def fill_by_layout(
                     continue
                 for piece, piece_origin in _row_blocks(cell, origin):
                     cast = wire_dtype is not None and wire_dtype != piece.dtype and piece.is_floating_point()
-                    bits = _expected_bits(piece, piece_origin, global_shape, key, version, wire_dtype if cast else None)
+                    bits = _expected_bits(
+                        piece, piece_origin, global_shape, key, version, wire_dtype if cast else None
+                    )
                     if cast:
                         piece.data.copy_(bits.view(wire_dtype).to(piece.dtype))
                     else:
@@ -438,5 +440,87 @@ def check_by_layout(state_dict: dict, shardings: dict | None, keys, version: int
                     f"{key}: {n_bad} of {cell.numel()} elements of the cell at "
                     f"origin {origin} differ, first at global coordinate {first}."
                 )
+        judged += 1
+    return judged, None
+
+
+# Exact FP8 judge. The trainer holds `fp8 value * 2^-k` per tile with one element at the FP8 maximum,
+# so block quantisation recovers the FP8 bits and the scale `2^-k` exactly, and both can be checked.
+_FP8_MAX_BITS = 0x7E
+
+
+def _global_flat(cell: torch.Tensor, origin, global_shape, device) -> list[torch.Tensor]:
+    """Global coordinate of every element of `cell`, one broadcastable tensor per dim."""
+    coords = []
+    for dim in range(cell.dim()):
+        shape = [1] * cell.dim()
+        shape[dim] = cell.shape[dim]
+        coords.append(
+            torch.arange(origin[dim], origin[dim] + cell.shape[dim], dtype=torch.int64, device=device).view(shape)
+        )
+    return coords
+
+
+def _flatten(coords, shape) -> torch.Tensor:
+    flat, stride = 0, 1
+    for c, n in zip(reversed(coords), reversed(shape)):
+        flat = flat + c * stride
+        stride *= n
+    return flat
+
+
+def _tile_scale(tile_flat: torch.Tensor, key: str, version: int) -> torch.Tensor:
+    exponent = _coord_hash(tile_flat, key + "#scale", version, 1) % 16
+    return torch.pow(2.0, -exponent.to(torch.float32))
+
+
+def _fp8_bits(coords, global_shape, tile, key: str, version: int) -> torch.Tensor:
+    bits = _coord_hash(_flatten(coords, global_shape), key, version, 1)
+    bits = torch.where((bits & 0x7F) == 0x7F, bits ^ 0x01, bits)  # never NaN
+    corner = torch.ones_like(bits, dtype=torch.bool)
+    for c, t in zip(coords, tile):
+        corner = corner & (c % t == 0)
+    return torch.where(corner, torch.full_like(bits, _FP8_MAX_BITS), bits)
+
+
+def _tile_coords(coords, tile):
+    return [c // t for c, t in zip(coords, tile)]
+
+
+def fill_fp8_exact(state_dict: dict, shardings: dict, keys, tile_of, version: int = 0) -> None:
+    """Fill `keys` so that block quantisation with the tile `tile_of(tensor)` gives known FP8 bits and scales."""
+    with torch.no_grad():
+        for key in keys:
+            for cell, origin, global_shape in _cells_with_origin(state_dict[key], shardings[key]):
+                tile = tile_of(cell)
+                coords = _global_flat(cell, origin, global_shape, cell.device)
+                bits = _fp8_bits(coords, global_shape, tile, key, version).to(torch.uint8)
+                scale_shape = [n // t for n, t in zip(global_shape, tile)]
+                scale = _tile_scale(_flatten(_tile_coords(coords, tile), scale_shape), key, version)
+                values = bits.view(torch.float8_e4m3fn).to(torch.float32) * scale
+                cell.data.copy_(values.reshape(cell.shape).to(cell.dtype))
+
+
+def check_fp8_exact(state_dict: dict, shardings: dict, weight_keys, tile, version: int = 0) -> tuple[int, str | None]:
+    """Judge FP8 weights bit for bit and their `_scale_inv` keys value for value on the rollout side."""
+    judged = 0
+    for key in sorted(weight_keys):
+        for name, is_scale in ((key, False), (key + "_scale_inv", True)):
+            for cell, origin, global_shape in _cells_with_origin(state_dict[name], shardings[name]):
+                cell_tile = (
+                    tuple(tile[-cell.dim() :])
+                    if cell.dim() <= len(tile)
+                    else (1,) * (cell.dim() - len(tile)) + tuple(tile)
+                )
+                coords = _global_flat(cell, origin, global_shape, cell.device)
+                if is_scale:
+                    expected = _tile_scale(_flatten(coords, global_shape), key, version).expand(cell.shape)
+                    bad = cell.detach().float() != expected
+                else:
+                    expected = _fp8_bits(coords, global_shape, cell_tile, key, version).to(torch.uint8)
+                    bad = cell.detach().view(torch.uint8) != expected.expand(cell.shape)
+                if bad.any():
+                    first = tuple(o + int(c) for o, c in zip(origin, bad.nonzero()[0]))
+                    return judged, f"{name}: {int(bad.sum())} of {cell.numel()} elements differ, first at {first}."
         judged += 1
     return judged, None

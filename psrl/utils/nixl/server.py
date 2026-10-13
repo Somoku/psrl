@@ -2,10 +2,12 @@ import logging
 import os
 import pickle
 import time
+from copy import deepcopy
 
 from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
+from psrl.utils.nixl.block_fp8 import SCALE_SUFFIX
 from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLCommPlan
 from psrl.utils.nixl.handshake_notif import NotifKind, decode
 from psrl.utils.nixl.join_admission import JoinDecision, JoinVerdict, classify_join
@@ -150,9 +152,7 @@ class NIXLMetaServer:
                 )
             time.sleep(0.01)
 
-        psrl_logger.info(
-            f"{len(reported)} agents sent {what} after {time.time() - start:.1f} seconds."
-        )
+        psrl_logger.info(f"{len(reported)} agents sent {what} after {time.time() - start:.1f} seconds.")
 
     def wait_for_client_shardings(self, expected_agents: int = 1, timeout: float | None = None):
         """Wait for `expected_agents` to send their sharding."""
@@ -190,9 +190,7 @@ class NIXLMetaServer:
                 if meta is None:
                     continue
                 mesh = dict(getattr(sharding_dict.get(key), "shard_mesh", {}) or {})
-                shapes[key] = tuple(
-                    extent * mesh.get(dim, 1) for dim, extent in enumerate(meta.shape)
-                )
+                shapes[key] = tuple(extent * mesh.get(dim, 1) for dim, extent in enumerate(meta.shape))
         return shapes
 
     def _classify_joiner(self, client: str) -> tuple[bool, bool, str]:
@@ -214,9 +212,7 @@ class NIXLMetaServer:
         needs_reshard = any(d.requires_reshard for d in decisions.values())
         reason = ""
         if needs_reshard:
-            key, decision = next(
-                (k, d) for k, d in decisions.items() if d.requires_reshard
-            )
+            key, decision = next((k, d) for k, d in decisions.items() if d.requires_reshard)
             reason = f"{key}: {decision.describe()}"
         return True, needs_reshard, reason
 
@@ -249,9 +245,7 @@ class NIXLMetaServer:
             # refused client's sharding must not reach the replan below -- leaving it
             # there would admit by the back door what A7 just rejected.
             self.client_sharding_dicts.pop(refused.client, None)
-            psrl_logger.warning(
-                f"Refused join from {refused.client}: {refused.reason}"
-            )
+            psrl_logger.warning(f"Refused join from {refused.client}: {refused.reason}")
         if not admitted:
             return changes
 
@@ -289,6 +283,13 @@ class NIXLMetaServer:
         for client_name, sharding_dict in self.client_sharding_dicts.items():
             all_keys.update(sharding_dict.keys())
         _t_keys = time.time()
+        # A block scale shards exactly like its weight, so a client holding only the weight produces its scale.
+        for key in [k for k in all_keys if k.endswith(SCALE_SUFFIX)]:
+            base = key[: -len(SCALE_SUFFIX)]
+            for sharding_dict in self.client_sharding_dicts.values():
+                held = sharding_dict.get(key)
+                if (held is None or held.is_empty) and base in sharding_dict and not sharding_dict[base].is_empty:
+                    sharding_dict[key] = deepcopy(sharding_dict[base])
         # Build each key's finest common sharding representation.
         for key in all_keys:
             shard_mesh_list = []
@@ -377,9 +378,9 @@ class NIXLMetaServer:
         psrl_logger.info("Making communication plan...")
         start = time.time()
         try:
-            self.comm_plan = CommunicationPlanner(
-                peer_diffusion=self._peer_diffusion
-            ).make_comm_plan(self.client_infos)
+            self.comm_plan = CommunicationPlanner(peer_diffusion=self._peer_diffusion).make_comm_plan(
+                self.client_infos
+            )
         except Exception as e:
             psrl_logger.error(f"Failed to make communication plan: {e}")
             raise e
@@ -432,9 +433,7 @@ class NIXLMetaServer:
         # Without it a direct-supply rollout is handed no remote descriptors at all and
         # its first read fails with "target client not found in client infos", which
         # reads as a handshake bug rather than a filter that was never updated.
-        has_ps_for_pull = any(
-            info.type is NIXLClientType.PS_FOR_PULL for info in self.client_infos.values()
-        )
+        has_ps_for_pull = any(info.type is NIXLClientType.PS_FOR_PULL for info in self.client_infos.values())
         if not has_ps_for_pull:
             type_needs[NIXLClientType.PULL_SIDE] = NIXLClientType.PUSH_SIDE
 

@@ -16,6 +16,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
+from psrl.utils.nixl.block_fp8 import FP8_DTYPE, SCALE_SUFFIX, quantize_blockwise, scale_shape
 from psrl.utils.nixl.chunk_notify import ChunkCompletionPublisher, ChunkCompletionWaiter
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.handshake_notif import NotifKind, decode, encode
@@ -182,8 +183,11 @@ class NIXLStorageClient:
 
         # Registry for all local registrations (desc_bytes -> desc object)
         self._registered_descs: dict[bytes, Any] = {}
-        # Source side contiguous copies of fragmented shards as `(view, copy)`, refreshed at every publish.
-        self._publish_copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+        # Source side contiguous copies as `(key, local_pos) -> (view, copy)`, refreshed at every publish.
+        self._publish_copies: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        # Tile of block FP8 weights published with derived scales, and the keys published that way.
+        self._fp8_block: tuple[int, int] | None = None
+        self._fp8_pairs: dict[str, tuple[object, NIXLSharding, object]] = {}
         self.publish_copy_bytes = 0
         # Train dtype to rollout dtype. Shards of a cast dtype are published as copies in the rollout dtype.
         self._publish_casts: dict[torch.dtype, torch.dtype] = {}
@@ -202,9 +206,7 @@ class NIXLStorageClient:
         # so the server gave up first and the clients were still waiting when it did --
         # which is why a slow start reports "Timeout waiting for agents" on the server and
         # nothing useful on the clients.
-        self._handshake_timeout = float(
-            getattr(nixl_config, "handshake_timeout_s", 600.0)
-        )
+        self._handshake_timeout = float(getattr(nixl_config, "handshake_timeout_s", 600.0))
 
         # mem_type -> [(base_addr, nbytes, device_id, mem_type)] tuples for storage registration
         self._mtype_to_reg_region_lists: dict[str, list[tuple[int, int, int, str]]] = {}
@@ -308,6 +310,61 @@ class NIXLStorageClient:
         assert self.client_type is NIXLClientType.PUSH_SIDE, "Only a train client publishes casts."
         if train_dtype != rollout_dtype:
             self._publish_casts[train_dtype] = rollout_dtype
+
+    def set_publish_fp8(self, block: tuple[int, int]) -> None:
+        """
+        Publish every weight whose block scale a rollout declares as FP8 with that scale. Call before registration.
+
+        The scale keys come from the unified sharding, so the rollout's own quantisation decides which
+        weights are quantised. The trainer only supplies the bytes.
+        """
+        assert self.client_type is NIXLClientType.PUSH_SIDE, "Only a train client publishes FP8."
+        self._fp8_block = (int(block[0]), int(block[1]))
+
+    def _derive_block_scales(self, state_dict: dict, sharding_dict: dict) -> dict:
+        """Add a local scale tensor for each weight whose scale key the server assigned to this client."""
+        self._fp8_pairs = {}
+        if self._fp8_block is None:
+            return state_dict
+        derived = dict(state_dict)
+        for scale_key, sharding in sharding_dict.items():
+            base = scale_key[: -len(SCALE_SUFFIX)] if scale_key.endswith(SCALE_SUFFIX) else None
+            if base is None or scale_key in state_dict or base not in state_dict or sharding.is_empty:
+                continue
+            entry = state_dict[base]
+            tensors = entry.shards if isinstance(entry, GroupedShards) else (entry,)
+            scales = tuple(
+                torch.empty(scale_shape(t.shape, self._tile_of(t)), dtype=torch.float32, device=t.device)
+                for t in tensors
+            )
+            self._assert_whole_tiles(scale_key, scales, sharding, isinstance(entry, GroupedShards))
+            scale_entry = (
+                GroupedShards(scales, entry.shard_indices, entry.shard_mesh)
+                if isinstance(entry, GroupedShards)
+                else scales[0]
+            )
+            derived[scale_key] = scale_entry
+            self._fp8_pairs[base] = (entry, sharding_dict[base], scale_entry)
+        return derived
+
+    @staticmethod
+    def _assert_whole_tiles(scale_key: str, scales, sharding: NIXLSharding, grouped: bool) -> None:
+        """Every cell of the unified mesh must hold whole FP8 tiles, as vLLM requires of every rank."""
+        local = sharding._local_shard_mesh
+        for scale in scales:
+            for dim, count in sharding.shard_mesh.items():
+                position = dim - 1 if grouped else dim
+                if position < 0:
+                    continue
+                cells_here = local.get(dim, 1)
+                assert scale.shape[position] % cells_here == 0, (
+                    f"{scale_key}: a cell along dim {dim} holds a fraction of an FP8 tile "
+                    f"({scale.shape[position]} tiles over {cells_here} cells of a {count} way cut). "
+                    "Some side cuts this weight finer than the 128 element tile, which block FP8 cannot express."
+                )
+
+    def _tile_of(self, tensor: torch.Tensor) -> tuple[int, ...]:
+        return (1,) * (tensor.dim() - 2) + self._fp8_block
 
     def pull_engine(self):
         """The rollout pull engine for this client, built against the current registrations."""
@@ -741,9 +798,7 @@ class NIXLStorageClient:
                     self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
                     local_pos = reregister_shard_pos_cache[key][shard_idx]
                     self.local_client_info.tensor_infos[key].temp_desc_bytes_list[local_pos] = desc_bytes
-            self._serialize_strided_descs(
-                self.local_client_info.tensor_infos, reregister_shard_pos_cache
-            )
+            self._serialize_strided_descs(self.local_client_info.tensor_infos, reregister_shard_pos_cache)
             self._all_temp_mappings[self.client_name] = self._temp_desc_bytes_mapping
             return
 
@@ -840,8 +895,10 @@ class NIXLStorageClient:
             tensor_infos = {}
             # Train shards change only at publish, so copies refreshed there stay exact. Others are read in place.
             is_upstream_source = self.client_type is NIXLClientType.PUSH_SIDE
+            if is_upstream_source and not meta_only:
+                state_dict = self._derive_block_scales(state_dict, sharding_dict)
             publish_requests: list[tuple[str, int, torch.Tensor, torch.dtype]] = []
-            self._publish_copies = []
+            self._publish_copies = {}
             self.publish_copy_bytes = 0
             for key, tensor in state_dict.items():
                 assert key in sharding_dict, f"Key {key} not found in sharding_dict."
@@ -903,9 +960,7 @@ class NIXLStorageClient:
                     # Only shards that the train side writes into a PS may be staged. Everything else is read from.
                     must_be_readable = self.client_type is not NIXLClientType.PS_FOR_PUSH
                     stage_despite_strided = strided_layout is not None and not (
-                        strided_is_cheaper_than_staging(
-                            strided_layout, must_be_readable=must_be_readable
-                        )
+                        strided_is_cheaper_than_staging(strided_layout, must_be_readable=must_be_readable)
                     )
                     if stage_despite_strided:
                         strided_layout = None
@@ -915,7 +970,12 @@ class NIXLStorageClient:
                     # descriptor rather than here -- this is what turns the handshake
                     # saving from 2.5x into 10.7x (measured on Qwen3-30B-A3B). Equal-but-
                     # distinct objects would serialise 128 times over.
-                    publish_dtype = self._publish_casts.get(local_sharded_tensor.dtype, local_sharded_tensor.dtype)
+                    if key in self._fp8_pairs:
+                        publish_dtype = FP8_DTYPE
+                    elif key.endswith(SCALE_SUFFIX) and key[: -len(SCALE_SUFFIX)] in self._fp8_pairs:
+                        publish_dtype = local_sharded_tensor.dtype  # scales stay float32 whatever the train dtype
+                    else:
+                        publish_dtype = self._publish_casts.get(local_sharded_tensor.dtype, local_sharded_tensor.dtype)
                     meta_info = self._intern_shard_meta(
                         NIXLShardMetaInfo(
                             dtype=publish_dtype,
@@ -1168,10 +1228,7 @@ class NIXLStorageClient:
                     # and hid the cost entirely: locating it took several cluster runs
                     # when one log line would have done. Avoiding the staging copy is
                     # genuinely cheaper only while the row count stays small.
-                    rows = [
-                        layout.row_count
-                        for layout, _mem_type in self.strided_desc_slice_map.values()
-                    ]
+                    rows = [layout.row_count for layout, _mem_type in self.strided_desc_slice_map.values()]
                     total_descs = sum(rows)
                     worst = max(rows, default=0)
                     est_ms = total_descs * STRIDED_US_PER_DESCRIPTOR / 1e3
@@ -1283,7 +1340,7 @@ class NIXLStorageClient:
                 offset += view.numel()
                 tensor_infos[key].read_addrs[local_pos] = copy.data_ptr()
                 tensor_infos[key].read_bases[local_pos] = flat.data_ptr()
-                self._publish_copies.append((view, copy))
+                self._publish_copies[(key, local_pos)] = (view, copy)
             self.publish_copy_bytes += flat.numel() * flat.element_size()
         casts = sum(1 for _, _, view, dtype in requests if view.dtype != dtype)
         psrl_logger.info(
@@ -1292,14 +1349,34 @@ class NIXLStorageClient:
         )
         self.refresh_publish_copies()
 
+    @torch.no_grad()
     def refresh_publish_copies(self) -> None:
         """Copy the live shards into their publish copies. Must run while no reader is in flight."""
         if not self._publish_copies:
             return
-        views, copies = zip(*self._publish_copies)
-        torch._foreach_copy_(list(copies), list(views))
+        # Quantise first, since scale tensors written here may themselves have plain copies.
+        for key, (entry, sharding, scale_entry) in self._fp8_pairs.items():
+            self._quantize_into_copies(key, entry, sharding, scale_entry)
+        plain = [pair for (key, _), pair in self._publish_copies.items() if key not in self._fp8_pairs]
+        if plain:
+            views, copies = zip(*plain)
+            torch._foreach_copy_(list(copies), list(views))
         if self.device.type == "cuda":
             torch.cuda.current_stream(self.device).synchronize()
+
+    def _quantize_into_copies(self, key: str, entry, sharding: NIXLSharding, scale_entry) -> None:
+        """Quantise one key a stored tensor at a time, writing its scales and the FP8 copies of its cells."""
+        grouped = isinstance(entry, GroupedShards)
+        tensors = entry.shards if grouped else (entry,)
+        scales = scale_entry.shards if grouped else (scale_entry,)
+        quantized = []
+        for tensor, scale in zip(tensors, scales):
+            q, s = quantize_blockwise(tensor, self._tile_of(tensor))
+            scale.copy_(s)
+            quantized.append(q)
+        q_entry = GroupedShards(tuple(quantized), entry.shard_indices, entry.shard_mesh) if grouped else quantized[0]
+        for local_pos, cell in enumerate(local_shards_of(q_entry, sharding)):
+            self._publish_copies[(key, local_pos)][1].copy_(cell)
 
     def deregister_local_tensors(self):
         """Deregister all local tensors"""
@@ -1407,9 +1484,7 @@ class NIXLStorageClient:
         Send local sharding to the server.
         """
         assert self._is_connected, "Not connected to server"
-        self.agent.send_notif(
-            self.server_name, encode(NotifKind.SHARDING, {self.client_name: sharding_dict})
-        )
+        self.agent.send_notif(self.server_name, encode(NotifKind.SHARDING, {self.client_name: sharding_dict}))
 
     def send_local_info(self):
         """
@@ -1567,18 +1642,14 @@ class NIXLStorageClient:
                     if parsed is None or parsed.kind is not NotifKind.UPDATE_INFO:
                         continue
                     for client_name, info_and_temp_mapping in parsed.entries.items():
-                        self._all_client_infos[client_name] = NIXLClientInfo.deserialize(
-                            info_and_temp_mapping["info"]
-                        )
+                        self._all_client_infos[client_name] = NIXLClientInfo.deserialize(info_and_temp_mapping["info"])
                         # Re-registered memory carries new keys, so the remote metadata must be loaded again.
                         if self._target_client_connected.pop(client_name, False):
                             self.agent.remove_remote_agent(self._all_client_infos[client_name].agent_name)
                         self._drop_pull_engine()
                         self._all_temp_mappings[client_name] = info_and_temp_mapping["temp_mapping"]
                     already_recved_agents.add(agent_name)
-                    psrl_logger.info(
-                        f"Already received {len(already_recved_agents)} agents: {already_recved_agents}"
-                    )
+                    psrl_logger.info(f"Already received {len(already_recved_agents)} agents: {already_recved_agents}")
             if time.time() - start > budget:
                 raise TimeoutError("Timeout waiting for agents.")
             time.sleep(0.1)
@@ -1687,8 +1758,7 @@ class NIXLStorageClient:
                 assert remote_version == expected_version, (
                     f"version mismatch reading {key} shard {shard_idx} from "
                     f"{target_client}: expected v{expected_version}, source holds "
-                    f"v{remote_version}"
-                    + (" (never published)" if remote_version == -1 else "")
+                    f"v{remote_version}" + (" (never published)" if remote_version == -1 else "")
                 )
             observed = getattr(self, "_observed_versions", None)
             if observed is not None:
@@ -2498,9 +2568,7 @@ class NIXLMultiStorageClients:
         self.server_port = nixl_config.server_port
         # Same budget as the single client and the meta server; without it the handshake
         # waits below raise AttributeError rather than timing out.
-        self._handshake_timeout = float(
-            getattr(nixl_config, "handshake_timeout_s", 600.0)
-        )
+        self._handshake_timeout = float(getattr(nixl_config, "handshake_timeout_s", 600.0))
         # Initialize NIXL agent
         from psrl.utils.nixl.port_scanner import get_port_scanner
 

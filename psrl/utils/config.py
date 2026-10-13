@@ -132,8 +132,15 @@ def _resolve_publish_cast(config: DictConfig) -> None:
     Written into the config so the cast a run used is visible in its dump.
     """
     nixl = config.psrl.nixl
+    rollout = config.gen_actor_rollout_ref.rollout
     nixl.publish_train_dtype = resolve_train_model_dtype(config)
-    nixl.publish_rollout_dtype = str(config.gen_actor_rollout_ref.rollout.dtype)
+    nixl.publish_rollout_dtype = str(rollout.dtype)
+    quantization = rollout.get("quantization")
+    assert quantization in (None, "fp8"), (
+        f"Direct supply publishes block FP8 only, got rollout quantization {quantization!r}."
+    )
+    # verl's online FP8 rollout is block quantised on 128 x 128 tiles.
+    nixl.publish_fp8_block = [128, 128] if quantization == "fp8" else None
 
 
 def _validate_nixl_offload_flags(config: DictConfig) -> None:
@@ -667,6 +674,5 @@ def validate_config(
                 "per-chunk reward normalization uses chunk-level statistics, not full-batch statistics. "
                 "Use reward_normalization='group' for exact equivalence with the full-batch path."
             )
-
 
     print("[validate_config] All configuration checks passed successfully!")

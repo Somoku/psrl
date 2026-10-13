@@ -253,6 +253,8 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 PrecisionType.to_dtype(nixl_config.publish_train_dtype),
                 PrecisionType.to_dtype(nixl_config.publish_rollout_dtype),
             )
+        if nixl_config.get("publish_fp8_block") is not None:
+            self.nixl_storage_client.set_publish_fp8(tuple(nixl_config.publish_fp8_block))
         self.nixl_storage_client.register_local_tensors(
             self.unified_state_dict, unified_sharding_dict, meta_only=meta_only
         )

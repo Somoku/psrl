@@ -64,6 +64,7 @@ class NIXLSharding:
         memo[id(self)] = new_obj  # avoid circular reference
         new_obj.shard_mesh = deepcopy(self.shard_mesh, memo)
         new_obj.shard_indices = deepcopy(self.shard_indices, memo)
+        new_obj._local_shard_mesh = deepcopy(self._local_shard_mesh, memo)
         return new_obj
 
     @property

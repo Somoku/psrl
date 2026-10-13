@@ -15,6 +15,7 @@ rm -rf "$OUT"; mkdir -p "$OUT"
 PY=python  # nixl_env.sh puts the cluster interpreter on PATH
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$NODE" \
   "source ${REPO}/scripts/nixl_env.sh >/dev/null 2>&1; unset http_proxy https_proxy; \
+   export PYTHONPATH=${EXTRA_PYTHONPATH:+${EXTRA_PYTHONPATH}:}\${PYTHONPATH:-}; \
    export PSRL_REPO=${REPO}; cd ${REPO}/tests/nixl; \
    PYTHONUNBUFFERED=1 timeout ${CELL_TIMEOUT_S:-3600} $PY test_nixl_e2e.py --config-name nixl_e2e_1node \
      logging.path=${OUT} $* > ${OUT}/driver.log 2>&1; echo \"exit=\$?\" >> ${OUT}/driver.log"

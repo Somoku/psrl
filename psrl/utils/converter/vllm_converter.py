@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 import torch
@@ -37,6 +38,7 @@ from psrl.utils.converter.vllm_module_info import (
     is_moe_experts_module,
 )
 from psrl.utils.converter.weight_layout_plan import PlanExecutor
+from psrl.utils.nixl.block_fp8 import FP8_DTYPE, SCALE_SUFFIX, scale_key_of, scale_view
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 # vLLM QKV shard identifiers map to split tensor indices.
@@ -169,6 +171,12 @@ class VllmConverter(BaseConverter):
                     continue
 
                 full_name = f"{module_prefix}.{param_name}" if module_prefix else param_name
+                # A block scale is emitted beside each canonical view of its weight, not as the fused tensor.
+                if param_name.endswith(SCALE_SUFFIX) and param_name[: -len(SCALE_SUFFIX)] in dict(
+                    module.named_parameters(recurse=False)
+                ):
+                    continue
+                fused_scale = getattr(module, param_name + SCALE_SUFFIX, None) if param.dtype == FP8_DTYPE else None
 
                 for converted in executor.execute(full_name, param, module):
                     sharding = converted.sharding
@@ -189,6 +197,10 @@ class VllmConverter(BaseConverter):
                     converted_param, sharding = self.maybe_reshape_qkv_to_3d(converted_name, converted_param, sharding)
                     converted_state_dict[converted_name] = converted_param
                     sharding_dict[converted_name] = sharding
+                    if fused_scale is not None:
+                        scale_name = scale_key_of(converted_name)
+                        converted_state_dict[scale_name] = scale_view(converted_param, param, fused_scale)
+                        sharding_dict[scale_name] = deepcopy(sharding)
 
             # Export only buffers with an explicit layout rule.
             for buf_name, buf in module.named_buffers(recurse=False):

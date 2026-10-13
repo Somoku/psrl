@@ -129,3 +129,13 @@ def test_mesh_total_is_the_product_over_dimensions():
     assert _mesh_total({}) == 1
     assert _mesh_total({0: 8}) == 8
     assert _mesh_total({0: 8, 1: 2}) == 16
+
+
+def test_a_deep_copied_sharding_keeps_its_local_mesh():
+    import copy
+
+    original = NIXLSharding(shard_mesh=OrderedDict([(0, 4)]), shard_indices=[(1,), (2,)])
+    clone = copy.deepcopy(original)
+    assert clone._local_shard_mesh == original._local_shard_mesh
+    clone.refactor_based_on_finer_shard_mesh(OrderedDict([(0, 8)]))
+    assert clone.shard_indices == [(2,), (3,), (4,), (5,)]

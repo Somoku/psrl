@@ -52,6 +52,8 @@ publish_copy_budget_mb: null
 # the rollout loads. When they differ the trainer publishes contiguous copies cast to the latter.
 publish_train_dtype: null
 publish_rollout_dtype: null
+# Tile of the block FP8 the rollout loads, or null when it loads unquantised weights.
+publish_fp8_block: null
 
 # Whether publishing waits for readers of the previous version to drain (item E1).
 #

@@ -45,7 +45,9 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 try:
     from tests.nixl.coord_judge import (
         check_by_layout,
+        check_fp8_exact,
         fill_by_layout,
+        fill_fp8_exact,
     )
 except ModuleNotFoundError:
     # Loaded by file path rather than by package name. Run as a script
@@ -64,6 +66,8 @@ except ModuleNotFoundError:
     _spec.loader.exec_module(_coord_judge)
     fill_by_layout = _coord_judge.fill_by_layout
     check_by_layout = _coord_judge.check_by_layout
+    fill_fp8_exact = _coord_judge.fill_fp8_exact
+    check_fp8_exact = _coord_judge.check_fp8_exact
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -209,7 +213,7 @@ class MetaServerActor:
 
     def protocol(self):
         self.print("step1: wait_for_client_shardings")
-        self.server.wait_for_client_shardings(self.expected_agents, timeout=120)
+        self.server.wait_for_client_shardings(self.expected_agents)
         # self.print(f"client_sharding_dicts: {self.server.client_sharding_dicts}")
         self.print("step2: make_unified_sharding")
         self.server.make_unified_sharding()
@@ -217,14 +221,14 @@ class MetaServerActor:
         self.print("step3: notify_all_client_shardings")
         self.server.notify_all_client_shardings()
         self.print("step4: wait_for_client_infos")
-        self.server.wait_for_client_infos(self.expected_agents, timeout=120)
+        self.server.wait_for_client_infos(self.expected_agents)
         # self.print(f"client_infos: {self.server.client_infos}")
         self.print("step5: make_comm_plan")
         self.server.make_comm_plan()
         self.print("step6: notify_all_client_infos_and_comm_plan")
         self.server.notify_all_client_infos_and_comm_plan()
         self.print("step7: wait_for_client_temp_mappings")
-        self.server.wait_for_client_temp_mappings(self.expected_agents, timeout=120)
+        self.server.wait_for_client_temp_mappings(self.expected_agents)
         self.print("step8: notify_all_client_temp_mappings")
         self.server.notify_all_client_temp_mappings()
         self.print("protocol done.")
@@ -278,6 +282,8 @@ class TrainClientActor:
         self.trust_remote_code = False
         self.train_dtype = resolve_torch_dtype(model_config.get("train_dtype", "bfloat16"))
         self.gen_dtype = resolve_torch_dtype(model_config.get("gen_dtype", "bfloat16"))
+        self.fp8_block = (128, 128) if model_config.get("gen_quantization") == "fp8" else None
+        self.fp8_keys: list[str] = []
         self.fsdp_hybrid_config = fsdp_hybrid_config
         self.megatron_config = megatron_config
         os.makedirs(log_dir, exist_ok=True)
@@ -448,13 +454,6 @@ class TrainClientActor:
             conversion_result = convert_megatron_inplace(parameter_mapping, self.model)
             state_dict = conversion_result.state_dict
             sharding = conversion_result.sharding_dict
-        # The layout judge hashes each element's global coordinate into its raw bits. See `coord_judge.py`.
-        self.judge_version = 0
-        self.coord_offsets = {
-            key: 0
-            for key in fill_by_layout(state_dict, sharding, version=self.judge_version, wire_dtype=self.gen_dtype)
-        }
-        # self.print(f"state_dict keys: {state_dict.keys()}")
         self.state_dict = state_dict
         self.sharding = sharding
         self.state_dict_keys = list(state_dict.keys())
@@ -465,8 +464,18 @@ class TrainClientActor:
         self.client.send_local_sharding(sharding)
         self.print("step3: wait_for_server_sharding")
         self.unified_sharding = self.client.wait_for_server_sharding()
+        # The scale keys the server assigned name the weights the rollout loads as block FP8.
+        if self.fp8_block is not None:
+            self.fp8_keys = sorted(
+                key[: -len("_scale_inv")]
+                for key, sharding in self.unified_sharding.items()
+                if key.endswith("_scale_inv") and not sharding.is_empty and key[: -len("_scale_inv")] in state_dict
+            )
+        self._fill(version=0)
         self.print("step4: register_local_tensors")
         self.client.set_publish_cast(self.train_dtype, self.gen_dtype)
+        if self.fp8_block is not None:
+            self.client.set_publish_fp8(self.fp8_block)
         self.client.register_local_tensors(self.state_dict, self.unified_sharding)
         self.print("step5: send_local_info")
         self.client.send_local_info()
@@ -520,15 +529,28 @@ class TrainClientActor:
         Returns the new offsets because they are what the judge compares against; the
         gen side cannot derive them, since the shift is this call's argument.
         """
-        self.judge_version = base
-        self.coord_offsets = {
-            key: base
-            for key in fill_by_layout(self.state_dict, self.sharding, version=base, wire_dtype=self.gen_dtype)
-        }
+        self._fill(version=base)
         torch.cuda.synchronize()
         # Publishing refreshes the contiguous copies readers take fragmented shards from.
         self.client.publish_version(base)
         return self.coord_offsets
+
+    def _fill(self, version: int) -> None:
+        """Fill block FP8 keys exactly quantisable and every other key with its layout hash."""
+        if self.fp8_keys:
+            fill_fp8_exact(
+                self.state_dict,
+                self.sharding,
+                self.fp8_keys,
+                lambda t: (1,) * (t.dim() - 2) + self.fp8_block,
+                version=version,
+            )
+        rest = {k: v for k, v in self.state_dict.items() if k not in self.fp8_keys}
+        self.judge_version = version
+        self.coord_offsets = {
+            key: version for key in fill_by_layout(rest, self.sharding, version=version, wire_dtype=self.gen_dtype)
+        }
+        self.coord_offsets.update({key: version for key in self.fp8_keys})
 
     def get_coord_offsets(self):
         """The per-key global coordinate offsets this rank filled with.
@@ -648,6 +670,20 @@ class GenClientActor:
         }
         if self.dp_size > 1:
             llm_kwargs["data_parallel_size"] = self.dp_size
+        if model_config.get("gen_quantization") == "fp8":
+            # The block FP8 that verl's rollout uses, quantised online from a bf16 checkpoint.
+            llm_kwargs["quantization"] = "fp8"
+            llm_kwargs["hf_overrides"] = {
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "activation_scheme": "dynamic",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                    "ignored_layers": [
+                        f"model.layers.{i}.mlp.gate" for i in range(model_config.get("num_layers", 128))
+                    ],
+                }
+            }
         if self.gpu_memory_utilization is not None:
             # Colocate shares the card with a train rank, so vLLM's default (>0.9) is not
             # available: it reserves a fraction of *total* memory and refuses to start
@@ -696,7 +732,20 @@ class GenClientActor:
         Judge the pulled weights in place against this client's own declared sharding.
         """
         torch.cuda.synchronize()
-        return check_by_layout(self.state_dict, self.sharding, keys, version=version)
+        fp8 = [
+            k
+            for k in keys
+            if k in self.state_dict
+            and k + "_scale_inv" in self.state_dict
+            and _first_tensor(self.state_dict[k]).dtype == torch.float8_e4m3fn
+        ]
+        judged, failure = check_fp8_exact(self.state_dict, self.sharding, fp8, (128, 128), version=version)
+        if failure is not None:
+            return judged, failure
+        rest_judged, failure = check_by_layout(
+            self.state_dict, self.sharding, [k for k in keys if k not in fp8], version=version
+        )
+        return judged + rest_judged, failure
 
     def get_nixl_names(self):
         """This client's (agent, client) names, for peers reading it (item D1).
@@ -837,6 +886,10 @@ def _assert_actors_run_this_tree() -> None:
     print(f"[PASS] all {len(seen)} nodes import this tree: {expected}")
 
 
+def _first_tensor(entry):
+    return entry.shards[0] if hasattr(entry, "shards") else entry
+
+
 def _timed_pull(gen_actors, *, epoch: int, label: str, expect_peers: bool, alone=None) -> list[dict]:
     """Run one pull on every gen actor and print what it moved."""
     start = time.time()
@@ -849,6 +902,14 @@ def _timed_pull(gen_actors, *, epoch: int, label: str, expect_peers: bool, alone
     peer = sum(r["peer_bytes"] for r in reports)
     fallback = sum(r["fallback_keys"] for r in reports)
     slowest = max(reports, key=lambda r: r["seconds"])
+    rates = sorted(
+        r["upstream_bytes"] / max(r["upstream_seconds"], 1e-9) / 1e9 for r in reports if r["upstream_bytes"]
+    )
+    if rates:
+        print(
+            f"[MEASURE] {label}: per client upstream GB/s min {rates[0]:.1f} median {rates[len(rates) // 2]:.1f} "
+            f"max {rates[-1]:.1f}, upstream seconds max {max(r['upstream_seconds'] for r in reports):.3f}"
+        )
     print(
         f"[PASS] {label} done. time: {elapsed:.3f}s (slowest client {slowest['seconds']:.3f}s, "
         f"upstream {slowest['upstream_seconds']:.3f}s, peer {slowest['peer_seconds']:.3f}s) "
@@ -977,6 +1038,7 @@ def test_nixl_e2e(cfg: DictConfig):
                 placement_group_bundle_index=index,
             )
         return NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
+
     # print(f"train_nodes: {train_nodes}, gen_nodes: {gen_nodes}")
     train_engine_type = cfg.test.train_engine_type
 
@@ -1012,9 +1074,7 @@ def test_nixl_e2e(cfg: DictConfig):
     # run it, and the lookup would hang rather than fail.
     from psrl.utils.nixl.port_scanner import create_port_scanners
 
-    alive_ip_to_node_id = {
-        node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes() if node["Alive"]
-    }
+    alive_ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes() if node["Alive"]}
     port_scanner_handles = create_port_scanners(alive_ip_to_node_id)
     print(f"[PASS] created {len(port_scanner_handles)} PortScanner actors")
 
@@ -1050,8 +1110,9 @@ def test_nixl_e2e(cfg: DictConfig):
         ps_for_push_worker_handles = {}
         for ps_for_push_name in ps_for_push_names:
             ps_for_push_worker_handles[ps_for_push_name] = ps_wg.distinguish_worker_by_method(
-                lambda worker, name=ps_for_push_name: ray.get(worker.get_nixl_train_storage_client_name.remote())
-                == name
+                lambda worker, name=ps_for_push_name: (
+                    ray.get(worker.get_nixl_train_storage_client_name.remote()) == name
+                )
             )
         end_time = time.time()
         print(f"[PASS] ps init done. time: {end_time - start_time}s")
@@ -1064,9 +1125,7 @@ def test_nixl_e2e(cfg: DictConfig):
     train_actors = [
         TrainClientActor.options(
             num_gpus=gpus_per_actor,
-            scheduling_strategy=_placement(
-                rank, train_nodes[rank // NUM_GPU_PER_NODE]["NodeID"]
-            ),
+            scheduling_strategy=_placement(rank, train_nodes[rank // NUM_GPU_PER_NODE]["NodeID"]),
         ).remote(
             global_store,
             train_engine_type,
@@ -1088,9 +1147,7 @@ def test_nixl_e2e(cfg: DictConfig):
     gen_actors = [
         GenClientActor.options(
             num_gpus=gpus_per_actor,
-            scheduling_strategy=_placement(
-                rank, gen_nodes[rank // NUM_GPU_PER_NODE]["NodeID"]
-            ),
+            scheduling_strategy=_placement(rank, gen_nodes[rank // NUM_GPU_PER_NODE]["NodeID"]),
         ).remote(
             global_store,
             rank,
@@ -1162,7 +1219,9 @@ def test_nixl_e2e(cfg: DictConfig):
     _timed_pull(gen_actors, epoch=1, label="gen pull", expect_peers=diffusion_planned)
     if diffusion_planned and os.environ.get("PSRL_E2E_BASELINE", "1") == "1":
         # Same run A/B. A client that is its only participant has no peers and reads everything upstream.
-        _timed_pull(gen_actors, epoch=2, label="no-diffusion baseline", alone=gen_names, expect_peers=False)
+        # The first baseline pull prepares its handles, so the second is the one to compare with round 2.
+        for epoch in (2, 3):
+            _timed_pull(gen_actors, epoch=epoch, label="no-diffusion baseline", alone=gen_names, expect_peers=False)
 
     # Fetch and verify gen client state_dicts against the coordinate function.
     print("[CHECK] Verifying GenClientActor state_dicts encode their global coordinates...")
@@ -1193,9 +1252,7 @@ def test_nixl_e2e(cfg: DictConfig):
     if cfg.test.get("rounds", 1) > 1:
         print("[ROUND 2] Advancing the train-side version...")
         version_shift = 1_000_000
-        per_rank_offsets_v2 = ray.get(
-            [t.advance_version.remote(version_shift) for t in train_actors]
-        )
+        per_rank_offsets_v2 = ray.get([t.advance_version.remote(version_shift) for t in train_actors])
         coord_offsets_v2: dict[str, int] = {}
         for rank_offsets in per_rank_offsets_v2:
             coord_offsets_v2.update(rank_offsets)
@@ -1206,7 +1263,7 @@ def test_nixl_e2e(cfg: DictConfig):
             "cannot tell a fresh pull from a stale one"
         )
 
-        _timed_pull(gen_actors, epoch=3, label="round 2 pull", expect_peers=diffusion_planned)
+        _timed_pull(gen_actors, epoch=4, label="round 2 pull", expect_peers=diffusion_planned)
 
         _judge_all_gen(gen_actors, coord_offsets_v2, version=version_shift, label=" (round 2)")
         print("[PASS] Round 2: every rollout picked up the new version, not a cached one.")

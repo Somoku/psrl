@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from collections.abc import Callable
 
 import torch
 from megatron.bridge import AutoBridge
@@ -41,6 +42,27 @@ from psrl.utils.converter.param_sync import (
 )
 from psrl.utils.converter.utils.parallel_states import ParallelStates
 from psrl.utils.nixl.nixl_spec import NIXLSharding
+
+
+def fp8_bytes_of(param) -> tuple[torch.Tensor, tuple[Callable[[], torch.Tensor], torch.dtype] | None]:
+    """
+    A Transformer Engine FP8 parameter (Megatron `fp8_param`) as its FP8 bytes and per tensor scale.
+
+    TE's wrapper has no address, and its own views do not keep shape and bytes in step, so the
+    conversion slices the bytes, viewed as a torch FP8 tensor, and each output carries
+    `psrl_fp8_scale = (scale_inv getter, nominal dtype)`. The getter reads the parameter's
+    current scale, since requantisation may replace it. Any other parameter passes through.
+    """
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+    except ImportError:
+        return param, None
+    if not isinstance(param, QuantizedTensor):
+        return param, None
+    import transformer_engine_torch as tex
+
+    fp8 = {tex.DType.kFloat8E4M3: torch.float8_e4m3fn, tex.DType.kFloat8E5M2: torch.float8_e5m2}[param._fp8_dtype]
+    return param._data.view(fp8), (lambda: param._scale_inv, param.dtype)
 
 
 class MegatronConverter(BaseConverter):
@@ -133,6 +155,8 @@ class MegatronConverter(BaseConverter):
                     yield vpp_rank, name, model.state_dict()[name]
 
         for vpp_rank, name, param in get_model_chunk_generator():
+            source = param  # carries Megatron's partitioning attributes
+            param, fp8_scale = fp8_bytes_of(param)
             task = task_by_local_name.get((vpp_rank, name))
             if task is None:
                 if name.endswith("output_layer.weight"):
@@ -157,7 +181,7 @@ class MegatronConverter(BaseConverter):
                 continue
             global_name = task.global_param_name
             new_params = self.convert_parameter(global_name, param, task.mapping)
-            sharding = self.get_sharding_for_param(global_name, param)
+            sharding = self.get_sharding_for_param(global_name, source)
             for new_param_name, new_param in new_params.items():
                 # Each output needs a distinct descriptor because server side refactoring
                 # mutates sharding objects in place.
@@ -166,6 +190,8 @@ class MegatronConverter(BaseConverter):
                     shard_indices=list(sharding.shard_indices),
                 )
                 new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, param_sharding)
+                if fp8_scale is not None:
+                    new_param.psrl_fp8_scale = fp8_scale
                 converted_state_dict[new_param_name] = new_param
                 sharding_dict[new_param_name] = sharding_for_param
 
@@ -240,9 +266,7 @@ class MegatronConverter(BaseConverter):
                 # A separate tensor, because the trainer keeps reading `param` as
                 # zero-centred while rollouts read the exposed copy at arbitrary times.
                 exposed = torch.empty_like(param)
-                self.sync_plan.add(
-                    ResidentZeroCenteredGammaSync(key=mapping.hf_param, source_param=param)
-                )
+                self.sync_plan.add(ResidentZeroCenteredGammaSync(key=mapping.hf_param, source_param=param))
                 return {mapping.hf_param: exposed}
             self.sync_plan.add(ZeroCenteredGammaSync(mapping.hf_param))
             return {mapping.hf_param: param}

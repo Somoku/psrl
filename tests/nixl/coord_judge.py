@@ -469,7 +469,11 @@ def _flatten(coords, shape) -> torch.Tensor:
     return flat
 
 
-def _tile_scale(tile_flat: torch.Tensor, key: str, version: int) -> torch.Tensor:
+def _tile_scale(tile_flat: torch.Tensor, key: str, version: int, uniform: bool = False) -> torch.Tensor:
+    if uniform:
+        # One scale for the whole model, so a per tensor FP8 trainer (TE `fp8_param`) holds the
+        # values exactly. Each tile still holds the FP8 maximum, so block quantisation recovers it.
+        return torch.full_like(tile_flat, 2.0 ** -(version % 8), dtype=torch.float32)
     exponent = _coord_hash(tile_flat, key + "#scale", version, 1) % 16
     return torch.pow(2.0, -exponent.to(torch.float32))
 
@@ -487,7 +491,7 @@ def _tile_coords(coords, tile):
     return [c // t for c, t in zip(coords, tile)]
 
 
-def fill_fp8_exact(state_dict: dict, shardings: dict, keys, tile_of, version: int = 0) -> None:
+def fill_fp8_exact(state_dict: dict, shardings: dict, keys, tile_of, version: int = 0, uniform: bool = False) -> None:
     """Fill `keys` so that block quantisation with the tile `tile_of(tensor)` gives known FP8 bits and scales."""
     with torch.no_grad():
         for key in keys:
@@ -496,15 +500,23 @@ def fill_fp8_exact(state_dict: dict, shardings: dict, keys, tile_of, version: in
                 coords = _global_flat(cell, origin, global_shape, cell.device)
                 bits = _fp8_bits(coords, global_shape, tile, key, version).to(torch.uint8)
                 scale_shape = [n // t for n, t in zip(global_shape, tile)]
-                scale = _tile_scale(_flatten(_tile_coords(coords, tile), scale_shape), key, version)
+                scale = _tile_scale(_flatten(_tile_coords(coords, tile), scale_shape), key, version, uniform)
                 values = bits.view(torch.float8_e4m3fn).to(torch.float32) * scale
                 cell.data.copy_(values.reshape(cell.shape).to(cell.dtype))
 
 
-def check_fp8_exact(state_dict: dict, shardings: dict, weight_keys, tile, version: int = 0) -> tuple[int, str | None]:
-    """Judge FP8 weights bit for bit and their `_scale_inv` keys value for value on the rollout side."""
+def check_fp8_exact(
+    state_dict: dict, shardings: dict, weight_keys, tile, version: int = 0, uniform: bool = False
+) -> tuple[int, str | None]:
+    """
+    Judge FP8 weights bit for bit and their `_scale_inv` keys value for value on the rollout side.
+
+    `tile` is the quantisation tile. A scale grid finer than it (vLLM's refined FP8 MoE grid)
+    must repeat each tile's scale over the finer cells that tile covers.
+    """
     judged = 0
     for key in sorted(weight_keys):
+        weight_global = None
         for name, is_scale in ((key, False), (key + "_scale_inv", True)):
             for cell, origin, global_shape in _cells_with_origin(state_dict[name], shardings[name]):
                 cell_tile = (
@@ -514,9 +526,15 @@ def check_fp8_exact(state_dict: dict, shardings: dict, weight_keys, tile, versio
                 )
                 coords = _global_flat(cell, origin, global_shape, cell.device)
                 if is_scale:
-                    expected = _tile_scale(_flatten(coords, global_shape), key, version).expand(cell.shape)
+                    # Weight elements per scale entry, then scale entries per quantisation tile.
+                    scale_tile = [w // g for w, g in zip(weight_global, global_shape)]
+                    repeat = [t // s for t, s in zip(cell_tile, scale_tile)]
+                    parent = [c // r for c, r in zip(coords, repeat)]
+                    parent_shape = [n // r for n, r in zip(global_shape, repeat)]
+                    expected = _tile_scale(_flatten(parent, parent_shape), key, version, uniform).expand(cell.shape)
                     bad = cell.detach().float() != expected
                 else:
+                    weight_global = global_shape
                     expected = _fp8_bits(coords, global_shape, cell_tile, key, version).to(torch.uint8)
                     bad = cell.detach().view(torch.uint8) != expected.expand(cell.shape)
                 if bad.any():

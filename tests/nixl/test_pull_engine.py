@@ -309,7 +309,9 @@ BLOCK = (32, 32)
 FP8_KEYS = ["layers.0.q_proj.weight", "layers.0.o_proj.weight", "layers.0.down_proj.weight"]
 
 
-def _fp8_cluster(train_tp, gen_tp, instances, peer_diffusion, train_dtype=torch.bfloat16):
+def _fp8_cluster(
+    train_tp, gen_tp, instances, peer_diffusion, train_dtype=torch.bfloat16, scale_tile=BLOCK, train_fp8=False
+):
     """Build a cluster whose rollouts are FP8, reusing `Cluster` with the gen state swapped before registration."""
     cluster = Cluster.__new__(Cluster)
     cluster.bus = NotifBus()
@@ -328,8 +330,9 @@ def _fp8_cluster(train_tp, gen_tp, instances, peer_diffusion, train_dtype=torch.
             declared = {k: _sharding(d, gen_tp, r) for k, (s, d) in MODEL.items()}
             for key in FP8_KEYS:
                 state[key] = torch.zeros(state[key].shape, dtype=torch.float8_e4m3fn)
-                state[key + "_scale_inv"] = torch.zeros(scale_shape(state[key].shape, BLOCK), dtype=torch.float32)
+                state[key + "_scale_inv"] = torch.zeros(scale_shape(state[key].shape, scale_tile), dtype=torch.float32)
                 declared[key + "_scale_inv"] = copy.deepcopy(declared[key])
+                declared[key + "_scale_inv"].scale_tile = scale_tile
             cluster.states[name], cluster.declared[name] = state, declared
 
     def tile_of(t):
@@ -337,9 +340,17 @@ def _fp8_cluster(train_tp, gen_tp, instances, peer_diffusion, train_dtype=torch.
 
     for r in range(train_tp):
         name = f"NIXLTrainClient_{r}"
-        fill_fp8_exact(cluster.states[name], cluster.declared[name], FP8_KEYS, tile_of, version=7)
+        fill_fp8_exact(cluster.states[name], cluster.declared[name], FP8_KEYS, tile_of, version=7, uniform=train_fp8)
         rest = {k: v for k, v in cluster.states[name].items() if k not in FP8_KEYS}
         fill_by_layout(rest, cluster.declared[name], version=7, wire_dtype=torch.bfloat16)
+        if train_fp8:
+            # A Megatron `fp8_param` trainer: per tensor scaled FP8 bytes, as the converter emits them.
+            for key in FP8_KEYS:
+                values = cluster.states[name][key]
+                scale = torch.tensor(2.0**-7)
+                fp8 = (values.float() / scale).to(torch.float8_e4m3fn)
+                fp8.psrl_fp8_scale = (lambda scale=scale: scale, train_dtype)
+                cluster.states[name][key] = fp8
 
     # The server derives the trainer's scale shardings, so run its unification rather than a copy of it.
     from psrl.utils.nixl.server import NIXLMetaServer
@@ -382,9 +393,11 @@ def _fp8_cluster(train_tp, gen_tp, instances, peer_diffusion, train_dtype=torch.
     return cluster
 
 
-def _judge_fp8(cluster, version):
+def _judge_fp8(cluster, version, uniform=False):
     for name in cluster.gen:
-        judged, failure = check_fp8_exact(cluster.states[name], cluster.declared[name], FP8_KEYS, BLOCK, version)
+        judged, failure = check_fp8_exact(
+            cluster.states[name], cluster.declared[name], FP8_KEYS, BLOCK, version, uniform=uniform
+        )
         assert failure is None, f"{name}: {failure}"
         assert judged == len(FP8_KEYS)
         rest = [k for k in MODEL if k not in FP8_KEYS]
@@ -398,6 +411,25 @@ def test_a_trainer_publishes_block_fp8_with_scales(train_dtype, train_tp, gen_tp
     cluster = _fp8_cluster(train_tp, gen_tp, instances=2, peer_diffusion=True, train_dtype=train_dtype)
     cluster.pull(epoch=1)
     _judge_fp8(cluster, version=7)
+
+
+@pytest.mark.parametrize("train_tp,gen_tp", [(2, 2), (2, 16)])
+def test_a_finer_rollout_scale_grid_gets_each_tile_scale_repeated(train_tp, gen_tp):
+    # vLLM refines an FP8 MoE scale grid when a TP cut splits a tile. At gen TP 16 each rank holds
+    # 16 of a 32 wide tile, which only the refined 16 x 16 grid can express.
+    cluster = _fp8_cluster(train_tp, gen_tp, instances=2, peer_diffusion=True, scale_tile=(16, 16))
+    cluster.pull(epoch=1)
+    _judge_fp8(cluster, version=7)
+
+
+@pytest.mark.parametrize("train_tp,gen_tp", [(2, 2), (4, 2), (1, 4)])
+def test_an_fp8_trainer_publishes_block_fp8_from_its_per_tensor_bytes(train_tp, gen_tp):
+    cluster = _fp8_cluster(train_tp, gen_tp, instances=2, peer_diffusion=True, train_fp8=True)
+    for name in cluster.clients:
+        if name.startswith("NIXLTrainClient"):
+            assert all(cluster.states[name][k].dtype == torch.float8_e4m3fn for k in FP8_KEYS)
+    cluster.pull(epoch=1)
+    _judge_fp8(cluster, version=7, uniform=True)
 
 
 def test_a_new_fp8_version_requantises_at_publish():

@@ -53,9 +53,45 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 # Utility function to combine tag, shard_idx, src_client, target_client, key
-def _local_shards_named(key: str, tensor, sharding) -> list[torch.Tensor]:
+def _is_quantized(tensor) -> bool:
+    """
+    Whether `tensor` holds the FP8 bytes of a per tensor scaled FP8 parameter (Megatron `fp8_param`).
+
+    The Megatron converter emits such a parameter as its bytes, a torch FP8 tensor carrying
+    `psrl_fp8_scale = (scale_inv getter, nominal dtype)`. Readers get a publish copy rather than the bytes.
+    """
+    return getattr(tensor, "psrl_fp8_scale", None) is not None
+
+
+class _QuantizedCell:
+    """One cell of a per tensor scaled FP8 parameter: its FP8 bytes, which carry its geometry, and its scale."""
+
+    def __init__(self, data: torch.Tensor, scale_inv, dtype: torch.dtype):
+        self.data, self.scale_inv, self.dtype = data, scale_inv, dtype
+
+    def __getattr__(self, name):
+        return getattr(self.data, name)
+
+    def dequantize(self) -> torch.Tensor:
+        return (self.data.float() * self.scale_inv()).to(self.dtype)
+
+
+def _plain(tensor: torch.Tensor) -> torch.Tensor:
+    """`tensor` in its nominal dtype, dequantised if it holds the bytes of an FP8 parameter."""
+    if not _is_quantized(tensor):
+        return tensor
+    scale_inv, dtype = tensor.psrl_fp8_scale
+    return (tensor.float() * scale_inv()).to(dtype)
+
+
+def _local_shards_named(key: str, tensor, sharding) -> list:
     """`local_shards_of`, with the key and the block FP8 tile rule in any refusal."""
     try:
+        if _is_quantized(tensor):
+            scale_inv, dtype = tensor.psrl_fp8_scale
+            return [_QuantizedCell(cell, scale_inv, dtype) for cell in local_shards_of(tensor, sharding)]
+        if isinstance(tensor, GroupedShards) and any(_is_quantized(t) for t in tensor.shards):
+            raise ValueError("grouped FP8 parameter experts are not supported yet.")
         return local_shards_of(tensor, sharding)
     except ValueError as e:
         hint = ""
@@ -198,7 +234,7 @@ class NIXLStorageClient:
         self._publish_copies: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         # Tile of block FP8 weights published with derived scales, and the keys published that way.
         self._fp8_block: tuple[int, int] | None = None
-        self._fp8_pairs: dict[str, tuple[object, NIXLSharding, object]] = {}
+        self._fp8_pairs: dict[str, tuple[object, NIXLSharding, object, tuple[int, int]]] = {}
         self.publish_copy_bytes = 0
         # Train dtype to rollout dtype. Shards of a cast dtype are published as copies in the rollout dtype.
         self._publish_casts: dict[torch.dtype, torch.dtype] = {}
@@ -345,8 +381,18 @@ class NIXLStorageClient:
                 continue
             entry = state_dict[base]
             tensors = entry.shards if isinstance(entry, GroupedShards) else (entry,)
+            scale_tile = tuple(getattr(sharding, "scale_tile", None) or self._fp8_block)
+            assert all(b % s == 0 for b, s in zip(self._fp8_block, scale_tile)), (
+                f"{scale_key}: the rollout's scale tile {scale_tile} does not divide the quantisation tile "
+                f"{self._fp8_block}."
+            )
+            for t in tensors:
+                assert all(n % b == 0 for n, b in zip(t.shape[-2:], self._fp8_block)), (
+                    f"{base}: this trainer holds a {tuple(t.shape)} shard, which does not hold whole "
+                    f"{self._fp8_block} quantisation tiles. The trainer must not cut a weight inside a tile."
+                )
             scales = tuple(
-                torch.empty(scale_shape(t.shape, self._tile_of(t)), dtype=torch.float32, device=t.device)
+                torch.empty(scale_shape(t.shape, self._tile_of(t, scale_tile)), dtype=torch.float32, device=t.device)
                 for t in tensors
             )
             self._assert_whole_tiles(scale_key, scales, sharding, isinstance(entry, GroupedShards))
@@ -356,7 +402,7 @@ class NIXLStorageClient:
                 else scales[0]
             )
             derived[scale_key] = scale_entry
-            self._fp8_pairs[base] = (entry, sharding_dict[base], scale_entry)
+            self._fp8_pairs[base] = (entry, sharding_dict[base], scale_entry, scale_tile)
         return derived
 
     @staticmethod
@@ -372,11 +418,11 @@ class NIXLStorageClient:
                 assert scale.shape[position] % cells_here == 0, (
                     f"{scale_key}: a cell along dim {dim} holds a fraction of an FP8 tile "
                     f"({scale.shape[position]} tiles over {cells_here} cells of a {count} way cut). "
-                    "Some side cuts this weight finer than the 128 element tile, which block FP8 cannot express."
+                    "Some side cuts this weight finer than its scale tile, which block FP8 cannot express."
                 )
 
-    def _tile_of(self, tensor: torch.Tensor) -> tuple[int, ...]:
-        return (1,) * (tensor.dim() - 2) + self._fp8_block
+    def _tile_of(self, tensor: torch.Tensor, tile: tuple[int, int] | None = None) -> tuple[int, ...]:
+        return (1,) * (tensor.dim() - 2) + tuple(tile or self._fp8_block)
 
     def pull_engine(self):
         """The rollout pull engine for this client, built against the current registrations."""
@@ -961,6 +1007,14 @@ class NIXLStorageClient:
                             f"CUDA_VISIBLE_DEVICES is {os.environ.get('CUDA_VISIBLE_DEVICES', 'None')}"
                         )
                     self._original_tensor_mapping[(key, shard_indices[local_pos])] = local_sharded_tensor
+                    # A TE FP8 parameter has no address of its own. Its FP8 bytes stand in for it below,
+                    # and readers only ever read its publish copy, dequantised in the nominal dtype.
+                    quantized_source = (
+                        local_sharded_tensor if isinstance(local_sharded_tensor, _QuantizedCell) else None
+                    )
+                    nominal_dtype = local_sharded_tensor.dtype
+                    if quantized_source is not None:
+                        local_sharded_tensor = quantized_source.data
 
                     # Create meta info for shards
                     is_contiguous = local_sharded_tensor.is_contiguous()
@@ -985,9 +1039,9 @@ class NIXLStorageClient:
                     if key in self._fp8_pairs:
                         publish_dtype = FP8_DTYPE
                     elif key.endswith(SCALE_SUFFIX) and key[: -len(SCALE_SUFFIX)] in self._fp8_pairs:
-                        publish_dtype = local_sharded_tensor.dtype  # scales stay float32 whatever the train dtype
+                        publish_dtype = nominal_dtype  # scales stay float32 whatever the train dtype
                     else:
-                        publish_dtype = self._publish_casts.get(local_sharded_tensor.dtype, local_sharded_tensor.dtype)
+                        publish_dtype = self._publish_casts.get(nominal_dtype, nominal_dtype)
                     meta_info = self._intern_shard_meta(
                         NIXLShardMetaInfo(
                             dtype=publish_dtype,
@@ -1011,9 +1065,15 @@ class NIXLStorageClient:
                             run_count(tuple(local_sharded_tensor.shape), local_sharded_tensor.stride())
                             > STRIDED_ROW_BUDGET
                         )
-                        if is_upstream_source and (fragmented or publish_dtype != local_sharded_tensor.dtype):
+                        # A block scale is tiny but has many short rows (one per tile row), so a reader's
+                        # column cut of it would cost a descriptor per row. Its copy costs 1/16384 of the weight.
+                        is_scale = key.endswith(SCALE_SUFFIX) and key[: -len(SCALE_SUFFIX)] in self._fp8_pairs
+                        if is_upstream_source and (
+                            fragmented or is_scale or publish_dtype != nominal_dtype or quantized_source is not None
+                        ):
                             # Readers get a contiguous copy in their dtype, so any cut of it is one descriptor.
-                            publish_requests.append((key, local_pos, local_sharded_tensor, publish_dtype))
+                            source = quantized_source if quantized_source is not None else local_sharded_tensor
+                            publish_requests.append((key, local_pos, source, publish_dtype))
                             # Filled by `_allocate_publish_copies`, or by `_within_copy_budget` past the budget.
                             read_addrs.append(None)
                             read_strides.append(contiguous_strides(tuple(local_sharded_tensor.shape)))
@@ -1367,23 +1427,36 @@ class NIXLStorageClient:
         if not self._publish_copies:
             return
         # Quantise first, since scale tensors written here may themselves have plain copies.
-        for key, (entry, sharding, scale_entry) in self._fp8_pairs.items():
-            self._quantize_into_copies(key, entry, sharding, scale_entry)
+        for key, (entry, sharding, scale_entry, scale_tile) in self._fp8_pairs.items():
+            self._quantize_into_copies(key, entry, sharding, scale_entry, scale_tile)
         plain = [pair for (key, _), pair in self._publish_copies.items() if key not in self._fp8_pairs]
+        quantized = [(view, copy) for view, copy in plain if isinstance(view, _QuantizedCell)]
+        plain = [(view, copy) for view, copy in plain if not isinstance(view, _QuantizedCell)]
         if plain:
             views, copies = zip(*plain)
             torch._foreach_copy_(list(copies), list(views))
+        for view, copy in quantized:
+            copy.copy_(view.dequantize())
         if self.device.type == "cuda":
             torch.cuda.current_stream(self.device).synchronize()
 
-    def _quantize_into_copies(self, key: str, entry, sharding: NIXLSharding, scale_entry) -> None:
-        """Quantise one key a stored tensor at a time, writing its scales and the FP8 copies of its cells."""
+    def _quantize_into_copies(self, key: str, entry, sharding: NIXLSharding, scale_entry, scale_tile) -> None:
+        """
+        Quantise one key a stored tensor at a time, writing its scales and the FP8 copies of its cells.
+
+        Quantisation runs on the publish tile. A rollout whose scale grid is finer gets each scale
+        repeated over the finer cells it covers, as vLLM's loader upsamples a checkpoint's scales.
+        """
+        repeat = [b // s for b, s in zip(self._fp8_block, scale_tile)]
         grouped = isinstance(entry, GroupedShards)
         tensors = entry.shards if grouped else (entry,)
         scales = scale_entry.shards if grouped else (scale_entry,)
         quantized = []
         for tensor, scale in zip(tensors, scales):
+            tensor = _plain(tensor)
             q, s = quantize_blockwise(tensor, self._tile_of(tensor))
+            if repeat != [1, 1]:
+                s = s.repeat_interleave(repeat[0], dim=-2).repeat_interleave(repeat[1], dim=-1)
             scale.copy_(s)
             quantized.append(q)
         q_entry = GroupedShards(tuple(quantized), entry.shard_indices, entry.shard_mesh) if grouped else quantized[0]
@@ -1456,7 +1529,9 @@ class NIXLStorageClient:
         catches. Measured: stamping after the handshake leaves readers seeing `-1`, which
         is how this was found.
         """
+        start = time.perf_counter()
         self.refresh_publish_copies()
+        self.last_publish_seconds = time.perf_counter() - start
         for tensor_info in self.local_client_info.tensor_infos.values():
             for meta in tensor_info.shard_meta_infos:
                 if meta is not None:

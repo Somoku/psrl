@@ -38,7 +38,7 @@ from psrl.utils.converter.vllm_module_info import (
     is_moe_experts_module,
 )
 from psrl.utils.converter.weight_layout_plan import PlanExecutor
-from psrl.utils.nixl.block_fp8 import FP8_DTYPE, SCALE_SUFFIX, scale_key_of, scale_view
+from psrl.utils.nixl.block_fp8 import FP8_DTYPE, SCALE_SUFFIX, block_scales_of, scale_key_of, scale_view
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 # vLLM QKV shard identifiers map to split tensor indices.
@@ -606,4 +606,9 @@ def convert_vllm_inplace(
     a keyword argument.
     """
     converter = VllmConverter(parameter_mapping=parameter_mapping, tp_rank=tp_rank, ep_rank=ep_rank)
-    return converter.convert_state_and_sharding_dict(model)
+    state_dict, sharding_dict = converter.convert_state_and_sharding_dict(model)
+    # A refined grid (vLLM upsamples FP8 MoE scales when a TP cut splits a tile) differs from the
+    # quantisation tile, so each scale declares its own tile for the trainer to publish on.
+    for scale_key, (_, tile) in block_scales_of(state_dict).items():
+        sharding_dict[scale_key].scale_tile = tuple(tile[-2:])
+    return state_dict, sharding_dict

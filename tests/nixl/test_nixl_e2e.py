@@ -128,7 +128,10 @@ def validate_parallel_config(cfg: DictConfig) -> None:
             f"{computed_dp} (num_gen={num_gen}, TP={gen_tp}, PP={gen_pp})."
         )
     if gen_ep > 1:
-        assert gen_ep == gen_tp, f"vLLM EP must match TP in PSRL. EP={gen_ep!r}, TP={gen_tp!r}."
+        # vLLM's expert parallel group spans every DP and TP rank of the engine, as in production.
+        assert gen_ep == computed_dp * gen_tp, (
+            f"vLLM EP spans DP x TP. EP={gen_ep!r}, DP={computed_dp!r}, TP={gen_tp!r}."
+        )
 
     if train_engine_type == "fsdp_hybrid":
         ddp_size = cfg.test.fsdp_hybrid.ddp_size
@@ -284,6 +287,11 @@ class TrainClientActor:
         self.gen_dtype = resolve_torch_dtype(model_config.get("gen_dtype", "bfloat16"))
         self.fp8_block = (128, 128) if model_config.get("gen_quantization") == "fp8" else None
         self.fp8_keys: list[str] = []
+        # Megatron FP8 training: TE keeps linear weights as per tensor scaled FP8 (`fp8_param`).
+        self.train_fp8 = model_config.get("train_fp8", None)
+        assert self.train_fp8 is None or (engine_type == "megatron" and self.fp8_block is not None), (
+            "train_fp8 needs a Megatron trainer and an FP8 rollout (FSDP2 has no FP8 parameters)."
+        )
         self.fsdp_hybrid_config = fsdp_hybrid_config
         self.megatron_config = megatron_config
         os.makedirs(log_dir, exist_ok=True)
@@ -412,6 +420,8 @@ class TrainClientActor:
             "context_parallel_size": self.megatron_config.get("context_parallel_size", 1),
             "sequence_parallel": self.megatron_config.get("sequence_parallel", False),
         }
+        if self.train_fp8 is not None:
+            provider_overrides.update({"fp8": "hybrid", "fp8_recipe": self.train_fp8, "fp8_param": True})
         provider.apply_overrides_and_finalize(
             dtype=dtype,
             overrides=provider_overrides,
@@ -428,7 +438,13 @@ class TrainClientActor:
         self.model = actor_module
 
         for name, param in self.model[0].named_parameters():
-            param.data.fill_(1)
+            if _is_te_quantized(param):
+                param.quantize_(torch.ones(param.shape, dtype=dtype, device=param.device))
+            else:
+                param.data.fill_(1)
+        quantized = sum(1 for _, p in self.model[0].named_parameters() if _is_te_quantized(p))
+        self.print(f"[Rank {self.rank}] {quantized} parameters are TE quantised (train_fp8={self.train_fp8}).")
+        assert self.train_fp8 is None or quantized > 0, "train_fp8 is set but TE built no FP8 parameters."
         for name, param in self.model[0].named_buffers():
             param.data.fill_(1)
 
@@ -533,18 +549,28 @@ class TrainClientActor:
         torch.cuda.synchronize()
         # Publishing refreshes the contiguous copies readers take fragmented shards from.
         self.client.publish_version(base)
+        self.print(
+            f"[MEASURE] publish refresh {self.client.last_publish_seconds * 1e3:.1f} ms, "
+            f"publish copies {self.client.publish_copy_bytes / 2**20:.0f} MiB"
+        )
         return self.coord_offsets
 
     def _fill(self, version: int) -> None:
         """Fill block FP8 keys exactly quantisable and every other key with its layout hash."""
         if self.fp8_keys:
+            target, requantize = self.state_dict, None
+            if self.train_fp8 is not None:
+                target, requantize = _bf16_shadows(self.model[0], self.state_dict)
             fill_fp8_exact(
-                self.state_dict,
+                target,
                 self.sharding,
                 self.fp8_keys,
                 lambda t: (1,) * (t.dim() - 2) + self.fp8_block,
                 version=version,
+                uniform=self.train_fp8 is not None,
             )
+            if requantize is not None:
+                requantize()
         rest = {k: v for k, v in self.state_dict.items() if k not in self.fp8_keys}
         self.judge_version = version
         self.coord_offsets = {
@@ -573,6 +599,77 @@ class TrainClientActor:
     def shutdown(self):
         self.client.shutdown()
         dist.destroy_process_group()
+
+
+def _is_te_quantized(tensor) -> bool:
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+    except ImportError:
+        return False
+    return isinstance(tensor, QuantizedTensor)
+
+
+def _bf16_shadows(module, state_dict: dict):
+    """
+    A copy of `state_dict` whose FP8 parameter entries are views of a high precision shadow of their parameter.
+
+    The converter emits a TE FP8 parameter as views of its FP8 bytes. TE cannot write into a
+    part of an FP8 parameter, so a fill writes the shadow, and the returned callback quantises
+    each whole parameter from it. A byte view and its shadow view share offset and strides.
+    """
+    from psrl.utils.nixl.moe_grouping import GroupedShards
+
+    # Megatron may pack several FP8 parameters into one buffer, so a view is matched by address range.
+    params = []
+    for _, param in module.named_parameters():
+        if _is_te_quantized(param):
+            params.append((param._data.data_ptr(), param._data.numel(), param, param.dequantize()))
+
+    def shadow_of(view):
+        address = view.data_ptr()
+        for start, numel, param, shadow in params:
+            if start <= address < start + numel:  # FP8 data is one byte per element
+                offset = view.storage_offset() - param._data.storage_offset()
+                return shadow.as_strided(view.shape, view.stride(), shadow.storage_offset() + offset)
+        raise KeyError("An FP8 parameter view lies in no FP8 parameter of the module.")
+
+    def is_fp8(t):
+        return getattr(t, "psrl_fp8_scale", None) is not None
+
+    shadowed = {}
+    for key, entry in state_dict.items():
+        if isinstance(entry, GroupedShards):
+            shards = tuple(shadow_of(t) if is_fp8(t) else t for t in entry.shards)
+            shadowed[key] = GroupedShards(shards, entry.shard_indices, entry.shard_mesh)
+        else:
+            shadowed[key] = shadow_of(entry) if is_fp8(entry) else entry
+
+    def requantize():
+        for _, _, param, shadow in params:
+            param.quantize_(shadow)
+
+    return shadowed, requantize
+
+
+def _assert_pynccl_loads() -> None:
+    """
+    Fail before vLLM starts when its NCCL binding cannot load.
+
+    vLLM disables pynccl for every group when the NCCL library lacks a symbol it binds
+    (`ncclCommSuspend` needs NCCL >= 2.29.7). TP collectives then fall back silently,
+    and MoE with data_parallel_size > 1 asserts deep inside `all_gatherv`.
+    """
+    from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
+    from vllm.utils.nccl import find_nccl_library
+
+    path = find_nccl_library()
+    try:
+        NCCLLibrary(path)
+    except Exception as e:
+        raise RuntimeError(
+            f"vLLM cannot load NCCL from {path}: {e}. Point VLLM_NCCL_SO_PATH at NCCL >= 2.29.7, "
+            f"which scripts/nixl_env.sh does when the staged copy exists."
+        ) from e
 
 
 @ray.remote(num_cpus=1)
@@ -695,6 +792,7 @@ class GenClientActor:
             # Disaggregate leaves this None and keeps vLLM's default, so the two
             # placements do not share a tuning constant that only one of them needs.
             llm_kwargs["gpu_memory_utilization"] = self.gpu_memory_utilization
+        _assert_pynccl_loads()
         llm = LLM(**llm_kwargs)
         self.model = llm.llm_engine.model_executor.driver_worker.model_runner.model
         self.print(f"local rank {self.rank} model: {self.model}")
@@ -739,7 +837,14 @@ class GenClientActor:
             and k + "_scale_inv" in self.state_dict
             and _first_tensor(self.state_dict[k]).dtype == torch.float8_e4m3fn
         ]
-        judged, failure = check_fp8_exact(self.state_dict, self.sharding, fp8, (128, 128), version=version)
+        judged, failure = check_fp8_exact(
+            self.state_dict,
+            self.sharding,
+            fp8,
+            (128, 128),
+            version=version,
+            uniform=self.model_config.get("train_fp8", None) is not None,
+        )
         if failure is not None:
             return judged, failure
         rest_judged, failure = check_by_layout(

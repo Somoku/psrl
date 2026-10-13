@@ -283,13 +283,22 @@ class NIXLMetaServer:
         for client_name, sharding_dict in self.client_sharding_dicts.items():
             all_keys.update(sharding_dict.keys())
         _t_keys = time.time()
-        # A block scale shards exactly like its weight, so a client holding only the weight produces its scale.
+        # A block scale shards exactly like its weight, so a client holding only the weight produces its scale,
+        # on the scale tile the rollouts declared.
         for key in [k for k in all_keys if k.endswith(SCALE_SUFFIX)]:
             base = key[: -len(SCALE_SUFFIX)]
+            declared = {
+                d[key].scale_tile
+                for d in self.client_sharding_dicts.values()
+                if key in d and getattr(d[key], "scale_tile", None) is not None
+            }
+            assert len(declared) <= 1, f"{key}: rollouts declare different scale tiles {sorted(declared)}."
+            tile = next(iter(declared), None)
             for sharding_dict in self.client_sharding_dicts.values():
                 held = sharding_dict.get(key)
                 if (held is None or held.is_empty) and base in sharding_dict and not sharding_dict[base].is_empty:
                     sharding_dict[key] = deepcopy(sharding_dict[base])
+                    sharding_dict[key].scale_tile = tile
         # Build each key's finest common sharding representation.
         for key in all_keys:
             shard_mesh_list = []

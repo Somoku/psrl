@@ -50,6 +50,8 @@ class NIXLSharding:
     _local_shard_mesh: OrderedDict[int, int]
     # Global shard coordinates owned by this tensor.
     shard_indices: list[tuple[int, ...]]
+    # Elements per scale entry along the last two dims, declared by the rollout for a block FP8 scale key.
+    scale_tile: tuple[int, int] | None = None
 
     def __init__(self, **kwargs):
         """Initialize the sharding"""
@@ -65,6 +67,7 @@ class NIXLSharding:
         new_obj.shard_mesh = deepcopy(self.shard_mesh, memo)
         new_obj.shard_indices = deepcopy(self.shard_indices, memo)
         new_obj._local_shard_mesh = deepcopy(self._local_shard_mesh, memo)
+        new_obj.scale_tile = self.scale_tile
         return new_obj
 
     @property

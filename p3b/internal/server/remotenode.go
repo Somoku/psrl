@@ -413,23 +413,47 @@ func cutPrefix(s, prefix string) (string, bool) {
 }
 
 func wireErrorToStatus(e *wireError) error {
-	var code codes.Code
-	switch e.Code {
-	case "capability":
-		code = codes.FailedPrecondition
-	case "capacity_timeout":
-		code = codes.ResourceExhausted
-	case "session_lost":
-		code = codes.NotFound
-	case "transport":
-		code = codes.Unavailable
-	case "command_timeout":
-		code = codes.DeadlineExceeded
-	default:
-		code = codes.Internal
-	}
-	return status.Error(code, e.Message)
+	return &nodeFailure{code: wireErrorCode(e.Code), message: e.Message, exitReason: e.ExitReason}
 }
+
+// wireErrorCode maps a wire classification onto the gRPC code a caller reads.
+func wireErrorCode(class string) codes.Code {
+	switch class {
+	case "capability":
+		return codes.FailedPrecondition
+	case "capacity_timeout":
+		return codes.ResourceExhausted
+	case "session_lost":
+		return codes.NotFound
+	case "transport":
+		return codes.Unavailable
+	case "command_timeout":
+		return codes.DeadlineExceeded
+	default:
+		return codes.Internal
+	}
+}
+
+// nodeFailure is a failure from a node plane that keeps both the classification
+// and the attribution across the hop.
+//
+// A plain status error would carry the code and drop the reason, and the reason
+// is what a post mortem reads: one `session_lost` means the caller released its
+// sandbox, another that it outlived its lifetime, and another that its owner went
+// silent. This implements the same interface the wire layer already looks for, so
+// a failure that crossed a node boundary is attributed exactly like one raised in
+// this process.
+type nodeFailure struct {
+	code       codes.Code
+	message    string
+	exitReason string
+}
+
+func (e *nodeFailure) Error() string { return e.message }
+
+func (e *nodeFailure) GRPCStatus() *status.Status { return status.New(e.code, e.message) }
+
+func (e *nodeFailure) ExitReason() string { return e.exitReason }
 
 func mustMarshal(v any) json.RawMessage {
 	b, err := json.Marshal(v)

@@ -199,6 +199,27 @@ func classify(err error) *wireError {
 // exitReasonOf extracts an attribution from an error that carries one. The
 // concrete type lives in this package (nodeserver.go); the interface keeps the
 // wire layer from depending on it and a wrapped/unrelated error answers "".
+// preserveSessionLost keeps a lost session distinguishable from a transport
+// fault, and reads every other failure as the transport fault it read before.
+//
+// The two need different answers from a caller. A node that did not answer is an
+// infrastructure fault and retrying it is sensible. A session that is gone means
+// the caller's own working directory, exported variables, or whole sandbox went
+// with it, so an infrastructure retry cannot bring it back and the caller has to
+// decide what to do. Only the second carries an attribution, so this passes that
+// one through untouched and covers everything else.
+func preserveSessionLost(err error) error {
+	switch {
+	case status.Code(err) == codes.NotFound:
+		// Already carries the code and the attribution the wire layer reports.
+		return err
+	case errors.Is(err, backend.ErrSessionLost):
+		return status.Error(codes.NotFound, err.Error())
+	default:
+		return status.Error(codes.Unavailable, err.Error())
+	}
+}
+
 func exitReasonOf(err error) string {
 	if attributed, ok := err.(interface{ ExitReason() string }); ok {
 		return attributed.ExitReason()
@@ -551,7 +572,7 @@ func (j *JSONListener) exec(ctx context.Context, raw json.RawMessage) (any, erro
 	}
 	code, output, err := j.control.nodes.ExecOn(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, preserveSessionLost(err)
 	}
 	return map[string]any{"exit_code": code, "stdout": output, "stderr": "", "truncated": false}, nil
 }

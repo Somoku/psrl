@@ -253,7 +253,7 @@ func (n *NodeListener) exec(ctx context.Context, raw json.RawMessage) (any, erro
 	}
 	code, output, err := n.node.Exec(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, preserveSessionLost(err)
 	}
 	return map[string]any{"exit_code": code, "stdout": output, "stderr": "", "truncated": false}, nil
 }
@@ -284,7 +284,7 @@ func (n *NodeListener) readBytes(ctx context.Context, raw json.RawMessage) (any,
 	}
 	code, output, err := n.node.Exec(ctx, handle, fmt.Sprintf("base64 %q", payload.Path), "", nil)
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, preserveSessionLost(err)
 	}
 	if code != 0 {
 		return nil, status.Errorf(codes.NotFound, "reading %q exited %d", payload.Path, code)
@@ -323,7 +323,7 @@ func (n *NodeListener) writeBytes(ctx context.Context, raw json.RawMessage) (any
 		payload.Path, payload.Data, payload.Path)
 	code, output, err := n.node.Exec(ctx, handle, command, "", nil)
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, preserveSessionLost(err)
 	}
 	if code != 0 {
 		return nil, status.Errorf(codes.FailedPrecondition, "writing %q exited %d: %s", payload.Path, code, output)

@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -495,5 +496,47 @@ func TestAFailedGroupLeavesNothingCharged(t *testing.T) {
 	}
 	if after := s.ledger.Headroom("rollout").MemoryMB; after != before {
 		t.Fatalf("quota went %d -> %d; a failed group must leave nothing charged", before, after)
+	}
+}
+
+func TestExecOnAReleasedSandboxIsReportedAsALostSession(t *testing.T) {
+	// A caller has to be able to tell "my session is gone" from "the node did not
+	// answer": the first means its own state is gone and no retry brings it back,
+	// and reading it as the second corrupts whatever the caller does next.
+	s := newStack(t, 4096)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	created, err := s.control.Create(ctx, &v1.CreateRequest{Spec: createSpec(64)})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	handle := backend.Handle{
+		Backend:   created.GetHandle().GetBackend(),
+		SandboxID: created.GetHandle().GetSandboxId(),
+		NodeID:    created.GetHandle().GetNodeId(),
+	}
+	if _, err := s.control.Release(ctx, created.GetHandle()); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	// Through the node-plane handler, which is one of the two places a failure
+	// could be flattened into a transport fault on its way to the caller.
+	payload, err := json.Marshal(map[string]any{
+		"backend": handle.Backend, "sandbox_id": handle.SandboxID, "node_id": handle.NodeID,
+		"command": "echo hi",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	listener := NewNodeListener(s.node, nil)
+	_, err = listener.exec(ctx, payload)
+	if err == nil {
+		t.Fatal("a command against a released sandbox must fail rather than run")
+	}
+	if reported := classify(err); reported.Code != "session_lost" {
+		t.Fatalf("the wire classified it %q, want session_lost (error: %v)", reported.Code, err)
+	} else if reported.ExitReason != string(node.ExitReleased) {
+		t.Fatalf("the attribution is %q, want %q so a post mortem reads why it went",
+			reported.ExitReason, node.ExitReleased)
 	}
 }

@@ -106,6 +106,25 @@ func NewReader() (*Reader, error) {
 func (r *Reader) Describe() string { return r.src.describe() }
 
 // newReaderFrom builds a reader over one source, resolving what does not change.
+// MeasuredBytes returns the memory the measured domain is using and the ceiling
+// that reading is a fraction of.
+//
+// A fraction alone does not say what was measured: the same 0.48 means "this
+// node's sandboxes hold half its memory" in one deployment and "the outer cgroup
+// is half full, for reasons this node does not control" in another. This is what
+// Read's MemUsedPct is a fraction of, so a caller comparing it against a ceiling
+// can say which domain the ceiling was applied to.
+//
+// The second result is false when the usage file cannot be read, which is the
+// one case a caller must not read as an idle machine.
+func (r *Reader) MeasuredBytes() (used, limit int64, ok bool) {
+	used, err := r.src.memoryUsage()
+	if err != nil {
+		return 0, r.limit, false
+	}
+	return used, r.limit, true
+}
+
 func newReaderFrom(src source) (*Reader, error) {
 	limit, err := src.memoryLimit()
 	if err != nil {

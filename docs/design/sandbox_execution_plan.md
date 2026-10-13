@@ -215,8 +215,9 @@ tuning.
 
 1. **Image materialization.** The largest single cost on a cold cluster.
    Locality and prefetch address it without a cache service, and the peer proxy
-   is the upgrade if the metrics ask for it. On demand layer loading is not
-   reachable here and is not attempted, for the reason in S8.
+   is the upgrade if the metrics ask for it. On demand layer loading through a
+   node local snapshotter is a separate, later opt in under D2 rather than part
+   of this phase.
 2. **Setup reuse.** A per task snapshot moves setup from once per group per step
    to once per task per run. On a task set visited across many steps this is
    larger than any tuning in the next item.
@@ -227,7 +228,7 @@ tuning.
    already paid.
 
 What this phase explicitly does not promise is provider grade density or cold
-start. That lives in Phase 6, and the internal backend is the test path (D2, S8).
+start. That lives in Phase 6, and the internal backend does not reach it (D2, S8).
 
 **Rollback.** Every step is a policy or a configuration that defaults to the
 Phase 3 behavior. The store is the exception, because a published snapshot

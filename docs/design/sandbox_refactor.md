@@ -22,8 +22,8 @@ moves behind a backend.
 - Every backend, **including the internal Docker backend**, is a service reached
   through the same top-level API. No component outside the sandbox module may
   treat the Docker path as special.
-- The internal Docker backend is the local distributed test backend. It needs no
-  external platform, runs on a plain cluster with a local daemon per node, and
+- The internal Docker backend is the default deployed backend. It needs no
+  external service, runs on a plain cluster with a local daemon per node, and
   exercises the same contract the external providers implement.
 
 ### Planes
@@ -49,7 +49,7 @@ are shown so a change has an obvious home.
 | Id | Decision | Consequence |
 |---|---|---|
 | D1 | PSRL keeps a thin control plane. Sandboxes are services, the internal Docker backend included | The manager stops growing runtime features. Feature work moves behind the backend contract |
-| D2 | The internal Docker backend is the local distributed test backend | It must need no external platform and stay contract complete. It must not become the production scale path. It keeps a filesystem state path over a shared snapshot store (D8) |
+| D2 | The internal Docker backend is the default deployed backend and stays contract complete | It must need no external service, and it is the backend that runs in the single node and small cluster shape. It does not reach a microVM provider's density, so kernel and microVM level efficiency stays there. It keeps a filesystem state path over a shared snapshot store (D8), and may adopt a capability gated node local image snapshotter |
 | D3 | One sandbox implementation. Every backend, internal or external, is reached through the same manager | Every sandbox invariant lives in one place, and a workload cannot reach a container by a second path |
 | D4 | Efficiency and density are fixed in the main stack. Exec is one interface with an injectable strategy, and the default strategy is a persistent shell | One exec interface, not two. A harness that runs a single long foreground command and a benchmark that needs shell state across turns are two strategies behind one contract, not two contracts |
 | D5 | Security controls are added and, where a provider offers them, delegated to the provider | Egress and secret handling are not reimplemented twice |
@@ -646,8 +646,10 @@ they buy.
   declares `IMAGE_BLOCK_DELIVERY` fetches blocks from a node cache and from
   peers instead of the origin. For either, the caller passes an image or template
   reference and PSRL does no pre pull at all.
-- This is why the external backends are the scale path and the internal Docker
-  backend is the test path. See {doc}`sandbox_external_backends`.
+- The internal Docker backend can serve this only through a capability gated node
+  local snapshotter, which is a deployment component rather than a service, and
+  its density still does not approach a provider's. The external backends remain
+  the scale path. See {doc}`sandbox_external_backends`.
 - The internal Docker backend gets no cache service in the baseline. A Docker
   daemon mirror redirects only Docker Hub, and a `distribution` proxy caches one
   upstream, so a cache that covers a real task corpus costs either rewritten
@@ -656,8 +658,8 @@ they buy.
   the pull rather than renaming it. See {doc}`sandbox_snapshot_store`.
 - DSec takes the shared filesystem plus EROFS route rather than a registry,
   precisely so it loads only the accessed image blocks. PSRL does not follow that
-  in the internal backend, by design, because that backend is the test path. The
-  comparison is in {doc}`sandbox_snapshot_store`.
+  kernel level route in the internal backend. The comparison is in
+  {doc}`sandbox_snapshot_store`.
 
 ---
 

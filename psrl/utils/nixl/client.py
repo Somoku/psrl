@@ -53,6 +53,17 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 # Utility function to combine tag, shard_idx, src_client, target_client, key
+def _local_shards_named(key: str, tensor, sharding) -> list[torch.Tensor]:
+    """`local_shards_of`, with the key and the block FP8 tile rule in any refusal."""
+    try:
+        return local_shards_of(tensor, sharding)
+    except ValueError as e:
+        hint = ""
+        if key.endswith("_scale_inv"):
+            hint = " A block FP8 scale shards like its weight, so each rank must hold whole 128 x 128 tiles."
+        raise ValueError(f"{key}: {e}{hint}") from e
+
+
 def make_xfer_tag(
     tag: str,
     src_client: str,
@@ -820,7 +831,7 @@ class NIXLStorageClient:
                         continue
                     sharding = sharding_dict[key]
                     shard_indices = sharding.shard_indices
-                    local_sharded_tensors = local_shards_of(tensor, sharding)
+                    local_sharded_tensors = _local_shards_named(key, tensor, sharding)
                     for local_pos, local_sharded_tensor in enumerate(local_sharded_tensors):
                         if not local_sharded_tensor.is_contiguous():
                             if (
@@ -877,7 +888,7 @@ class NIXLStorageClient:
                         tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
                     sharding = sharding_dict[key]
                     shard_indices = sharding.shard_indices
-                    local_sharded_tensors = local_shards_of(tensor, sharding)
+                    local_sharded_tensors = _local_shards_named(key, tensor, sharding)
                     for local_pos, local_sharded_tensor in enumerate(local_sharded_tensors):
                         if local_sharded_tensor.device == torch.device("meta"):
                             entries.append(
@@ -923,7 +934,7 @@ class NIXLStorageClient:
 
                 # A grouped MoE key (item C1) has no single tensor to slice: its experts
                 # are separate storages, so the shards arrive pre-split.
-                local_sharded_tensors = local_shards_of(tensor, sharding)
+                local_sharded_tensors = _local_shards_named(key, tensor, sharding)
 
                 for local_pos, tbd_local_sharded_tensor in enumerate(local_sharded_tensors):
                     # Store the original tensor mapping

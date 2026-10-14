@@ -103,15 +103,16 @@ clip_ratio_high=0.28
 # One multi-turn trajectory shares a 65536-token budget between prompt and response,
 # and max_model_len matches it so the CLI compaction trigger stays trainable.
 #
-# Codex takes no turn cap of its own, so the episode is bounded by
-# `agent.trajectory_timeout` rather than by a turn count: -1 leaves turns unlimited.
-max_turns=-1
-val_max_turns=-1
+# Codex takes no turn cap of its own, so this is declared as the session's turn budget
+# and the session router refuses the turn after it is spent. The numbers match the
+# Claude Code recipe: both bound the parent agent's turns, and a subagent's calls are
+# charged separately rather than to the same budget.
+max_turns=80
+val_max_turns=160
 trajectory_timeout=1800
-# A codex episode that runs past the trajectory budget is stopped at the deadline and
-# its partial patch and trajectory are kept and graded, instead of being cancelled and
-# re-run with all of its turns discarded. Codex takes no turn cap, so the wall clock is
-# the only bound and an over-budget episode is common enough to be worth keeping.
+# An episode can still exhaust the trajectory budget before it exhausts its turns, and
+# one that does is stopped at the deadline with its partial patch and trajectory kept and
+# graded, instead of being cancelled and re-run with all of its turns discarded.
 trajectory_timeout_action=keep
 max_prompt_length=32768
 max_response_length=32768

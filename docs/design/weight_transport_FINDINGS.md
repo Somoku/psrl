@@ -29,6 +29,37 @@ block FP8 格在 train 侧填「block 量化恰好可逆」的值，于是 gen �
 
 档位：多节点，`tests/nixl/scripts/run_pair_bw.sh`。
 
+## 1b. 一对 agent 只占一条 bond，聚合靠并发对数
+
+一个 NIXL agent 对的 READ 稳定在 **49 GB/s**，等于一条 400G bond，且**与 `UCX_MAX_RNDV_RAILS` 无关**
+（1 / 2 / 4 / 8 四档实测都是 49.0 GB/s）。原因是 GPU 与 NIC 的亲和性：`nvidia-smi topo` 下每张 GPU 只有一个
+`PIX` 的 NIC，UCX 选中它之后不会把同一个 rendezvous 拆到其余 bond 上。
+
+于是节点聚合带宽是**并发对数**的函数，不是单流调优的函数：
+
+```
+节点聚合 ≈ min(Σ 每个源的 49 GB/s, Σ 每个读方的 49 GB/s)，且只有在「源与读方是一一匹配」时取到
+```
+
+实测佐证，Qwen3-30B-A3B（48 层），train EP8 单节点 → 8 个 rollout（TP4·EP8）在另一节点，稳态 0.41 s
+搬 64.3 GB，即每节点 **156 GB/s**：
+
+| 每源出口 | 该源的并发读方数 |
+|---|---|
+| 46.0 GB/s（最快） | 1 |
+| 24.0 GB/s（中位） | 2 |
+| 18.5 GB/s（最慢） | 2 以上 |
+
+每个源搬的字节几乎相等（7.3–9.5 GB），但速率差 2.6 倍，差异正好落在「一条 bond 被几个读方分」。
+**planner 现在按字节均衡，不按「同时读同一个源的读方数」均衡**，所以得到的是多对多而不是一一匹配，
+聚合停在探测值 386 GB/s 的 40%。把「每波内每个源只服务一个读方」做进 plan 是下一步（实现规划 §12 W12），
+预期上界是 386 GB/s。
+
+235B 规模下每节点 107 GB/s 是同一现象的更极端形态：EP 让每个 gen GPU 的专家只有一个持有者，
+读方无从分散，而一个源被多个读方同时读时就退化到 bond 的几分之一。
+
+档位：两节点。复现见 §8 的 `bench_rails.sh` 与矩阵格。
+
 ## 2. peer 读的粒度：gen 本地整张量
 
 designate 与 follower 的 gen TP rank 相同，本地张量逐字节相同，两者之间不需要重分片。
@@ -86,7 +117,7 @@ Qwen3-8B，train TP4·PP2 × 24 rank，gen TP2，每 gen 节点 8 个 rollout：
 | FP8 rollout，扩散分波（Megatron FP8 train） | 18.9 GB | 4201 | 0.113 s（上游 0.093 s，peer 0.016 s） |
 
 FP8 两行每个 train rank 的发布刷新（重量化进发布副本）为 22 ms（bf16 train）与 32 ms（FP8 train），
-发布副本 828 MiB / rank。
+发布副本 828 MiB / rank。这些数字取自融合 kernel 之前的实现；之后同样的副本刷新快 14.8 倍（§6）。
 
 - 四个 instance 轮流当 designate，节点入口分散到每个 instance 的 NIC 上。
 - 分波后 peer 阶段只剩最后一波的尾巴。
@@ -120,7 +151,7 @@ rollout 用 TP 而非 EP 切专家时，每个 instance 持有全部专家的一
 是实测节点聚合 386 GB/s 的 28%，每 train 节点出口约 102 GB/s。瓶颈在并发度而非带宽，
 train 侧只有 2 个节点供给 2 个 gen 节点，且专家键的读取粒度是每 expert 一段。
 
-**FP8 把字节减半，但把发布成本放大了 36 倍。** bf16 下每个 train rank 的发布副本 6016 MiB
+**FP8 把字节减半，但曾把发布成本放大 36 倍（已修复，见 §6）。** bf16 下每个 train rank 的发布副本 6016 MiB
 （只有 attention，因为 gen TP4 把它切得比 train 的 TP1 细），刷新 14 ms。
 FP8 下副本涨到 19933 MiB（专家权重也要量化成 FP8 副本），刷新 513–545 ms。
 后者与一次稳态 sync（1.5 s）同量级，**所以 235B 规模下重量化是发布点的主要成本，不是传输**。
@@ -176,9 +207,38 @@ FP8 下副本涨到 19933 MiB（专家权重也要量化成 FP8 副本），刷�
 - 细化网格格的稳态 0.383 s 慢于其他 MoE FP8 格，是因为 EP1 下每个 expert 被 TP4 切开，
   每 rollout 37,491 个 descriptor。block scale 改走发布副本之前是 228,675 个、1.23 s。
 
+## 5b. 同设备的源：拷贝而不是传输（colocate）
+
+一个 NIXL agent 对在**同一张卡**上 READ 只有 **52 GB/s**，而同样字节的 `cudaMemcpy` 是 **399–447 GB/s**，
+差 7.7 倍。原因是 UCX 走的是 rendezvous 协议而不是交出指针；想只开 IPC 也不行，
+NIXL 的控制面需要一个 active message 传输，`UCX_TLS=cuda_ipc,cuda_copy,self` 直接被拒绝建后端。
+
+所以同设备的源改走 CUDA IPC：train client 为**每个已注册 region** 导出一个句柄（region 本就装着许多 shard，
+句柄数与模型规模无关），同卡的读方映射一次，之后按 descriptor 本来要用的地址做设备拷贝。
+单节点 8 train + 8 rollout 共卡、扩散开、两轮、每轮每 client 判 399 个 key：
+
+| 格 | 稳态（NIXL 同卡） | 稳态（IPC） | 走拷贝的字节 |
+|---|---|---|---|
+| Megatron bf16 → bf16 | 0.056 s | **0.044 s** | 16.38 GB（全部上游） |
+| Megatron bf16 → FP8 | 0.034 s | **0.033 s** | 9.44 GB |
+| FSDP2 bf16 → bf16 | 0.061 s | **0.057 s** | 2.05 GB，其余回落到 NIXL |
+
+**收益按「同设备字节占比」缩放。** 这三格里 peer 读（跨卡、走 NVLink）占大头，所以总时间只动一两成；
+FSDP2 一格只有 2.05 GB 走拷贝，因为它多数 region 不是 caching allocator 能导出的块，回落路径按设计生效。
+235B 规模的 colocate 下同设备字节是每 rank 约 20 GB，52 GB/s 要 0.38 s，拷贝只要 0.05 s，差距才显出来。
+
+跨进程导入自己导出的句柄会被 CUDA 拒绝，所以地址算术单独做纯函数测试（`locate`），
+映射与拷贝由另一个进程验证（`test_device_ipc_gpu.py`）。
+
 ## 6. block FP8 的数值
 
 - `block_fp8.quantize_blockwise` 与 vLLM 的 `per_block_cast_to_fp8` 逐位一致（CPU）。
+- **发布点的融合量化 kernel**（`fp8_kernels.py`）与上面那条逐位一致，25 个形状与分布全覆盖，
+  包括 strided 的输入与输出。速度 **3169 GB/s**，高于 bf16 拷贝的 880 GB/s，
+  因为它每元素只搬 3 字节（读 2 写 1）而拷贝搬 4；原来的四趟实现是 133 GB/s。
+  端到端实测：同样 3313 MiB 的发布副本，每 rank 的发布刷新从 **118 ms 降到 8.0 ms**（14.8 倍），
+  Qwen3-8B TP2 单节点格。235B 下原为 513 ms，按同一比例落到 35 ms 量级，
+  不再与一次稳态 sync 同量级。
 - 真实 Qwen3-8B 权重经 trainer 的量化器发布、FP8 rollout 生成，与 bf16 rollout 对比
   （4 个 prompt，32 token，贪心）：贪心 token **100% 一致**，首 token logprob 差
   0.003–0.10。档位：单 GPU，`bench_fp8_logprob_gap.py`。

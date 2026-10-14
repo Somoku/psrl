@@ -660,3 +660,60 @@ def test_one_model_republishing_does_not_disturb_the_other():
             judged, failure = check_by_layout(cluster.states[name], cluster.declared[name], list(MODEL), version)
             assert failure is None, f"{name} ({role}) after actor republished: {failure}"
             assert judged == len(MODEL)
+
+
+def test_an_instance_that_joins_later_pulls_correct_bytes():
+    """A rollout started after the handshake is admitted, replanned for, and reads the right bytes."""
+    roles = {"actor": 7}
+    cluster = _multi_role_cluster(roles, train_tp=2, gen_tp=2)
+    cluster.pull(epoch=1)
+    incumbents = list(cluster.gen)
+
+    # A second instance registers after everyone else has been planned for.
+    joiners = []
+    for r in range(2):
+        name = gen_client_name(1, r)
+        cluster.states[name] = _locals(MODEL, 2)
+        cluster.declared[name] = {k: _sharding(d, 2, r) for k, (s, d) in MODEL.items()}
+        joiners.append(name)
+
+    server = NIXLMetaServer.__new__(NIXLMetaServer)
+    server.client_sharding_dicts = {n: copy.deepcopy(d) for n, d in cluster.declared.items()}
+    server.client_unified_sharding_dicts, server.finest_shard_meshes = {}, {}
+    server._agents_reported = {kind: set() for kind in NotifKind}
+    server._agents_reported[NotifKind.SHARDING] = set(cluster.declared)
+    server.make_unified_sharding()
+    unified = server.client_unified_sharding_dicts
+
+    for name in joiners:
+        client = NIXLStorageClient(
+            client_name=name,
+            server_name="server",
+            use_gpu=False,
+            client_type=NIXLClientType.PULL_SIDE,
+            nixl_config=CONFIG,
+            binded_agent=MemcpyAgent(name, cluster.bus),
+        )
+        client.register_local_tensors(cluster.states[name], unified[name])
+        cluster.clients[name] = client
+    infos = {name: c.local_client_info for name, c in cluster.clients.items()}
+    server.client_infos = infos
+    server._agents_reported[NotifKind.CLIENT_INFO] = set(infos)
+    server._peer_diffusion = False
+    server.comm_plan = None
+    server.make_comm_plan()
+    for client in cluster.clients.values():
+        client._all_client_infos = dict(infos)
+        client._comm_plan = server.comm_plan
+    cluster.gen = incumbents + joiners
+    cluster.engines.update(
+        {n: NIXLPullEngine(cluster.clients[n], staging_bytes=1 << 16, peer_timeout_s=2.0) for n in joiners}
+    )
+
+    # The replan must cover the joiners and leave the incumbents able to pull as before.
+    assert all(name in server.comm_plan.rollout_pull_from_ps_plan for name in joiners)
+    cluster.pull(epoch=2, participants=set(cluster.gen))
+    for name in cluster.gen:
+        judged, failure = check_by_layout(cluster.states[name], cluster.declared[name], list(MODEL), version=7)
+        assert failure is None, f"{name}: {failure}"
+        assert judged == len(MODEL)

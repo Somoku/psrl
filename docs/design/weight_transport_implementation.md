@@ -902,7 +902,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | A5 配置防御 | ✅ | ✅ `config.py` | L1 ✅ |
 > | A6 删 FSDP1 | ✅ | ✅ | L1 ✅ |
 > | A7 join 三级判定 | ✅ | ✅ `server.py` | L1 ✅ |
-> | A8 colocate IPC | ✅ 机制（`test_colocate_ipc_gpu.py`） | ❌ colocate 走 NIXL 同卡读 | L2 ✅（NIXL 路径，含扩散与 FP8） |
+> | A8 colocate IPC | ✅ `device_ipc.py` | ✅ 同设备的源改为设备拷贝 | L1 4 条跨进程；L2 colocate 三格（Megatron bf16 / FP8、FSDP2）逐位通过，16.4 / 9.4 / 2.1 GB 走拷贝 |
 > | **A9 FP8 wire** | ✅ `block_fp8.py` | ✅ trainer 发布 block FP8 副本与 scale | L1 量化器与 vLLM 逐位一致，L2 17 格 FP8 位与 scale 逐位判定（含 Megatron FP8 train 4 格），单 GPU 真实权重贪心 token 100% 一致 |
 > | B1 chunk/commit group | — | — | **已删除**：拉取引擎按源一次提交，不再需要 chunk 计划 |
 > | B2 slot ack | ✅ | ❌ 零 import | **不再需要**：cast 产物是常驻发布副本，在推送锁内刷新（主文档 §3.4.2） |
@@ -912,22 +912,22 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | C3 发布边界 | ✅ | ✅ | L2 ✅ |
 > | **D1 去冗余** | ✅ | ✅ `pull_engine.py`，默认开 | L3 ✅ 4 节点 16 rollout：出口 131 → 32.8 GB，稳态 0.178 s |
 > | D1 选源 `source_resolution` | ✅ | ❌ 零 import | L1，选源由 planner 的 designate 次序承担 |
-> | D2 `holder_index` | ✅ | ❌ 零 import | L1 |
+> | D2 `holder_index` | ✅ | ❌ 零 import | L1；多模型隔离改由客户端名承担（§11.1） |
 > | D3 `nixl_direct` | ✅ | ✅ | L2 ✅ 31 格，L3 ✅，**PS 未删** |
 > | D4 单向标记 | ✅ | ✅ `ray_trainer.py` | L2 ✅ |
 > | D4 `holder_roles` / bootstrap | ✅ | ❌ 零 import | L1 |
 > | D5 `chunk_offset` | ✅ | ❌ 零 import | L1 |
 > | D6 降级继续生成 | ✅ | ✅ | L2 ✅ |
-> | D7/D8 `chunk_availability` | ✅ | ❌ 零 import | L1，生产无 DP 接管 |
+> | D7/D8 `chunk_availability` | ✅ 判定 | ✅ 逻辑在 `pull_engine.py` | L1 四条故障注入：源失效改读 DP 副本，整组失效抛 `ChunkUnavailable` 且不动权重 |
 > | E1 版本级等待 | ✅ | ✅ `ps_manager` + `vllm_async_server` | L2 ✅ |
 > | E2 `staleness` | ✅ | ⚠️ 仅类型被引用 | L1 |
 > | E3 握手解复用 | ✅ | ✅ `server.py` / `client.py` | L2 ✅ |
-> | E3 `admit_joiners` | ✅ | ❌ 生产无调用者 | L3（测试直接调用） |
+> | E3 `admit_joiners` | ✅ | ✅ `ps_manager.nixl_admit_joiners` | L3 真实 agent 准入；L1 后加入的 instance 拉到正确字节 |
 > | E4 partial MD | ✅ 上半 | ❌ 零 import | L1，下半被 NIXL 缺绑定阻塞 |
 > | F1 delta | ✅ 决策函数 | ❌ | L1 |
 > | T1 判据 | ✅ layout 判据 + FP8 逐位判据 | — | 坐标哈希写入原始位，对整行 / 整块错位可见 |
 > | T3 colocate | ✅ | — | L2 ✅ |
-> | T4 矩阵 | ✅ | — | L2 31 格通过（`weight_transport_FINDINGS.md` §5） |
+> | T4 矩阵 | ✅ | — | L2 34 格通过（`weight_transport_FINDINGS.md` §5），L4 235B |
 
 实现期逐项打勾。**判据栏必须可执行**，不接受「已实现」这种描述。
 
@@ -1713,9 +1713,7 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 
 | 项 | 缺它会怎样 | 依赖 |
 |---|---|---|
-| D2 `holder_index` / D4 `holder_roles` | 没有「谁持有哪个版本的哪一段」的索引。单实例直供下 plan 就够，多角色（critic / ref）与弹性都需要它 | — |
-| D7/D8 `chunk_availability` | trainer rank 故障时没有 DP 副本接管，拉取只能整体降级（D6 已能继续生成，但读不到新版本） | D2 |
-| E3 `admit_joiners` | 生产只有一次性握手屏障，没有 join / leave。扩缩容必须重启整个握手 | 6b（已有） |
+| D2 `holder_index` / D4 `holder_roles` | 没有「谁持有哪个版本的哪一段」的索引。多模型隔离改由客户端名承担（§11.1），它只剩「档位 B 的 CPU holder」这一个用途 | — |
 | E4 `partial_md` 下半 | 缩容缺 `invalidateLocalMD`，会留下可用的陈旧 descriptor | NIXL 缺绑定 |
 | F1 `delta_plan` | 跨 DC / 慢链路的增量传输，设计上就是 opt-in | — |
 
@@ -1723,8 +1721,8 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 
 | 项 | 现状 |
 |---|---|
-| **2 / A8 colocate CUDA IPC + stage 边界 offload** | 生产 colocate 走 NIXL 同卡读。机制有 GPU 测试（`test_colocate_ipc_gpu.py`），但没有接到切换路径，所以大 MoE 下的 `register_memory` 次数没有省掉 |
-| **3.10 多角色** | client 命名里有 `replica_idx` / `base_worker_id`，但 holder 表没有 role 维度，actor 与 critic 不能并发发布版本 |
+| **stage 边界 offload** | 同设备读已走 IPC（§11.1），但「rollout 阶段把 trainer 权重 offload 到 CPU 腾出 KV cache」没做；每次 colocate 切换仍整体重注册（实测每 region 约 2.2 ms） |
+| **3.10 多角色的生产接线** | 数据面已按模型隔离并有 CPU 测试（§11.1），但生产只有 actor 一个模型走 NIXL，critic / ref / RM 仍各自读 checkpoint |
 | **3.11 LoRA 合并路径** | 只做了「`merge=false` 拒绝」这一半，`merge=true` 的端到端没跑过 |
 | **3.8.1 FP4 / MXFP8** | 只有 blockwise FP8。MXFP8 需要 SM100+ |
 | **零拷贝 FP8-native** | TE 的 blockwise recipe 需要 CUDA ≥ 12.9，本集群 12.8。当前 FP8 训练走「反量化 + 重量化进发布副本」 |
@@ -1733,14 +1731,16 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 
 已覆盖：1（零额外存储）、2（流量与重叠率，含 235B）、5（注册有效性三条）、
 7（atomic group，FP8 的 weight 与 scale 同组）、8（等价性，量化器与 vLLM 逐位一致）、
-10（扩散有效性，含 235B 的结构性上界）、14（精度矩阵，31 格）、16（后端对称性）、
-18（布局转换产物时效性）、19（并行度不匹配的 shard 代数）。
+**9 与 17a（故障注入：源失效改读 DP 副本，整组失效不动权重）**、
+10（扩散有效性，含 235B 的结构性上界）、**13 的前两条（后加入的 instance 被准入并拉到正确字节）**、
+14（精度矩阵，34 格）、16（后端对称性）、18（布局转换产物时效性）、
+19（并行度不匹配的 shard 代数）、**22（role 隔离：两个模型同名 key 互不串读）**。
 
 未覆盖：3（单源瓶颈随 replica 数的亚线性）、4（pause 窗口与冲突等待分布）、
-6（colocate 切换的 KV cache 可用量）、9 与 17a（故障注入）、11（四条运行时断言各一个反例）、
-12（`is_rollout_mode_in_actor=True` 全流程）、13（弹性伸缩四条）、15（LoRA 两条路径）、
-20（colocate buffer 上界）、21–22（多角色与 role 隔离）、23（epoch 与 version 两段校验）、
-24（档位 B 的 GPS 一致性）、25（长跑 logprob 不漂移）。
+6（colocate 切换的 KV cache 可用量）、11（四条运行时断言各一个反例）、
+12（`is_rollout_mode_in_actor=True` 全流程）、13 的后两条（缩容与非整除 join）、
+15（LoRA 两条路径，按要求不做）、20（colocate buffer 上界）、21（多角色切换的生产编排）、
+23（epoch 与 version 两段校验）、24（档位 B 的 GPS 一致性）、25（长跑 logprob 不漂移）。
 
 ## 12. 剩余工作
 

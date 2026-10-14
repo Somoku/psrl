@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from psrl.workers.agent_loop.harness import STOP_REASON_MAX_TURNS, HarnessEpisodeSummary
 from psrl.workers.agent_loop.loops.harness_agent_loop import HarnessAgentLoop, _raise_if_episode_is_over
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 from psrl.workers.agent_loop.worker import _classify_rollout_failure
@@ -20,6 +21,7 @@ def _reason(
     grader_unavailable: bool = False,
     grader_capacity_timeout: bool = False,
     agent_timed_out: bool = False,
+    episode_stop_reason: str | None = None,
 ) -> TerminateReason:
     loop = SimpleNamespace(
         rollout_budget=_BUDGET,
@@ -27,6 +29,7 @@ def _reason(
         grader_unavailable=grader_unavailable,
         grader_capacity_timeout=grader_capacity_timeout,
         _agent_timed_out=agent_timed_out,
+        _episode_summary=(HarnessEpisodeSummary(stop_reason=episode_stop_reason) if episode_stop_reason else None),
     )
     return HarnessAgentLoop.get_harness_terminate_reason(loop, training_data)
 
@@ -61,16 +64,33 @@ def test_response_length_exceeded_reports_when_the_budget_overflows() -> None:
     assert _reason(data) is TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
 
-def test_budget_overflow_wins_over_the_turn_cap() -> None:
+def test_the_harness_own_verdict_wins_over_the_length_check() -> None:
+    # Both are budget truncations, so the only question is which reason to report. The
+    # harness's own verdict is a fact about why it stopped; the length check is the
+    # framework's reconstruction of what it could train, and it cannot see either a
+    # context rewrite or a subagent.
     data = [_item(prompt_tokens=_BUDGET, response_tokens=1, num_turns=_MAX_TURNS)]
 
-    assert _reason(data) is TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+    assert _reason(data, episode_stop_reason=STOP_REASON_MAX_TURNS) is TerminateReason.MAX_TURNS_EXCEEDED
 
 
-def test_turn_cap_reports_when_the_budget_fits() -> None:
+def test_turn_cap_reports_when_the_harness_says_it_hit_one() -> None:
     data = [_item(prompt_tokens=1000, response_tokens=1000, num_turns=_MAX_TURNS)]
 
-    assert _reason(data) is TerminateReason.MAX_TURNS_EXCEEDED
+    assert _reason(data, episode_stop_reason=STOP_REASON_MAX_TURNS) is TerminateReason.MAX_TURNS_EXCEEDED
+
+
+def test_a_count_reaching_the_cap_is_not_a_turn_cap_by_itself() -> None:
+    """The framework's own count must not stand in for the harness's verdict.
+
+    A context rewrite cuts a trajectory mid-run while the CLI's counter keeps going, so a
+    trajectory whose own count reaches the configured cap may have been stopped by the
+    harness's cap, or may just be the longest segment of a run that was nowhere near it.
+    Reporting the cap from the count alone mislabels in both directions.
+    """
+    data = [_item(prompt_tokens=1000, response_tokens=1000, num_turns=_MAX_TURNS * 2)]
+
+    assert _reason(data) is TerminateReason.FINISHED
 
 
 def test_an_unlimited_episode_finishes_instead_of_exceeding_turns() -> None:
@@ -82,6 +102,7 @@ def test_an_unlimited_episode_finishes_instead_of_exceeding_turns() -> None:
         grader_unavailable=False,
         grader_capacity_timeout=False,
         _agent_timed_out=False,
+        _episode_summary=None,
     )
     data = [_item(prompt_tokens=1000, response_tokens=1000, num_turns=10_000)]
 

@@ -923,6 +923,13 @@ class AgentLoopBase(ABC):
         turns = info.get("num_turns")
         if turns is None:
             turns = out.num_turns if out.num_turns is not None else 0
+        # The harness's own count for the whole episode, which is the number comparable to
+        # the cap the harness was given. It differs from this trajectory's own count
+        # whenever the harness rewrote its context or ran a subagent.
+        episode_turns = info.get("episode_num_turns")
+        turn_fields = f"turns: {turns}"
+        if episode_turns is not None:
+            turn_fields += f", episode_turns: {episode_turns}"
 
         # Prefer the loop's wall-clock timing. Mini-SWE carries finer timing under
         # agent_reward_info['timing'] (assistant/env/prep/grading) measured in the runner.
@@ -958,7 +965,7 @@ class AgentLoopBase(ABC):
             text += f"=== Submission ===\n{patch}\n\n"
         text += (
             "=== Summary ===\n"
-            f"turns: {turns}, patch: {'yes' if patch else 'no'}, "
+            f"{turn_fields}, patch: {'yes' if patch else 'no'}, "
             f"stop: {terminate_reason.value}, elapsed: {elapsed_s:.1f}s\n"
             f"[Token Counts] prompt: {n_prompt} | assistant: {n_assistant} | "
             f"env: {n_env} | total: {total_tokens}\n"

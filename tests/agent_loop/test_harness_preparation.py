@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from psrl.sandbox import SandboxManager, SandboxSource, SandboxSpec
 from psrl.sandbox.backends.docker import DockerBackend
-from psrl.workers.agent_loop.harness import HarnessTaskContext
+from psrl.workers.agent_loop.harness import HarnessResult, HarnessTaskContext
 from psrl.workers.agent_loop.loops.budget import EpisodeBudget
 from psrl.workers.agent_loop.timeouts import resolve_rollout_timeouts
 from tests.sandbox.test_docker_backend import FakeDockerEngine
@@ -61,9 +61,15 @@ async def test_grader_preparation_overlaps_rollout_without_allocating_a_grader(h
         assert len(manager._leases) == 1, "Speculative preparation must not reserve grader capacity."
         assert engine.config["Image"] == "rollout", "Only the rollout container should exist."
         finish.set()
-        return SimpleNamespace(exit_code=0, stderr_tail="", timed_out=False)
+        return HarnessResult(exit_code=0)
 
-    harness = SimpleNamespace(prepare=AsyncMock(), run=run_harness, abort=AsyncMock())
+    harness = SimpleNamespace(
+        prepare=AsyncMock(),
+        run=run_harness,
+        abort=AsyncMock(),
+        # The lifecycle reads the CLI's own episode report from the harness.
+        episode_summary=lambda log_bytes: None,
+    )
     monkeypatch.setattr(harness_module, "create_harness", lambda *args: harness)
     loop = harness_module.HarnessAgentLoop.__new__(harness_module.HarnessAgentLoop)
     # Mirrors `AgentLoopBase.__init__`, which `__new__` skipped.

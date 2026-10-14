@@ -140,9 +140,14 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
         sandbox: SandboxSession,
         runtime: HarnessRuntime,
         harness_result: HarnessResult,
+        *,
+        harness_log: bytes | None = None,
     ) -> MiniSWEHarnessArtifact:
         """
         Capture the repository patch and harness tool trace before teardown.
+
+        ``harness_log`` is the CLI's own output, already read by the lifecycle; the scan
+        uses it rather than reading the same file again.
         """
         swe_problem = task.state.payload["observation"].get("swe_problem", {})
         patch = await collect_git_patch(
@@ -160,7 +165,8 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
             "malformed_lines": 0,
             "tool_calls": 0,
         }
-        if harness_result.stdout_path:
+        log_bytes = harness_log
+        if log_bytes is None and harness_result.stdout_path:
             try:
                 log_bytes = await sandbox.read_bytes(harness_result.stdout_path)
             except Exception as exc:
@@ -172,18 +178,18 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
                     }
                 )
                 psrl_logger.warning("Could not read the harness tool trace for integrity analysis.", exc_info=True)
-            else:
-                trajectory_format = self.harness_config.resolved_trajectory_format()
-                integrity = scan_trajectory_integrity(
-                    log_bytes,
-                    trajectory_format,
-                    str(swe_problem.get("repo") or ""),
+        if log_bytes is not None:
+            trajectory_format = self.harness_config.resolved_trajectory_format()
+            integrity = scan_trajectory_integrity(
+                log_bytes,
+                trajectory_format,
+                str(swe_problem.get("repo") or ""),
+            )
+            if not integrity.get("scannable", True):
+                psrl_logger.warning(
+                    f"Harness integrity scan could not parse the {trajectory_format!r} trajectory: "
+                    f"{integrity.get('scan_note', 'unknown reason')}."
                 )
-                if not integrity.get("scannable", True):
-                    psrl_logger.warning(
-                        f"Harness integrity scan could not parse the {trajectory_format!r} trajectory: "
-                        f"{integrity.get('scan_note', 'unknown reason')}."
-                    )
         return MiniSWEHarnessArtifact(patch=patch, integrity=integrity)
 
     async def finalize_harness_task(

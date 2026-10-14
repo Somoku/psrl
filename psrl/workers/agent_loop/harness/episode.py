@@ -1,0 +1,129 @@
+"""What the harness CLI itself reported about the episode it ran.
+
+The framework must not reconstruct an episode's stop reason or its turn count from
+its own bookkeeping. Two of its counters are known to disagree with the CLI's:
+
+- A harness that rewrites its own context (Claude Code's auto-compact) replays
+  messages the session never generated, and the gateway cuts a trajectory there.
+  The CLI's turn counter keeps running across that rewrite, so a per-trajectory
+  count covers only the segment after the last rewrite while the CLI counts the run.
+- A harness that runs a subagent makes model calls the CLI does not count against
+  the parent, while every call reaches the same endpoint.
+
+So the CLI's own machine-readable output is the authority, parsed here per
+``trajectory_format``. Everything downstream reads that verdict rather than a
+reconstruction of it.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+
+# Trajectory output formats. These key both this dispatch and `HarnessConfig`'s
+# kind default, so they live here rather than in two places.
+CLAUDE_CODE_STREAM_JSON = "claude_code_stream_json"
+CODEX_JSONL = "codex_jsonl"
+
+# The stop reason a harness reports when its own turn cap stopped it. A harness
+# maps its own wording onto this, so a caller never parses harness-specific text.
+STOP_REASON_MAX_TURNS = "max_turns"
+
+
+@dataclass(frozen=True)
+class HarnessEpisodeSummary:
+    """What a harness CLI said about the episode it just ran.
+
+    ``stop_reason`` is the CLI's own reason in the vocabulary this module defines,
+    or its raw terminal reason when it has no equivalent here. ``num_turns`` is the
+    number of turns the CLI counted for the episode: subagent turns excluded, and
+    every internal run of one invocation summed, because a single invocation can
+    report several results.
+    """
+
+    stop_reason: str | None = None
+    num_turns: int | None = None
+
+
+def episode_summary(trajectory_format: str, log_bytes: bytes) -> HarnessEpisodeSummary | None:
+    """Parse a harness's own log for what the CLI reported about the episode.
+
+    Returns ``None`` when the format carries no such report, so a caller can tell
+    "the harness reported nothing" from "the harness reported zero turns".
+    """
+    parser = _EPISODE_PARSERS.get(trajectory_format)
+    if parser is None:
+        return None
+    return parser(log_bytes)
+
+
+def _parse_claude_code_episode(log_bytes: bytes) -> HarnessEpisodeSummary | None:
+    """Read the Claude Code stream-json results.
+
+    ``-p --output-format stream-json`` closes every internal run with a ``result``
+    event carrying ``num_turns`` and a ``terminal_reason``. One invocation can run
+    more than once (a continuation re-enters the query loop in the same session and
+    emits its own ``init``/``result`` pair), and each run counts from its own start,
+    so the episode's count is their sum. That sum matched the main-agent model calls
+    observed on the wire, with a subagent's calls excluded.
+    """
+    capped = False
+    saw_turns = False
+    turns = 0
+    last_reason: str | None = None
+    found = False
+
+    for event in _iter_json_events(log_bytes):
+        if event.get("type") != "result":
+            continue
+        found = True
+        reported = event.get("num_turns")
+        run_turns = reported if isinstance(reported, int) and reported >= 0 else None
+        if _claude_code_hit_the_turn_cap(event):
+            capped = True
+            # A capped run reports the turn it refused to start, not the turns it
+            # completed, so its count is one more than the work it did.
+            if run_turns is not None:
+                run_turns = max(0, run_turns - 1)
+        else:
+            last_reason = event.get("terminal_reason") or event.get("subtype") or last_reason
+        if run_turns is not None:
+            saw_turns = True
+            turns += run_turns
+
+    if not found:
+        return None
+    return HarnessEpisodeSummary(
+        stop_reason=STOP_REASON_MAX_TURNS if capped else last_reason,
+        num_turns=turns if saw_turns else None,
+    )
+
+
+def _claude_code_hit_the_turn_cap(event: dict) -> bool:
+    """Whether one Claude Code result event reports its ``--max-turns`` cap."""
+    return event.get("terminal_reason") == STOP_REASON_MAX_TURNS or event.get("subtype") == "error_max_turns"
+
+
+def _iter_json_events(log_bytes: bytes) -> Iterator[dict]:
+    """Yield the JSON objects in one JSONL stream, skipping anything else.
+
+    A harness log interleaves JSON events with human-readable output, and a partial
+    line is possible when the CLI was stopped mid-write. Neither is an error: the
+    caller is reading a report, so anything unparsable is simply not part of it.
+    """
+    for raw_line in log_bytes.splitlines():
+        line = raw_line.strip()
+        if not line.startswith(b"{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
+_EPISODE_PARSERS: dict[str, Callable[[bytes], HarnessEpisodeSummary | None]] = {
+    CLAUDE_CODE_STREAM_JSON: _parse_claude_code_episode,
+}

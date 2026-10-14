@@ -17,6 +17,12 @@ from urllib.parse import urlsplit
 from omegaconf import DictConfig, OmegaConf
 
 from psrl.sandbox import ExecResult, SandboxSession
+from psrl.workers.agent_loop.harness.episode import (
+    CLAUDE_CODE_STREAM_JSON,
+    CODEX_JSONL,
+    HarnessEpisodeSummary,
+    episode_summary,
+)
 from psrl.workers.agent_loop.harness.runtime import executable_path
 
 psrl_logger = logging.getLogger(__file__)
@@ -25,17 +31,18 @@ psrl_logger = logging.getLogger(__file__)
 # deadline rather than the CLI exiting on its own.
 EXIT_TIME_BUDGET_EXCEEDED = -1
 
-# Trajectory output formats the post-rollout integrity scanner can dispatch on.
-# `auto` resolves to the kind default below, but the scan dispatch key is always a concrete format.
+# Trajectory output formats the post-rollout integrity scanner and the episode
+# summary parser can dispatch on. `auto` resolves to the kind default below, but the
+# scan dispatch key is always a concrete format.
 SUPPORTED_TRAJECTORY_FORMATS = (
     "auto",
-    "claude_code_stream_json",
-    "codex_jsonl",
+    CLAUDE_CODE_STREAM_JSON,
+    CODEX_JSONL,
     "plain_text",
 )
 _KIND_DEFAULT_TRAJECTORY_FORMATS: dict[str, str] = {
-    "claude_code": "claude_code_stream_json",
-    "codex": "codex_jsonl",
+    "claude_code": CLAUDE_CODE_STREAM_JSON,
+    "codex": CODEX_JSONL,
 }
 
 # Harnesses that take no turn cap of their own. Codex runs an episode from one
@@ -380,6 +387,15 @@ class Harness(ABC):
             stdout_tail=await self._read_tail(result.stdout_path),
             stderr_tail=await self._read_tail(result.stderr_path),
         )
+
+    def episode_summary(self, log_bytes: bytes) -> HarnessEpisodeSummary | None:
+        """Parse what this harness's CLI reported about the episode it just ran.
+
+        The CLI is the only component that knows how many turns it ran and why it
+        stopped, so its own output is what a caller should label the episode from.
+        Returns ``None`` when this harness's output format carries no such report.
+        """
+        return episode_summary(self.config.resolved_trajectory_format(), log_bytes)
 
     async def abort(self) -> None:
         """Cancel the active exec. Sandbox lease release supplies the hard stop."""

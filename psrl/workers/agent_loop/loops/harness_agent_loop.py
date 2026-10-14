@@ -15,8 +15,10 @@ from omegaconf import DictConfig
 from psrl.sandbox import SandboxFeature, SandboxLease, SandboxSession, SnapshotKind, SnapshotRef, SyncSandboxManager
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.harness import (
+    STOP_REASON_MAX_TURNS,
     Harness,
     HarnessConfig,
+    HarnessEpisodeSummary,
     HarnessResult,
     HarnessRuntime,
     HarnessTaskContext,
@@ -121,6 +123,10 @@ class HarnessAgentLoop(SessionAgentLoop):
         self.grader_capacity_timeout = False
         # Per-request: set when the episode deadline stopped the agent phase.
         self._agent_timed_out = False
+        # Per-request: what the harness CLI itself reported about the episode it ran
+        # (its stop reason and its own turn count). None until the harness returns, and
+        # None for a harness whose output carries no such report.
+        self._episode_summary: HarnessEpisodeSummary | None = None
         self.keeps_partial_on_timeout = self._resolve_timeout_action(
             context.config.gen_actor_rollout_ref.rollout.agent
         )
@@ -167,9 +173,16 @@ class HarnessAgentLoop(SessionAgentLoop):
         sandbox: SandboxSession,
         runtime: HarnessRuntime,
         harness_result: HarnessResult,
+        *,
+        harness_log: bytes | None = None,
     ) -> Any:
         """
         Collect an optional task artifact before the agent sandbox is destroyed.
+
+        ``harness_log`` is the CLI's own output, already read by the lifecycle. A hook
+        that needs it must use these bytes rather than reading the file again, both
+        because the same bytes were just transferred and because a hook that reads a
+        large log twice pays for it on every episode.
         """
         return None
 
@@ -450,11 +463,18 @@ class HarnessAgentLoop(SessionAgentLoop):
             # breaker that exists to catch a genuinely broken harness.
             _raise_if_episode_is_over(lease)
 
+            # The CLI's own report of the episode is the authority for how many turns it
+            # ran and why it stopped, so it is read once here and handed on to the task
+            # hook, which scans the same bytes for trajectory integrity.
+            harness_log = await self._read_harness_log(lease.session, harness_result)
+            self._episode_summary = harness.episode_summary(harness_log or b"")
+
             artifact = await self.collect_harness_artifact(
                 task,
                 lease.session,
                 harness_runtime,
                 harness_result,
+                harness_log=harness_log,
             )
             await self._capture_resource_metrics(task, lease, timing)
             training_data = await self.get_training_data(session_id)
@@ -518,8 +538,7 @@ class HarnessAgentLoop(SessionAgentLoop):
                     reward_info,
                 )
                 raise
-            for output in outputs:
-                output.agent_reward_info = dict(reward_info)
+            self._stamp_reward_info(outputs, training_data, reward_info)
             self.attach_tito_tree_metadata(training_data, outputs)
             output_value: TokenOutput | list[TokenOutput] = outputs[0] if len(outputs) == 1 else outputs
             scored_output = await self.compute_reward_score(output_value, **request)
@@ -531,6 +550,22 @@ class HarnessAgentLoop(SessionAgentLoop):
                 prepare_task.cancel()
             await asyncio.gather(*prepare_tasks, return_exceptions=True)
             await self._cleanup_harness_run(task, session_id, lease, harness, clean_snapshot)
+
+    @staticmethod
+    async def _read_harness_log(sandbox: SandboxSession, harness_result: HarnessResult) -> bytes | None:
+        """Read the harness CLI's own output log, or None when it cannot be read.
+
+        A missing log costs the episode its label, not its trajectory, so the failure is
+        absorbed here: whatever is wrong with the sandbox is reported by the collection
+        that follows, against the sandbox's real state.
+        """
+        if not harness_result.stdout_path:
+            return None
+        try:
+            return await sandbox.read_bytes(harness_result.stdout_path)
+        except Exception:
+            psrl_logger.warning("Could not read the harness output log for episode reporting.", exc_info=True)
+            return None
 
     async def _try_snapshot_clean_sandbox(
         self,
@@ -645,11 +680,16 @@ class HarnessAgentLoop(SessionAgentLoop):
         training_data: list[dict],
         harness_result: HarnessResult,
     ) -> dict:
-        """Build diagnostics that are safe even for an incomplete trajectory."""
-        num_turns = max((item.get("num_turns", 0) for item in training_data), default=0)
+        """Build diagnostics that are safe even for an incomplete trajectory.
+
+        Deliberately carries no ``num_turns``: the trajectories of one episode do not
+        have the same length, so a single value here would be stamped onto all of them
+        and reported as each one's own. ``_stamp_reward_info`` gives every trajectory its
+        own count instead. ``episode_num_turns`` is the harness's own count for the
+        episode, which is the only number comparable to the cap the harness was given.
+        """
         return {
-            "num_turns": num_turns,
-            "actual_num_turns": num_turns,
+            "episode_num_turns": (self._episode_summary.num_turns if self._episode_summary else None),
             "trajectory_count": len(training_data),
             "trajectory_token_lengths": [
                 len(item.get("prompt_ids", [])) + len(item.get("response_ids", [])) for item in training_data
@@ -660,6 +700,16 @@ class HarnessAgentLoop(SessionAgentLoop):
             "harness_exit_code": harness_result.exit_code,
             "harness_stderr_tail": harness_result.stderr_tail if harness_result.exit_code != 0 else "",
         }
+
+    @staticmethod
+    def _stamp_reward_info(
+        outputs: list["TokenOutput"],
+        training_data: list[dict],
+        reward_info: dict,
+    ) -> None:
+        """Attach shared episode diagnostics plus each trajectory's own turn count."""
+        for output, item in zip(outputs, training_data):
+            output.agent_reward_info = {**reward_info, "num_turns": int(item.get("num_turns") or 0)}
 
     async def _dump_harness_training_data(
         self,
@@ -679,8 +729,7 @@ class HarnessAgentLoop(SessionAgentLoop):
             return
         try:
             outputs = [self.build_token_output(item) for item in training_data]
-            for output in outputs:
-                output.agent_reward_info = dict(reward_info)
+            self._stamp_reward_info(outputs, training_data, reward_info)
             self.attach_tito_tree_metadata(training_data, outputs)
             output_value: TokenOutput | list[TokenOutput] = outputs[0] if len(outputs) == 1 else outputs
             await self._resolve_version_for_dump(output_value, request)
@@ -739,6 +788,12 @@ class HarnessAgentLoop(SessionAgentLoop):
         the partial trajectory is complete and graded, so it reports `AGENT_TIMEOUT`: a
         success kept for training and counted apart from a naturally finished episode,
         rather than the `TRAJECTORY_TIMEOUT` that discards and retries.
+
+        The turn cap is reported only when the harness itself said it hit one. The
+        framework's own counts cannot stand in for that: a context rewrite cuts a
+        trajectory in the middle of a run while the CLI's counter keeps going, and a
+        subagent adds turns the CLI does not count against the parent, so a comparison
+        against the configured cap is wrong in both directions.
         """
         if self.grader_capacity_timeout:
             return TerminateReason.GRADER_CAPACITY_TIMEOUT
@@ -749,10 +804,8 @@ class HarnessAgentLoop(SessionAgentLoop):
         # it is counted apart from a finished episode in metrics.
         if self._agent_timed_out:
             return TerminateReason.AGENT_TIMEOUT
+        if self._episode_summary is not None and self._episode_summary.stop_reason == STOP_REASON_MAX_TURNS:
+            return TerminateReason.MAX_TURNS_EXCEEDED
         if any(len(item["prompt_ids"]) + len(item["response_ids"]) > self.rollout_budget for item in training_data):
             return TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
-        # An unlimited episode has no turn cap to exceed, so it finishes rather than
-        # being reported as exhausted at whatever count it happened to reach.
-        if self.max_turns is not None and max(item["num_turns"] for item in training_data) >= self.max_turns:
-            return TerminateReason.MAX_TURNS_EXCEEDED
         return TerminateReason.FINISHED

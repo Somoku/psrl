@@ -1042,7 +1042,8 @@ def _timed_pull(gen_actors, *, epoch: int, label: str, expect_peers: bool, alone
         f"upstream {slowest['upstream_seconds']:.3f}s, peer {slowest['peer_seconds']:.3f}s) "
         f"trainer egress {upstream / 1e9:.2f} GB, peer {peer / 1e9:.2f} GB, "
         f"descriptors max {max(r['descriptors'] for r in reports)}, "
-        f"staged {max(r['staged_bytes'] for r in reports) / 2**20:.0f} MiB, fallback keys {fallback}"
+        f"staged {max(r['staged_bytes'] for r in reports) / 2**20:.0f} MiB, fallback keys {fallback}, "
+        f"ipc {sum(r.get('ipc_bytes', 0) for r in reports) / 1e9:.2f} GB"
     )
     assert fallback == 0, f"{fallback} keys fell back to upstream reads because a designate did not answer."
     if expect_peers:

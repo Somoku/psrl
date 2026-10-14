@@ -144,6 +144,8 @@ class PullReport:
     # Keys re-read from a DP replica because their planned source was unavailable or failed.
     takeover_keys: int = 0
     failed_sources: set[str] = field(default_factory=set)
+    # Bytes copied from a source that shares this device, rather than transferred (3.7.2.1).
+    ipc_bytes: int = 0
 
 
 class NIXLPullEngine:
@@ -514,9 +516,15 @@ class NIXLPullEngine:
         direct = self._post(phase.direct)
         if phase.ipc:
             # Same device reads are copies, issued on the copy stream that `_finish` waits for.
-            with torch.cuda.stream(self._copy_stream) if self._copy_stream is not None else nullcontext():
+            # The views are detached because a shard is often an output of `chunk`, which autograd
+            # refuses to let anyone write into; the transfer path wrote raw addresses and never
+            # met that rule. Weights are data here, so stepping outside autograd is the point.
+            with (
+                torch.no_grad(),
+                torch.cuda.stream(self._copy_stream) if self._copy_stream is not None else nullcontext(),
+            ):
                 for destination, origin in phase.ipc:
-                    destination.copy_(origin, non_blocking=True)
+                    destination.detach().copy_(origin.detach(), non_blocking=True)
         slot_free: list[torch.cuda.Event | None] = [None, None]
         in_flight: list[tuple[int, list[_Handle]]] = []
 
@@ -667,6 +675,7 @@ class NIXLPullEngine:
             "staged": 0,
             "fallback": 0,
             "takeover": takeover,
+            "ipc": 0,
         }
 
         def take_over(keys: dict[str, dict[str, list]]) -> None:
@@ -708,6 +717,7 @@ class NIXLPullEngine:
                 phase = self._phase(specs)
                 stats["peer_bytes"] += phase.nbytes
                 stats["descriptors"] += phase.descriptors
+                stats["ipc"] += phase.ipc_bytes
                 handles = self._start(phase)
             late = set(wanted) - ready
             if late:
@@ -735,6 +745,7 @@ class NIXLPullEngine:
                 stats["upstream_bytes"] += phase.nbytes
                 stats["descriptors"] += phase.descriptors
                 stats["staged"] += phase.staged_bytes
+                stats["ipc"] += phase.ipc_bytes
                 # Before followers hear this wave is ready, so they never read a hole.
                 take_over(up_waves[w])
             if self.client.device.type == "cuda":
@@ -790,6 +801,7 @@ class NIXLPullEngine:
             versions=versions,
             sources=dict(self.source_trace),
             takeover_keys=stats["takeover"],
+            ipc_bytes=stats["ipc"],
             failed_sources=set(self.failed),
         )
 

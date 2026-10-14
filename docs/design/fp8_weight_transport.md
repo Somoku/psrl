@@ -484,6 +484,22 @@ scale grid 可组合、scale dtype 在 `_DTYPE_MAP` 里、每个 fp8 weight 都�
 
 ---
 
+## 10b. 三条未落地精度路径：什么是硬件/CUDA 限制，什么还要写代码
+
+本集群实测（H20，compute capability 9.0，CUDA 12.8，TE 2.7.0）：
+
+| 路径 | TE / vLLM 的门禁 | 本集群 | 还需要的代码 |
+|---|---|---|---|
+| FP8 delayed / tensorwise 训练 | `check_fp8_support` → True | ✅ 可用，**已落地** | 无 |
+| **零拷贝 FP8-native**（blockwise 常驻参数） | `check_fp8_block_scaling_support` → False：`requires Hopper and CUDA >= 12.9` | ❌ CUDA 12.8 | **仍需 F8**：TE 的 block scale 布局与 vLLM 的 `weight_scale_inv` 不同，要做编码转换才能把 TE 的字节直供出去。升级 CUDA 只解开 recipe，不解开布局 |
+| **MXFP8** | `check_mxfp8_support` → False：`compute capability 10.0 or higher` | ❌ Hopper 不支持 | 需要 F8 的 MXFP8 分支（含 scale 的 unswizzle）。`torch.float8_e8m0fnu` 已存在，缺的是硬件与布局转换 |
+| **FP4** | vLLM 的 FP4 kernel 要 SM100+ | ❌ 同上 | `torch.float4_e2m1fn_x2` 已存在；§3.8.1 的两处（scale dtype、grid 可组合性）仍要显式处理 |
+
+**结论：三条都卡在硬件或 CUDA 版本上，但没有一条只靠升级就完成。** 升级 CUDA 到 12.9 让 Hopper 上的
+blockwise FP8 训练跑起来，可 PSRL 仍要把 TE 的 scale 布局翻译成 rollout 声明的那一种，否则只能像现在这样
+反量化再重量化（实测每 rank 发布刷新 513 ms，现已被融合 kernel 降到 56 ms 量级）。
+MXFP8 与 FP4 在拿到 Blackwell 之前无法验证，按设计惯例**不写无法验证的代码**，留作规划。
+
 ## 11. 落地项
 
 顺序即依赖顺序。标 `*` 的是两种精度组合共用。

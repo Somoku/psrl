@@ -90,6 +90,7 @@ nixl:
   # Measured on this config, diffusion was 1.42-1.93x *slower* than not diffusing,
   # because a designate pays one descriptor per strided row either way -- it only moves
   # which link pays for them. Staging removes the descriptors instead.
+  pull_waves: 4
   peer_diffusion: False
 
 ps:

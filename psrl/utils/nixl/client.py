@@ -16,6 +16,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
+from psrl.utils.nixl import fp8_kernels
 from psrl.utils.nixl.block_fp8 import FP8_DTYPE, SCALE_SUFFIX, quantize_blockwise, scale_shape
 from psrl.utils.nixl.chunk_notify import ChunkCompletionPublisher, ChunkCompletionWaiter
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
@@ -246,6 +247,7 @@ class NIXLStorageClient:
         self._pull_staging_bytes = int(getattr(nixl_config, "pull_staging_bytes", 256 << 20))
         self._peer_timeout_s = float(getattr(nixl_config, "peer_timeout_s", 120.0))
         self._pull_waves = int(getattr(nixl_config, "pull_waves", 4))
+        self._read_timeout_s = float(getattr(nixl_config, "read_timeout_s", 300.0))
 
         # Prepped dlists for the hot path (item A1). Holds raw addresses, so it must be
         # cleared whenever registered memory changes -- see deregister_all_local_tensors.
@@ -429,7 +431,13 @@ class NIXLStorageClient:
         if self._pull_engine is None:
             from psrl.utils.nixl.pull_engine import NIXLPullEngine
 
-            self._pull_engine = NIXLPullEngine(self, self._pull_staging_bytes, self._peer_timeout_s, self._pull_waves)
+            self._pull_engine = NIXLPullEngine(
+                self,
+                self._pull_staging_bytes,
+                self._peer_timeout_s,
+                self._pull_waves,
+                self._read_timeout_s,
+            )
         return self._pull_engine
 
     def _drop_pull_engine(self) -> None:
@@ -1451,10 +1459,30 @@ class NIXLStorageClient:
         grouped = isinstance(entry, GroupedShards)
         tensors = entry.shards if grouped else (entry,)
         scales = scale_entry.shards if grouped else (scale_entry,)
+        plain = tuple(_plain(t) for t in tensors)
+        fused = fp8_kernels.available(plain[0])
+        if repeat == [1, 1] and fused:
+            # Cells hold whole tiles (`_assert_whole_tiles`), so quantising cell by cell gives the
+            # same bytes and scales as quantising the stored tensor, and each cell's FP8 bytes go
+            # straight into its publish copy: one pass over the train shard, no temporaries.
+            source = GroupedShards(plain, entry.shard_indices, entry.shard_mesh) if grouped else plain[0]
+            cells = local_shards_of(source, sharding)
+            scale_cells = local_shards_of(scale_entry, sharding)
+            for local_pos, (cell, scale_cell) in enumerate(zip(cells, scale_cells)):
+                fp8_kernels.quantize_into(cell, self._publish_copies[(key, local_pos)][1], scale_cell, self._fp8_block)
+            return
+        # A refined scale grid may cut a quantisation tile across cells, so quantise each stored
+        # tensor whole and then cut. The transient is one stored tensor.
         quantized = []
-        for tensor, scale in zip(tensors, scales):
-            tensor = _plain(tensor)
-            q, s = quantize_blockwise(tensor, self._tile_of(tensor))
+        for tensor, scale in zip(plain, scales):
+            if fused:
+                q = torch.empty(tensor.shape, dtype=FP8_DTYPE, device=tensor.device)
+                s = torch.empty(
+                    scale_shape(tensor.shape, self._tile_of(tensor)), dtype=torch.float32, device=tensor.device
+                )
+                fp8_kernels.quantize_into(tensor, q, s, self._fp8_block)
+            else:
+                q, s = quantize_blockwise(tensor, self._tile_of(tensor))
             if repeat != [1, 1]:
                 s = s.repeat_interleave(repeat[0], dim=-2).repeat_interleave(repeat[1], dim=-1)
             scale.copy_(s)

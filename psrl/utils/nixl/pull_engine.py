@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from psrl.utils.nixl.nixl_spec import NIXLClientType
 from psrl.utils.nixl.read_geometry import coalesce, pair_runs, view_runs
 
 if TYPE_CHECKING:
@@ -77,6 +78,7 @@ class _Handle:
     handle: object
     descriptors: int
     nbytes: int
+    posted_at: float = 0.0
 
 
 @dataclass
@@ -90,6 +92,30 @@ class _Phase:
     descriptors: int = 0
     nbytes: int = 0
     staged_bytes: int = 0
+
+
+class ChunkUnavailable(RuntimeError):
+    """
+    Some keys have no live train source. Raised before any byte moves, so the rollout's weights are untouched.
+
+    The caller keeps generating at its current version (design 3.5.7, D6).
+    """
+
+    def __init__(self, client: str, keys: list[str], dead: set[str]):
+        self.keys, self.dead = keys, dead
+        super().__init__(
+            f"{client}: no live source holds {len(keys)} key(s), first {keys[0]!r}. "
+            f"Unavailable sources: {sorted(dead)}."
+        )
+
+
+class TornPull(RuntimeError):
+    """
+    A source failed mid pull and no replica holds what it was serving.
+
+    Earlier waves have already written the new version, so the weights mix two versions and
+    the instance must not generate until a later pull completes.
+    """
 
 
 @dataclass
@@ -108,6 +134,11 @@ class PullReport:
     staged_bytes: int
     followers: int
     versions: set[int]
+    # Per source `(bytes, first post, last completion)` of the upstream and peer reads.
+    sources: dict[str, tuple[int, float, float]] = field(default_factory=dict)
+    # Keys re-read from a DP replica because their planned source was unavailable or failed.
+    takeover_keys: int = 0
+    failed_sources: set[str] = field(default_factory=set)
 
 
 class NIXLPullEngine:
@@ -119,11 +150,25 @@ class NIXLPullEngine:
         staging_bytes (int): Size of the staging pool, split into two alternating slots.
         peer_timeout_s (float): How long a follower waits for its designate before reading upstream.
         waves (int): Upstream waves per pull. Peer reads of one wave overlap the next wave's upstream.
+        read_timeout_s (float): How long one wave's reads may take before their sources count as failed.
     """
 
-    def __init__(self, client: NIXLStorageClient, staging_bytes: int, peer_timeout_s: float, waves: int = 4):
+    def __init__(
+        self,
+        client: NIXLStorageClient,
+        staging_bytes: int,
+        peer_timeout_s: float,
+        waves: int = 4,
+        read_timeout_s: float = 300.0,
+    ):
         self.client = client
         self.waves = max(1, int(waves))
+        self.source_trace: dict[str, tuple[int, float, float]] = {}
+        self.read_timeout_s = float(read_timeout_s)
+        # Sources known to be gone (told by the coordinator, or learned from a failed read).
+        self.unavailable: set[str] = set()
+        # Sources that failed during the current pull.
+        self.failed: set[str] = set()
         self.agent = client.agent
         self.staging_bytes = int(staging_bytes)
         self.peer_timeout_s = float(peer_timeout_s)
@@ -339,25 +384,56 @@ class NIXLPullEngine:
     # ------------------------------------------------------------------ execution
 
     def _post(self, handles: list[_Handle]) -> list[_Handle]:
+        posted = []
         for h in handles:
-            state = self.agent.transfer(h.handle)
+            h.posted_at = time.time()
+            if h.source in self.failed:
+                continue
+            try:
+                state = self.agent.transfer(h.handle)
+            except Exception as exc:  # the transport may raise rather than return ERR for a lost peer
+                psrl_logger.warning(f"{self.client.client_name}: posting a read from {h.source} raised {exc!r}.")
+                state = "ERR"
             if state == "ERR":
-                raise RuntimeError(
-                    f"{self.client.client_name}: posting a read of {h.nbytes} bytes from {h.source} failed."
-                )
-        return handles
+                psrl_logger.warning(f"{self.client.client_name}: posting a read from {h.source} failed.")
+                self.failed.add(h.source)
+                continue
+            posted.append(h)
+        return posted
 
-    def _wait(self, handles: list[_Handle], timeout: float = 1800.0) -> None:
+    def _wait(self, handles: list[_Handle], timeout: float | None = None) -> None:
+        """
+        Wait for every handle, polling them together and recording when each source finished.
+
+        A handle that errors or outlives the read timeout marks its source failed rather than
+        raising, so the other handles still complete and the caller can re-read that source's
+        keys from a replica. A late completion from a merely slow source writes the same
+        version's bytes, so it cannot corrupt the re-read.
+        """
+        timeout = self.read_timeout_s if timeout is None else timeout
         start = time.time()
-        for h in handles:
-            while True:
+        pending = list(handles)
+        while pending:
+            still = []
+            for h in pending:
                 state = self.agent.check_xfer_state(h.handle)
                 if state == "DONE":
-                    break
+                    done = time.time()
+                    bytes_, first, last = self.source_trace.get(h.source, (0, done, done))
+                    self.source_trace[h.source] = (bytes_ + h.nbytes, min(first, h.posted_at), done)
+                    continue
                 if state == "ERR":
-                    raise RuntimeError(f"{self.client.client_name}: read of {h.nbytes} bytes from {h.source} failed.")
+                    psrl_logger.warning(f"{self.client.client_name}: read of {h.nbytes} bytes from {h.source} failed.")
+                    self.failed.add(h.source)
+                    continue
+                still.append(h)
+            pending = still
+            if pending:
                 if time.time() - start > timeout:
-                    raise TimeoutError(f"{self.client.client_name}: read from {h.source} exceeded {timeout}s.")
+                    late = sorted({h.source for h in pending})
+                    psrl_logger.warning(f"{self.client.client_name}: reads from {late} exceeded {timeout}s.")
+                    self.failed.update(late)
+                    return
                 time.sleep(5e-5)
 
     def _scatter(self, items: list[tuple[_Staged, int]]) -> None:
@@ -406,6 +482,57 @@ class NIXLPullEngine:
         return direct
 
     # ------------------------------------------------------------------ pull
+
+    def mark_unavailable(self, sources) -> None:
+        """Exclude train sources from every later pull, for example after the coordinator saw them die."""
+        self.unavailable.update(sources)
+
+    def _replica_of(self, key: str, shards: list, load: dict[str, int]) -> str | None:
+        """
+        A live train source holding every shard in `shards` of `key`, least loaded first.
+
+        DP replicas of a train rank declare the same shard indices, so any of them serves the
+        same bytes at the same version.
+        """
+        wanted = set(map(tuple, shards))
+        candidates = []
+        for name, info in self.client.all_client_infos.items():
+            if name in self.unavailable or name in self.failed or info.type is not NIXLClientType.PUSH_SIDE:
+                continue
+            tensor_info = info.tensor_infos.get(key)
+            if tensor_info is None or not wanted <= set(map(tuple, tensor_info.sharding.shard_indices)):
+                continue
+            candidates.append((load.get(name, 0), name))
+        return min(candidates)[1] if candidates else None
+
+    def _reroute(self, keys: dict[str, dict[str, list]]) -> tuple[dict[str, dict[str, list]], int, list[str]]:
+        """
+        Replace every unavailable or failed source in `keys` by a replica.
+
+        Returns the rerouted reads, how many keys moved, and the keys no live source holds.
+        """
+        dead = self.unavailable | self.failed
+        load: dict[str, int] = {}
+        out: dict[str, dict[str, list]] = {}
+        moved, missing = 0, []
+        for key, per_source in keys.items():
+            if not dead.intersection(per_source):
+                out[key] = per_source
+                continue
+            rerouted: dict[str, list] = {}
+            for source, shards in per_source.items():
+                target = source
+                if source in dead:
+                    target = self._replica_of(key, shards, load)
+                    if target is None:
+                        missing.append(key)
+                        break
+                    load[target] = load.get(target, 0) + 1
+                rerouted.setdefault(target, []).extend(shards)
+            else:
+                out[key] = {src: sorted(map(tuple, shards)) for src, shards in rerouted.items()}
+                moved += 1
+        return out, moved, missing
 
     def _assign(self, participates) -> tuple[dict[str, dict[str, list]], dict[str, list[str]], set[str]]:
         """Split this client's keys into upstream reads and reads from a designate."""
@@ -457,7 +584,13 @@ class NIXLPullEngine:
             participants (set[str] | None): Pull clients syncing together. None means all of them.
         """
         start = time.time()
+        self.source_trace = {}
+        self.failed = set()
         upstream, peer, followers = self._assign(lambda c: participants is None or c in participants)
+        # Resolve known dead sources before any byte moves, so a missing key leaves the weights untouched.
+        upstream, takeover, missing = self._reroute(upstream)
+        if missing:
+            raise ChunkUnavailable(self.client.client_name, missing, set(self.unavailable))
         publisher, waiter = self.client.chunk_completion_channel()
         all_keys = list(upstream) + [key for keys in peer.values() for key in keys]
         wave_of = self._waves_of(all_keys)
@@ -468,7 +601,36 @@ class NIXLPullEngine:
         ]
 
         versions: set[int] = set()
-        stats = {"upstream_bytes": 0, "peer_bytes": 0, "descriptors": 0, "staged": 0, "fallback": 0}
+        stats = {
+            "upstream_bytes": 0,
+            "peer_bytes": 0,
+            "descriptors": 0,
+            "staged": 0,
+            "fallback": 0,
+            "takeover": takeover,
+        }
+
+        def take_over(keys: dict[str, dict[str, list]]) -> None:
+            """Re-read from replicas the keys of `keys` whose sources failed during this pull."""
+            affected = {k: v for k, v in keys.items() if self.failed.intersection(v)}
+            if not affected:
+                return
+            rerouted, moved, lost = self._reroute(affected)
+            if lost:
+                raise TornPull(
+                    f"{self.client.client_name}: sources {sorted(self.failed)} failed mid pull and no replica "
+                    f"holds {len(lost)} key(s), first {lost[0]!r}. The weights now mix two versions."
+                )
+            psrl_logger.warning(
+                f"{self.client.client_name}: re-reading {moved} key(s) of failed sources {sorted(self.failed)} "
+                f"from DP replicas in epoch {epoch}."
+            )
+            stats["takeover"] += moved
+            phase = self._phase(self._upstream_specs(rerouted))
+            versions.update(phase.versions)
+            self._run(phase)
+            take_over(rerouted)
+
         upstream_done = start
 
         def peer_wave(w: int) -> list[_Handle]:
@@ -514,6 +676,8 @@ class NIXLPullEngine:
                 stats["upstream_bytes"] += phase.nbytes
                 stats["descriptors"] += phase.descriptors
                 stats["staged"] += phase.staged_bytes
+                # Before followers hear this wave is ready, so they never read a hole.
+                take_over(up_waves[w])
             if self.client.device.type == "cuda":
                 torch.cuda.synchronize(self.client.device)
             if followers:
@@ -521,6 +685,24 @@ class NIXLPullEngine:
         upstream_done = time.time()
         pending_peer += peer_wave(self.waves - 1)
         self._finish(pending_peer)
+        lost_designates = self.failed.intersection(peer)
+        if lost_designates:
+            plan = self.client.comm_plan.rollout_pull_from_ps_plan[self.client.client_name]
+            keys = {key: plan[key] for d in lost_designates for key in peer[d]}
+            psrl_logger.warning(
+                f"{self.client.client_name}: designates {sorted(lost_designates)} failed mid read, "
+                f"reading their {len(keys)} key(s) upstream."
+            )
+            stats["fallback"] += len(keys)
+            rerouted, moved, lost = self._reroute(keys)
+            if lost:
+                raise TornPull(
+                    f"{self.client.client_name}: no live source holds {lost[0]!r} after its designate failed."
+                )
+            stats["takeover"] += moved
+            fallback = self._phase(self._upstream_specs(rerouted))
+            versions.update(fallback.versions)
+            self._run(fallback)
         if self.client.device.type == "cuda":
             torch.cuda.synchronize(self.client.device)
         if peer:
@@ -547,6 +729,9 @@ class NIXLPullEngine:
             staged_bytes=stats["staged"],
             followers=len(followers),
             versions=versions,
+            sources=dict(self.source_trace),
+            takeover_keys=stats["takeover"],
+            failed_sources=set(self.failed),
         )
 
     def _await(self, waiter, epoch: int, chunk: int, sources: set[str]) -> set[str]:

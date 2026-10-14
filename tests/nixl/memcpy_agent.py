@@ -37,11 +37,24 @@ class NotifBus:
         return {sender: list(payloads) for sender, payloads in box.items()}
 
 
+class _Rows(np.ndarray):
+    """Descriptor rows that remember which agent registered them, so a read can be failed by source."""
+
+    owner: str | None = None
+
+    def __new__(cls, rows: np.ndarray):
+        return rows.view(cls)
+
+    def __array_finalize__(self, obj):
+        self.owner = getattr(obj, "owner", None)
+
+
 class _Handle:
     def __init__(self, local: np.ndarray, remote: np.ndarray) -> None:
         self.local = local
         self.remote = remote
         self.posts = 0
+        self.owner: str | None = None
 
 
 class MemcpyAgent(nixl_agent):
@@ -54,6 +67,9 @@ class MemcpyAgent(nixl_agent):
         self.registered: list[object] = []
         self.descriptors_posted = 0
         self.bytes_read = 0
+        # Agents whose reads fail, standing in for a dead train rank. `transfer` reports ERR
+        # for them rather than moving bytes, which is what the transport does once a peer is gone.
+        self.dead_sources: set[str] = set()
 
     def register_memory(self, reg_list, mem_type=None, backends=()):
         descs = self.get_reg_descs(reg_list, mem_type)
@@ -73,8 +89,9 @@ class MemcpyAgent(nixl_agent):
         return metadata.decode()
 
     def prep_xfer_dlist(self, agent_name, xfer_list, mem_type=None, backends=()):
-        rows = np.asarray(xfer_list, dtype=np.uint64).copy()
+        rows = _Rows(np.asarray(xfer_list, dtype=np.uint64).copy())
         owner = self.agent_name if agent_name == "NIXL_INIT_AGENT" else agent_name
+        rows.owner = None if agent_name == "NIXL_INIT_AGENT" else agent_name
         regions = self.bus.regions[owner]
         for address, length, _dev in rows.tolist():
             # Like the real transport, a descriptor must lie inside one registered region.
@@ -85,9 +102,13 @@ class MemcpyAgent(nixl_agent):
 
     def make_prepped_xfer(self, operation, local_xfer_side, local_indices, remote_xfer_side, remote_indices, *a, **k):
         assert operation == "READ", f"Only READ is modelled, got {operation!r}."
-        return _Handle(local_xfer_side[np.asarray(local_indices)], remote_xfer_side[np.asarray(remote_indices)])
+        handle = _Handle(local_xfer_side[np.asarray(local_indices)], remote_xfer_side[np.asarray(remote_indices)])
+        handle.owner = getattr(remote_xfer_side, "owner", None)
+        return handle
 
     def transfer(self, handle, notif_msg=b""):
+        if handle.owner in self.dead_sources:
+            return "ERR"
         for (dst, n, _), (src, m, _) in zip(handle.local.tolist(), handle.remote.tolist()):
             assert n == m, f"Paired descriptors disagree in length: {n} != {m}."
             ctypes.memmove(dst, src, n)
@@ -97,7 +118,7 @@ class MemcpyAgent(nixl_agent):
         return "DONE"
 
     def check_xfer_state(self, handle):
-        return "DONE"
+        return "ERR" if handle.owner in self.dead_sources else "DONE"
 
     def release_xfer_handle(self, handle):
         return None

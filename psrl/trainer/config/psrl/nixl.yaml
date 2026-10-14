@@ -46,6 +46,10 @@ peer_timeout_s: 120
 # Upstream waves per pull. Followers read wave w over NVLink while wave w + 1 crosses the NIC.
 pull_waves: 4
 
+# How long one wave's reads may run before their sources are treated as failed and their keys
+# re-read from a DP replica. Must exceed the time to move one wave at the slowest tolerable rate.
+read_timeout_s: 300
+
 # MiB a train rank may spend on contiguous copies of shards that rollouts cut finer than it does.
 # Each copy turns a read of one descriptor per row into one descriptor. Past the budget rollouts
 # span read the shard instead, which moves more bytes. null is unbounded.

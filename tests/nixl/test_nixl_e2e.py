@@ -1021,6 +1021,22 @@ def _timed_pull(gen_actors, *, epoch: int, label: str, expect_peers: bool, alone
             f"[MEASURE] {label}: per client upstream GB/s min {rates[0]:.1f} median {rates[len(rates) // 2]:.1f} "
             f"max {rates[-1]:.1f}, upstream seconds max {max(r['upstream_seconds'] for r in reports):.3f}"
         )
+    # Per source egress across all readers: bytes served and the span from first post to last completion.
+    served: dict[str, list] = {}
+    for r in reports:
+        for source, (nbytes, first, last) in r.get("sources", {}).items():
+            agg = served.setdefault(source, [0, first, last])
+            agg[0] += nbytes
+            agg[1], agg[2] = min(agg[1], first), max(agg[2], last)
+    if served:
+        egress = sorted((v[0] / max(v[2] - v[1], 1e-9) / 1e9, v[0] / 1e9, k) for k, v in served.items())
+        print(
+            f"[MEASURE] {label}: per source egress GB/s "
+            f"min {egress[0][0]:.1f} ({egress[0][2]}, {egress[0][1]:.1f} GB) "
+            f"median {egress[len(egress) // 2][0]:.1f} "
+            f"max {egress[-1][0]:.1f} ({egress[-1][2]}, {egress[-1][1]:.1f} GB), "
+            f"bytes per source min {min(e[1] for e in egress):.1f} max {max(e[1] for e in egress):.1f} GB"
+        )
     print(
         f"[PASS] {label} done. time: {elapsed:.3f}s (slowest client {slowest['seconds']:.3f}s, "
         f"upstream {slowest['upstream_seconds']:.3f}s, peer {slowest['peer_seconds']:.3f}s) "

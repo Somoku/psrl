@@ -98,6 +98,7 @@ nixl:
   # contiguously instead of registering one descriptor per row.
   # Diffusion needs readable shards, which staging precludes; and with train and gen on
   # the same card there is no NIC hop to save in the first place.
+  pull_waves: 4
   peer_diffusion: False
 
 ps:

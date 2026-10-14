@@ -20,7 +20,7 @@ from psrl.utils.nixl.block_fp8 import scale_shape
 from psrl.utils.nixl.client import NIXLStorageClient
 from psrl.utils.nixl.comm_plan import CommunicationPlanner
 from psrl.utils.nixl.nixl_spec import NIXLClientType, NIXLSharding
-from psrl.utils.nixl.pull_engine import NIXLPullEngine
+from psrl.utils.nixl.pull_engine import ChunkUnavailable, NIXLPullEngine
 
 from tests.nixl.coord_judge import check_by_layout, check_fp8_exact, fill_by_layout, fill_fp8_exact
 from tests.nixl.memcpy_agent import MemcpyAgent, NotifBus
@@ -458,3 +458,110 @@ def test_any_wave_count_moves_the_same_bytes(waves):
     cluster.judge(cluster.gen, version=7)
     model_bytes = sum(torch.Size(s).numel() * 2 for s, _ in MODEL.values())
     assert sum(r.upstream_bytes for r in reports.values()) == model_bytes
+
+
+def _replicated_cluster(train_tp, dp, gen_tp, instances, peer_diffusion=False):
+    """A cluster whose train ranks come in `dp` identical replicas, as Megatron's DP groups do."""
+    cluster = Cluster.__new__(Cluster)
+    cluster.bus = NotifBus()
+    cluster.declared, cluster.states = {}, {}
+    kinds = {}
+    for d in range(dp):
+        for r in range(train_tp):
+            name = f"NIXLTrainClient_{d * train_tp + r}"
+            kinds[name] = NIXLClientType.PUSH_SIDE
+            cluster.states[name] = _locals(MODEL, train_tp)
+            cluster.declared[name] = {k: _sharding(dim, train_tp, r) for k, (s, dim) in MODEL.items()}
+            fill_by_layout(cluster.states[name], cluster.declared[name], version=7, wire_dtype=torch.bfloat16)
+    for i in range(instances):
+        for r in range(gen_tp):
+            name = f"NIXLGenClient_I{i}_R{r}"
+            kinds[name] = NIXLClientType.PULL_SIDE
+            cluster.states[name] = _locals(MODEL, gen_tp)
+            cluster.declared[name] = {k: _sharding(dim, gen_tp, r) for k, (s, dim) in MODEL.items()}
+
+    unified = {name: copy.deepcopy(d) for name, d in cluster.declared.items()}
+    for key in MODEL:
+        finest = NIXLSharding.find_finest_shard_mesh([unified[n][key].shard_mesh for n in unified])
+        for name in unified:
+            unified[name][key].refactor_based_on_finer_shard_mesh(finest)
+
+    cluster.clients = {}
+    for name, kind in kinds.items():
+        client = NIXLStorageClient(
+            client_name=name,
+            server_name="server",
+            use_gpu=False,
+            client_type=kind,
+            nixl_config=CONFIG,
+            binded_agent=MemcpyAgent(name, cluster.bus),
+        )
+        client.register_local_tensors(cluster.states[name], unified[name])
+        cluster.clients[name] = client
+    infos = {name: c.local_client_info for name, c in cluster.clients.items()}
+    plan = CommunicationPlanner(peer_diffusion=peer_diffusion).make_comm_plan(infos)
+    for client in cluster.clients.values():
+        client._all_client_infos = dict(infos)
+        client._comm_plan = plan
+    cluster.plan = plan
+    cluster.gen = [n for n in cluster.clients if n.startswith("NIXLGenClient")]
+    cluster.engines = {
+        n: NIXLPullEngine(cluster.clients[n], staging_bytes=1 << 16, peer_timeout_s=2.0, read_timeout_s=2.0)
+        for n in cluster.gen
+    }
+    return cluster
+
+
+def _kill(cluster, sources):
+    """Make every reader's transport fail for `sources`, as it does once a train rank is gone."""
+    for name in cluster.gen:
+        cluster.clients[name].agent.dead_sources.update(sources)
+
+
+def test_a_known_dead_source_is_replaced_before_the_pull_starts():
+    cluster = _replicated_cluster(train_tp=2, dp=2, gen_tp=2, instances=1)
+    dead = {"NIXLTrainClient_0"}
+    _kill(cluster, dead)
+    for engine in cluster.engines.values():
+        engine.mark_unavailable(dead)
+    reports = cluster.pull(epoch=1)
+    cluster.judge(cluster.gen, version=7)
+    assert all(dead.isdisjoint(r.sources) for r in reports.values()), "a dead source still served bytes"
+    assert sum(r.takeover_keys for r in reports.values()) > 0
+
+
+def test_a_source_that_fails_mid_pull_is_taken_over_by_its_replica():
+    cluster = _replicated_cluster(train_tp=2, dp=2, gen_tp=2, instances=1)
+    _kill(cluster, {"NIXLTrainClient_1"})  # not announced: the engine must learn it from the read
+    reports = cluster.pull(epoch=1)
+    cluster.judge(cluster.gen, version=7)
+    # Only the readers whose plan named that rank see it fail; they must all recover from a replica.
+    hit = [r for r in reports.values() if r.failed_sources]
+    assert hit, "no reader was planned against the failed source"
+    assert all(r.failed_sources == {"NIXLTrainClient_1"} and r.takeover_keys > 0 for r in hit)
+
+
+def test_losing_a_whole_dp_group_is_refused_before_any_byte_moves():
+    cluster = _replicated_cluster(train_tp=2, dp=2, gen_tp=2, instances=1)
+    # Both replicas of train rank 0's shards: nothing holds those keys any more.
+    dead = {"NIXLTrainClient_0", "NIXLTrainClient_2"}
+    _kill(cluster, dead)
+    for engine in cluster.engines.values():
+        engine.mark_unavailable(dead)
+    before = {k: v.clone() for k, v in cluster.states[cluster.gen[0]].items()}
+    with pytest.raises(ChunkUnavailable):
+        cluster.engines[cluster.gen[0]].pull(epoch=1)
+    for key, value in before.items():
+        assert torch.equal(value, cluster.states[cluster.gen[0]][key]), f"{key} was modified by a refused pull"
+
+
+def test_a_designate_that_dies_sends_its_followers_upstream():
+    cluster = _replicated_cluster(train_tp=2, dp=2, gen_tp=2, instances=2, peer_diffusion=True)
+    reports = cluster.pull(epoch=1)
+    designates = {src for r in reports.values() for src in r.sources if src.startswith("NIXLGenClient")}
+    assert designates, "no peer reads were planned"
+    cluster.judge(cluster.gen, version=7)
+    _kill(cluster, designates)
+    reports = cluster.pull(epoch=2)
+    cluster.judge(cluster.gen, version=7)
+    assert sum(r.fallback_keys for r in reports.values()) > 0

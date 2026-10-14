@@ -515,6 +515,18 @@ def _replicated_cluster(train_tp, dp, gen_tp, instances, peer_diffusion=False):
     return cluster
 
 
+def _planned_source(cluster, train_tp):
+    """A train rank some reader is planned to read from, with its DP twin."""
+    for reader in cluster.gen:
+        for per_source in cluster.plan.rollout_pull_from_ps_plan[reader].values():
+            for source in per_source:
+                rank = int(source.rsplit("_", 1)[1])
+                twin = f"NIXLTrainClient_{(rank + train_tp) % (2 * train_tp)}"
+                if twin in cluster.clients:
+                    return source, twin
+    raise AssertionError("no reader was planned against any train rank")
+
+
 def _kill(cluster, sources):
     """Make every reader's transport fail for `sources`, as it does once a train rank is gone."""
     for name in cluster.gen:
@@ -523,7 +535,8 @@ def _kill(cluster, sources):
 
 def test_a_known_dead_source_is_replaced_before_the_pull_starts():
     cluster = _replicated_cluster(train_tp=2, dp=2, gen_tp=2, instances=1)
-    dead = {"NIXLTrainClient_0"}
+    victim, _twin = _planned_source(cluster, train_tp=2)
+    dead = {victim}
     _kill(cluster, dead)
     for engine in cluster.engines.values():
         engine.mark_unavailable(dead)
@@ -535,27 +548,34 @@ def test_a_known_dead_source_is_replaced_before_the_pull_starts():
 
 def test_a_source_that_fails_mid_pull_is_taken_over_by_its_replica():
     cluster = _replicated_cluster(train_tp=2, dp=2, gen_tp=2, instances=1)
-    _kill(cluster, {"NIXLTrainClient_1"})  # not announced: the engine must learn it from the read
+    victim, _twin = _planned_source(cluster, train_tp=2)
+    _kill(cluster, {victim})  # not announced: the engine must learn it from the read
     reports = cluster.pull(epoch=1)
     cluster.judge(cluster.gen, version=7)
     # Only the readers whose plan named that rank see it fail; they must all recover from a replica.
     hit = [r for r in reports.values() if r.failed_sources]
     assert hit, "no reader was planned against the failed source"
-    assert all(r.failed_sources == {"NIXLTrainClient_1"} and r.takeover_keys > 0 for r in hit)
+    assert all(r.failed_sources == {victim} and r.takeover_keys > 0 for r in hit)
 
 
 def test_losing_a_whole_dp_group_is_refused_before_any_byte_moves():
     cluster = _replicated_cluster(train_tp=2, dp=2, gen_tp=2, instances=1)
-    # Both replicas of train rank 0's shards: nothing holds those keys any more.
-    dead = {"NIXLTrainClient_0", "NIXLTrainClient_2"}
+    # Both replicas of one rank's shards: nothing holds those keys any more.
+    victim, twin = _planned_source(cluster, train_tp=2)
+    dead = {victim, twin}
     _kill(cluster, dead)
     for engine in cluster.engines.values():
         engine.mark_unavailable(dead)
-    before = {k: v.clone() for k, v in cluster.states[cluster.gen[0]].items()}
+    reader = next(
+        r
+        for r in cluster.gen
+        if dead.intersection(src for per in cluster.plan.rollout_pull_from_ps_plan[r].values() for src in per)
+    )
+    before = {k: v.clone() for k, v in cluster.states[reader].items()}
     with pytest.raises(ChunkUnavailable):
-        cluster.engines[cluster.gen[0]].pull(epoch=1)
+        cluster.engines[reader].pull(epoch=1)
     for key, value in before.items():
-        assert torch.equal(value, cluster.states[cluster.gen[0]][key]), f"{key} was modified by a refused pull"
+        assert torch.equal(value, cluster.states[reader][key]), f"{key} was modified by a refused pull"
 
 
 def test_a_designate_that_dies_sends_its_followers_upstream():

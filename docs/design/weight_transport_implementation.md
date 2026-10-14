@@ -1756,7 +1756,7 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 | W9 | ~~block FP8 的细化 scale 网格~~ | ✅ rollout 在 scale sharding 上声明 scale tile，trainer 按 128 tile 量化后复制 scale（与 vLLM loader 的 `repeat_interleave` 逐位相同） | MoE Megatron TP2·EP2 → vLLM TP4（EP1）FP8 格通过 | 已完成 |
 | W11 | ~~MoE 下 vLLM DP > 1 的 L2 覆盖~~ | ✅ 根因是 NCCL 2.28.9 让 vLLM 禁用 pynccl，改用 2.29.7，harness 的 EP 规则改为 EP = DP × TP | EP4 跨 DP 的三格通过 | 已完成 |
 | ~~W10~~ | ~~规模验证~~ | ✅ Qwen3-235B-A22B（470 GB bf16，94 层，128 experts）4 节点通过，见 `weight_transport_FINDINGS.md` §4b。**1TB 级仍未测**，需要更多节点 | — | 已完成（235B 档） |
-| W12 | 提高大 MoE 的拉取并发度 | 235B 稳态每节点入口约 107 GB/s，是探测带宽 386 GB/s 的 28%。先定位是波内并发不足、每 expert 一段的粒度、还是 train 节点数不足 | 入口 ≥ 探测带宽的 60% | 4 节点 |
+| W12 | 提高大 MoE 的拉取并发度 | 235B 稳态每节点入口约 107 GB/s，是探测带宽 386 GB/s 的 28%。**已排除两条：波数（1 / 4 / 8 实测无差别）与 planner 选源（推向一一匹配反而慢 1.6 倍，已回滚，见 FINDINGS §1b）**。剩下的候选是每对连接的协议开销与 train 侧并行度 | 入口 ≥ 探测带宽的 60% | 2 节点可复现 |
 | W15 | FP8 发布点的重量化成本 | 235B FP8 下每 train rank 的发布刷新 513 ms、副本 20 GB，与一次稳态 sync 同量级。候选：只重量化变化过的 key、把量化与 optimizer step 重叠、或按专家分批 | 发布刷新 ≤ 稳态 sync 的 20% | 4 节点 |
 | W13 | colocate 走 CUDA IPC（设计项 2 / A8） | 机制有 GPU 测试但未接切换路径，大 MoE 下的 `register_memory` 次数没省掉 | colocate 切换路径上 `register_memory` 调用数 == 0，KV cache 可用量不降 | 单节点 |
 | W14 | 多角色与 role 隔离（设计 §3.10） | holder 表加 role 维度，actor 与 critic 并发发布版本 | 两个角色各自推进版本而互不影响 | 单节点 |

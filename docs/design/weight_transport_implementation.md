@@ -978,7 +978,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
       发布时逐张量重量化，瞬时显存只有一个 key。
       `quantize_blockwise` 与 vLLM 的 `per_block_cast_to_fp8` 逐位一致（`test_block_fp8.py`）。
       L2 8 格 FP8 位与 scale 逐位判定通过。真实 Qwen3-8B 权重下贪心 token 与 bf16 rollout 100% 一致。
-      比一个 tile 更细的切法在注册时拒绝并报出 key 名（细化网格见 §11 W9）。
+      比一个 tile 更细的切法在注册时拒绝并报出 key 名（细化网格见 §12 W9）。
 
 **单机验证总计：510 passed, 23 skipped**（含全部 GPU 测试）。
 FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运行）。
@@ -1670,7 +1670,79 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 
 ---
 
-## 11. 剩余工作
+## 11. 与设计文档的对照：哪些已落地，哪些没有
+
+「生产接线」= 被 `psrl/` 下非测试文件 import **且**在活跃同步路径上
+（rollout 侧 `vllm_extension.nixl_pull_model_core` 与 `vllm_async_server.pull_model_for_sync`，
+trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模块算「仅模块」。
+
+### 11.1 数据面：已落地
+
+`weight_transport.md` §5 优化项清单的 0–6d 与 7b、9、9b、9d-a、9e 在生产路径上运行：
+
+| 设计项 | 落点 | 验证 |
+|---|---|---|
+| 1 prepped descriptor | `pull_engine.py` 每源每次 pull 一个 handle | L2 |
+| 2 colocate 不碰 NIXL 注册 | ❌ **未落地**，见 §11.2 | — |
+| 3 strided / 连续段配对 | `read_geometry.py` | L2 |
+| 4 源头 FP8 wire | `block_fp8.py`，trainer 发布 FP8 副本与 scale | L2 17 格，L4 235B |
+| 5 上游分波与 peer 读重叠 | `pull_engine.py` 的 `_waves_of` | L3 |
+| 5b post / wait 拆分 | `pull_engine.py` 的 `_start` / `_finish` | L1 |
+| 6 MoE 分组 | `moe_grouping.py` | L2，235B 下 1131 key |
+| 6b 控制面下热路径 | plan 握手期编译，稳态零 RPC | L2（`test_the_pull_path_makes_no_control_plane_calls`） |
+| 6c / 6d chunk 相关 | **已删除**：引擎按源一次提交，无 chunk 概念 | — |
+| 7 三阶段去冗余 + 同节点 peer | `comm_plan.py` + `pull_engine.py`，默认开 | L3 |
+| 7b 发布点挂步边界 | `step_boundary.py` | L2 |
+| 8c 版本级等待 | `ps_manager.py` 的 `VersionBarrier`，`conflict_wait_budget_ms` | L2 |
+| 9 trainer 直供 / 不建 PS | `ray_trainer.py:2005` 的 `ps_mode=nixl_direct` 分支 | L2 / L3 |
+| 9d-a 配置期防御 | `config.py` 的 dtype 读取、offload 双 flag、LoRA `merge=false` 拒绝 | L1 |
+| 9e 删 FSDP1 | 已删 | L1 |
+| D6 降级继续生成 | `vllm_async_server.py:1109` 返回真实版本而非 assert | L2 |
+
+### 11.2 未落地的设计项
+
+**(a) 有模块但零生产 import，且当前架构已不需要**
+
+| 项 | 为什么不需要了 |
+|---|---|
+| B2 `slot_ack` | cast 产物改为常驻发布副本，在推送锁内刷新，没有可复用的 slot（主文档 §3.4.2） |
+| D5 `chunk_offset` | chunk 概念已删除 |
+| D1 `source_resolution` | 选源由 planner 的 designate 次序承担 |
+
+**(b) 有模块但零生产 import，仍然需要**
+
+| 项 | 缺它会怎样 | 依赖 |
+|---|---|---|
+| D2 `holder_index` / D4 `holder_roles` | 没有「谁持有哪个版本的哪一段」的索引。单实例直供下 plan 就够，多角色（critic / ref）与弹性都需要它 | — |
+| D7/D8 `chunk_availability` | trainer rank 故障时没有 DP 副本接管，拉取只能整体降级（D6 已能继续生成，但读不到新版本） | D2 |
+| E3 `admit_joiners` | 生产只有一次性握手屏障，没有 join / leave。扩缩容必须重启整个握手 | 6b（已有） |
+| E4 `partial_md` 下半 | 缩容缺 `invalidateLocalMD`，会留下可用的陈旧 descriptor | NIXL 缺绑定 |
+| F1 `delta_plan` | 跨 DC / 慢链路的增量传输，设计上就是 opt-in | — |
+
+**(c) 完全没有实现**
+
+| 项 | 现状 |
+|---|---|
+| **2 / A8 colocate CUDA IPC + stage 边界 offload** | 生产 colocate 走 NIXL 同卡读。机制有 GPU 测试（`test_colocate_ipc_gpu.py`），但没有接到切换路径，所以大 MoE 下的 `register_memory` 次数没有省掉 |
+| **3.10 多角色** | client 命名里有 `replica_idx` / `base_worker_id`，但 holder 表没有 role 维度，actor 与 critic 不能并发发布版本 |
+| **3.11 LoRA 合并路径** | 只做了「`merge=false` 拒绝」这一半，`merge=true` 的端到端没跑过 |
+| **3.8.1 FP4 / MXFP8** | 只有 blockwise FP8。MXFP8 需要 SM100+ |
+| **零拷贝 FP8-native** | TE 的 blockwise recipe 需要 CUDA ≥ 12.9，本集群 12.8。当前 FP8 训练走「反量化 + 重量化进发布副本」 |
+
+### 11.3 验证项对照（主文档 §7.1 的 25 条）
+
+已覆盖：1（零额外存储）、2（流量与重叠率，含 235B）、5（注册有效性三条）、
+7（atomic group，FP8 的 weight 与 scale 同组）、8（等价性，量化器与 vLLM 逐位一致）、
+10（扩散有效性，含 235B 的结构性上界）、14（精度矩阵，31 格）、16（后端对称性）、
+18（布局转换产物时效性）、19（并行度不匹配的 shard 代数）。
+
+未覆盖：3（单源瓶颈随 replica 数的亚线性）、4（pause 窗口与冲突等待分布）、
+6（colocate 切换的 KV cache 可用量）、9 与 17a（故障注入）、11（四条运行时断言各一个反例）、
+12（`is_rollout_mode_in_actor=True` 全流程）、13（弹性伸缩四条）、15（LoRA 两条路径）、
+20（colocate buffer 上界）、21–22（多角色与 role 隔离）、23（epoch 与 version 两段校验）、
+24（档位 B 的 GPS 一致性）、25（长跑 logprob 不漂移）。
+
+## 12. 剩余工作
 
 数据面（直供、去冗余、发布副本、cast、block FP8）已接入生产并通过 §9 所列验证，
 实测见 `weight_transport_FINDINGS.md`。以下按「解锁的能力 ÷ 改动面」排序，每项给判据与最轻验证档位。
@@ -1683,14 +1755,18 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 | W8 | 删 PS（D3/T2） | 需项目主人定迁移节奏 | — | — |
 | W9 | ~~block FP8 的细化 scale 网格~~ | ✅ rollout 在 scale sharding 上声明 scale tile，trainer 按 128 tile 量化后复制 scale（与 vLLM loader 的 `repeat_interleave` 逐位相同） | MoE Megatron TP2·EP2 → vLLM TP4（EP1）FP8 格通过 | 已完成 |
 | W11 | ~~MoE 下 vLLM DP > 1 的 L2 覆盖~~ | ✅ 根因是 NCCL 2.28.9 让 vLLM 禁用 pynccl，改用 2.29.7，harness 的 EP 规则改为 EP = DP × TP | EP4 跨 DP 的三格通过 | 已完成 |
-| W10 | 规模验证 | 1TB 级 MoE（真实权重，多节点 train 与多节点 rollout）的出口、稳态 sync 与发布副本显存 | 出口 == 每 gen 节点每 TP rank 一份，副本显存 ≤ 预算 | 多节点 |
+| ~~W10~~ | ~~规模验证~~ | ✅ Qwen3-235B-A22B（470 GB bf16，94 层，128 experts）4 节点通过，见 `weight_transport_FINDINGS.md` §4b。**1TB 级仍未测**，需要更多节点 | — | 已完成（235B 档） |
+| W12 | 提高大 MoE 的拉取并发度 | 235B 稳态每节点入口约 107 GB/s，是探测带宽 386 GB/s 的 28%。先定位是波内并发不足、每 expert 一段的粒度、还是 train 节点数不足 | 入口 ≥ 探测带宽的 60% | 4 节点 |
+| W15 | FP8 发布点的重量化成本 | 235B FP8 下每 train rank 的发布刷新 513 ms、副本 20 GB，与一次稳态 sync 同量级。候选：只重量化变化过的 key、把量化与 optimizer step 重叠、或按专家分批 | 发布刷新 ≤ 稳态 sync 的 20% | 4 节点 |
+| W13 | colocate 走 CUDA IPC（设计项 2 / A8） | 机制有 GPU 测试但未接切换路径，大 MoE 下的 `register_memory` 次数没省掉 | colocate 切换路径上 `register_memory` 调用数 == 0，KV cache 可用量不降 | 单节点 |
+| W14 | 多角色与 role 隔离（设计 §3.10） | holder 表加 role 维度，actor 与 critic 并发发布版本 | 两个角色各自推进版本而互不影响 | 单节点 |
 
 **顺序约束**：W5、W6 独立且便宜，W9 独立。W10 依赖足够的节点，W7 的故障注入最好在 W10 的规模上跑。
 **复现命令**见 `weight_transport_FINDINGS.md` §8。
 
 ---
 
-## 10. 与主设计文档的对应关系
+## 13. 与主设计文档的对应关系
 
 | 本文阶段 | 设计项 | 主文档章节 |
 |---|---|---|

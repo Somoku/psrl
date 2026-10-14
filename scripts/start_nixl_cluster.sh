@@ -55,6 +55,7 @@ for ip in "${WORKERS[@]}"; do
     echo "=== joining ${ip} ==="
     joined=$(timeout 260 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$ip" \
         "source ${ENV_SH} >/dev/null 2>&1; unset http_proxy https_proxy; \
+         ${VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR:+export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=${VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR};} \
          timeout 200 ${RAY_BIN} start --address='${HEAD_IP}:${PORT}' --num-gpus=${GPUS} 2>&1 \
          | grep -c 'Ray runtime started'" 2>/dev/null | tail -1)
     [ "${joined:-0}" = "1" ] || { echo "ERROR: ${ip} failed to join" >&2; exit 1; }

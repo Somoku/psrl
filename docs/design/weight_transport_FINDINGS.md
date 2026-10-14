@@ -95,6 +95,43 @@ FP8 两行每个 train rank 的发布刷新（重量化进发布副本）为 22 
 
 档位：CPU（出口）、多节点（时间）。
 
+## 4b. 规模验证：Qwen3-235B-A22B（94 层，128 experts，470 GB bf16）
+
+4 节点：16 个 Megatron train rank（EP16，TP1，不包 DDP）→ 16 个 vLLM rollout（TP4，EP16 跨 DP4），
+每节点 2 个 instance，扩散开，两轮换版本。**16/16 个 gen client 两轮各 1131/1131 key 通过 layout 判据，fallback 0。**
+
+| | trainer 出口 | peer | 每 rollout descriptor 上限 | 首轮 / 稳态 |
+|---|---|---|---|---|
+| bf16，无扩散 | 519.4 GB | 0 | 2339 | 2.41 / 3.26 s |
+| bf16，扩散分波 | 486.2 GB | 33.2 GB | 2353 | 4.05 / 2.39 s |
+| **bf16 → FP8**，无扩散 | 265.5 GB | 0 | 4421 | 1.31 / 1.43 s |
+| **bf16 → FP8**，扩散分波 | 245.7 GB | 19.8 GB | 4421 | 5.04 / 1.53 s |
+
+**这个布局下扩散几乎没有可省的字节，原因是结构性的。** 专家权重占模型的 97%（423 GiB），
+而 vLLM 的 EP16 让 16 个 gen GPU 各持**不同**的 1/16 专家，同节点两个 instance 之间没有重复的专家字节。
+可去重的只有 dense 部分（attention 与 embedding，15 GiB），算术与实测吻合：
+`519.4 − 486.2 = 33.2 GB` 恰好等于 peer 字节。
+**去冗余的收益上界是「被多个 rollout 重复持有的字节」**，EP = DP × TP 时这只是 dense 部分。
+rollout 用 TP 而非 EP 切专家时，每个 instance 持有全部专家的一个切片，重复度才回到 100%
+（单节点矩阵的 MoE 格就是这一类），但那样每 rank 的显存需求按 TP 而非 EP 下降，
+235B 下放不进 96 GB 卡。
+
+**稳态 2.39 s 不是链路限制。** 每 gen 节点入口约 107 GB/s（8 client × 13–16 GB/s），
+是实测节点聚合 386 GB/s 的 28%，每 train 节点出口约 102 GB/s。瓶颈在并发度而非带宽，
+train 侧只有 2 个节点供给 2 个 gen 节点，且专家键的读取粒度是每 expert 一段。
+
+**FP8 把字节减半，但把发布成本放大了 36 倍。** bf16 下每个 train rank 的发布副本 6016 MiB
+（只有 attention，因为 gen TP4 把它切得比 train 的 TP1 细），刷新 14 ms。
+FP8 下副本涨到 19933 MiB（专家权重也要量化成 FP8 副本），刷新 513–545 ms。
+后者与一次稳态 sync（1.5 s）同量级，**所以 235B 规模下重量化是发布点的主要成本，不是传输**。
+它发生在推送锁内、不在拉取路径上，但会计入 trainer 的步间开销。
+`weight_transport.md` §3.4.2 说的「代价按 rank 计」在这里是每 rank 约 20 GB 与半秒。
+
+启动耗时：meta server 100 s，16 train + 16 rollout 的 client init 1020 s。
+
+档位：4 节点。模型只需 `config.json` 与 tokenizer，权重用 `+test.gen.load_format=dummy` 起，
+传输会覆盖每一个字节。
+
 ## 5. 配置矩阵（单节点 4 train + 4 gen GPU，layout 判据，两轮）
 
 | 格 | 精度 | 判据 | 第一轮 / 稳态 | trainer 出口 |

@@ -429,8 +429,10 @@ class TrainClientActor:
 
         from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
 
+        # No training happens here, so skip DDP: its gradient buffer is as large as the parameters
+        # and at 235B scale it is what runs the card out of memory, not the weights.
         actor_module, _ = make_megatron_module(
-            wrap_config=McoreModuleWrapperConfig(),
+            wrap_config=McoreModuleWrapperConfig(wrap_with_ddp=self.megatron_config.get("wrap_with_ddp", True)),
             hf_config=hf_config,
             bridge=bridge,
             provider=provider,
@@ -767,6 +769,10 @@ class GenClientActor:
         }
         if self.dp_size > 1:
             llm_kwargs["data_parallel_size"] = self.dp_size
+        # The transfer overwrites every weight, so a scale run can start from dummy weights instead
+        # of reading a checkpoint that may not exist locally (only config and tokenizer are needed).
+        if gen_config.get("load_format", None):
+            llm_kwargs["load_format"] = gen_config.load_format
         if model_config.get("gen_quantization") == "fp8":
             # The block FP8 that verl's rollout uses, quantised online from a bf16 checkpoint.
             llm_kwargs["quantization"] = "fp8"

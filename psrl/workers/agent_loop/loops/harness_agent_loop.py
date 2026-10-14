@@ -682,14 +682,14 @@ class HarnessAgentLoop(SessionAgentLoop):
     ) -> dict:
         """Build diagnostics that are safe even for an incomplete trajectory.
 
-        Deliberately carries no ``num_turns``: the trajectories of one episode do not
-        have the same length, so a single value here would be stamped onto all of them
-        and reported as each one's own. ``_stamp_reward_info`` gives every trajectory its
-        own count instead. ``episode_num_turns`` is the harness's own count for the
-        episode, which is the only number comparable to the cap the harness was given.
+        ``num_turns`` is the episode's turn count, not a trajectory's: one session is one
+        episode, and a harness that rewrites its context or runs a subagent leaves its
+        trajectories at different lengths. Put one trajectory's own count here and it is
+        stamped onto all of them and reported as each one's own, which is what the
+        per-trajectory ``trajectory_num_turns`` is for.
         """
         return {
-            "episode_num_turns": (self._episode_summary.num_turns if self._episode_summary else None),
+            "num_turns": self._episode_num_turns(training_data),
             "trajectory_count": len(training_data),
             "trajectory_token_lengths": [
                 len(item.get("prompt_ids", [])) + len(item.get("response_ids", [])) for item in training_data
@@ -701,15 +701,39 @@ class HarnessAgentLoop(SessionAgentLoop):
             "harness_stderr_tail": harness_result.stderr_tail if harness_result.exit_code != 0 else "",
         }
 
-    @staticmethod
+    def _episode_num_turns(self, training_data: list[dict]) -> int:
+        """Return how many turns the episode ran.
+
+        The harness's own count when it reported one. Otherwise the longest trajectory's,
+        which is the best reconstruction available and is still short of the truth for a
+        session whose trajectories are segments of one run: only the harness knows how many
+        turns it ran across a rewrite, so a harness that reports nothing cannot be summed
+        into an episode count.
+        """
+        if self._episode_summary is not None and self._episode_summary.num_turns is not None:
+            return int(self._episode_summary.num_turns)
+        return max((int(item.get("num_turns") or 0) for item in training_data), default=0)
+
     def _stamp_reward_info(
+        self,
         outputs: list["TokenOutput"],
         training_data: list[dict],
         reward_info: dict,
     ) -> None:
-        """Attach shared episode diagnostics plus each trajectory's own turn count."""
+        """Give every output the episode's diagnostics and its own trajectory's count.
+
+        ``num_turns`` is the episode's, and it is also what the returned output carries as
+        its own sample field: everything downstream — the trainer's ``num_turns`` metric and
+        the reward — reads a session as one episode. The trajectory's own count is kept
+        beside it, so that trajectory's log can report the turns it ran.
+        """
+        episode_turns = self._episode_num_turns(training_data)
         for output, item in zip(outputs, training_data):
-            output.agent_reward_info = {**reward_info, "num_turns": int(item.get("num_turns") or 0)}
+            output.agent_reward_info = {
+                **reward_info,
+                "trajectory_num_turns": int(item.get("num_turns") or 0),
+            }
+            output.num_turns = episode_turns
 
     async def _dump_harness_training_data(
         self,

@@ -920,13 +920,15 @@ class AgentLoopBase(ABC):
         n_env = out.response_mask.count(0) if out.response_mask else 0
         total_tokens = n_prompt + n_assistant + n_env
 
-        turns = info.get("num_turns")
+        # This trajectory's own count, which is what the log is about. It is not
+        # `num_turns`: that one is the session's, since one session is one episode and a
+        # harness that rewrites its context leaves its trajectories at different lengths.
+        turns = info.get("trajectory_num_turns")
+        if turns is None:
+            turns = info.get("num_turns")
         if turns is None:
             turns = out.num_turns if out.num_turns is not None else 0
-        # The harness's own count for the whole episode, which is the number comparable to
-        # the cap the harness was given. It differs from this trajectory's own count
-        # whenever the harness rewrote its context or ran a subagent.
-        episode_turns = info.get("episode_num_turns")
+        episode_turns = info.get("num_turns")
         turn_fields = f"turns: {turns}"
         if episode_turns is not None:
             turn_fields += f", episode_turns: {episode_turns}"

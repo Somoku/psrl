@@ -9,7 +9,7 @@ all of them.
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 from psrl.workers.agent_loop.harness import (
@@ -132,22 +132,48 @@ def _item(num_turns: int) -> dict:
     return {"prompt_ids": [1, 2, 3], "response_ids": [4], "num_turns": num_turns}
 
 
-def test_every_trajectory_keeps_its_own_turn_count() -> None:
-    """A rewrite or a subagent leaves one episode's trajectories at different lengths.
+def _loop(**attributes) -> SimpleNamespace:
+    """A stand-in loop whose bound helpers are the real ones.
 
-    A single value broadcast to all of them would be reported as each one's own count.
+    These tests call unbound loop methods, so the stand-in has to answer a method that
+    another method calls on it.
     """
-    outputs = [SimpleNamespace(agent_reward_info={}), SimpleNamespace(agent_reward_info={})]
+    loop = SimpleNamespace(**attributes)
+    loop._episode_num_turns = MethodType(HarnessAgentLoop._episode_num_turns, loop)
+    return loop
+
+
+def _stamped_loop(episode: HarnessEpisodeSummary | None) -> SimpleNamespace:
+    return _loop(_episode_summary=episode)
+
+
+def test_the_session_reports_the_harness_count_as_its_own_turn_count() -> None:
+    """One session is one episode, so its samples carry the episode's count.
+
+    A trajectory's own count is not the episode's: a rewrite cuts one run into several
+    trajectories, and a subagent adds turns the CLI does not count against the parent.
+    """
+    loop = _stamped_loop(HarnessEpisodeSummary(stop_reason=None, num_turns=47))
+    outputs = [SimpleNamespace(agent_reward_info={}, num_turns=0), SimpleNamespace(agent_reward_info={}, num_turns=0)]
     training_data = [_item(num_turns=3), _item(num_turns=41)]
 
-    HarnessAgentLoop._stamp_reward_info(outputs, training_data, {"episode_num_turns": 47})
+    HarnessAgentLoop._stamp_reward_info(loop, outputs, training_data, {"num_turns": 47})
 
-    assert [output.agent_reward_info["num_turns"] for output in outputs] == [3, 41]
-    assert outputs[0].agent_reward_info["episode_num_turns"] == 47
+    assert [output.num_turns for output in outputs] == [47, 47]
+    assert [output.agent_reward_info["num_turns"] for output in outputs] == [47, 47]
+    # The trajectory's own count stays beside it, for that trajectory's log.
+    assert [output.agent_reward_info["trajectory_num_turns"] for output in outputs] == [3, 41]
 
 
-def test_episode_diagnostics_carry_the_harness_count_under_its_own_name() -> None:
-    loop = SimpleNamespace(
+def test_a_harness_that_reports_nothing_falls_back_to_the_longest_trajectory() -> None:
+    loop = _stamped_loop(None)
+    training_data = [_item(num_turns=3), _item(num_turns=41)]
+
+    assert HarnessAgentLoop._episode_num_turns(loop, training_data) == 41
+
+
+def test_episode_diagnostics_report_the_harness_count() -> None:
+    loop = _loop(
         _episode_summary=HarnessEpisodeSummary(stop_reason=None, num_turns=47),
         compaction_budget=None,
         harness_config=SimpleNamespace(kind="claude_code"),
@@ -155,21 +181,21 @@ def test_episode_diagnostics_carry_the_harness_count_under_its_own_name() -> Non
 
     info = HarnessAgentLoop._build_partial_reward_info(loop, [_item(3), _item(41)], HarnessResult(exit_code=0))
 
-    assert info["episode_num_turns"] == 47
-    # The shared diagnostics must not claim a turn count: it would be stamped onto every
-    # trajectory as if the episode's count were each trajectory's own.
-    assert "num_turns" not in info
+    assert info["num_turns"] == 47
+    # A trajectory's count is not an episode-level diagnostic: stamping one here would
+    # report it as every trajectory's own.
+    assert "trajectory_num_turns" not in info
 
 
 def test_the_summary_prints_the_local_count_and_the_episode_count_separately() -> None:
     loop = SimpleNamespace()
     out = SimpleNamespace(
-        agent_reward_info={"patch": "", "num_turns": 12, "episode_num_turns": 47},
+        agent_reward_info={"patch": "", "num_turns": 47, "trajectory_num_turns": 12},
         extra_fields={},
         prompt_ids=[1, 2, 3],
         response_ids=[4],
         response_mask=[1],
-        num_turns=12,
+        num_turns=47,
     )
 
     text = AgentLoopBase._build_summary_text(loop, out, TerminateReason.FINISHED)

@@ -306,6 +306,14 @@ def _compute_advantage_over_valid_samples(
     reward as if it were a relative one, and reported, because the answer is to replace
     the group (the group-level dynamic-sampling filter) rather than to compare against
     nothing.
+
+    The rows kept out are not contiguous, so the estimator's output is scattered back into
+    a full-size pair of buffers. Those buffers are sized from the estimator's own output,
+    not from `token_level_rewards`: a batch's fields are padded to their own lengths
+    (`TensorDict.to_padded_tensor` pads each field to that field's maximum), so an advantage
+    is shaped like the `response_mask` the estimator read and may be wider or narrower than
+    the rewards. Sizing from the rewards would make the scatter fail whenever they differ,
+    and the trainer un-pads the result against `response_mask` regardless.
     """
     valid = valid_sample_mask(data.batch["response_mask"])
     if bool(valid.all()):
@@ -317,10 +325,12 @@ def _compute_advantage_over_valid_samples(
     # restriction's own requirement rather than as an estimator's precondition.
     starved_rows, starved_groups = _starved_groups(data, kept)
     measured = compute(data.select_idxs(kept))
-    advantages = torch.zeros_like(data.batch["token_level_rewards"])
-    returns = torch.zeros_like(data.batch["token_level_rewards"])
-    advantages[kept] = measured.batch["advantages"]
-    returns[kept] = measured.batch["returns"]
+    measured_advantages = measured.batch["advantages"]
+    measured_returns = measured.batch["returns"]
+    advantages = measured_advantages.new_zeros((len(data), *measured_advantages.shape[1:]))
+    returns = measured_returns.new_zeros((len(data), *measured_returns.shape[1:]))
+    advantages[kept] = measured_advantages
+    returns[kept] = measured_returns
 
     if starved_rows:
         advantages[starved_rows] = 0.0

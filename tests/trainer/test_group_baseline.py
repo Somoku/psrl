@@ -28,13 +28,26 @@ _EPS = 1e-6
 _LENGTH = 3
 
 
-def _batch(rewards: list[float], masks: list[float], groups: list[int], *, values: bool = False) -> DataProto:
+def _batch(
+    rewards: list[float],
+    masks: list[float],
+    groups: list[int],
+    *,
+    values: bool = False,
+    mask_width: int | None = None,
+) -> DataProto:
+    """A batch whose fields may be padded to different widths.
+
+    Batch fields do not share a trailing width: each is padded to its own maximum, so a
+    test can hand the estimator a `response_mask` wider than `token_level_rewards`.
+    """
     size = len(rewards)
     token_rewards = torch.tensor([[reward / _LENGTH] * _LENGTH for reward in rewards], dtype=torch.float32)
+    width = mask_width or _LENGTH
     tensors = {
         "token_level_rewards": token_rewards.clone(),
         "token_level_scores": token_rewards.clone(),
-        "response_mask": torch.tensor([[mask] * _LENGTH for mask in masks], dtype=torch.float32),
+        "response_mask": torch.tensor([[mask] * width for mask in masks], dtype=torch.float32),
     }
     if values:
         tensors["values"] = torch.zeros(size, _LENGTH)
@@ -113,6 +126,29 @@ def test_each_group_is_measured_against_its_own_measured_rows() -> None:
         0.0,
         0.0,
     ]
+
+
+def test_the_advantage_follows_the_response_mask_not_the_reward_width() -> None:
+    """A batch pads each field to its own maximum, so the two widths can differ.
+
+    The estimator reads `token_level_rewards` but shapes its output like `response_mask`.
+    Sizing the scatter buffer from the rewards would make it fail whenever a row's reward
+    is padded narrower than its mask, and the trainer un-pads against `response_mask`.
+    """
+    rewards = [1.0, 0.5, 0.5, 0.25, 0.0]
+    masks = [1.0, 1.0, 1.0, 1.0, 0.0]
+    data = _batch(rewards, masks, [7] * 5, mask_width=5)
+    assert data.batch["token_level_rewards"].shape[1] == _LENGTH
+    assert data.batch["response_mask"].shape[1] == 5
+
+    PSRL_compute_advantage(data, AdvantageEstimator.GRPO, config={_SWITCH: True})
+
+    advantages = data.batch["advantages"]
+    assert tuple(advantages.shape) == (5, 5)
+    assert [round(float(row[0]), 6) for row in advantages[:4]] == [
+        round(_baseline([1.0, 0.5, 0.5, 0.25], i), 6) for i in range(4)
+    ]
+    assert float(advantages[4].abs().sum()) == 0.0
 
 
 def test_a_group_left_with_one_measurement_gets_no_advantage(caplog) -> None:

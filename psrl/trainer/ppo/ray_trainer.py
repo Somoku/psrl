@@ -99,7 +99,12 @@ from psrl.utils.post_processor import (
     load_group_post_processor,
 )
 from psrl.utils.server.command import Command, CommandType
-from psrl.utils.transferqueue_utils import PayloadState, clear_payload
+from psrl.utils.transferqueue_utils import (
+    RESPONSE_ALIGNED_FIELDS,
+    PayloadState,
+    assert_response_aligned_lengths,
+    clear_payload,
+)
 from psrl.workers.agent_loop.manager import PSRL_AgentLoopManager
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.workers.agent_loop.timeouts import resolve_from_config
@@ -3184,6 +3189,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         fields = [
             "uid",
             "parent_id",
+            "responses",
             "response_mask",
             "rm_scores",
             "rollout_log_probs",
@@ -3192,6 +3198,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             "values",
         ]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        # A producer that gets a length wrong only changes a width here, and the advantage math
+        # reads two fields that were padded apart from each other.
+        assert_response_aligned_lengths(
+            {"responses": data["responses"], **{n: data[n] for n in RESPONSE_ALIGNED_FIELDS if n in data.keys()}},
+            stage="advantage",
+        )
         response_mask = data["response_mask"]
 
         # Extract non-tensor uid/parent_id BEFORE calling to_padded_tensor() to avoid
@@ -3250,6 +3262,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 fields.append("rollout_is_weights")
 
         output = {}
+        # `response_to_nested` slices by `response_mask`, so a wider field would be trimmed silently.
+        for field in ("advantages", "returns"):
+            assert data.batch[field].shape[1] == data.batch["response_mask"].shape[1], (
+                f"{field} has {data.batch[field].shape[1]} response positions but response_mask has "
+                f"{data.batch['response_mask'].shape[1]}."
+            )
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
         if self.config.train_actor_rollout_ref.actor.loss_agg_mode == "session-mean-token-mean":
@@ -3360,29 +3378,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         uids = tu.pop(data, "uid") if use_session_mean else None
 
         # Training pads log probabilities to `responses` but slices them by `response_mask`.
-        # Enforce equal row lengths here so drift fails near its source.
-        response_lens = data["responses"].offsets().diff()
-        mask_lens = data["response_mask"].offsets().diff()
-        psrl_logger.info(
-            "[length-contract] old_log_prob stage: rows=%d responses[min=%d max=%d] "
-            "response_mask[min=%d max=%d] equal=%s",
-            len(response_lens),
-            int(response_lens.min()),
-            int(response_lens.max()),
-            int(mask_lens.min()),
-            int(mask_lens.max()),
-            bool(torch.equal(response_lens, mask_lens)),
+        assert_response_aligned_lengths(
+            {"responses": data["responses"], "response_mask": data["response_mask"]},
+            stage="old_log_prob",
         )
-        if not torch.equal(response_lens, mask_lens):
-            bad = (response_lens != mask_lens).nonzero().flatten().tolist()
-            raise AssertionError(
-                f"responses and response_mask disagree on length for {len(bad)} of "
-                f"{len(response_lens)} rows. First offenders (row, responses, mask): "
-                f"{[(int(i), int(response_lens[i]), int(mask_lens[i])) for i in bad[:5]]}. "
-                "Both are written per trajectory by the agent loop and must stay in lockstep, "
-                "because old_log_probs is cut to the mask length while the training forward is "
-                "padded to the responses length."
-            )
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])

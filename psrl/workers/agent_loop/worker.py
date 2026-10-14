@@ -31,6 +31,7 @@ from psrl.utils.common.http_io_thread import init_http_io_thread
 from psrl.utils.common.http_utils import configure_distributed_post, init_http_client
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
+from psrl.utils.transferqueue_utils import RESPONSE_ALIGNED_FIELDS, assert_response_aligned_lengths
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
 from psrl.workers.gen.utils import TokenOutput
@@ -710,16 +711,11 @@ class PSRL_AgentLoopWorker:
             field["multi_modal_inputs"] = multi_modal_inputs
             field["images_seqlens"] = images_seqlens
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
-            # Merged batch fields can carry a stale `response_mask`, so recheck the
-            # response-length invariant after assembly.
-            mask_len = field["response_mask"].size(0)
-            if mask_len != response_len:
-                raise AssertionError(
-                    f"[uid={uid} trajectory={i}/{len(outputs)}] responses has {response_len} "
-                    f"tokens but response_mask has {mask_len} after merging the batch fields "
-                    f"with this trajectory's output (prompt_len={prompt_len}). The merge picked "
-                    "up a mask that does not belong to this trajectory."
-                )
+            # Merged batch fields can carry a stale mask, so recheck the length contract after assembly.
+            assert_response_aligned_lengths(
+                {"responses": field["responses"], **{n: field[n] for n in RESPONSE_ALIGNED_FIELDS if n in field}},
+                stage=f"assemble uid={uid} trajectory={i}/{len(outputs)} prompt_len={prompt_len}",
+            )
             field["seq_len"] = prompt_len + response_len
             field["prompt_len"] = prompt_len
             field["response_len"] = response_len

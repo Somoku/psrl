@@ -21,12 +21,6 @@ from psrl.workers.agent_loop.harness.runtime import executable_path
 
 psrl_logger = logging.getLogger(__file__)
 
-# Deadline for reading a diagnostic log tail out of the sandbox. Bounded well below the
-# episode budget because it runs after the harness has already exited: a container that
-# cannot answer within this window is not going to, and the caller absorbs the failure
-# rather than spending the rest of the episode's wall clock waiting for it.
-_DIAGNOSTIC_READ_TIMEOUT_S = 60.0
-
 # The exit code a `HarnessResult` carries when the harness stopped the CLI at its
 # deadline rather than the CLI exiting on its own.
 EXIT_TIME_BUDGET_EXCEEDED = -1
@@ -132,6 +126,16 @@ class HarnessConfig:
                 f"expected one of {SUPPORTED_TRAJECTORY_FORMATS}."
             )
 
+    def state_dir(self) -> str:
+        """The harness's own directory inside the sandbox.
+
+        It holds the CLI's logs and any payload the framework stages for this episode,
+        so it is the one directory on the guest side that the framework owns. Nothing
+        the agent is told to use lives here, which is what makes it safe to stage a file
+        in without competing with the agent's own scratch space.
+        """
+        return str(PurePosixPath(self.home_dir) / ".psrl-harness")
+
     def resolved_trajectory_format(self) -> str:
         """Return the concrete format the integrity scanner should dispatch on."""
         if self.trajectory_format != "auto":
@@ -232,7 +236,7 @@ class Harness(ABC):
         self.config = config
         self.sandbox = sandbox
         self._active_exec: asyncio.Task[ExecResult] | None = None
-        self._log_dir = str(PurePosixPath(config.home_dir) / ".psrl-harness")
+        self._log_dir = config.state_dir()
 
     def config_dir(self) -> str | None:
         """Harness-specific config directory created during preparation."""
@@ -395,13 +399,17 @@ class Harness(ABC):
         had already finished its work — turning a complete episode into a reported budget
         expiry or a lost container. Losing the tail costs a post mortem; losing the
         trajectory costs the episode.
+
+        It reads the file rather than running `tail` in the sandbox, because a command is
+        not free: on a backend whose exec cannot be signalled (a one-shot exec), a command
+        that stalls is stopped by destroying the container. Swallowing that exception here
+        would leave a sandbox already destroyed under an episode that still has a patch to
+        collect, and the collection is what would then report the failure. A diagnostic
+        must not be able to cost the episode its sandbox.
         """
         try:
-            result = await self.sandbox.exec(
-                f"tail -c {self.config.output_tail_chars} {shlex.quote(path)}",
-                timeout_s=_DIAGNOSTIC_READ_TIMEOUT_S,
-            )
+            payload = await self.sandbox.read_bytes(path)
         except Exception:
             psrl_logger.warning(f"Could not read harness log tail {path!r}.", exc_info=True)
             return ""
-        return result.stdout if result.exit_code == 0 else ""
+        return payload[-self.config.output_tail_chars :].decode(errors="replace")

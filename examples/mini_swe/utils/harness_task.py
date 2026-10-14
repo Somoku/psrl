@@ -2,6 +2,7 @@
 
 import logging
 import shlex
+from pathlib import PurePosixPath
 
 from psrl.sandbox import SandboxSession, SandboxSessionLostError
 
@@ -11,12 +12,12 @@ psrl_logger = logging.getLogger(__file__)
 # capped at `max_exec_output_bytes`, and a patch is user-controlled data that has no
 # business going through a diagnostic channel: a truncated patch would grade an
 # incomplete solution and report the result as if it were measured.
-_HARNESS_PATCH_PATH = "/tmp/psrl-harness.patch"
+_HARNESS_PATCH_NAME = "psrl-harness.patch"
 # Collection diagnostics, written by the script and read back through the file API.
 # The sandbox exec channel does not carry stderr on every backend (the p3b node agent
 # returns an empty stderr), so a failing collection would otherwise report only an
 # exit code with no way to tell which step failed.
-_HARNESS_DIAG_PATH = "/tmp/psrl-harness-collect.diag"
+_HARNESS_DIAG_NAME = "psrl-harness-collect.diag"
 # A repository read by git, not an interactive command, so one generous call is enough
 # and every retry cost is the agent's work being wasted.
 _PATCH_COLLECT_TIMEOUT_S = 600.0
@@ -52,6 +53,8 @@ async def collect_git_patch(
     session: SandboxSession,
     workdir: str,
     base_commit: str | None = None,
+    *,
+    staging_dir: str,
     timeout_s: float = _PATCH_COLLECT_TIMEOUT_S,
 ) -> str:
     """Collect staged, unstaged, and untracked changes as one git patch.
@@ -62,6 +65,15 @@ async def collect_git_patch(
     the episode and abort its whole training group, when the patch itself was complete
     and gradeable. Reading it back as a file keeps the full patch intact.
 
+    ``staging_dir`` is where the patch and the collector's self-report are written. It is
+    the harness's own state directory rather than a world-writable convention like
+    ``/tmp``, for two reasons: the harness prompt tells the agent to use ``/tmp`` as its
+    scratch space, so a framework payload staged there competes with agent-controlled
+    files; and a sandbox whose ``/tmp`` is gone - which happens on a node under enough
+    pressure that the container's filesystem is disturbed - reported a collectable patch
+    as a failed collection, costing the episode and then its whole group. The script
+    re-asserts the directory either way, so a directory the agent removed costs nothing.
+
     Robust against nested git repositories that an agent may have created inside
     the workdir (e.g. ``test_repo/`` used to reproduce a DVC bug): a nested repo
     without a checked-out commit makes ``git add -A`` fail with
@@ -70,9 +82,12 @@ async def collect_git_patch(
     plus ``git diff`` (worktree vs index) for tracked changes, then adds
     untracked files as ``new file`` diffs while excluding nested repositories.
     """
+    patch_path = str(PurePosixPath(staging_dir) / _HARNESS_PATCH_NAME)
+    diag_path = str(PurePosixPath(staging_dir) / _HARNESS_DIAG_NAME)
     base_arg = f"{shlex.quote(base_commit)} --" if base_commit else "--"
-    patch_path = shlex.quote(_HARNESS_PATCH_PATH)
-    diag_path = shlex.quote(_HARNESS_DIAG_PATH)
+    patch_arg = shlex.quote(patch_path)
+    diag_arg = shlex.quote(diag_path)
+    staging_arg = shlex.quote(staging_dir)
     workdir_arg = shlex.quote(workdir)
     # Per-file body for the untracked pass. It is executed by `sh` (via `xargs -0`),
     # not by a `while read -d` loop: the sandbox runs commands with `/bin/sh`, and
@@ -95,9 +110,13 @@ async def collect_git_patch(
     )
     script = (
         "set -u\n"
-        f"out={patch_path}\n"
-        f"diag={diag_path}\n"
+        f"out={patch_arg}\n"
+        f"diag={diag_arg}\n"
         "export out diag\n"
+        # The staging directory belongs to the harness, but nothing here may assume the
+        # step that created it still ran or still holds: the agent has a shell in this
+        # container too. One builtin buys independence from any directory it removed.
+        f"mkdir -p {staging_arg}\n"
         ': > "$out"\n'
         ': > "$diag"\n'
         # Self-report so a non-zero exit is diagnosable without an stderr channel.
@@ -105,10 +124,11 @@ async def collect_git_patch(
         '    echo "shell=$0"\n'
         '    echo "cwd=$(pwd)"\n'
         f'    echo "wanted_cwd={workdir}"\n'
+        f'    echo "staging_dir={staging_dir}"\n'
         "    for tool in git wc dirname xargs tr; do\n"
         '        printf "%s=%s\\n" "$tool" "$(command -v "$tool" 2>/dev/null || echo MISSING)"\n'
         "    done\n"
-        f"    ls -ld {workdir_arg} 2>&1 || true\n"
+        f"    ls -ld {workdir_arg} {staging_arg} 2>&1 || true\n"
         '} >> "$diag" 2>&1\n'
         # staged changes (index vs base / HEAD)
         f'git diff --cached --binary --submodule=diff {base_arg} >> "$out" 2>>"$diag" '
@@ -137,17 +157,17 @@ async def collect_git_patch(
         )
         raise
     if result.exit_code != 0:
-        diagnostics = await _read_collector_diagnostics(session)
+        diagnostics = await _read_collector_diagnostics(session, diag_path)
         raise RuntimeError(
             f"Could not collect harness patch (exit {result.exit_code}, cwd={workdir!r}): "
             f"{result.stderr.strip() or '<backend reported no stderr>'}\n"
             f"collector diagnostics:\n{diagnostics}"
         )
     try:
-        payload = await session.read_bytes(_HARNESS_PATCH_PATH)
+        payload = await session.read_bytes(patch_path)
     except Exception as exc:
         raise RuntimeError(
-            f"Could not read the collected harness patch from {_HARNESS_PATCH_PATH!r}: {exc!r}"
+            f"Could not read the collected harness patch from {patch_path!r}: {exc!r}"
         ) from exc
     if len(payload) >= _PATCH_SIZE_WARNING_BYTES:
         psrl_logger.warning(
@@ -159,7 +179,7 @@ async def collect_git_patch(
     return payload.decode(errors="replace")
 
 
-async def _read_collector_diagnostics(session: SandboxSession) -> str:
+async def _read_collector_diagnostics(session: SandboxSession, diag_path: str) -> str:
     """Read the collector's self-report after a non-zero exit.
 
     Read as a file rather than from the exec response because the sandbox exec channel
@@ -167,10 +187,10 @@ async def _read_collector_diagnostics(session: SandboxSession) -> str:
     is reported inline instead of masking the collection error.
     """
     try:
-        payload = await session.read_bytes(_HARNESS_DIAG_PATH)
+        payload = await session.read_bytes(diag_path)
     except Exception:
         psrl_logger.warning(
-            "Could not read the patch-collector diagnostics from %r.", _HARNESS_DIAG_PATH, exc_info=True
+            "Could not read the patch-collector diagnostics from %r.", diag_path, exc_info=True
         )
         return "<unavailable>"
     return payload.decode(errors="replace").strip() or "<empty>"

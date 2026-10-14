@@ -149,6 +149,7 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
             sandbox,
             runtime.workdir,
             base_commit=str(swe_problem.get("base_commit") or "") or None,
+            staging_dir=self.harness_config.state_dir(),
         )
         integrity: dict = {
             "violated": False,

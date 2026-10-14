@@ -8,12 +8,13 @@ import json
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from examples.mini_swe.config import build_runtime_config
 from examples.mini_swe.utils.harness_task import (
-    _HARNESS_DIAG_PATH,
-    _HARNESS_PATCH_PATH,
+    _HARNESS_DIAG_NAME,
+    _HARNESS_PATCH_NAME,
     build_harness_prompt,
     collect_git_patch,
 )
@@ -37,6 +38,7 @@ from psrl.workers.agent_loop.harness import (
     EXIT_TIME_BUDGET_EXCEEDED,
     HarnessCompactionConfig,
     HarnessConfig,
+    HarnessResult,
     HarnessRuntime,
     HarnessTaskContext,
     clean_snapshot_compatible,
@@ -45,6 +47,13 @@ from psrl.workers.agent_loop.harness import (
 from psrl.workers.agent_loop.harness.claude_code import ClaudeCodeHarness
 from psrl.workers.agent_loop.harness.codex import CodexHarness
 from psrl.workers.agent_loop.harness.runtime import executable_path, host_runtime_dir, runtime_mount_spec
+from psrl.workers.agent_loop.loops.mini_swe_harness_agent_loop import MiniSWEHarnessAgentLoop
+
+# Where an episode stages the collector's payload: the harness's own state directory,
+# next to the CLI's logs. Deliberately not /tmp, which is the agent's scratch space.
+_STAGING_DIR = "/root/.psrl-harness"
+_PATCH_PATH = f"{_STAGING_DIR}/{_HARNESS_PATCH_NAME}"
+_DIAG_PATH = f"{_STAGING_DIR}/{_HARNESS_DIAG_NAME}"
 
 
 class FakeSandbox(SandboxSession):
@@ -87,12 +96,10 @@ class FakeSandbox(SandboxSession):
         # The prepare probe creates the state dir and checks the mounted CLI.
         if command.startswith("mkdir -p /root/.psrl-harness"):
             return ExecResult(0 if self.runtime_available else 1, "", "" if self.runtime_available else "no such file")
-        if _HARNESS_PATCH_PATH in command and not command.startswith("tail -c"):
+        if _HARNESS_PATCH_NAME in command:
             # The patch collector. Its diagnostics are read back through the file API,
             # never from this response (the backend does not carry stderr).
             return ExecResult(self.collect_exit_code, "", "")
-        if command.startswith("tail -c"):
-            return ExecResult(0, "bounded tail", "")
         if "/opt/harness/bin/" in command and self.block_cli:
             self.cli_started.set()
             try:
@@ -177,6 +184,8 @@ async def test_claude_code_uses_session_root_and_bounded_process_output() -> Non
     harness = create_harness(config, sandbox)
 
     await harness.prepare(_runtime())
+    # What the CLI had written to its log before it exited non-zero.
+    sandbox.writes[f"{_STAGING_DIR}/stderr.log"] = b"bounded tail"
     result = await harness.run("fix the bug", _runtime())
 
     assert isinstance(harness, ClaudeCodeHarness)
@@ -213,7 +222,9 @@ async def test_successful_harness_skips_diagnostic_tail_commands() -> None:
     assert result.exit_code == 0
     assert result.stdout_tail == ""
     assert result.stderr_tail == ""
-    assert not any(command.startswith("tail -c") for command, _, _ in sandbox.commands)
+    # Only the prepare probe and the CLI itself: a successful run spends nothing on
+    # diagnostics, and reading them costs no command at all.
+    assert len(sandbox.commands) == 2
 
 
 @pytest.mark.asyncio
@@ -227,6 +238,8 @@ async def test_the_harness_stops_at_the_deadline_and_keeps_partial_output() -> N
     sandbox = FakeSandbox(block_cli=True)
     harness = create_harness(HarnessConfig(kind="codex", executable="codex"), sandbox)
     await harness.prepare(_runtime())
+    # What the CLI had written to its log before the deadline stopped it.
+    sandbox.writes[f"{_STAGING_DIR}/stdout.log"] = b"bounded tail"
 
     result = await harness.run("fix", _runtime(), deadline_s=0.05)
 
@@ -297,11 +310,35 @@ async def test_failed_trajectory_can_collect_output_after_successful_cli_exit() 
     await harness.prepare(_runtime())
 
     result = await harness.run("fix", _runtime())
+    sandbox.writes[result.stdout_path] = b"stdout diagnostics"
+    sandbox.writes[result.stderr_path] = b"stderr diagnostics"
+
     diagnostic_result = await harness.collect_diagnostics(result)
 
-    assert diagnostic_result.stdout_tail == "bounded tail"
-    assert diagnostic_result.stderr_tail == "bounded tail"
-    assert sum(command.startswith("tail -c") for command, _, _ in sandbox.commands) == 2
+    assert diagnostic_result.stdout_tail == "stdout diagnostics"
+    assert diagnostic_result.stderr_tail == "stderr diagnostics"
+
+
+@pytest.mark.asyncio
+async def test_a_log_tail_is_read_as_a_file_rather_than_run_as_a_command() -> None:
+    """A diagnostic must not be able to cost the episode its sandbox.
+
+    On a one-shot exec a command that stalls is stopped by destroying the container, so
+    reading the tail with `tail -c` left the collection that follows to fail against a
+    sandbox this read had already destroyed. The file API cannot do that.
+    """
+    sandbox = FakeSandbox()
+    harness = create_harness(HarnessConfig(kind="codex", executable="codex"), sandbox)
+    log_path = f"{_STAGING_DIR}/stdout.log"
+    sandbox.writes[log_path] = b"x" * 40_000 + b"THE-TAIL"
+
+    tail = await harness._read_tail(log_path)
+
+    assert tail.endswith("THE-TAIL")
+    assert len(tail) == harness.config.output_tail_chars, "The reported tail stays bounded."
+    assert not any(command.startswith("tail -c") for command, _, _ in sandbox.commands)
+    # An unreadable log still costs only a post mortem, never the episode.
+    assert await harness._read_tail(f"{_STAGING_DIR}/missing.log") == ""
 
 
 @pytest.mark.asyncio
@@ -313,9 +350,9 @@ async def test_patch_collection_reads_the_patch_file_in_full() -> None:
     """
     sandbox = FakeSandbox()
     collected = b"diff --git a/x b/x\n+line\n" * 100_000
-    sandbox.writes[_HARNESS_PATCH_PATH] = collected
+    sandbox.writes[_PATCH_PATH] = collected
 
-    patch = await collect_git_patch(sandbox, "/testbed")
+    patch = await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
 
     script, cwd, _ = sandbox.commands[-1]
     assert cwd == "/testbed"
@@ -332,9 +369,12 @@ async def test_patch_collection_reads_the_patch_file_in_full() -> None:
     # The collector never stages, so a nested repo without a commit cannot break it.
     assert "git add" not in script
     # The patch leaves the sandbox as a file rather than as command output.
-    assert f"out={_HARNESS_PATCH_PATH}" in script
+    assert f"out={_PATCH_PATH}" in script
+    # The staging directory is re-asserted by the collector itself, so a directory the
+    # agent removed cannot turn a collectable patch into a failed collection.
+    assert f"mkdir -p {_STAGING_DIR}" in script
     # A self-report the caller can read back when the backend reports no stderr.
-    assert f"diag={_HARNESS_DIAG_PATH}" in script
+    assert f"diag={_DIAG_PATH}" in script
     assert "command -v" in script
     assert "cat " not in script
     assert patch == collected.decode()
@@ -348,15 +388,46 @@ async def test_patch_collection_failure_surfaces_collector_diagnostics() -> None
     alone said nothing about which step failed.
     """
     sandbox = FakeSandbox(collect_exit_code=127)
-    sandbox.writes[_HARNESS_DIAG_PATH] = b"cwd=/testbed\nwc=MISSING\n"
+    sandbox.writes[_DIAG_PATH] = b"cwd=/testbed\nwc=MISSING\n"
 
     with pytest.raises(RuntimeError) as excinfo:
-        await collect_git_patch(sandbox, "/testbed")
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
 
     message = str(excinfo.value)
     assert "exit 127" in message
     assert "cwd='/testbed'" in message
     assert "wc=MISSING" in message
+
+
+@pytest.mark.asyncio
+async def test_mini_swe_stages_the_patch_in_the_harness_state_dir() -> None:
+    """The mini-SWE collector stages where the harness already owns the directory.
+
+    Not /tmp: that is the scratch space the harness prompt hands to the agent, and a
+    sandbox whose /tmp was gone reported a collectable patch as a failed collection.
+    """
+    loop = MiniSWEHarnessAgentLoop.__new__(MiniSWEHarnessAgentLoop)
+    loop.harness_config = HarnessConfig(kind="codex", executable="codex")
+    sandbox = FakeSandbox()
+    sandbox.writes[_PATCH_PATH] = b"diff --git a/x b/x\n"
+    task = HarnessTaskContext(
+        state=SimpleNamespace(payload={"observation": {"swe_problem": {}}}),
+        prompt="fix",
+        sandbox_spec=SandboxSpec(SandboxSource.image("image")),
+    )
+
+    artifact = await loop.collect_harness_artifact(
+        task,
+        sandbox,
+        SimpleNamespace(workdir="/testbed"),
+        HarnessResult(exit_code=0),
+    )
+
+    script, cwd, _ = sandbox.commands[-1]
+    assert cwd == "/testbed"
+    assert f"out={_PATCH_PATH}" in script
+    assert f"mkdir -p {_STAGING_DIR}" in script
+    assert artifact.patch == "diff --git a/x b/x\n"
 
 
 @pytest.mark.asyncio

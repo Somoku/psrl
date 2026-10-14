@@ -339,11 +339,10 @@ def _compute_advantage_over_valid_samples(
         # worth a line per step. Leaving a group without a relative baseline is not: that
         # group trains nothing, and the answer is to replace it.
         psrl_logger.warning(
-            "Group baseline restricted to valid samples: %d row(s) in %d group(s) are left without a relative "
-            "baseline (fewer than two measured samples), so their advantages are zero. A group with no relative "
-            "baseline trains nothing; replace those groups with the group-level dynamic-sampling filter.",
-            len(starved_rows),
-            len(starved_groups),
+            f"Group baseline restricted to valid samples: {len(starved_rows)} row(s) in "
+            f"{len(starved_groups)} group(s) are left without a relative baseline, fewer than two "
+            "measured samples. A group with no relative baseline trains nothing, so replace it with "
+            "the group-level dynamic-sampling filter."
         )
     data.batch["advantages"] = advantages
     data.batch["returns"] = returns

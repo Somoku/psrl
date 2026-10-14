@@ -114,7 +114,7 @@ def test_a_row_without_a_measurement_leaves_its_group_baseline() -> None:
 
 
 def test_each_group_is_measured_against_its_own_measured_rows() -> None:
-    # Group 7 has two measured rows and keeps measuring them against each other; group 8
+    # Group 7 has two measured rows and keeps measuring them against each other. Group 8
     # has one, which leaves it without a relative baseline.
     data = _batch([1.0, 0.5, 1.0, 0.0], [1.0, 1.0, 1.0, 0.0], [7, 7, 8, 8])
 
@@ -170,8 +170,8 @@ def test_a_masked_session_does_not_move_its_groups_baseline() -> None:
     whose episode was masked holds a placeholder instead of a measurement, so it leaves the
     statistic and its trajectories get no advantage.
     """
-    # Session 11 has two trajectories, of which the final one is measured; session 12 is
-    # measured; session 13's episode was masked as budget-truncated.
+    # Session 11 has two trajectories, of which the final one is measured. Session 12 is
+    # measured, and session 13's episode was masked as budget-truncated.
     rewards = [1.0, 1.0, 0.5, 0.0]
     masks = [1.0, 1.0, 1.0, 0.0]
     groups = [7, 7, 7, 7]

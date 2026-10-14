@@ -1,6 +1,9 @@
 import enum
 import json
+import logging
+import os
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -16,6 +19,9 @@ from verl.single_controller.ray import RayResourcePool
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
+
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 # from verl.trainer.ppo.ray_trainer import compute_response_mask
 
@@ -211,6 +217,24 @@ class PSRL_DummyWorker(Worker):
         return
 
 
+# The algorithm switch that decides whether a sample carrying no measurement may take part
+# in the cross-sample statistics an advantage is built from. Read from `algorithm`, next to
+# `norm_adv_by_std_in_grpo`, because it is a property of the advantage's population.
+VALID_BASELINE_CONFIG_KEY = "group_baseline_valid_only"
+
+
+def valid_sample_mask(response_mask: torch.Tensor) -> torch.Tensor:
+    """Return one flag per row: whether that row carries a measurement of the objective.
+
+    A row that trains no tokens is a row whose reward cannot be compared with its group's:
+    an episode no verifier ever scored, one whose loss the rollout masked as
+    budget-truncated, or a padding row that exists only to keep the batch shape. Its
+    reward is then a placeholder, and a placeholder compared as if it were a measurement
+    moves the baseline its siblings are measured against.
+    """
+    return response_mask.sum(dim=-1) > 0
+
+
 def PSRL_compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -224,6 +248,11 @@ def PSRL_compute_advantage(
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
     The advantage estimates are used to guide policy optimization in RL algorithms.
+
+    An estimator that measures a sample against its group does so over the samples that
+    carry a measurement, when ``algorithm.group_baseline_valid_only`` is on. The
+    restriction lives here rather than in each estimator so that every estimator, and
+    every caller of this function, gets it without having to know about it.
 
     Args:
         data (DataProto): The data containing batched model outputs and inputs.
@@ -242,6 +271,109 @@ def PSRL_compute_advantage(
     # Remain compatible with trainers that do not compute a response mask in fit.
     if "response_mask" not in data.batch:
         data.batch["response_mask"] = compute_response_mask(data)
+
+    def compute(rows: DataProto) -> DataProto:
+        return _compute_advantage(
+            rows,
+            adv_estimator,
+            gamma=gamma,
+            lam=lam,
+            num_repeat=num_repeat,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+
+    if config is not None and bool(config.get(VALID_BASELINE_CONFIG_KEY, False)):
+        return _compute_advantage_over_valid_samples(data, compute)
+    return compute(data)
+
+
+def _compute_advantage_over_valid_samples(
+    data: DataProto,
+    compute: Callable[[DataProto], DataProto],
+) -> DataProto:
+    """Compute advantages with the cross-sample statistics over valid samples only.
+
+    A row that trains no tokens is a row whose reward is a placeholder, and a placeholder
+    in a mean or a standard deviation moves every sibling's advantage by an amount that
+    says nothing about the task. So such rows are taken out of the statistic and put back
+    with a zero advantage: they train no tokens anyway, so nothing is lost by leaving them
+    out of the baseline as well.
+
+    A group left with fewer than two measured samples has no relative signal to offer:
+    a single sample's deviation from its own mean is zero, and a leave-one-out baseline
+    divides by a count of zero. Such a group is zeroed rather than given an absolute
+    reward as if it were a relative one, and reported, because the answer is to replace
+    the group (the group-level dynamic-sampling filter) rather than to compare against
+    nothing.
+    """
+    valid = valid_sample_mask(data.batch["response_mask"])
+    if bool(valid.all()):
+        return compute(data)
+
+    kept = torch.nonzero(valid, as_tuple=False).flatten().tolist()
+    # Resolved before the estimator runs: the groups a row belongs to are what the guard
+    # below needs, and asking for them first keeps a missing group index reported as this
+    # restriction's own requirement rather than as an estimator's precondition.
+    starved_rows, starved_groups = _starved_groups(data, kept)
+    measured = compute(data.select_idxs(kept))
+    advantages = torch.zeros_like(data.batch["token_level_rewards"])
+    returns = torch.zeros_like(data.batch["token_level_rewards"])
+    advantages[kept] = measured.batch["advantages"]
+    returns[kept] = measured.batch["returns"]
+
+    if starved_rows:
+        advantages[starved_rows] = 0.0
+        returns[starved_rows] = 0.0
+        # Excluding a row without a measurement is what this switch asks for, so it is not
+        # worth a line per step. Leaving a group without a relative baseline is not: that
+        # group trains nothing, and the answer is to replace it.
+        psrl_logger.warning(
+            "Group baseline restricted to valid samples: %d row(s) in %d group(s) are left without a relative "
+            "baseline (fewer than two measured samples), so their advantages are zero. A group with no relative "
+            "baseline trains nothing; replace those groups with the group-level dynamic-sampling filter.",
+            len(starved_rows),
+            len(starved_groups),
+        )
+    data.batch["advantages"] = advantages
+    data.batch["returns"] = returns
+    return data
+
+
+def _starved_groups(data: DataProto, kept: list[int]) -> tuple[list[int], set]:
+    """Return the rows and the groups left with fewer than two measured samples."""
+    index = _group_index(data)
+    counts: dict = {}
+    for row in kept:
+        counts[index[row]] = counts.get(index[row], 0) + 1
+    starved = {group for group, count in counts.items() if count < 2}
+    return [row for row in kept if index[row] in starved], starved
+
+
+def _group_index(data: DataProto) -> "np.ndarray":
+    """Return the group each row belongs to, as the advantage estimators read it."""
+    non_tensor = data.non_tensor_batch
+    if "parent_id" in non_tensor:
+        return non_tensor["parent_id"]
+    if "uid" in non_tensor:
+        return non_tensor["uid"]
+    raise ValueError("Restricting the group baseline needs the group each row belongs to (parent_id or uid).")
+
+
+def _compute_advantage(
+    data: DataProto,
+    adv_estimator: AdvantageEstimator,
+    gamma: float = 1.0,
+    lam: float = 1.0,
+    num_repeat: int = 1,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: AlgoConfig | None = None,
+) -> DataProto:
+    """Compute advantages from every row the caller handed over.
+
+    An estimator that measures a sample against its group does so over all of them; see
+    `PSRL_compute_advantage` for the switch that restricts that population.
+    """
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)

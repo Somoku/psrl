@@ -75,6 +75,8 @@ async def test_grader_preparation_overlaps_rollout_without_allocating_a_grader(h
     # Mirrors `AgentLoopBase.__init__`, which `__new__` skipped.
     loop.episode_budget = EpisodeBudget(None, starts_after_provisioning=True)
     loop.timeouts = resolve_rollout_timeouts(None, None)
+    # Mirrors `SessionAgentLoop.__init__`: the session view this loop counts turns from.
+    loop.session_snapshot = None
     # The base class is stubbed out for this module, so borrow the real arming hook.
     loop.arm_episode_budget = loop.episode_budget.arm
     output = SimpleNamespace()
@@ -124,6 +126,8 @@ async def test_cancelled_session_setup_cancels_preparation_and_cleans_task(harne
     # Mirrors `AgentLoopBase.__init__`, which `__new__` skipped.
     loop.episode_budget = EpisodeBudget(None, starts_after_provisioning=True)
     loop.timeouts = resolve_rollout_timeouts(None, None)
+    # Mirrors `SessionAgentLoop.__init__`: the session view this loop counts turns from.
+    loop.session_snapshot = None
     # The base class is stubbed out for this module, so borrow the real arming hook.
     loop.arm_episode_budget = loop.episode_budget.arm
     task = HarnessTaskContext(state=None, prompt="fix", sandbox_spec=SandboxSpec(SandboxSource.image("rollout")))

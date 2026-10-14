@@ -45,12 +45,12 @@ _KIND_DEFAULT_TRAJECTORY_FORMATS: dict[str, str] = {
     "codex": CODEX_JSONL,
 }
 
-# Harnesses that take no turn cap of their own. Codex runs an episode from one
-# `exec` process and exposes no `--max-turns`-style flag, so
-# `rollout.multi_turn.max_turns` silently does nothing there; the episode is
-# bounded only by the trajectory time budget. Listed by kind because the cap is
-# a property of the CLI, and a new harness that ignores it belongs here.
-_KINDS_WITHOUT_TURN_LIMIT = frozenset({"codex"})
+# Harnesses whose CLI takes no turn cap of its own. Codex runs an episode from one
+# `exec` process and exposes no `--max-turns`-style flag, so a cap cannot be handed to
+# it; the session it talks to is held to the budget instead, which is the one component
+# that sees every model call. Listed by kind because taking a cap is a property of the
+# CLI, and a new harness whose CLI takes none belongs here.
+_KINDS_WITHOUT_CLI_TURN_CAP = frozenset({"codex"})
 
 
 @dataclass(frozen=True)
@@ -150,13 +150,14 @@ class HarnessConfig:
         return _KIND_DEFAULT_TRAJECTORY_FORMATS.get(self.kind, "plain_text")
 
     @property
-    def supports_turn_limit(self) -> bool:
-        """Return whether this harness enforces `rollout.multi_turn.max_turns`.
+    def cli_takes_turn_cap(self) -> bool:
+        """Return whether this harness's CLI accepts `rollout.multi_turn.max_turns`.
 
-        A harness that does not would let a configured cap pass silently, so the
-        agent loop warns when one is set for a kind listed here.
+        A CLI that takes one stops itself at the configured number. A CLI that takes none
+        is held to the same number by the session it talks to, declared as that session's
+        turn budget, so a configured cap is honoured either way.
         """
-        return self.kind not in _KINDS_WITHOUT_TURN_LIMIT
+        return self.kind not in _KINDS_WITHOUT_CLI_TURN_CAP
 
     @classmethod
     def from_value(cls, value: HarnessConfig | DictConfig | Mapping[str, Any]) -> HarnessConfig:

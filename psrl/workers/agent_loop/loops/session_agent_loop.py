@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
-from psrl.utils.common.http_utils import delete, get, post
+from psrl.utils.common.http_utils import SESSION_TURN_BUDGET_HEADER, delete, get, post
 from psrl.utils.rollout.vision_utils import normalize_messages
 from psrl.utils.tito.training_data import build_training_data
 from psrl.workers.agent_loop.agent_data import AgentData
@@ -62,6 +62,16 @@ class SessionAgentLoop(AgentLoopBase):
             headers["x-target-dp-rank"] = str(rollout_instance_id[1])
         return headers
 
+    def session_turn_budget(self) -> int | None:
+        """Return the model-call budget this session declares, or None when it declares none.
+
+        Only a loop whose harness CLI takes no turn cap of its own declares one: for such a
+        CLI the router is the only component that sees every model call. A loop with a cap
+        in the CLI declares nothing, because that CLI already counts the parent agent's
+        turns and a second counter would have to guess at the same number.
+        """
+        return None
+
     async def create_session(self, request: dict) -> str:
         """Create one TITO session and bind its routing metadata."""
         headers = self.build_session_headers(request)
@@ -70,6 +80,9 @@ class SessionAgentLoop(AgentLoopBase):
         limit = getattr(self, "prompt_too_long_limit", None)
         if limit is not None:
             headers["x-smg-prompt-too-long-limit"] = str(limit)
+        budget = self.session_turn_budget()
+        if budget is not None:
+            headers[SESSION_TURN_BUDGET_HEADER] = str(budget)
         response = await post(
             f"{self.session_router_url}/sessions",
             payload={},

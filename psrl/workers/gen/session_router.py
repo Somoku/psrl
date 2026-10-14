@@ -10,6 +10,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from psrl.utils.common.http_utils import (
+    SESSION_TURN_ACCOUNTING_KEY,
+    SESSION_TURN_BUDGET_ERROR_CODE,
+    SESSION_TURN_BUDGET_HEADER,
     HttpResponse,
     create_aiohttp_client,
     filter_http_headers,
@@ -40,6 +43,12 @@ STATUS_ENV = "env"
 SESSION_ID_HEADER = "x-smg-tito-session-id"
 TRAJECTORY_ID_HEADER = "x-smg-tito-trajectory-id"
 
+# Codex marks every model call with its own turn metadata. `thread_source` separates a
+# subagent's calls from the parent's, which is what lets a session be held to a
+# parent-agent budget without charging a subagent's work to it.
+CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata"
+CODEX_SUBAGENT_THREAD_SOURCE = "subagent"
+
 
 @dataclass(slots=True)
 class SessionState:
@@ -69,6 +78,13 @@ class SessionState:
     continue_event: asyncio.Event = field(default_factory=asyncio.Event)
     # A continue target pins only the next turn. `None` leaves routing to SMG.
     pin_once_instance: tuple[str, str] | None = None
+    # The turn budget this session declared when it was created, and what it has spent.
+    # `main_turns` is the parent agent's model calls, which is what the budget bounds: a
+    # harness that counts its own turns counts the parent's, so charging a subagent's
+    # calls to the same budget would make one configuration mean two different numbers.
+    max_turns: int | None = None
+    main_turns: int = 0
+    subagent_turns: int = 0
 
     def __post_init__(self) -> None:
         if self.inflight == 0:
@@ -91,6 +107,18 @@ class SessionState:
         """Advance the turn counter for a specific trajectory."""
         current = self.trajectory_turns.get(trajectory_id, 0)
         self.trajectory_turns[trajectory_id] = current + 1
+
+    @property
+    def turn_budget_exhausted(self) -> bool:
+        """Whether this session has spent the turn budget it declared."""
+        return self.max_turns is not None and self.main_turns >= self.max_turns
+
+    def charge_turn(self, *, is_subagent: bool) -> None:
+        """Charge one model call to this session."""
+        if is_subagent:
+            self.subagent_turns += 1
+        else:
+            self.main_turns += 1
 
 
 class SessionRouter:
@@ -145,7 +173,89 @@ class SessionRouter:
             state = await self._ensure_state(session_id)
             async with state.lock:
                 state.headers = self.session_headers(request.headers, session_id)
+                state.max_turns = self.parse_turn_budget(request.headers)
         return self.build_response(result)
+
+    @staticmethod
+    def parse_turn_budget(headers: Mapping[str, str]) -> int | None:
+        """Read the model-call budget a session declared, or None when it declared none.
+
+        Only a harness whose CLI takes no cap of its own declares one, so a session that
+        declares nothing is unbounded here and bounded by its CLI if it has one.
+        """
+        raw = headers.get(SESSION_TURN_BUDGET_HEADER)
+        if raw is None:
+            return None
+        try:
+            budget = int(str(raw).strip())
+        except ValueError:
+            psrl_logger.warning(f"Ignoring an unreadable {SESSION_TURN_BUDGET_HEADER} value: {raw!r}.")
+            return None
+        return budget if budget > 0 else None
+
+    @staticmethod
+    def is_subagent_request(request: Request) -> bool:
+        """Whether this model call is a subagent's rather than the parent agent's.
+
+        Codex labels every call with its own turn metadata. A caller that sends no such
+        label has its calls charged to the parent, which is the stricter reading: a call
+        that cannot be attributed still spends the session's budget.
+        """
+        raw = request.headers.get(CODEX_TURN_METADATA_HEADER)
+        if not raw:
+            return False
+        try:
+            metadata = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        return isinstance(metadata, dict) and metadata.get("thread_source") == CODEX_SUBAGENT_THREAD_SOURCE
+
+    async def charge_session_turn(self, state: SessionState, request: Request) -> HttpResponse | None:
+        """Charge this model call to its session, refusing it once the budget is spent.
+
+        Charged on the attempt rather than on success: the budget bounds what a session
+        may ask for, and a call that fails and is retried is another ask. Once the parent
+        agent's budget is spent nothing more runs, so a subagent's call is refused too.
+
+        Returns the response to send instead of running the turn, or None to run it.
+        """
+        is_subagent = self.is_subagent_request(request)
+        async with state.lock:
+            if state.turn_budget_exhausted:
+                psrl_logger.info(
+                    f"Session {state.headers.get(SESSION_ID_HEADER, '?')!r} spent its turn budget "
+                    f"(main_turns={state.main_turns}, subagent_turns={state.subagent_turns}); refusing this turn."
+                )
+                return self.turn_budget_response(state)
+            state.charge_turn(is_subagent=is_subagent)
+        return None
+
+    @staticmethod
+    def turn_budget_response(state: SessionState) -> HttpResponse:
+        """Build the refusal a session gets when its turn budget is spent.
+
+        It carries the code in the body because a harness CLI echoes an error body
+        verbatim into its own output, and that is where the framework reads an episode's
+        stop reason from. The header repeats it for callers that classify on it, the way
+        the gateway's own sentinels are read.
+        """
+        return HttpResponse(
+            status=400,
+            body=json.dumps(
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": SESSION_TURN_BUDGET_ERROR_CODE,
+                        "message": (
+                            f"this session's turn budget ({state.max_turns}) is spent; "
+                            "stop working and report what you have"
+                        ),
+                    }
+                },
+                ensure_ascii=False,
+            ).encode(),
+            headers={"content-type": "application/json", "x-smg-error-code": SESSION_TURN_BUDGET_ERROR_CODE},
+        )
 
     async def get_session(self, sid: str) -> Response:
         result = await self._request_upstream("GET", f"{TITO_SESSIONS_PATH}/{sid}")
@@ -156,7 +266,33 @@ class SessionRouter:
                     result.headers["x-base-worker-id"] = state.base_worker_id
                 if state.target_dp_rank is not None:
                     result.headers["x-target-dp-rank"] = state.target_dp_rank
+                result = self.with_turn_accounting(result, state)
         return self.build_response(result)
+
+    @staticmethod
+    def with_turn_accounting(result: HttpResponse, state: SessionState) -> HttpResponse:
+        """Add this router's turn accounting to a session view it is proxying.
+
+        A body that will not parse is passed through untouched: the session view is the
+        gateway's, and its shape is not this router's to guarantee.
+        """
+        try:
+            body = result.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return result
+        if not isinstance(body, dict):
+            return result
+        body[SESSION_TURN_ACCOUNTING_KEY] = {
+            "max_turns": state.max_turns,
+            "main_turns": state.main_turns,
+            "subagent_turns": state.subagent_turns,
+            "exhausted": state.turn_budget_exhausted,
+        }
+        return HttpResponse(
+            status=result.status,
+            body=json.dumps(body, ensure_ascii=False).encode(),
+            headers=result.headers,
+        )
 
     async def delete_session(self, sid: str) -> Response:
         state = await self._ensure_state(sid)
@@ -304,6 +440,13 @@ class SessionRouter:
     ) -> tuple[HttpResponse, Mapping[str, object] | None]:
         """Run one completed protocol turn with shared TITO bookkeeping."""
         state = await self._ensure_state(sid)
+
+        # This is where a model call is made, so it is where a declared turn budget is
+        # enforced. Charging happens before the hang wait: a session that is out of turns
+        # must not be held open waiting to be continued.
+        refusal = await self.charge_session_turn(state, request)
+        if refusal is not None:
+            return refusal, None
 
         # SMG owns trajectory resolution in auto mode, so the SessionRouter only
         # tracks caller-selected IDs in manual mode.

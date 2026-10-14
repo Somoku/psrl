@@ -21,6 +21,8 @@ import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
+from psrl.utils.common.http_utils import SESSION_TURN_BUDGET_ERROR_CODE
+
 # Trajectory output formats. These key both this dispatch and `HarnessConfig`'s
 # kind default, so they live here rather than in two places.
 CLAUDE_CODE_STREAM_JSON = "claude_code_stream_json"
@@ -105,6 +107,32 @@ def _claude_code_hit_the_turn_cap(event: dict) -> bool:
     return event.get("terminal_reason") == STOP_REASON_MAX_TURNS or event.get("subtype") == "error_max_turns"
 
 
+def _parse_codex_episode(log_bytes: bytes) -> HarnessEpisodeSummary | None:
+    """Read a Codex run's own report of how it stopped.
+
+    Codex reports no turn count of its own: its ``turn`` is one submission, not one model
+    call, so a single ``exec`` reports one turn however many times it called the model.
+    The one stop reason it can be asked about is a budget this framework enforced, because
+    it arrives as an error whose body the CLI echoes verbatim. Any other reason is the
+    CLI's own wording, which is not this module's vocabulary, so it is left unreported.
+    """
+    for event in _iter_json_events(log_bytes):
+        if any(SESSION_TURN_BUDGET_ERROR_CODE in message for message in _codex_error_messages(event)):
+            return HarnessEpisodeSummary(stop_reason=STOP_REASON_MAX_TURNS)
+    return None
+
+
+def _codex_error_messages(event: dict) -> Iterator[str]:
+    """Yield the error text of one Codex event, if it carries any."""
+    if event.get("type") == "error" and isinstance(event.get("message"), str):
+        yield event["message"]
+        return
+    if event.get("type") == "turn.failed":
+        error = event.get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            yield error["message"]
+
+
 def _iter_json_events(log_bytes: bytes) -> Iterator[dict]:
     """Yield the JSON objects in one JSONL stream, skipping anything else.
 
@@ -126,4 +154,5 @@ def _iter_json_events(log_bytes: bytes) -> Iterator[dict]:
 
 _EPISODE_PARSERS: dict[str, Callable[[bytes], HarnessEpisodeSummary | None]] = {
     CLAUDE_CODE_STREAM_JSON: _parse_claude_code_episode,
+    CODEX_JSONL: _parse_codex_episode,
 }

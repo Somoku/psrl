@@ -13,6 +13,7 @@ from typing import Any
 from omegaconf import DictConfig
 
 from psrl.sandbox import SandboxFeature, SandboxLease, SandboxSession, SnapshotKind, SnapshotRef, SyncSandboxManager
+from psrl.utils.common.http_utils import SESSION_TURN_ACCOUNTING_KEY
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.harness import (
     STOP_REASON_MAX_TURNS,
@@ -111,9 +112,6 @@ class HarnessAgentLoop(SessionAgentLoop):
         self.harness_config = HarnessConfig.from_value(harness)
         self.compaction_budget: tuple[int, int] | None = None
         self.prompt_too_long_limit: int | None = None
-        # A turn cap the harness ignores is worth saying once per loop, not once per
-        # request, so the warning is emitted on the first request and never again.
-        self._turn_limit_warned = False
         # Set by a task hook when grading never ran, so the completed trajectory is kept
         # and reported as ungraded instead of being discarded or scored as a measured zero.
         self.grader_unavailable = False
@@ -313,21 +311,18 @@ class HarnessAgentLoop(SessionAgentLoop):
 
         A positive number caps the episode's turns; anything else -- null, -1, or
         any non-positive value -- means no cap, so the episode is bounded by
-        ``rollout.agent.trajectory_timeout`` alone. A harness that takes no turn
-        cap ignores a positive value too, so a configured one is reported rather
-        than silently doing nothing.
+        ``rollout.agent.trajectory_timeout`` alone.
+
+        A cap is honoured whichever way this harness can take one: handed to a CLI that
+        takes it, and declared to the session as its turn budget for one that does not.
         """
-        limit = None if configured is None or int(configured) < 1 else int(configured)
-        if limit is not None and not self.harness_config.supports_turn_limit and not self._turn_limit_warned:
-            self._turn_limit_warned = True
-            psrl_logger.warning(
-                "rollout.multi_turn.max_turns=%s is set, but the %r harness takes no turn cap and ignores it, "
-                "so the episode is bounded by rollout.agent.trajectory_timeout instead. Unset it (or set -1) "
-                "to silence this.",
-                limit,
-                self.harness_config.kind,
-            )
-        return limit
+        return None if configured is None or int(configured) < 1 else int(configured)
+
+    def session_turn_budget(self) -> int | None:
+        """Declare the turn cap to the session when this harness's CLI takes none."""
+        if self.max_turns is None or self.harness_config.cli_takes_turn_cap:
+            return None
+        return self.max_turns
 
     async def run(
         self,
@@ -704,15 +699,35 @@ class HarnessAgentLoop(SessionAgentLoop):
     def _episode_num_turns(self, training_data: list[dict]) -> int:
         """Return how many turns the episode ran.
 
-        The harness's own count when it reported one. Otherwise the longest trajectory's,
-        which is the best reconstruction available and is still short of the truth for a
-        session whose trajectories are segments of one run: only the harness knows how many
-        turns it ran across a rewrite, so a harness that reports nothing cannot be summed
-        into an episode count.
+        Three sources, in the order they can be trusted. The harness's own count, which
+        knows how many turns it ran across a context rewrite. Failing that, the session's
+        accounting of the model calls the parent agent made, which is the same thing
+        counted from outside and is what a session with a declared budget is held to.
+        Failing both, the longest trajectory's count: a reconstruction that cannot see
+        past the last rewrite, so it is short rather than wrong about a session that has
+        no other record.
         """
         if self._episode_summary is not None and self._episode_summary.num_turns is not None:
             return int(self._episode_summary.num_turns)
+        session_main_turns = self._session_main_turns()
+        if session_main_turns is not None:
+            return session_main_turns
         return max((int(item.get("num_turns") or 0) for item in training_data), default=0)
+
+    def _session_main_turns(self) -> int | None:
+        """Return the parent agent's model calls as the session counted them.
+
+        Read from the session view the loop already fetched. Absent for a session whose
+        router did not report it, which is a session no budget applies to.
+        """
+        snapshot = self.session_snapshot
+        if not isinstance(snapshot, dict):
+            return None
+        accounting = snapshot.get(SESSION_TURN_ACCOUNTING_KEY)
+        if not isinstance(accounting, dict):
+            return None
+        main_turns = accounting.get("main_turns")
+        return int(main_turns) if isinstance(main_turns, int) else None
 
     def _stamp_reward_info(
         self,

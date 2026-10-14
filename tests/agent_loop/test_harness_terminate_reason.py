@@ -109,57 +109,49 @@ def test_an_unlimited_episode_finishes_instead_of_exceeding_turns() -> None:
     assert HarnessAgentLoop.get_harness_terminate_reason(loop, data) is TerminateReason.FINISHED
 
 
-def _limit_loop(kind: str, *, supports_turn_limit: bool) -> SimpleNamespace:
+def _limit_loop(kind: str, *, cli_takes_turn_cap: bool, max_turns: int | None = None) -> SimpleNamespace:
     return SimpleNamespace(
-        harness_config=SimpleNamespace(kind=kind, supports_turn_limit=supports_turn_limit),
-        _turn_limit_warned=False,
+        harness_config=SimpleNamespace(kind=kind, cli_takes_turn_cap=cli_takes_turn_cap),
+        max_turns=max_turns,
     )
 
 
 @pytest.mark.parametrize("configured", [None, -1, 0, -5])
 def test_a_non_positive_turn_budget_means_unlimited(configured) -> None:
-    loop = _limit_loop("claude_code", supports_turn_limit=True)
+    loop = _limit_loop("claude_code", cli_takes_turn_cap=True)
 
     assert HarnessAgentLoop._resolve_turn_limit(loop, configured) is None
 
 
 def test_a_positive_turn_budget_is_a_cap() -> None:
-    loop = _limit_loop("claude_code", supports_turn_limit=True)
+    loop = _limit_loop("claude_code", cli_takes_turn_cap=True)
 
     assert HarnessAgentLoop._resolve_turn_limit(loop, 80) == 80
-    # The supported harness does not warn about a cap it honours.
-    assert loop._turn_limit_warned is False
 
 
-def test_a_turn_cap_on_a_harness_that_ignores_it_warns_once(caplog) -> None:
-    import logging
+def test_a_harness_whose_cli_takes_no_cap_declares_the_session_budget() -> None:
+    """A CLI that cannot be handed a cap is held to it by the session it talks to.
 
-    loop = _limit_loop("codex", supports_turn_limit=False)
+    Codex exposes no `--max-turns`, so the configured cap reaches it as the session's turn
+    budget instead of silently doing nothing.
+    """
+    loop = _limit_loop("codex", cli_takes_turn_cap=False, max_turns=80)
 
-    with caplog.at_level(logging.WARNING):
-        assert HarnessAgentLoop._resolve_turn_limit(loop, 80) == 80
-
-    warnings = [r for r in caplog.records if "takes no turn cap" in r.getMessage()]
-    assert len(warnings) == 1, "a cap the harness ignores must be reported"
-    assert loop._turn_limit_warned is True
-
-    # A second request does not repeat the warning.
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        HarnessAgentLoop._resolve_turn_limit(loop, 80)
-    assert not [r for r in caplog.records if "takes no turn cap" in r.getMessage()]
+    assert HarnessAgentLoop.session_turn_budget(loop) == 80
 
 
-def test_an_unset_turn_budget_on_a_codex_loop_does_not_warn(caplog) -> None:
-    # Unlimited is the intended default for codex, not a misconfiguration.
-    import logging
+def test_a_harness_whose_cli_takes_the_cap_declares_no_session_budget() -> None:
+    # Its CLI already counts the parent agent's turns, so a second counter would have to
+    # guess at the same number.
+    loop = _limit_loop("claude_code", cli_takes_turn_cap=True, max_turns=80)
 
-    loop = _limit_loop("codex", supports_turn_limit=False)
+    assert HarnessAgentLoop.session_turn_budget(loop) is None
 
-    with caplog.at_level(logging.WARNING):
-        assert HarnessAgentLoop._resolve_turn_limit(loop, None) is None
 
-    assert not [r for r in caplog.records if "takes no turn cap" in r.getMessage()]
+def test_an_unset_turn_budget_declares_nothing() -> None:
+    loop = _limit_loop("codex", cli_takes_turn_cap=False, max_turns=None)
+
+    assert HarnessAgentLoop.session_turn_budget(loop) is None
 
 
 def test_any_trajectory_over_budget_marks_the_request_truncated() -> None:

@@ -12,6 +12,7 @@ import json
 from types import MethodType, SimpleNamespace
 
 import pytest
+from psrl.utils.common.http_utils import SESSION_TURN_BUDGET_ERROR_CODE
 from psrl.workers.agent_loop.harness import (
     CLAUDE_CODE_STREAM_JSON,
     CODEX_JSONL,
@@ -135,16 +136,17 @@ def _item(num_turns: int) -> dict:
 def _loop(**attributes) -> SimpleNamespace:
     """A stand-in loop whose bound helpers are the real ones.
 
-    These tests call unbound loop methods, so the stand-in has to answer a method that
-    another method calls on it.
+    These tests call unbound loop methods, so the stand-in has to answer the methods those
+    call on it.
     """
     loop = SimpleNamespace(**attributes)
-    loop._episode_num_turns = MethodType(HarnessAgentLoop._episode_num_turns, loop)
+    for helper in ("_episode_num_turns", "_session_main_turns"):
+        setattr(loop, helper, MethodType(getattr(HarnessAgentLoop, helper), loop))
     return loop
 
 
-def _stamped_loop(episode: HarnessEpisodeSummary | None) -> SimpleNamespace:
-    return _loop(_episode_summary=episode)
+def _stamped_loop(episode: HarnessEpisodeSummary | None, snapshot: dict | None = None) -> SimpleNamespace:
+    return _loop(_episode_summary=episode, session_snapshot=snapshot or {})
 
 
 def test_the_session_reports_the_harness_count_as_its_own_turn_count() -> None:
@@ -202,3 +204,119 @@ def test_the_summary_prints_the_local_count_and_the_episode_count_separately() -
 
     assert "turns: 12" in text
     assert "episode_turns: 47" in text
+
+
+# --- Codex: what it can and cannot report ---------------------------------------------
+
+BUDGET_CODE = SESSION_TURN_BUDGET_ERROR_CODE
+
+
+def _codex_budget_error() -> dict:
+    """The event Codex emits when the session router refuses its turn."""
+    body = json.dumps({"error": {"code": "session_turn_budget_exhausted", "message": "budget spent"}})
+    return {"type": "error", "message": body}
+
+
+def test_codex_reports_a_spent_turn_budget_as_the_turn_cap() -> None:
+    """The refusal travels back through the CLI's own output.
+
+    The router's error body is echoed verbatim by the CLI, which is the only channel a
+    Codex episode has for saying it was stopped by a cap.
+    """
+    log = _events({"type": "turn.started"}, _codex_budget_error())
+
+    summary = episode_summary(CODEX_JSONL, log)
+
+    assert summary is not None
+    assert summary.stop_reason == STOP_REASON_MAX_TURNS
+    # Codex counts turns, not model calls, so it has no count to report.
+    assert summary.num_turns is None
+
+
+def test_codex_reports_a_spent_turn_budget_from_a_failed_turn() -> None:
+    log = _events(
+        {"type": "error", "message": "stream disconnected"},
+        {"type": "turn.failed", "error": {"message": json.dumps({"error": {"code": BUDGET_CODE}})}},
+    )
+
+    summary = episode_summary(CODEX_JSONL, log)
+
+    assert summary is not None
+    assert summary.stop_reason == STOP_REASON_MAX_TURNS
+
+
+def test_a_codex_run_that_ended_for_another_reason_reports_nothing() -> None:
+    """Only the code this framework emits is translated.
+
+    Codex's own wording is not this module's vocabulary, and inventing a mapping for it
+    would label an episode from a guess.
+    """
+    log = _events(
+        {"type": "turn.completed", "usage": {"input_tokens": 1}},
+        {"type": "error", "message": "stream disconnected before completion"},
+        {"type": "turn.failed", "error": {"message": "stream disconnected before completion"}},
+    )
+
+    assert episode_summary(CODEX_JSONL, log) is None
+
+
+def test_the_budget_code_inside_model_output_is_not_a_stop_reason() -> None:
+    """The code is read from the CLI's error events, not from anywhere in the log.
+
+    A log is mostly what the model produced; a conversation that happens to discuss this
+    code must not be read as an episode the code stopped.
+    """
+    log = _events(
+        {"type": "item.completed", "item": {"type": "agent_message", "text": f"the code {BUDGET_CODE} means..."}},
+        {"type": "turn.completed", "usage": {}},
+    )
+
+    assert episode_summary(CODEX_JSONL, log) is None
+
+
+# --- Which count an episode reports ---------------------------------------------------
+
+
+def _router_snapshot(main_turns: int | None) -> dict:
+    if main_turns is None:
+        return {}
+    return {
+        "psrl_turn_accounting": {
+            "max_turns": 8,
+            "main_turns": main_turns,
+            "subagent_turns": 2,
+            "exhausted": False,
+        }
+    }
+
+
+def _counting_loop(episode, snapshot) -> SimpleNamespace:
+    loop = _loop(
+        _episode_summary=episode,
+        session_snapshot=snapshot,
+        max_turns=None,
+        harness_config=SimpleNamespace(kind="codex", cli_takes_turn_cap=False),
+    )
+    return loop
+
+
+def test_the_harness_own_count_wins_over_the_session_accounting() -> None:
+    loop = _counting_loop(HarnessEpisodeSummary(stop_reason=None, num_turns=90), _router_snapshot(12))
+    training_data = [_item(3), _item(41)]
+
+    assert HarnessAgentLoop._episode_num_turns(loop, training_data) == 90
+
+
+def test_the_session_accounting_is_used_when_the_harness_reports_no_count() -> None:
+    """A Codex session's model calls are counted from outside, excluding subagents."""
+    loop = _counting_loop(None, _router_snapshot(12))
+    training_data = [_item(3), _item(41)]
+
+    assert HarnessAgentLoop._episode_num_turns(loop, training_data) == 12
+
+
+def test_a_session_without_accounting_falls_back_to_the_longest_trajectory() -> None:
+    loop = _counting_loop(None, _router_snapshot(None))
+    training_data = [_item(3), _item(41)]
+
+    assert HarnessAgentLoop._episode_num_turns(loop, training_data) == 41

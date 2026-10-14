@@ -149,7 +149,7 @@ def assert_response_aligned_lengths(
         if divergent:
             offenders[name] = [(int(row), int(reference_lengths[row]), int(lengths[row])) for row in divergent[:5]]
 
-    psrl_logger.info(
+    psrl_logger.debug(
         f"[length-contract] stage={stage}: rows={reference_lengths.numel()} reference={reference} "
         f"min={int(reference_lengths.min())} max={longest} offenders={sorted(offenders)} "
         f"truncated={sorted(truncated)}."

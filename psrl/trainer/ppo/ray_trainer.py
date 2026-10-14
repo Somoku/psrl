@@ -3189,7 +3189,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         fields = [
             "uid",
             "parent_id",
-            "responses",
             "response_mask",
             "rm_scores",
             "rollout_log_probs",
@@ -3199,9 +3198,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         ]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
         # A producer that gets a length wrong only changes a width here, and the advantage math
-        # reads two fields that were padded apart from each other.
+        # reads two fields that were padded apart from each other. `responses` anchors the mask
+        # at the old-log-prob stage, so the mask can anchor the rest without fetching it again.
         assert_response_aligned_lengths(
-            {"responses": data["responses"], **{n: data[n] for n in RESPONSE_ALIGNED_FIELDS if n in data.keys()}},
+            {n: data[n] for n in RESPONSE_ALIGNED_FIELDS if n in data.keys()},
+            reference="response_mask",
             stage="advantage",
         )
         response_mask = data["response_mask"]

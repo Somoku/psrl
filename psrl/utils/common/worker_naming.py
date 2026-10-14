@@ -21,6 +21,12 @@ from psrl.utils.common.nixl_names import (
 
 WorkerRole = Literal["rollout", "actor", "validate"]
 
+# The model a client carries weights for. Several models train at once in PPO, and each
+# publishes its own version stream of keys that are *named identically* ("model.layers.0...").
+# The model name therefore belongs in the client name: the meta server unifies sharding and
+# plans transfers per model, and it knows a client's name before it knows anything else about it.
+DEFAULT_MODEL_ROLE = "actor"
+
 
 @dataclass(frozen=True)
 class WorkerKey:
@@ -57,7 +63,7 @@ class WorkerKey:
         """
         return f"{self.role}_I{self.instance_id}_R{self.rank}"
 
-    def to_nixl_client_name(self, n_rollout_instances: int = 0) -> str:
+    def to_nixl_client_name(self, n_rollout_instances: int = 0, model_role: str = DEFAULT_MODEL_ROLE) -> str:
         """
         Return the NIXL client name registered with the meta server.
 
@@ -69,17 +75,17 @@ class WorkerKey:
         Args:
             n_rollout_instances (int): Total number of rollout instances.
                 Only used when role='validate' and ignored for 'rollout' and 'actor'. Defaults to 0.
+            model_role (str): Which model this worker carries, e.g. 'actor' or 'critic'.
 
         Returns:
             str: NIXL client name, e.g. 'NIXLGenClient_I2_R0'.
         """
         if self.role == "rollout":
-            return f"{NIXL_GEN_CLIENT_PREFIX}_I{self.instance_id}_R{self.rank}"
+            return gen_client_name(self.instance_id, self.rank, model_role)
         elif self.role == "validate":
-            nixl_instance_id = n_rollout_instances + self.instance_id
-            return f"{NIXL_GEN_CLIENT_PREFIX}_I{nixl_instance_id}_R{self.rank}"
+            return gen_client_name(n_rollout_instances + self.instance_id, self.rank, model_role)
         elif self.role == "actor":
-            return f"{NIXL_TRAIN_CLIENT_PREFIX}_{self.rank}"
+            return train_client_name(self.rank, model_role)
         else:
             raise AssertionError(
                 f"to_nixl_client_name: unhandled role {self.role!r}. Expected 'rollout', 'actor', or 'validate'."
@@ -131,7 +137,33 @@ def ps_client_pull_name(rank: int) -> str:
 # --- Gen / train worker naming helpers ---
 
 
-def gen_client_name(instance_id: int, rank: int) -> str:
+def model_role_of(client_name: str) -> str:
+    """
+    The model role encoded in a NIXL client name, `DEFAULT_MODEL_ROLE` when the name carries none.
+
+    Args:
+        client_name (str): A name built by `gen_client_name` or `train_client_name`.
+    """
+    for prefix in (NIXL_GEN_CLIENT_PREFIX, NIXL_TRAIN_CLIENT_PREFIX, NIXL_PS_CLIENT_PREFIX):
+        if client_name.startswith(prefix + "_"):
+            rest = client_name[len(prefix) + 1 :]
+            head = rest.split("_", 1)[0]
+            # A role is alphabetic; `NIXLTrainClient_3` and `NIXLGenClient_I0_R1` carry none.
+            return head if head.isalpha() and not head.startswith("I") else DEFAULT_MODEL_ROLE
+    return DEFAULT_MODEL_ROLE
+
+
+def _role_infix(model_role: str) -> str:
+    """`""` for the default role, so existing names and logs are unchanged, `"<role>_"` otherwise."""
+    if model_role == DEFAULT_MODEL_ROLE:
+        return ""
+    assert model_role.isalpha() and not model_role.startswith("I"), (
+        f"A model role must be alphabetic and not start with 'I', got {model_role!r}."
+    )
+    return f"{model_role}_"
+
+
+def gen_client_name(instance_id: int, rank: int, model_role: str = DEFAULT_MODEL_ROLE) -> str:
     """
     Return the NIXL client name for a gen worker.
 
@@ -143,11 +175,12 @@ def gen_client_name(instance_id: int, rank: int) -> str:
         instance_id (int): Final NIXL instance_id (offset already applied
             by the caller for validate workers).
         rank (int): Worker rank within the instance.
+        model_role (str): Which model this client carries, e.g. 'actor' or 'critic'.
 
     Returns:
-        str: Gen client name, e.g. 'NIXLGenClient_I1_R0'.
+        str: Gen client name, e.g. 'NIXLGenClient_I1_R0' or 'NIXLGenClient_critic_I1_R0'.
     """
-    return f"{NIXL_GEN_CLIENT_PREFIX}_I{instance_id}_R{rank}"
+    return f"{NIXL_GEN_CLIENT_PREFIX}_{_role_infix(model_role)}I{instance_id}_R{rank}"
 
 
 def gen_client_instance(client_name: str) -> int:
@@ -157,19 +190,20 @@ def gen_client_instance(client_name: str) -> int:
     Args:
         client_name (str): Gen client name, e.g. 'NIXLGenClient_I1_R0'.
     """
-    prefix = f"{NIXL_GEN_CLIENT_PREFIX}_I"
+    prefix = f"{NIXL_GEN_CLIENT_PREFIX}_{_role_infix(model_role_of(client_name))}I"
     assert client_name.startswith(prefix), f"{client_name!r} is not a gen client name."
     return int(client_name[len(prefix) :].split("_R", 1)[0])
 
 
-def train_client_name(rank: int) -> str:
+def train_client_name(rank: int, model_role: str = DEFAULT_MODEL_ROLE) -> str:
     """
     Return the NIXL client name for a train (actor) worker.
 
     Args:
         rank (int): Global rank of the train worker.
+        model_role (str): Which model this client carries, e.g. 'actor' or 'critic'.
 
     Returns:
-        str: Train client name, e.g. 'NIXLTrainClient_3'.
+        str: Train client name, e.g. 'NIXLTrainClient_3' or 'NIXLTrainClient_critic_3'.
     """
-    return f"{NIXL_TRAIN_CLIENT_PREFIX}_{rank}"
+    return f"{NIXL_TRAIN_CLIENT_PREFIX}_{_role_infix(model_role)}{rank}"

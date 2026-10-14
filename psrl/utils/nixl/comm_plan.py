@@ -84,6 +84,23 @@ class NIXLCommPlan:
         return result
 
 
+def merge_comm_plans(plans: list[NIXLCommPlan]) -> NIXLCommPlan:
+    """
+    Merge the per model plans into one.
+
+    Every client belongs to exactly one model, so the per client dicts have disjoint keys and
+    the merge cannot silently drop or overwrite an entry. The assertion states that.
+    """
+    merged = NIXLCommPlan(push_to_ps_plan={}, rollout_pull_from_ps_plan={}, train_pull_from_ps_plan={}, peer_groups={})
+    for plan in plans:
+        for name in ("push_to_ps_plan", "rollout_pull_from_ps_plan", "train_pull_from_ps_plan", "peer_groups"):
+            target, source = getattr(merged, name), getattr(plan, name)
+            clash = set(target).intersection(source)
+            assert not clash, f"{name}: {sorted(clash)} appear in two models' plans."
+            target.update(source)
+    return merged
+
+
 class CommunicationPlanner:
     """Intelligent communication planning with load balancing"""
 

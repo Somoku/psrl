@@ -7,8 +7,9 @@ from copy import deepcopy
 from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
+from psrl.utils.common.worker_naming import model_role_of
 from psrl.utils.nixl.block_fp8 import SCALE_SUFFIX
-from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLCommPlan
+from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLCommPlan, merge_comm_plans
 from psrl.utils.nixl.handshake_notif import NotifKind, decode
 from psrl.utils.nixl.join_admission import JoinDecision, JoinVerdict, classify_join
 from psrl.utils.nixl.membership import Membership, MembershipChange, MembershipEvent
@@ -278,9 +279,26 @@ class NIXLMetaServer:
             "Unified sharding already made; pass rebuild=True to replan after a join."
         )
         _t_start = time.time()
+        # Models train side by side (actor, critic) and their keys are named identically, so
+        # a key is only ever unified within one model's clients. Mixing them would give a
+        # rollout a plan that reads the other model's bytes for a correctly shaped tensor.
+        by_role: dict[str, dict] = {}
+        for client_name, sharding_dict in self.client_sharding_dicts.items():
+            by_role.setdefault(model_role_of(client_name), {})[client_name] = sharding_dict
+        for role, role_dicts in sorted(by_role.items()):
+            self._unify_role(role, role_dicts)
+        psrl_logger.info(
+            f"[timing] make_unified_sharding done: total={time.time() - _t_start:.3f}s, "
+            f"roles={sorted(by_role)}, n_clients={len(self.client_sharding_dicts)}"
+        )
+        self.log_finest_mesh_summary()
+
+    def _unify_role(self, role: str, client_sharding_dicts: dict) -> None:
+        """Build the finest common sharding of one model's keys, over that model's clients only."""
+        _t_start = time.time()
         # We first need to guarantee that all client shardings have the same keys
         all_keys = set()
-        for client_name, sharding_dict in self.client_sharding_dicts.items():
+        for client_name, sharding_dict in client_sharding_dicts.items():
             all_keys.update(sharding_dict.keys())
         _t_keys = time.time()
         # A block scale shards exactly like its weight, so a client holding only the weight produces its scale,
@@ -289,12 +307,12 @@ class NIXLMetaServer:
             base = key[: -len(SCALE_SUFFIX)]
             declared = {
                 d[key].scale_tile
-                for d in self.client_sharding_dicts.values()
+                for d in client_sharding_dicts.values()
                 if key in d and getattr(d[key], "scale_tile", None) is not None
             }
             assert len(declared) <= 1, f"{key}: rollouts declare different scale tiles {sorted(declared)}."
             tile = next(iter(declared), None)
-            for sharding_dict in self.client_sharding_dicts.values():
+            for sharding_dict in client_sharding_dicts.values():
                 held = sharding_dict.get(key)
                 if (held is None or held.is_empty) and base in sharding_dict and not sharding_dict[base].is_empty:
                     sharding_dict[key] = deepcopy(sharding_dict[base])
@@ -302,14 +320,14 @@ class NIXLMetaServer:
         # Build each key's finest common sharding representation.
         for key in all_keys:
             shard_mesh_list = []
-            for client_name, sharding_dict in self.client_sharding_dicts.items():
+            for client_name, sharding_dict in client_sharding_dicts.items():
                 if key not in sharding_dict:
                     # Pipeline stages may omit keys but still need an empty shard descriptor.
                     sharding_dict[key] = NIXLSharding.empty()
                 shard_mesh_list.append(sharding_dict[key].shard_mesh)
             finest_shard_mesh = NIXLSharding.find_finest_shard_mesh(shard_mesh_list)
             self.finest_shard_meshes[key] = dict(finest_shard_mesh)
-            for client_name, sharding_dict in self.client_sharding_dicts.items():
+            for client_name, sharding_dict in client_sharding_dicts.items():
                 if client_name not in self.client_unified_sharding_dicts:
                     self.client_unified_sharding_dicts[client_name] = {}
                 # NOTE(claude): Mutation is safe because `client_sharding_dicts` is
@@ -387,9 +405,14 @@ class NIXLMetaServer:
         psrl_logger.info("Making communication plan...")
         start = time.time()
         try:
-            self.comm_plan = CommunicationPlanner(peer_diffusion=self._peer_diffusion).make_comm_plan(
-                self.client_infos
-            )
+            # One plan per model, merged. A transfer never crosses models, so planning them
+            # together would only let a reader be matched to the wrong model's source.
+            planner = CommunicationPlanner(peer_diffusion=self._peer_diffusion)
+            by_role: dict[str, dict] = {}
+            for name, info in self.client_infos.items():
+                by_role.setdefault(model_role_of(name), {})[name] = info
+            plans = [planner.make_comm_plan(infos) for _, infos in sorted(by_role.items())]
+            self.comm_plan = plans[0] if len(plans) == 1 else merge_comm_plans(plans)
         except Exception as e:
             psrl_logger.error(f"Failed to make communication plan: {e}")
             raise e

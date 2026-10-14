@@ -1177,7 +1177,15 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             self._solo_pulls = getattr(self, "_solo_pulls", 0) + 1
             epoch, participants = -self._solo_pulls, [self.get_replica_idx()]
         if not self.psrl_config.profile.fix_weight:
-            await self.engine.collective_rpc("nixl_pull_model_core", args=(epoch, participants))
+            reached = await self.engine.collective_rpc("nixl_pull_model_core", args=(epoch, participants))
+            if not all(reached):
+                # D6/D7: some key had no live train source, so the weights were left untouched. The
+                # version is not committed and the caller keeps generating at the one it already has.
+                psrl_logger.warning(
+                    f"{self.base_worker_id}: {sum(not r for r in reached)} of {len(reached)} rank(s) found no "
+                    f"live source for some keys; keeping the current version."
+                )
+                return self.curr_rollout_instance_model_version[0]
         # C2: the version commit is not made here. It rides on the shared-pull lock
         # release (`finish_shared_pull`), which has to happen anyway -- so the commit
         # costs no round trip of its own. `_pull_commit_instance_ids` tells the lock

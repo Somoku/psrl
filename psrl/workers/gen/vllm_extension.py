@@ -19,6 +19,7 @@ from psrl.utils.nixl import (
     NIXLClientType,
     NIXLStorageClient,
 )
+from psrl.utils.nixl.pull_engine import ChunkUnavailable
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -211,9 +212,17 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """Versions the last pull read, for the caller to compare against the announced one."""
         return set(getattr(self, "pulled_version", set()))
 
-    def nixl_pull_model_core(self, epoch: int, participant_instances: list[int] | None = None):
+    def nixl_mark_sources_unavailable(self, sources: list[str]) -> None:
+        """Stop reading from train ranks the coordinator has declared dead (design 3.5.7, D7)."""
+        self.nixl_storage_client.pull_engine().mark_unavailable(sources)
+
+    def nixl_pull_model_core(self, epoch: int, participant_instances: list[int] | None = None) -> bool:
         """
         Pull the latest weights through the NIXL pull engine.
+
+        Returns whether the weights now hold the published version. False means no live train rank
+        holds some key, the weights were left untouched, and the caller keeps generating at its
+        current version (D6). A failure that leaves the weights mixing two versions raises instead.
 
         Args:
             epoch (int): Identifier of this sync, shared by every syncing replica and never reused.
@@ -227,7 +236,14 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             peers = {w for groups in plan.peer_groups.values() for wanters in groups.values() for w in wanters}
             participants = {name for name in peers if gen_client_instance(name) in allowed}
             participants.add(self.nixl_storage_client.client_name)
-        report = self.nixl_storage_client.pull_engine().pull(epoch, participants)
+        try:
+            report = self.nixl_storage_client.pull_engine().pull(epoch, participants)
+        except ChunkUnavailable as unavailable:
+            # Nothing was written, so the instance is still consistent at its current version.
+            psrl_logger.warning(
+                f"{self.nixl_storage_client.client_name}: pull {self.pull_times} skipped: {unavailable}"
+            )
+            return False
         self.cuda_synchronize()
         # Every shard of one pull must come from one version. More than one means some sources had republished.
         self.pulled_version = report.versions
@@ -238,8 +254,10 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             f"{self.nixl_storage_client.client_name}: pull {self.pull_times} (epoch {epoch}) took "
             f"{report.seconds:.3f}s, upstream {report.upstream_bytes / 1e9:.2f} GB in {report.upstream_seconds:.3f}s, "
             f"peer {report.peer_bytes / 1e9:.2f} GB, {report.descriptors} descriptors, "
-            f"{report.followers} follower(s), {report.fallback_keys} fallback key(s)."
+            f"{report.followers} follower(s), {report.fallback_keys} fallback key(s), "
+            f"{report.takeover_keys} key(s) taken over from a replica."
         )
+        return True
 
     def get_total_kv_cache_tokens(self) -> int:
         """Total KV-cache token capacity of this instance, post-allocation.

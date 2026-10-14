@@ -16,11 +16,14 @@ from collections import OrderedDict
 import pytest
 import torch
 from omegaconf import OmegaConf
+from psrl.utils.common.worker_naming import gen_client_name, model_role_of, train_client_name
 from psrl.utils.nixl.block_fp8 import scale_shape
 from psrl.utils.nixl.client import NIXLStorageClient
 from psrl.utils.nixl.comm_plan import CommunicationPlanner
+from psrl.utils.nixl.handshake_notif import NotifKind
 from psrl.utils.nixl.nixl_spec import NIXLClientType, NIXLSharding
 from psrl.utils.nixl.pull_engine import ChunkUnavailable, NIXLPullEngine
+from psrl.utils.nixl.server import NIXLMetaServer
 
 from tests.nixl.coord_judge import check_by_layout, check_fp8_exact, fill_by_layout, fill_fp8_exact
 from tests.nixl.memcpy_agent import MemcpyAgent, NotifBus
@@ -565,3 +568,95 @@ def test_a_designate_that_dies_sends_its_followers_upstream():
     reports = cluster.pull(epoch=2)
     cluster.judge(cluster.gen, version=7)
     assert sum(r.fallback_keys for r in reports.values()) > 0
+
+
+def _multi_role_cluster(roles, train_tp, gen_tp):
+    """One cluster carrying several models at once, their keys named identically."""
+    cluster = Cluster.__new__(Cluster)
+    cluster.bus = NotifBus()
+    cluster.declared, cluster.states, cluster.roles = {}, {}, {}
+    kinds = {}
+    for role in roles:
+        for r in range(train_tp):
+            name = train_client_name(r, role)
+            kinds[name] = NIXLClientType.PUSH_SIDE
+            cluster.states[name] = _locals(MODEL, train_tp)
+            cluster.declared[name] = {k: _sharding(d, train_tp, r) for k, (s, d) in MODEL.items()}
+            # Each model fills at its own version, so bytes of one are never valid for the other.
+            fill_by_layout(
+                cluster.states[name], cluster.declared[name], version=roles[role], wire_dtype=torch.bfloat16
+            )
+        for r in range(gen_tp):
+            name = gen_client_name(0, r, role)
+            kinds[name] = NIXLClientType.PULL_SIDE
+            cluster.states[name] = _locals(MODEL, gen_tp)
+            cluster.declared[name] = {k: _sharding(d, gen_tp, r) for k, (s, d) in MODEL.items()}
+        cluster.roles[role] = [n for n in kinds if model_role_of(n) == role and n.startswith("NIXLGenClient")]
+
+    # The real server unifies and plans, which is what must keep the models apart.
+    server = NIXLMetaServer.__new__(NIXLMetaServer)
+    server.client_sharding_dicts = {n: copy.deepcopy(d) for n, d in cluster.declared.items()}
+    server.client_unified_sharding_dicts, server.finest_shard_meshes = {}, {}
+    server._agents_reported = {kind: set() for kind in NotifKind}
+    server._agents_reported[NotifKind.SHARDING] = set(cluster.declared)
+    server.make_unified_sharding()
+    unified = server.client_unified_sharding_dicts
+
+    cluster.clients = {}
+    for name, kind in kinds.items():
+        client = NIXLStorageClient(
+            client_name=name,
+            server_name="server",
+            use_gpu=False,
+            client_type=kind,
+            nixl_config=CONFIG,
+            binded_agent=MemcpyAgent(name, cluster.bus),
+        )
+        client.register_local_tensors(cluster.states[name], unified[name])
+        cluster.clients[name] = client
+    infos = {name: c.local_client_info for name, c in cluster.clients.items()}
+    server.client_infos = infos
+    server._agents_reported[NotifKind.CLIENT_INFO] = set(infos)
+    server._peer_diffusion = False
+    server.comm_plan = None
+    server.make_comm_plan()
+    for client in cluster.clients.values():
+        client._all_client_infos = dict(infos)
+        client._comm_plan = server.comm_plan
+    cluster.plan = server.comm_plan
+    cluster.gen = [n for n in cluster.clients if n.startswith("NIXLGenClient")]
+    cluster.engines = {
+        n: NIXLPullEngine(cluster.clients[n], staging_bytes=1 << 16, peer_timeout_s=2.0) for n in cluster.gen
+    }
+    return cluster
+
+
+def test_two_models_publish_and_pull_without_reading_each_other():
+    roles = {"actor": 7, "critic": 11}
+    cluster = _multi_role_cluster(roles, train_tp=2, gen_tp=2)
+    reports = cluster.pull(epoch=1)
+    for role, version in roles.items():
+        for name in cluster.roles[role]:
+            judged, failure = check_by_layout(cluster.states[name], cluster.declared[name], list(MODEL), version)
+            assert failure is None, f"{name} ({role}): {failure}"
+            assert judged == len(MODEL)
+    # Every byte a reader took came from its own model's ranks.
+    for name, report in reports.items():
+        role = model_role_of(name)
+        assert all(model_role_of(src) == role for src in report.sources), f"{name} read {sorted(report.sources)}"
+
+
+def test_one_model_republishing_does_not_disturb_the_other():
+    roles = {"actor": 7, "critic": 11}
+    cluster = _multi_role_cluster(roles, train_tp=2, gen_tp=2)
+    cluster.pull(epoch=1)
+    for r in range(2):
+        name = train_client_name(r, "actor")
+        fill_by_layout(cluster.states[name], cluster.declared[name], version=9, wire_dtype=torch.bfloat16)
+        cluster.clients[name].publish_version(9)
+    cluster.pull(epoch=2)
+    for role, version in {"actor": 9, "critic": 11}.items():
+        for name in cluster.roles[role]:
+            judged, failure = check_by_layout(cluster.states[name], cluster.declared[name], list(MODEL), version)
+            assert failure is None, f"{name} ({role}) after actor republished: {failure}"
+            assert judged == len(MODEL)

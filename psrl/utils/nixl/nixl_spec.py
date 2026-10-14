@@ -2,6 +2,7 @@ import pickle
 from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, field
+from dataclasses import field as dc_field
 from enum import Enum
 from functools import lru_cache
 
@@ -594,6 +595,11 @@ class NIXLClientInfo:
     is_registered: bool = False
     # Name of the NIXL agent that serves this client, which several clients may share.
     agent_name: str = ""
+    # Identity of this client's device across processes, so a reader can tell it shares the GPU.
+    device_uuid: str = ""
+    # CUDA IPC handle per registered region, keyed by the region's base address in this process.
+    # A reader on the same device maps these and copies instead of reading through NIXL (3.7.2.1).
+    ipc_regions: dict[int, object] = dc_field(default_factory=dict)
 
     def get_tensor_info(self, key):
         """Get tensor descriptor info for specific key"""

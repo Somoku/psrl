@@ -8,9 +8,8 @@ from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 
-from psrl.utils.common.worker_naming import train_client_name
-from psrl.utils.ps_mode import has_ps_data_plane, uses_nixl
 from psrl.utils.common.http_utils import find_available_port
+from psrl.utils.common.worker_naming import train_client_name
 from psrl.utils.logger import (
     EventType,
     deprecated,
@@ -20,19 +19,20 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.nixl import NIXLMetaServer
+from psrl.utils.ps_mode import uses_nixl
 from psrl.utils.ray import add_busy_polling_lock
 from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
 from psrl.workers.ps.broadcast import build_broadcast_plan
 from psrl.workers.ps.ps_worker_group import PSWorkerGroup
 from psrl.workers.ps.request_status_tracker import RequestStatusTracker, _state_locked
-from psrl.workers.ps.version_barrier import (
-    PublishOutcome,
-    VersionBarrier,
-)
 from psrl.workers.ps.staleness_controller import (
     BufferStatus,
     EntryInfo,
     StalenessInventory,
+)
+from psrl.workers.ps.version_barrier import (
+    PublishOutcome,
+    VersionBarrier,
 )
 
 psrl_logger = get_ps_logger()
@@ -1087,8 +1087,7 @@ class PSManager(RequestStatusTracker):
         self.ps_nixl_train_storage_client_names = list(self.ps_nixl_agent_names)
         self.ps_nixl_gen_storage_client_names = list(self.ps_nixl_agent_names)
         psrl_logger.info(
-            f"Direct supply: pull sources are the {train_world_size} train ranks "
-            f"{self.ps_nixl_agent_names}"
+            f"Direct supply: pull sources are the {train_world_size} train ranks {self.ps_nixl_agent_names}"
         )
 
     def enable_broadcast_init_on_server(self) -> None:
@@ -1427,9 +1426,7 @@ class PSManager(RequestStatusTracker):
         return self.model_store.model_state_dict_ref
 
     @_state_locked
-    def pull_model_state_dict_nixl(
-        self, rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId]
-    ) -> int:
+    def pull_model_state_dict_nixl(self, rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId]) -> int:
         """
         Pull the latest model state dict from PS via NIXL. Only used in 'nixl_cpu' or 'nixl_gpu' mode.
         This only updates the version tag of the model state dict pulled from the PS.
@@ -1446,8 +1443,7 @@ class PSManager(RequestStatusTracker):
         # from ever advancing a rollout's version, which does not fail loudly: the pull
         # succeeds and silently returns the previous weights.
         assert uses_nixl(self.psrl_config.ps_mode), (
-            f"pull_model_state_dict_nixl needs a NIXL transport, got "
-            f"ps_mode={self.psrl_config.ps_mode!r}"
+            f"pull_model_state_dict_nixl needs a NIXL transport, got ps_mode={self.psrl_config.ps_mode!r}"
         )
         assert self.model_store is not None, "Model instance is not initialized."
 

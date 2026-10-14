@@ -20,6 +20,7 @@ from psrl.utils.nixl import fp8_kernels
 from psrl.utils.nixl.block_fp8 import FP8_DTYPE, SCALE_SUFFIX, quantize_blockwise, scale_shape
 from psrl.utils.nixl.chunk_notify import ChunkCompletionPublisher, ChunkCompletionWaiter
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
+from psrl.utils.nixl.device_ipc import RegionMapper, device_uuid, export_region
 from psrl.utils.nixl.handshake_notif import NotifKind, decode, encode
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.moe_grouping import GroupedShards, entry_is_empty, local_shards_of
@@ -260,6 +261,8 @@ class NIXLStorageClient:
 
         # mem_type -> [(base_addr, nbytes, device_id, mem_type)] tuples for storage registration
         self._mtype_to_reg_region_lists: dict[str, list[tuple[int, int, int, str]]] = {}
+        self._ipc_regions: dict[int, object] = {}
+        self._region_mapper: RegionMapper | None = None
         self._reg_regions: set[tuple[int, int, int, str]] = set()
 
         # Mapping from (key, shard_idx) to registered desc slice info
@@ -426,6 +429,12 @@ class NIXLStorageClient:
     def _tile_of(self, tensor: torch.Tensor, tile: tuple[int, int] | None = None) -> tuple[int, ...]:
         return (1,) * (tensor.dim() - 2) + tuple(tile or self._fp8_block)
 
+    def region_mapper(self) -> RegionMapper:
+        """Regions imported from sources that share this process's device (design 3.7.2.1)."""
+        if self._region_mapper is None:
+            self._region_mapper = RegionMapper(self.device)
+        return self._region_mapper
+
     def pull_engine(self):
         """The rollout pull engine for this client, built against the current registrations."""
         if self._pull_engine is None:
@@ -560,6 +569,13 @@ class NIXLStorageClient:
         if storage_region not in self._reg_regions:
             self._reg_regions.add(storage_region)
             self._mtype_to_reg_region_lists.setdefault(mem_type, []).append((base_addr, nbytes, device_id, ""))
+            # One IPC handle per region, so a reader sharing this GPU copies rather than reading
+            # through NIXL. A handful of regions hold every shard, so this does not grow with the
+            # model. Export is best effort: a region the allocator cannot share falls back to NIXL.
+            if mem_type == "cuda":
+                handle = export_region(tensor)
+                if handle is not None:
+                    self._ipc_regions[base_addr] = handle
         return storage_region
 
     def _build_xfer_desc_bytes(self, addr: int, length: int, device_id: int, mem_type: str) -> bytes:
@@ -1350,6 +1366,8 @@ class NIXLStorageClient:
                 client_group_id=self.client_group_id,
                 is_registered=not meta_only,
                 agent_name=self.agent.name,
+                device_uuid=device_uuid(self.device),
+                ipc_regions=dict(self._ipc_regions),
             )
             psrl_logger.debug(
                 f"Local client info is built, "
@@ -1502,6 +1520,10 @@ class NIXLStorageClient:
         prepped_cache = getattr(self, "_prepped_cache", None)
         if prepped_cache is not None:
             prepped_cache.clear()
+        # An imported mapping outliving its exporter's allocation is the same hazard
+        # `registration_epoch` guards against remotely, so drop them with the registrations.
+        self._region_mapper = None
+        self._ipc_regions = {}
         # Deregister all registered regions.
         self._deregister_all_descs()
         if not self.enable_tms_for_temp_buffers:

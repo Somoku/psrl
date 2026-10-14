@@ -70,6 +70,9 @@ class _Spec:
     staged: list[_Staged]
     versions: set[int]
     nbytes: int
+    # `(destination view, source view)` pairs for a source that shares this process's device.
+    # Reading those through NIXL costs 7.7x a device copy, so they are copied, not transferred.
+    ipc: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
 
 
 @dataclass
@@ -92,6 +95,8 @@ class _Phase:
     descriptors: int = 0
     nbytes: int = 0
     staged_bytes: int = 0
+    ipc: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
+    ipc_bytes: int = 0
 
 
 class ChunkUnavailable(RuntimeError):
@@ -213,6 +218,24 @@ class NIXLPullEngine:
             )
             cells.append((local, local_runs, remote_runs, tuple(remote_info.read_strides[pos]), meta.version, region))
 
+        shared = self._ipc_cells(source, remote_info, shards, positions, cells)
+        if shared is not None:
+            empty = np.zeros(0, dtype=np.int64)
+            spec = _Spec(
+                source,
+                key,
+                empty,
+                empty,
+                empty,
+                empty,
+                [],
+                {c[4] for c in cells},
+                sum(c[1].total_bytes for c in cells),
+                ipc=shared,
+            )
+            self._specs[(source, key)] = spec
+            return spec
+
         pairs = [pair_runs(c[1], c[2]) for c in cells]
         empty = np.zeros(0, dtype=np.int64)
         local = np.concatenate([p[0] for p in pairs]) if pairs else empty
@@ -230,6 +253,33 @@ class NIXLPullEngine:
             self._restage(spec, cells)
         self._specs[(source, key)] = spec
         return spec
+
+    def _ipc_cells(self, source, remote_info, shards, positions, cells) -> list | None:
+        """
+        `(destination, source)` view pairs when `source` shares this device, else None.
+
+        The source views are strided over the mapped region exactly as the remote descriptors
+        would have addressed it, so the copy moves the same bytes the transfer would have.
+        """
+        info = self.client.all_client_infos[source]
+        mapper = self.client.region_mapper()
+        if not info.ipc_regions or info.device_uuid != mapper.uuid or self.client.device.type != "cuda":
+            return None
+        if not mapper.knows(source) and not mapper.adopt(source, info.ipc_regions):
+            return None
+        pairs = []
+        for shard, (local, local_runs, _remote_runs, remote_strides, _version, _region) in zip(shards, cells):
+            pos = positions[shard]
+            address = remote_info.read_addrs[pos]
+            itemsize = local.element_size()
+            found = mapper.resolve(source, address, local_runs.total_bytes)
+            if found is None or found[1] % itemsize:
+                return None  # unmapped, or a view that would not start on an element boundary
+            region, offset = found
+            typed = region.view(local.dtype)
+            view = torch.as_strided(typed, tuple(local.shape), tuple(remote_strides), offset // itemsize)
+            pairs.append((local, view))
+        return pairs
 
     def _restage(self, spec: _Spec, cells: list) -> None:
         """Pick, per shard, the cheapest of a direct read, a staged read, or a staged span read."""
@@ -335,6 +385,10 @@ class NIXLPullEngine:
             by_source[spec.source].append(spec)
             phase.versions |= spec.versions
         staged: list[tuple[str, _Staged]] = []
+        for spec in specs:
+            phase.ipc.extend(spec.ipc)
+            if spec.ipc:
+                phase.ipc_bytes += spec.nbytes
         for source, group in sorted(by_source.items()):
             info = self.client.all_client_infos[source].tensor_infos[group[0].key]
             local, remote, lengths, _ = _coalesce(
@@ -458,6 +512,11 @@ class NIXLPullEngine:
         if self._copy_stream is None and self.client.device.type == "cuda":
             self._copy_stream = torch.cuda.Stream(device=self.client.device)
         direct = self._post(phase.direct)
+        if phase.ipc:
+            # Same device reads are copies, issued on the copy stream that `_finish` waits for.
+            with torch.cuda.stream(self._copy_stream) if self._copy_stream is not None else nullcontext():
+                for destination, origin in phase.ipc:
+                    destination.copy_(origin, non_blocking=True)
         slot_free: list[torch.cuda.Event | None] = [None, None]
         in_flight: list[tuple[int, list[_Handle]]] = []
 

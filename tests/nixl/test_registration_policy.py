@@ -260,3 +260,65 @@ class TestGranularityIsPerKey:
         plan.rollout_pull_from_ps_plan["gen1_0"]["w1"] = {}
 
         assert keys_read_across_nodes(plan, clients, "train0") == {"w0"}
+
+
+class TestClientShouldRegisterRdma:
+    """_should_register_rdma() wires needs_rdma_registration into NIXLStorageClient.
+
+    The criterion: returns True when the comm plan has any cross-node reader for this
+    client, False only when every reader is same-node (pure colocate). Tested through
+    the policy layer; the client method is a thin wrapper that adds the safe fallback.
+    """
+
+    def test_no_plan_means_register(self):
+        """Before wait_for_server_info the plan is None; must not skip registration."""
+        from psrl.utils.nixl.registration_policy import needs_rdma_registration
+
+        class _FakePlan:
+            push_to_ps_plan = {}
+            rollout_pull_from_ps_plan = {}
+            train_pull_from_ps_plan = {}
+
+        # needs_rdma_registration with an empty plan returns False (no readers),
+        # but _should_register_rdma returns True when _comm_plan is None.
+        # We test the wrapper logic directly:
+        from unittest.mock import patch
+
+        # Simulate a client with no plan set
+        class _Stub:
+            _comm_plan = None
+            _all_client_infos = {}
+            client_name = "train0"
+
+            def _should_register_rdma(self_):
+                from psrl.utils.nixl.client import NIXLStorageClient
+                return NIXLStorageClient._should_register_rdma(self_)
+
+        stub = _Stub()
+        assert stub._should_register_rdma() is True, \
+            "no comm plan -> should register (safe fallback)"
+
+    def test_disaggregate_registers(self):
+        """A cross-node reader forces registration in direct-supply disaggregate."""
+        # rollout_nodes=2: node 0 is same as trainer (TRAIN_NODE), node 1 is on 10.1.0.1.
+        # So gen1_* clients are on a different node, forcing RDMA registration.
+        clients = _direct_supply_cluster(rollout_nodes=2, per_node=1)
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+
+        from psrl.utils.nixl.registration_policy import needs_rdma_registration
+        # gen1_0 is on 10.1.0.1 (different from TRAIN_NODE), so train0 must register.
+        assert needs_rdma_registration(plan, clients, "train0") is True
+
+    def test_colocate_skips_registration(self):
+        """All readers on the same node -> registration can be skipped."""
+        node = TRAIN_NODE
+        clients = {
+            "train0": _client("train0", NIXLClientType.PUSH_SIDE, node),
+            "ps0": _client("ps0", NIXLClientType.PS_FOR_PUSH, node),
+            "ps1": _client("ps1", NIXLClientType.PS_FOR_PULL, node),
+            "gen0": _client("gen0", NIXLClientType.PULL_SIDE, node),
+        }
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+
+        from psrl.utils.nixl.registration_policy import needs_rdma_registration
+        assert needs_rdma_registration(plan, clients, "train0") is False

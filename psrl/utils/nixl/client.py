@@ -935,13 +935,16 @@ class NIXLStorageClient:
             and self.local_client_info is not None
             and self.local_client_info.is_registered
         ):
-            # Re-register local tensors
+            # Re-register local tensors (skip if all readers are same-node; no remote NIC needs these pages).
             assert self._mtype_to_reg_region_lists is not None, "No registered regions found."
-            for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
-                if not reg_list:
-                    continue
-                reg_descs = self._register_memory(mem_type, reg_list)
-                self._track_registered_desc(reg_descs)
+            if self._should_register_rdma():
+                for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
+                    if not reg_list:
+                        continue
+                    reg_descs = self._register_memory(mem_type, reg_list)
+                    self._track_registered_desc(reg_descs)
+            else:
+                psrl_logger.info(f"{self.client_name}: skipping RDMA registration (all readers are same-node)")
 
             # Rebuild descriptors by memory type to reduce get_xfer_descs round-trips to O(mem_types).
             # Precompute shard positions for O(1) lookup instead of repeated O(S) list.index calls.
@@ -1360,7 +1363,9 @@ class NIXLStorageClient:
                 )
 
             # Batch register all tensors and cache the reg list once.
-            if not meta_only and self._mtype_to_reg_region_lists:
+            # Skip when every reader is same-node: no remote NIC needs these pages,
+            # and the registration cost (O(#shards)) is pure overhead at MoE scale.
+            if not meta_only and self._mtype_to_reg_region_lists and self._should_register_rdma():
                 for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
                     if not reg_list:
                         continue
@@ -1934,6 +1939,26 @@ class NIXLStorageClient:
         payload = encode(NotifKind.UPDATE_INFO, payload_dict)
         for dst_agent_name in dst_agent_names:
             self.agent.send_notif(dst_agent_name, payload)
+
+    def _should_register_rdma(self) -> bool:
+        """Whether this client must register its tensors with NIXL for RDMA access.
+
+        When every reader in the comm plan is on the same node as this client, no remote
+        NIC will ever issue a GET against these pages — the IPC copy path handles them
+        instead (design §3.7.2.1). Registering anyway costs one `nixlRegDList` call plus
+        `get_xfer_descs`/`get_serialized_descs` per region, which at MoE scale is the
+        same O(#shards) cost that drove §3.5.5. Skipping it entirely removes that cost
+        from every colocate wakeup.
+
+        Falls back to True when the plan or the client infos are not yet populated:
+        without them we cannot prove the deployment is pure colocate, so the safe answer
+        is to register.
+        """
+        if self._comm_plan is None or not self._all_client_infos:
+            return True
+        from psrl.utils.nixl.registration_policy import needs_rdma_registration  # noqa: PLC0415
+
+        return needs_rdma_registration(self._comm_plan, self._all_client_infos, self.client_name)
 
     def _is_reader_of(self, source: str) -> bool:
         """Whether this client reads from ``source`` according to the comm plan.

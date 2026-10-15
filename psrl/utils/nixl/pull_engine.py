@@ -238,6 +238,34 @@ class NIXLPullEngine:
             self._specs[(source, key)] = spec
             return spec
 
+        # Whole-storage fast path (FINDINGS §2, design item D1).
+        #
+        # Peer diffusion (designate → follower) assigns byte-identical shards: both sides
+        # hold the same gen-TP rank and lay the shard out in the same contiguous storage.
+        # When local *and* remote are both contiguous we can issue one descriptor per shard
+        # rather than one per contiguous run of each strided cell.  For a row-parallel key
+        # cut by finest-mesh TP that collapses from O(hidden) descriptors to O(1).
+        #
+        # Safety: `meta.is_contiguous` is set by the source at registration time and means
+        # the readable bytes form a single flat allocation starting at `read_addrs[pos]`.
+        # `local.is_contiguous()` means the local destination is equally flat.  If either
+        # fails the code falls through to the general strided path, which is always correct.
+        if cells and all(
+            c[0].is_contiguous()
+            and remote_info.shard_meta_infos[positions[shard]].is_contiguous
+            for c, shard in zip(cells, shards)
+        ):
+            local_arr = np.array([c[0].data_ptr() for c in cells], dtype=np.int64)
+            remote_arr = np.array([remote_info.read_addrs[positions[shard]] for shard in shards], dtype=np.int64)
+            lengths_arr = np.array([c[1].total_bytes for c in cells], dtype=np.int64)
+            regions_arr = np.array([c[5] for c in cells], dtype=np.int64)
+            spec = _Spec(
+                source, key, local_arr, remote_arr, lengths_arr, regions_arr,
+                [], {c[4] for c in cells}, int(lengths_arr.sum()),
+            )
+            self._specs[(source, key)] = spec
+            return spec
+
         pairs = [pair_runs(c[1], c[2]) for c in cells]
         empty = np.zeros(0, dtype=np.int64)
         local = np.concatenate([p[0] for p in pairs]) if pairs else empty

@@ -531,8 +531,8 @@ CPU 占用从 `N×M` 降到 `M`，且回灌不再需要控制面参与。
 | 能力 | C++ | Python | PSRL 用了吗 |
 |---|---|---|---|
 | 加载某个 peer 的元数据 | `loadRemoteMD` | `add_remote_agent` | **用了**（握手期） |
-| 撤销某个 peer | `invalidateRemoteMD` | `remove_remote_agent` | 没用 |
-| 撤销自己（向所有 peer） | `invalidateLocalMD` | `invalidate_local_metadata` | 没用 |
+| 撤销某个 peer | `invalidateRemoteMD` | `remove_remote_agent` | **用了**（重注册、缩容吊销） |
+| 撤销自己（向某个 peer） | `invalidateLocalMD` | `invalidate_local_metadata` | 只在 server `shutdown` 用 |
 | **只发布部分 descriptor** | `getLocalPartialMD` / `sendLocalPartialMD` | `get_partial_agent_metadata` / `send_partial_agent_metadata` | **没用,而这是关键** |
 | 查询某 peer 是否已就绪 | `checkRemoteMD` | `check_remote_metadata` | 用了 |
 
@@ -723,7 +723,7 @@ benchmark 可以关掉它,只因为它只测提交开销、从不等完成。
 
 ---
 
-**地址正确性:缩容路径必须用 `invalidateLocalMD`,不能只靠 holder 撤销。**
+**地址正确性:缩容路径必须吊销 descriptor,不能只靠 holder 撤销。**
 
 §3.4.5 的「撤销 holder 资格 → 等在飞读者归零 → sleep」保证了**不会有新的读发起**,
 但**不保证远端忘掉了 descriptor**。远端此时仍持有可用的 MD,
@@ -736,12 +736,30 @@ benchmark 可以关掉它,只因为它只测提交开销、从不等完成。
 ```
 撤销 holder 资格（index 层,阻止新读者）
   -> 等在飞读者归零（§3.4.5,现有）
-  -> invalidateLocalMD()（NIXL 层,让所有远端忘掉我的 descriptor）  ← 新增
+  -> 吊销 descriptor 并收齐确认（让所有持有者忘掉我的 descriptor）  ← 新增
   -> sleep / 释放显存
 ```
 
 **第三步缺失的后果与 epoch 缺失完全同构**,所以验证项 5(c) 的「陈旧 descriptor
 必须被拒绝」应当扩一个 case:成员退出后远端持有的 descriptor 也必须失效。
+
+**落地时第三步的形态与这里的初稿不同,两点实测修正**（详见
+`psrl/utils/nixl/leave_protocol.py` 与实现文档 E4）:
+
+1. **不调 `invalidateLocalMD`,走 PSRL 自己的 notif 通道。**
+   读 NIXL 源码后,`invalidateLocalMD(ip, port)` 的全部语义就是
+   「向该 peer 发一条 `NIXLCOMM:INVL`,让它执行一次 `invalidateRemoteMD(我)`」——
+   真正干活的永远是持有者本地那一次驱逐。它**不是广播**（广播形式只在
+   etcd/tcpstore 中心存储下成立,而 PSRL 的 MD 是 out-of-band 分发的）、
+   **需要对端监听端口**（`NIXLClientInfo` 不发布）、
+   且**fire-and-forget 无法确认**。而第四步释放显存的安全性恰恰取决于这个确认,
+   所以真正的缺口是确认而不是调用。
+2. **第三步本身不需要 epoch 同构的额外机制。** 实测(H20)驱逐之后,
+   用退出前的 prepped dlist 新建请求、以及 repost 退出前已建好的句柄,
+   **都被 `NIXL_ERR_NOT_FOUND` 拒绝**,不会读到已释放显存——
+   NIXL 对 remote section 持弱引用并在 `makeXferReq` / `postXferReq` /
+   `getXferStatus` 三处校验 generation。所以这里只需保证「驱逐确实执行过」,
+   而这正是 ack 的作用。
 
 ---
 
@@ -753,7 +771,7 @@ benchmark 可以关掉它,只因为它只测提交开销、从不等完成。
 | 握手协议 | — | 一次性屏障,需改事件驱动。**工作量,非难题** |
 | **finest mesh 全局耦合** | 未识别 | 整除走快路径,非整除**告警放行**；但**整除性同时是一条运行时约束**,不可表达的那一类必须拒绝 |
 | MD 扇出规模 | 未识别 | partial MD 两段式,实测 1884x 压缩 |
-| 缩容的地址正确性 | 未识别 | 需 `invalidateLocalMD`,与 epoch 同构 |
+| 缩容的地址正确性 | 未识别 | 需吊销 descriptor 并收齐确认（实测:驱逐后陈旧 descriptor 已被 NIXL 拒绝,故不需要额外 epoch） |
 | 重分片的地址正确性 | 未识别 | 必须在版本边界进行并推进 `epoch`,与陈旧 descriptor 同构 |
 
 **所以 9c 不应再写成「等 NIXL 能力」,而是「改 PSRL 握手协议 + 把重分片做成一等路径」。**
@@ -3982,7 +4000,7 @@ train step v 完成
 | **9c-a** | **join 的三级判定：整除→快路径；非整除但可表达→告警放行；不可表达→拒绝**（§3.3.1d 第二层） | 第三级是**正确性**:`new_finest` 不整除某张量的相应维度时,`get_local_sharded_tensors` 会让**所有既有 client** 在重注册时抛 `ValueError`——一次扩容变成全链路故障。前两级是性能告警。**必须最先定,它决定弹性的语义边界** | **是**，与 1-5 同批 |
 | 9c-a2 | **非整除 join 的重分片走版本边界 + 推进 `registration_epoch`** | 「同一地址的不同切分」对远端同样是陈旧描述,与 §3.7.3.0a 同构。复用撤 holder → 等读者归零 → 重分片 → 推 epoch 的既有协议,**不新建机制** | 否，依赖 8 |
 | 9c-b | **握手协议从一次性屏障改为事件驱动 join / leave** | `ps_manager.py:907` 的八步直线没有「中途加入」状态（§3.3.1d 第一层）。工作量项,非难题 | 否，依赖 6b |
-| 9c-c | **join / leave 走 partial MD 两段式 + 缩容加 `invalidateLocalMD`** | 实测 **1884x** 压缩（conn-info 401B vs 全量 1.6MB @4096 区）。缩容缺 `invalidateLocalMD` 会留下可用的陈旧 descriptor,与缺 epoch 同构的静默损坏（§3.3.1d 第三层与末段） | 否，依赖 9c-b |
+| 9c-c | **join / leave 走 partial MD 两段式 + 缩容吊销 descriptor（带确认）** | 实测 **1884x** 压缩（conn-info 401B vs 全量 1.6MB @4096 区）。缩容不吊销会留下可用的陈旧 descriptor,与缺 epoch 同构的静默损坏（§3.3.1d 第三层与末段） | 否，依赖 9c-b |
 | **9d-a** | **配置期防御五项**：`model_dtype` 真实读取（不再按后端硬分流，§3.8.0）、offload 双 flag 校验拒绝、uneven sharding 断言、finest mesh 可观测、**LoRA `merge=false` 拒绝**（§3.11） | **纯防御性**，不做则以难归因的方式失败（传输期报错而非校验期、按错 dtype 准备缓冲、**LoRA 下静默同步基座模型**） | **是**，与 1-5 同批 |
 | 9d-b | FSDP2 的副本数运行时推导 | 纯 FSDP2 无 DP 副本，§3.5.7 的 ① 不可用 | 否，**与 8b 同批实现** |
 | 9e | **删除 `fsdp_converter.py` 的 FSDP1 分支** | FSDP1 已被 `config.py:303` 拒绝，保留它只是死代码 | 是 |
@@ -4182,10 +4200,14 @@ PSRL 现有的 `pause_generation` + 直写 + `resume_after_sync` 才是正确的
   放行的结果是全链路故障而非变慢（9c-a 的三级判定）。
   非整除重分片还必须在版本边界进行并推进 `registration_epoch`（9c-a2）。
   `server.py:56/90` 的一次性屏障是第二层（9c-b,工作量项）。
-- **缩容必须调 `invalidateLocalMD`,只撤 holder 不够**（§3.3.1d 末段）。
+- **缩容必须吊销 descriptor 并收齐确认,只撤 holder 不够**（§3.3.1d 末段）。
   撤销 holder 阻止的是「新读者发起」,但远端仍持有可用的 descriptor,
-  retry 路径下会读到已释放显存。**这与缺 `registration_epoch` 是同构的静默损坏**,
-  只是触发源从「地址变更」换成「成员退出」。
+  retry 路径下会读到已释放显存。
+  落地修正两点（实测,详见 §3.3.1d 末段与实现文档 E4）:
+  吊销走 PSRL 的 notif 通道而非 `invalidateLocalMD`（后者无法广播、无法确认）;
+  且**驱逐之后 NIXL 自己就会拒绝陈旧 descriptor**,
+  所以这一项并不像初稿判断的那样需要与 `registration_epoch` 同构的额外机制,
+  真正要保证的只是「每个持有者都确实执行过驱逐」。
 - **QP 数量是万卡下的隐性上限**（§3.5.2.1 约束 ④），单边读仍需 NIC 维护 QP 状态。
 - **GPUDirect 不可用会退化为 host bounce**，带宽可能差一个量级，必须探测（§3.6.2a）。
 - **容错未在本设计完整覆盖。** holder 抽象天然支持（失效即摘除、pull 重新解析），
@@ -4390,8 +4412,10 @@ colocate 需要：同一组 GPU 上先跑 train client、再跑 gen client，
     这一条是重点，放行它的后果是所有既有 client 在重注册时集体抛
     `ValueError`，把扩容变成全链路故障。
     (b) **缩容的地址正确性**：缩容的 instance 先撤 holder、等读者归零、
-    调 `invalidateLocalMD`、再 sleep。**关掉第三步后，让远端用它退出前的
+    吊销 descriptor 并收齐确认、再 sleep。**让远端用它退出前的
     descriptor 发起读，必须失败而非读到垃圾**——与验证项 5(c) 同构。
+    再加一条：**任一持有者未确认吊销时，必须拒绝释放显存**，
+    因为「已发出吊销」与「吊销已生效」之间的差别正是这一步存在的理由。
     (c) 扩容的新 instance 能冷启动拿到当前版本，期间无读者失败。
     (d) **join 的扇出代价**：记录每次 join 时每个既有成员加载的 MD 字节数，
     应为 conn-info 量级（~400B）而非全量（~406B × region 数），

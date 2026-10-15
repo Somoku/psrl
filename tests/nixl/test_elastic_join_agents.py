@@ -231,3 +231,77 @@ class TestALateClientIsAdmittedOverRealNixl:
 
         planned = set(server.client_infos)
         assert {"incumbent", "joiner"} <= planned
+
+
+class TestAMemberLeavesOverRealNixl:
+    """The shrink half of E3/E4, end to end on real agents.
+
+    The CPU suite drives `release_member` against stand-ins, which pins the ordering
+    and the refusals but cannot show that the MEMBER_LEAVE *arrives* -- and arrival is
+    the half that was previously assumed rather than built. Here the server's
+    notification has to cross a real agent stream, be recognised by a client that is
+    not sitting in any waiter, and come back as an ack before the member is released.
+
+    Runs last in the file: it removes the joiner, so the tests above would see a
+    cluster of one.
+    """
+
+    def test_an_unconfirmed_leave_refuses_rather_than_releasing(self, cluster):
+        """With nobody pumping, the ack never comes. The member must stay drained and
+        intact -- freeing memory a peer can still address is the failure this exists
+        to prevent, and a timeout is the safe answer to it.
+
+        First, because it needs a peer that could hold the leaver's descriptors; once
+        the joiner is gone the incumbent is alone and has nobody to be confirmed by.
+        """
+        server, _, _, _ = cluster
+        assert "joiner" in server._membership.members, "the join test must run first"
+
+        with pytest.raises(TimeoutError, match="confirm revocation"):
+            server.release_member("joiner", timeout=1.0)
+
+        assert "joiner" in server._membership.members
+        assert "joiner" in server.client_infos
+        assert "joiner" not in server._membership.serving, "it must stop being served"
+
+    def test_the_leaver_is_released_only_after_the_peer_confirms(self, cluster):
+        import threading
+
+        server, incumbent, _, _ = cluster
+        assert "joiner" in server._membership.members
+
+        # The incumbent is doing something else -- which is the point. Nothing in
+        # production parks a client in a drain loop waiting to be told about a leave,
+        # so the message has to be picked up by a pump the client runs itself.
+        stop = threading.Event()
+        pumped: list[int] = []
+
+        def pump():
+            while not stop.is_set():
+                pumped.append(incumbent.absorb_membership_notifs())
+                time.sleep(0.01)
+
+        thread = threading.Thread(target=pump, daemon=True)
+        thread.start()
+        try:
+            change = server.release_member("joiner", timeout=30)
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert change.event is MembershipEvent.LEFT
+        assert sum(pumped) >= 1, "the incumbent never saw the MEMBER_LEAVE"
+        # Count, not equality: the previous test's abandoned attempt left announcements
+        # queued, and the peer revokes once per message it sees. That duplication is
+        # expected and harmless (eviction is idempotent); what matters is that it
+        # revoked the leaver and nothing else.
+        assert set(incumbent.revoked_clients) == {"joiner"}
+        assert "joiner" not in server._membership.members
+        assert "joiner" not in server.client_infos
+
+    def test_the_incumbent_survives_the_shrink(self, cluster):
+        """The mirror of the join criterion: shrinking must not disturb who remains."""
+        server, _, _, _ = cluster
+
+        assert "incumbent" in server.client_infos
+        assert server.comm_plan is not None

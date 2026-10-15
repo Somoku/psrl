@@ -22,6 +22,7 @@ from psrl.utils.nixl.chunk_notify import ChunkCompletionPublisher, ChunkCompleti
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.device_ipc import RegionMapper, device_uuid, export_region
 from psrl.utils.nixl.handshake_notif import NotifKind, decode, encode
+from psrl.utils.nixl.leave_protocol import encode_leave_ack, revoke_descriptors
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.moe_grouping import GroupedShards, entry_is_empty, local_shards_of
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
@@ -288,9 +289,18 @@ class NIXLStorageClient:
         self._shard_meta_interner: dict[tuple, NIXLShardMetaInfo] = {}
         #: Per-chunk completion signalling, built lazily by `chunk_completion_channel`.
         self._chunk_channel: tuple[ChunkCompletionPublisher, ChunkCompletionWaiter] | None = None
-        #: Notifications drained by the chunk channel that belong to another subsystem.
-        #: Held rather than dropped -- the stream is shared with the handshake.
+        #: Notifications drained by one subsystem that belong to another. Held rather
+        #: than dropped -- the stream is shared -- and re-offered by `_drain_notifs`.
         self._foreign_notifs: dict[str, list[bytes]] = {}
+        #: Clients this one has been told to forget, newest last. Kept for assertions
+        #: and for the log: a pull that fails on a revoked source should say so rather
+        #: than look like a transport fault.
+        self._revoked_clients: list[str] = []
+        #: Other clients sharing this NIXL agent, set by `NIXLMultiStorageClients`.
+        #: Revocation is agent-level, so one client's eviction invalidates all of their
+        #: caches; without this the siblings keep believing they are connected and post
+        #: transfers against a remote the agent has already forgotten.
+        self._agent_siblings: list[NIXLStorageClient] = []
         #: Microseconds spent in each phase of `client_read`'s per-shard loop.
         #: Three separate attempts to reduce the measured post cost (drop the wave
         #: barrier, merge descriptors, pre-post every wave) each left it the same or
@@ -487,7 +497,7 @@ class NIXLStorageClient:
                 send=self._send_chunk_notif,
             )
             waiter = ChunkCompletionWaiter(
-                drain=self.agent.get_new_notifs,
+                drain=self._drain_notifs,
                 stash_foreign=self._stash_foreign_notif,
             )
             self._chunk_channel = (publisher, waiter)
@@ -518,6 +528,105 @@ class NIXLStorageClient:
         """
         taken, self._foreign_notifs = self._foreign_notifs, {}
         return taken
+
+    def _drain_notifs(self) -> dict[str, list[bytes]]:
+        """Every pending notification: new ones plus whatever a previous drain stashed.
+
+        `get_new_notifs` is destructive, so a subsystem that drains and discards what it
+        does not recognise destroys another's mail. Stashing was already in place for the
+        chunk channel, but nothing ever re-offered the stash -- `take_foreign_notifs` had
+        no callers, so a stashed payload was merely lost later rather than sooner. Making
+        every drain go through here closes that: whoever polls next sees it.
+
+        This matters for leaves specifically. A MEMBER_LEAVE can land while a client sits
+        in any other waiter, and dropping it would leave that client holding descriptors
+        of a member whose memory is about to be freed -- the exact failure the message
+        exists to prevent.
+        """
+        merged = self.take_foreign_notifs()
+        for agent_name, payloads in self.agent.get_new_notifs().items():
+            merged.setdefault(agent_name, []).extend(payloads)
+        return merged
+
+    def handle_membership_notif(self, agent_name: str, raw: bytes) -> bool:
+        """Consume ``raw`` if it is a membership message. True when it was ours.
+
+        Offered by every drain loop so that a leave is acted on wherever it arrives,
+        rather than only in whichever loop happens to be the membership one. Returning a
+        bool instead of raising on a foreign payload keeps the caller's fallback (stash
+        it) a normal path.
+        """
+        notif = decode(raw)
+        if notif is None or notif.kind is not NotifKind.MEMBER_LEAVE:
+            return False
+        for leaver, payload in notif.entries.items():
+            self._revoke_member(leaver, str(payload.get("agent", "")), ack_to=agent_name)
+        return True
+
+    def _revoke_member(self, leaver: str, leaver_agent: str, ack_to: str) -> None:
+        """Forget ``leaver``'s descriptors and confirm it (E4 shrink, step three).
+
+        The eviction is agent-level in NIXL, so this also drops the cached connection
+        flag and the pull engine: both hold state derived from descriptors that are
+        about to stop existing, and a pull engine rebuilt from stale handles would fail
+        at post time with a NOT_FOUND that reads like a network fault.
+
+        The ack is sent even when there was nothing to forget. "This agent holds no
+        descriptors of the leaver" is the state the shrink is waiting for, and treating
+        silence as the answer for that case would stall every shrink involving a member
+        some peers never read from -- which, under a comm plan, is most of them.
+        """
+        agent_name = leaver_agent or getattr(self._all_client_infos.get(leaver), "agent_name", "")
+        # Whether this peer was held is read from our own cache, not from NIXL: the
+        # eviction call reports nothing (see `revoke_descriptors`). Cleared before the
+        # eviction so the two cannot disagree if the eviction raises.
+        #
+        # Across *every* client on this agent, because `remove_remote_agent` is an
+        # agent-level operation: a sibling left believing it is still connected skips
+        # `_ensure_client_info_fetched` and posts against a forgotten remote.
+        held = False
+        for client in self._agent_siblings or (self,):
+            held = client._target_client_connected.pop(leaver, False) or held
+            client._drop_pull_engine()
+        if agent_name:
+            revoke_descriptors(self.agent, agent_name)
+        self._revoked_clients.append(leaver)
+        psrl_logger.info(
+            f"{self.client_name}: revoked descriptors of departing member {leaver} "
+            f"(agent {agent_name or 'unknown'}, was_loaded={held})"
+        )
+        try:
+            self.agent.send_notif(ack_to, encode_leave_ack(leaver, held))
+        except Exception as e:
+            # The server re-sends on timeout, so a lost ack costs a retry rather than
+            # correctness. Raising here would instead fail the *reader*, which has
+            # already done the one thing that mattered.
+            psrl_logger.warning(f"{self.client_name}: could not ack revocation of {leaver}: {e}")
+
+    def absorb_membership_notifs(self) -> int:
+        """Drain once, acting on membership messages. Returns how many were consumed.
+
+        The entry point a client needs because every other drain is inside a waiter,
+        and a leave does not arrive during a wait -- it arrives while the client is
+        working. Cheap enough to call on a step boundary: one `get_new_notifs`, and
+        nothing else unless a message is actually there.
+
+        Payloads belonging to other subsystems are stashed, not dropped, so calling
+        this never costs another consumer its mail.
+        """
+        consumed = 0
+        for agent_name, payloads in self._drain_notifs().items():
+            for payload in payloads:
+                if self.handle_membership_notif(agent_name, payload):
+                    consumed += 1
+                else:
+                    self._stash_foreign_notif(agent_name, payload)
+        return consumed
+
+    @property
+    def revoked_clients(self) -> list[str]:
+        """Members this client has been told to forget, in order."""
+        return list(self._revoked_clients)
 
     def read_phase_us(self) -> dict[str, float]:
         """Microseconds spent per phase inside `client_read`, and reset the counters.
@@ -1769,7 +1878,7 @@ class NIXLStorageClient:
         start = time.time()
         already_recved_agents = set()
         while len(already_recved_agents) < expected_agents:
-            notifs = self.agent.get_new_notifs()
+            notifs = self._drain_notifs()
             for agent_name, notif_list in notifs.items():
                 for notif in notif_list:
                     # Route on the tag rather than on "a dict arrived while we were
@@ -1777,6 +1886,13 @@ class NIXLStorageClient:
                     # old shape check accepted them as client infos.
                     parsed = decode(notif)
                     if parsed is None or parsed.kind is not NotifKind.UPDATE_INFO:
+                        # Not ours. A membership message is acted on here rather than
+                        # deferred -- this loop runs concurrently with live traffic, so
+                        # it is the most likely place for a leave to land -- and
+                        # anything else is kept for its own consumer. Dropping was the
+                        # old behaviour and silently destroyed both.
+                        if not self.handle_membership_notif(agent_name, notif):
+                            self._stash_foreign_notif(agent_name, notif)
                         continue
                     for client_name, info_and_temp_mapping in parsed.entries.items():
                         self._all_client_infos[client_name] = NIXLClientInfo.deserialize(info_and_temp_mapping["info"])
@@ -2731,6 +2847,10 @@ class NIXLMultiStorageClients:
                     logging_path=logging_path,
                 )
             )
+
+        # They share one NIXL agent, so an eviction by any of them applies to all.
+        for client in self.multi_clients:
+            client._agent_siblings = self.multi_clients
 
         self._is_connected = False
         self._multi_unified_sharding_dicts_fetched = False

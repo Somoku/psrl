@@ -53,6 +53,15 @@ class NotifKind(Enum):
     #: one, and because its reader rejects anything else by raising -- an untagged
     #: handshake notification landing there took the run down rather than being skipped.
     UPDATE_INFO = "update_info"
+    #: Server -> peers: forget a departing member's descriptors (E4's shrink step three).
+    #: It rides this channel rather than NIXL's own `invalidateLocalMD` socket because
+    #: the revocation has to be *confirmed* before the leaver frees memory, and the
+    #: socket path is fire-and-forget (`nixl_p2p_metadata_backend.cpp` submits the INVL
+    #: to a worker queue and only logs failures). See `leave_protocol`.
+    MEMBER_LEAVE = "member_leave"
+    #: Peer -> server: this agent has executed the revocation. The half that makes the
+    #: shrink safe; without it the server cannot distinguish "revoked" from "unreachable".
+    LEAVE_ACK = "leave_ack"
 
 
 @dataclass(frozen=True)

@@ -18,11 +18,11 @@ requires, and a transfer only happens between pairs the comm plan already names.
 compiles that plan at handshake (design 3.6, "plan once post many"), so the set of peers
 needing stage two is known before any bytes move -- it does not have to be discovered.
 
-**What this module does not do.** `invalidate_local_md` is absent from this NIXL build
-(checked: `hasattr(nixl_agent, 'invalidate_local_md')` is False), so the leave path cannot
-yet revoke descriptors a departing member handed out. That half of E4 is blocked upstream
-rather than unimplemented, and `describe_leave_gap` states it in one place so it is not
-rediscovered.
+**What this module does not do.** It covers the join half of E4 only. The leave half --
+revoking descriptors a departing member handed out -- lives in `leave_protocol`, which
+also records why the "NIXL has no `invalidateLocalMD` binding" note that used to sit here
+was wrong: the binding is `invalidate_local_metadata`, the probe asked for the wrong name,
+and `NIXLMetaServer.shutdown` was already calling it.
 """
 
 from __future__ import annotations
@@ -99,21 +99,3 @@ def descriptors_for(agent, tensors: list) -> bytes:
             "connection-info stage rather than sending an empty descriptor payload"
         )
     return agent.get_partial_agent_metadata(agent.get_reg_descs(tensors), False)
-
-
-def describe_leave_gap() -> str:
-    """Why the leave path cannot yet revoke descriptors, in one place.
-
-    The design's four-step shrink is: drop holder status, drain in-flight readers,
-    `invalidateLocalMD()`, then release memory. Step three has no binding in this NIXL
-    build, so a departed member's descriptors stay loadable by whoever already fetched
-    them. Steps one and two still bound the exposure -- a client that is not a holder is
-    not in anyone's plan, so nothing *chooses* to read it -- but a stale descriptor used
-    anyway would read freed memory and succeed, which is the failure mode the design
-    wanted step three for.
-    """
-    return (
-        "invalidate_local_md is not exposed by this NIXL build; the shrink path relies on "
-        "holder removal plus in-flight drain, and cannot yet revoke descriptors already "
-        "handed out"
-    )

@@ -12,6 +12,7 @@ from psrl.utils.nixl.block_fp8 import SCALE_SUFFIX
 from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLCommPlan, merge_comm_plans
 from psrl.utils.nixl.handshake_notif import NotifKind, decode
 from psrl.utils.nixl.join_admission import JoinDecision, JoinVerdict, classify_join
+from psrl.utils.nixl.leave_protocol import RevokeOutcome, encode_member_leave
 from psrl.utils.nixl.membership import Membership, MembershipChange, MembershipEvent
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
@@ -21,6 +22,12 @@ from psrl.utils.nixl.nixl_spec import (
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+
+#: How often `release_member` re-announces a leave to holders that have not acked.
+#: Deliberately far slower than the ack poll: the message is idempotent, so re-sending
+#: buys nothing against a peer that is simply slow, and costs one notification per
+#: holder per round against every peer at once.
+LEAVE_RESEND_INTERVAL_S = 1.0
 
 
 def _mesh_total(mesh: dict[int, int]) -> int:
@@ -107,6 +114,19 @@ class NIXLMetaServer:
                 if notif is None:
                     continue
                 for client_name, payload in notif.entries.items():
+                    if notif.kind is NotifKind.LEAVE_ACK:
+                        # `client_name` here is the *leaver*, not a client of the
+                        # sending agent, so this must not reach `_add_client` below --
+                        # that would file the departing member as hosted by whoever
+                        # acked its removal. The acker's identity is the delivering
+                        # agent, which is also the granularity of the eviction.
+                        self._membership.record_revocation(client_name, agent_name)
+                        continue
+                    if notif.kind is NotifKind.MEMBER_LEAVE:
+                        # The server is the only sender; one arriving here means a
+                        # client addressed the wrong agent.
+                        psrl_logger.warning(f"Server received MEMBER_LEAVE for {client_name} from {agent_name}")
+                        continue
                     if notif.kind is NotifKind.SHARDING:
                         self.client_sharding_dicts[client_name] = payload
                     elif notif.kind is NotifKind.CLIENT_INFO:
@@ -265,6 +285,139 @@ class NIXLMetaServer:
         self.make_comm_plan(rebuild=True)
         self.notify_all_client_infos_and_comm_plan()
         return changes
+
+    def _holder_agents_of(self, client: str) -> set[str]:
+        """Agents that may hold ``client``'s descriptors: every agent but its own.
+
+        Agent granularity, not client granularity, because `remove_remote_agent` evicts
+        for the whole agent at once. Asking each co-hosted client to ack separately
+        would wait for confirmations that no second call can produce.
+
+        Conservative by construction: it names every peer agent rather than the ones the
+        comm plan says read from ``client``. A plan is a statement about who *should*
+        read, and the descriptors are held by whoever loaded them -- including an agent
+        whose plan entry was removed by an earlier replan.
+        """
+        own_agent = getattr(self.client_infos.get(client), "agent_name", "")
+        agents = {
+            agent_name
+            for agent_name, client_names in self.connected_clients.items()
+            if any(name in self._membership.members and name != client for name in client_names)
+        }
+        return agents - {own_agent} if own_agent else agents
+
+    def release_member(
+        self,
+        client: str,
+        timeout: float | None = None,
+        *,
+        in_flight: int = 0,
+    ) -> MembershipChange:
+        """Shrink the cluster by one member, revoking its descriptors first (E4).
+
+        The counterpart to `admit_joiners`, and the shape is deliberately different: a
+        join can be absorbed by polling, because a joiner nobody has heard of harms
+        nobody, whereas a leave has a **deadline on the other side** -- the member is
+        about to free the memory its peers hold descriptors for. So this is driven, not
+        polled, and it does not return until every holder has confirmed.
+
+        The four design steps map onto: `begin_leave` (holder status), ``in_flight``
+        (drain, asserted by `Membership`), the MEMBER_LEAVE round trip below
+        (revocation), and the caller's own teardown afterwards (release).
+
+        **The server sends the revocation, not the leaver.** The leaver may be gone --
+        scale-down after a crash is the normal reason to shrink -- and the server
+        already has a notification link to every agent plus the membership state the
+        acks belong to. A leaver-driven protocol would need both rebuilt on a client
+        that is by assumption unhealthy.
+
+        Raises `TimeoutError` with the unconfirmed holders named if the round trip does
+        not complete. The member then stays in `draining`: no longer served to new
+        readers, but with its memory intact. That is the safe degradation -- the unsafe
+        one is freeing memory a peer can still address, which fails as a *successful*
+        read of freed pages.
+        """
+        self._membership.begin_leave(client)
+        if in_flight > 0:
+            # Before the revocation, not after. Revoking under an active read makes
+            # that read fail (`getXferStatus` checks the same expired section), so
+            # checking this only in `complete_leave` would break the very transfers the
+            # drain step exists to protect -- and after doing the whole round trip.
+            raise RuntimeError(
+                f"{client} still has {in_flight} reader(s) in flight; revoking its "
+                f"descriptors now would fail those reads. Drain first, then release."
+            )
+        leaver_agent = getattr(self.client_infos.get(client), "agent_name", "")
+        required = self._holder_agents_of(client)
+        budget = self._handshake_timeout if timeout is None else timeout
+        payload = encode_member_leave(client, leaver_agent)
+
+        start = time.time()
+        outstanding = required - self._membership.revoked_by(client)
+        last_send = 0.0
+        while outstanding:
+            # Re-send on its own, much slower clock than the poll. Sending once per
+            # poll is the obvious loop and it is a notification storm: a peer that is
+            # merely slow to drain receives a hundred identical messages per second,
+            # and at 10k members that is the control-plane flood C2 exists to avoid.
+            # The peer is idempotent, so re-sending is for lost messages only.
+            now = time.time()
+            if now - last_send >= LEAVE_RESEND_INTERVAL_S:
+                last_send = now
+                for agent_name in sorted(outstanding):
+                    try:
+                        self.agent.send_notif(agent_name, payload)
+                    except Exception as e:
+                        # Re-sent on the next round; a transient send failure must not
+                        # end the shrink, because the alternative is leaving the member
+                        # drained but un-revoked forever.
+                        psrl_logger.warning(f"Could not send MEMBER_LEAVE for {client} to {agent_name}: {e}")
+            self._drain_notifs()
+            outstanding = required - self._membership.revoked_by(client)
+            if not outstanding:
+                break
+            if time.time() - start > budget:
+                outcome = RevokeOutcome(
+                    leaver=client,
+                    required=frozenset(required),
+                    acked=frozenset(self._membership.revoked_by(client)),
+                )
+                raise TimeoutError(outcome.describe())
+            time.sleep(0.01)
+
+        change = self._membership.complete_leave(client, in_flight=in_flight, required_revokers=required)
+        psrl_logger.info(
+            f"Released {client} after {len(required)} holder agent(s) confirmed revocation "
+            f"in {time.time() - start:.2f}s."
+        )
+        self._forget_client(client)
+        if self._membership.members:
+            self.make_unified_sharding(rebuild=True)
+            self.notify_all_client_shardings()
+            self.make_comm_plan(rebuild=True)
+            self.notify_all_client_infos_and_comm_plan()
+        return change
+
+    def _forget_client(self, client: str) -> None:
+        """Drop every server-side trace of a released member.
+
+        All of it, because each registry feeds a different consumer and a leftover entry
+        in any one of them puts the departed member back into a plan: its sharding would
+        rejoin the unified mesh, its info would be broadcast to peers as a readable
+        source, and `connected_clients` would address notifications to an agent that is
+        gone.
+        """
+        self.client_sharding_dicts.pop(client, None)
+        self.client_unified_sharding_dicts.pop(client, None)
+        self.client_infos.pop(client, None)
+        self._client_temp_mappings.pop(client, None)
+        for agent_name, client_names in list(self.connected_clients.items()):
+            if client in client_names:
+                client_names.remove(client)
+            if not client_names:
+                del self.connected_clients[agent_name]
+                for reported in self._agents_reported.values():
+                    reported.discard(agent_name)
 
     def make_unified_sharding(self, *, rebuild: bool = False):
         """Make unified sharding for all clients.

@@ -20,8 +20,14 @@ cluster must do about it.
 **Why leaves need a quiesce step and joins do not.** A joiner has nothing anyone reads
 yet, so it can be added the moment its metadata lands. A leaver may be mid-service: the
 design's shrink order is drop holder status, drain in-flight readers, invalidate
-descriptors, then release memory. Steps one and two live here; step three is blocked on a
-NIXL binding (see `partial_md.describe_leave_gap`).
+descriptors, then release memory. All four are represented here -- one, two and four as
+the `begin_leave`/`complete_leave` split, three as the revocations `complete_leave`
+refuses to proceed without (`leave_protocol` carries out the eviction itself).
+
+**Revocation is tracked, not assumed.** `complete_leave` already refused to run with
+readers in flight; it now refuses equally when a holder has not confirmed that it
+forgot the leaver's descriptors. The two failures are the same failure -- memory freed
+while something can still address it -- so they are reported the same way.
 """
 
 from __future__ import annotations
@@ -63,6 +69,10 @@ class Membership:
     members: set[str] = field(default_factory=set)
     #: Members that have been told to stop serving but may still have readers in flight.
     draining: set[str] = field(default_factory=set)
+    #: leaver -> holders that confirmed they evicted its descriptors (E4 step three).
+    #: Keyed by whatever identity the caller uses for a holder: the server records
+    #: *agent* names, because `remove_remote_agent` evicts per agent, not per client.
+    revocations: dict[str, set[str]] = field(default_factory=dict)
     history: list[MembershipChange] = field(default_factory=list)
 
     def join(self, client: str) -> MembershipChange:
@@ -107,13 +117,43 @@ class Membership:
         if client not in self.members:
             raise KeyError(f"{client} is not a member; nothing to drain")
         self.draining.add(client)
+        # A re-leave starts its confirmations over. Acks from a previous attempt refer
+        # to descriptors the member has since re-published, so counting them would clear
+        # the shrink on evidence about a registration that no longer exists.
+        self.revocations.pop(client, None)
 
-    def complete_leave(self, client: str, in_flight: int) -> MembershipChange:
-        """Remove ``client`` once its readers have drained.
+    def record_revocation(self, client: str, holder: str) -> None:
+        """Note that ``holder`` has evicted ``client``'s descriptors.
+
+        Accepted before `begin_leave` as well as after: the ack is a statement about the
+        holder's own state, and dropping an early one would deadlock a shrink whose acks
+        outran its bookkeeping.
+        """
+        self.revocations.setdefault(client, set()).add(holder)
+
+    def revoked_by(self, client: str) -> set[str]:
+        """Holders that have confirmed eviction of ``client``."""
+        return set(self.revocations.get(client, set()))
+
+    def complete_leave(
+        self,
+        client: str,
+        in_flight: int,
+        required_revokers: set[str] | None = None,
+    ) -> MembershipChange:
+        """Remove ``client`` once its readers have drained and its holders have forgotten it.
 
         Refuses while readers remain rather than removing anyway: the caller's job is to
         wait, and silently dropping the member here would leave those readers pointed at
         memory about to be released.
+
+        ``required_revokers`` names who must have confirmed step three. It defaults to
+        the other members, which is the right answer when holders are identified by
+        client name; the server overrides it with agent names, since one eviction covers
+        every client an agent hosts. Pass an empty set only for a member that never
+        published anything -- the check exists because a holder that still has the
+        descriptors can read freed memory *successfully*, which is the silent corruption
+        §3.3.1d catalogues.
         """
         if client not in self.draining:
             raise KeyError(
@@ -125,9 +165,18 @@ class Membership:
                 f"{client} still has {in_flight} reader(s) in flight; releasing its "
                 f"memory now would let those reads land on freed pages"
             )
+        required = self.members - {client} if required_revokers is None else set(required_revokers)
+        missing = required - self.revoked_by(client)
+        if missing:
+            raise RuntimeError(
+                f"{client} has not been revoked by {sorted(missing)}; those holders can "
+                f"still address its descriptors, so releasing its memory now would let "
+                f"their reads land on freed pages"
+            )
 
         self.members.discard(client)
         self.draining.discard(client)
+        self.revocations.pop(client, None)
         change = MembershipChange(
             MembershipEvent.LEFT,
             client,

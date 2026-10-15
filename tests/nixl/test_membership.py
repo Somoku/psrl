@@ -5,7 +5,10 @@ interrupting existing ones*. Two properties carry that:
 
 * a join must not disturb members already serving -- it adds a replan, not a pause;
 * a leave must not release memory while a reader is still mid-transfer, because that read
-  lands on freed pages and succeeds.
+  lands on freed pages and succeeds;
+* a leave must not release memory while any peer can still *address* it, which is the
+  same failure reached a different way -- the peer need not be mid-transfer, only
+  holding descriptors it has not been told to forget.
 
 Admission itself is A7's job (`classify_join`); these tests cover when its answer is acted
 on and what the rest of the cluster owes as a result.
@@ -106,6 +109,7 @@ class TestLeaveIsTwoPhase:
     def test_completing_a_leave_after_draining_removes_it(self):
         m = Membership(admit=_always_admit, members={"gen0", "gen1"})
         m.begin_leave("gen1")
+        m.record_revocation("gen1", "gen0")
 
         change = m.complete_leave("gen1", in_flight=0)
 
@@ -130,9 +134,92 @@ class TestLeaveIsTwoPhase:
         m = Membership(admit=_always_admit, members={"gen0", "gen1", "gen2"})
 
         m.begin_leave("gen1")
+        m.record_revocation("gen1", "gen0")
+        m.record_revocation("gen1", "gen2")
         m.complete_leave("gen1", in_flight=0)
 
         assert m.serving == {"gen0", "gen2"}
+
+
+class TestLeaveRequiresRevocation:
+    """E4 step three: nobody may still hold usable descriptors when the memory goes.
+
+    Measured on this NIXL build, a holder that has *not* been told to forget keeps a
+    working descriptor, while one that has gets NIXL_ERR_NOT_FOUND -- so the difference
+    between these two states is the difference between a loud failure and a silent read
+    of freed pages. That makes it a precondition, not a best effort.
+    """
+
+    def test_completing_a_leave_without_any_revocation_is_refused(self):
+        m = Membership(admit=_always_admit, members={"gen0", "gen1"})
+        m.begin_leave("gen1")
+
+        with pytest.raises(RuntimeError, match="has not been revoked by"):
+            m.complete_leave("gen1", in_flight=0)
+
+        assert "gen1" in m.members
+
+    def test_a_partial_revocation_is_refused_and_names_the_holdout(self):
+        """The holdout's name is the point: one unconfirmed peer is the whole risk."""
+        m = Membership(admit=_always_admit, members={"gen0", "gen1", "gen2"})
+        m.begin_leave("gen2")
+        m.record_revocation("gen2", "gen0")
+
+        with pytest.raises(RuntimeError, match="gen1"):
+            m.complete_leave("gen2", in_flight=0)
+
+    def test_the_required_set_can_be_overridden_for_agent_granularity(self):
+        """One `remove_remote_agent` covers every client an agent hosts, so the server
+        confirms per agent; demanding a per-client ack would wait forever."""
+        m = Membership(admit=_always_admit, members={"gen0", "gen1", "gen2"})
+        m.begin_leave("gen2")
+        m.record_revocation("gen2", "agent-a")
+
+        change = m.complete_leave("gen2", in_flight=0, required_revokers={"agent-a"})
+
+        assert change.event is MembershipEvent.LEFT
+
+    def test_a_member_nobody_holds_can_leave_immediately(self):
+        m = Membership(admit=_always_admit, members={"gen0"})
+        m.begin_leave("gen0")
+
+        assert m.complete_leave("gen0", in_flight=0).event is MembershipEvent.LEFT
+
+    def test_in_flight_readers_are_reported_before_missing_revocations(self):
+        """Both are fatal; the drain is the earlier step, so it is the actionable one."""
+        m = Membership(admit=_always_admit, members={"gen0", "gen1"})
+        m.begin_leave("gen1")
+
+        with pytest.raises(RuntimeError, match="in flight"):
+            m.complete_leave("gen1", in_flight=1)
+
+    def test_an_early_ack_still_counts(self):
+        """Acks can outrun the bookkeeping; dropping them would deadlock the shrink."""
+        m = Membership(admit=_always_admit, members={"gen0", "gen1"})
+        m.record_revocation("gen1", "gen0")
+        m.begin_leave("gen1")
+
+        assert m.revoked_by("gen1") == set()
+        m.record_revocation("gen1", "gen0")
+        assert m.complete_leave("gen1", in_flight=0).event is MembershipEvent.LEFT
+
+    def test_restarting_a_leave_discards_the_previous_confirmations(self):
+        """A re-leave follows a re-registration, so old acks describe gone descriptors."""
+        m = Membership(admit=_always_admit, members={"gen0", "gen1"})
+        m.begin_leave("gen1")
+        m.record_revocation("gen1", "gen0")
+        m.begin_leave("gen1")
+
+        with pytest.raises(RuntimeError, match="has not been revoked by"):
+            m.complete_leave("gen1", in_flight=0)
+
+    def test_revocations_do_not_outlive_the_member(self):
+        m = Membership(admit=_always_admit, members={"gen0", "gen1"})
+        m.begin_leave("gen1")
+        m.record_revocation("gen1", "gen0")
+        m.complete_leave("gen1", in_flight=0)
+
+        assert m.revoked_by("gen1") == set()
 
 
 class TestReplanAccounting:
@@ -150,6 +237,7 @@ class TestReplanAccounting:
 
         m.join("gen1")
         m.begin_leave("gen1")
+        m.record_revocation("gen1", "gen0")
         m.complete_leave("gen1", in_flight=0)
 
         assert m.replan_count == 2

@@ -64,7 +64,7 @@
   E1  8c   版本级等待（FSDP2 bf16 同精度必需）+ per-chunk 写屏障（可选）
   E2  9c-a2 非整除 join 重分片走版本边界 + 推 epoch
   E3  9c-b 握手改事件驱动 join / leave
-  E4  9c-c partial MD 两段式 + invalidateLocalMD
+  E4  9c-c partial MD 两段式 + 缩容吊销 descriptor（带确认）
 
 阶段 F  正交可选
   F1  10   delta 传输（跨 DC），显式 opt-in
@@ -751,7 +751,7 @@ per-chunk 写屏障（始终是优化）：
 
 ---
 
-### E4 — partial MD 两段式 + `invalidateLocalMD`（设计项 9c-c）
+### E4 — partial MD 两段式 + 缩容吊销 descriptor（设计项 9c-c）
 
 **落点**：`psrl/utils/nixl/client.py`（握手与退出路径）
 
@@ -762,16 +762,21 @@ per-chunk 写屏障（始终是优化）：
    第二段（只有真正的对端）：按 plan 解析出的那部分 descriptor
                             用 get_partial_agent_metadata 而非全量
    ```
-2. **缩容四步**（现状缺第三步）：
+2. **缩容四步**：
    ```
-   撤销 holder 资格 → 等在飞读者归零 → invalidateLocalMD() → sleep/释放显存
+   撤销 holder 资格 → 等在飞读者归零 → 吊销 descriptor（带确认） → sleep/释放显存
    ```
+   第三步不走 NIXL 的 `invalidateLocalMD` socket，而是走 PSRL 自己的 notif 通道，
+   原因见 `leave_protocol` 模块头：`invalidateLocalMD` 的实现就是
+   「让对端执行一次 `remove_remote_agent(我)`」，它**无法广播、需要对端监听端口、
+   且 fire-and-forget 无法确认**。而第四步（释放显存）的安全性恰恰取决于
+   「所有持有者都已忘记」这个确认。
 
 **判据**：
 - 每次 join 时每个既有成员加载的 MD 字节数为 **conn-info 量级（~400B）**
   而非全量（~406B × region 数）
-- 关掉 `invalidateLocalMD` 后，让远端用成员退出前的 descriptor 发起读，
-  **必须失败而非读到垃圾**
+- 让远端用成员退出前的 descriptor 发起读，**必须失败而非读到垃圾**
+- 任一持有者未确认吊销时，**必须拒绝释放显存**（而不是超时后照常释放）
 
 **实测依据**：全量 MD 约 406 B/region 线性增长（4096 区 = 1.6MB）；
 partial（4096 区中发布 1 个）= 883 B；conn-info-only = 401 B，**压缩 1884×**。
@@ -1587,7 +1592,7 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       「0 个 agent」—— 读起来像连通性故障;以及 joiner 必须**先进入等待**再让服务端
       重新发布,因为两半互相依赖:它拿不到 sharding 就发不出 client info,
       而服务端拿不到 info 就结束不了准入。
-- [ ] **E4 第一半（partial MD 两段式）模块已落地并实测；第二半被上游阻塞**。
+- [x] **E4 两半都已落地并实测**。
       `psrl/utils/nixl/partial_md.py`，`test_partial_md.py` 10 passed，
       实测 `bench_partial_md.py`（H20）：
 
@@ -1605,11 +1610,94 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       第二段只发给 plan 指明的读者（实测 606 B/读者），
       且**读者数不随集群规模增长** —— 这是测试钉住的性质。
 
-      **第二半（`invalidateLocalMD`）被上游阻塞**：本 NIXL 构建未导出
-      `invalidate_local_md`（`hasattr` 为 False）。
-      缩容路径目前只有「撤销 holder + 等在飞归零」两步，
-      无法吊销已发出的 descriptor。`describe_leave_gap()` 把这条写在一处，
-      并有一个测试在 NIXL 补上该绑定时**失败**，作为继续施工的信号。
+      **第二半（吊销 descriptor）已落地**：`psrl/utils/nixl/leave_protocol.py`，
+      `NIXLMetaServer.release_member`，`test_leave_protocol.py` 13 passed +
+      `test_release_member.py` 18 passed + `test_revoke_descriptors_gpu.py` 5 passed。
+
+      **先纠正一个连续两轮的错误归因。** 此前写的「本 NIXL 构建缺
+      `invalidateLocalMD` 绑定」是错的，错在**探测名写错**：真实名字是
+      `invalidate_local_metadata`，`hasattr(nixl_agent, 'invalidate_local_md')`
+      当然永远为 False。更直接的反证是 PSRL 自己一直在调它
+      （`server.py` 的 `shutdown`），而 `weight_transport.md` §9c 开头的
+      早期审计（「NIXL 侧该有的全有」）本来就是对的。
+      那个「等 NIXL 补上绑定就失败」的哨兵测试因此永远不会触发，
+      是个假哨兵，已删除；替换为直接断言真实绑定存在的测试。
+
+      **读源码后，真正的缺口不是绑定而是确认。**
+      `nixl_p2p_metadata_backend.cpp`：
+
+      ```
+      invalidateLocal(ip, port) -> sendToPeer(ip, port, "NIXLCOMM:INVL" + myName)
+      对端 listener 收到 INVL  -> ctx_.invalidateRemoteMD(myName)
+      ```
+
+      即 `invalidateLocalMD` 只是「远程触发对端执行一次 `remove_remote_agent(我)`」，
+      干活的始终是持有者本地那一次驱逐。由此三点：
+      (a) **不是广播** —— `ip_addr=""` 的广播形式只在中心 MD 存储（etcd/tcpstore）
+      下成立，而 PSRL 的 MD 走 server 的 notif 通道 out-of-band 分发，没有中心存储；
+      (b) **需要对端监听端口**，而 `NIXLClientInfo` 只发布 `node_ip`；
+      (c) **无法确认** —— `worker_.submit` 之后没有完成通知，失败只打日志，
+      而第四步释放显存的安全性正好取决于这个确认。
+
+      所以吊销改走 PSRL 已有的 notif 通道：
+      `MEMBER_LEAVE`（server → 各 peer agent）/ `LEAVE_ACK`（peer → server），
+      由 `Membership.complete_leave` 在确认未齐时**拒绝**完成缩容。
+      这条通道本来就在做同一件事 —— `wait_for_update_infos` 对重注册的 peer
+      执行的就是 `remove_remote_agent`。
+
+      **实测（H20，`test_revoke_descriptors_gpu.py`）：驱逐之后陈旧 descriptor
+      会被拒绝，而不是读到已释放显存。**
+
+      | 用法 | 结果 |
+      |---|---|
+      | 用退出前的 prepped dlist 新建请求 | `makeXferReq` 拒绝，`NIXL_ERR_NOT_FOUND` |
+      | 退出前已建好的 req 句柄 repost | `postXferReq` 拒绝，`NIXL_ERR_NOT_FOUND` |
+
+      机制是 NIXL 对 remote section 的弱引用 + generation 校验
+      （`nixl_agent.cpp` 在 `makeXferReq` / `postXferReq` / `getXferStatus`
+      三处检查 `remoteSection.expired()`）。
+      **所以这条路径不需要 PSRL 自己再加一层 epoch** —— §3.4.5 担心的
+      「retry 路径读到已释放显存且成功」在本构建上不成立，
+      前提只是「驱逐确实在每个持有者上执行过」，而这正是 ack 保证的。
+
+      **确认的粒度是 agent 而非 client**：`remove_remote_agent` 一次驱逐覆盖
+      该 agent 上的所有 client，按 client 收 ack 会等一个第二次调用无法产生的确认。
+
+      **另一条实测修正了接口形状。** `remove_remote_agent` 在本构建上
+      **从不报错**：对已驱逐过的 peer、甚至对一个从未加载过的名字，
+      都正常返回（probe 验证）。所以「这次驱逐是否真的忘掉了什么」
+      在 NIXL 这一层**无法回答**，`revoke_descriptors` 因此不返回布尔值——
+      返回一个没有依据的值会把它写进 ack。
+      ack 里的 `held` 改为取自 PSRL 自己的连接缓存
+      （`_target_client_connected`），那是确实知道的。
+      顺带：这也意味着重复吊销天然幂等，丢 ack 后的重试是安全的。
+
+      **退化行为**：任一持有者未确认 → `release_member` 抛 `TimeoutError` 并点名，
+      成员停留在 `draining`（不再被路由新读，但显存保留）。
+      这是安全的那一侧退化；不安全的那一侧是释放了别人还能寻址的显存。
+
+      **读方的入口是 `absorb_membership_notifs()`**：其余 drain 都在某个 waiter 里，
+      而 leave 恰恰在客户端**干活时**到达，不在任何等待里。
+      真机测试（`test_elastic_join_agents.py::TestAMemberLeavesOverRealNixl`）
+      就是让 incumbent 在后台跑这个 pump 的同时让 server 发起缩容。
+
+      **重发节奏单独一个常数（`LEAVE_RESEND_INTERVAL_S = 1.0`）。**
+      最初写成「每轮轮询都重发」，真机跑出来一次被放弃的 1 秒尝试给对端留下了
+      **100 多条排队的通告**。消息本身幂等，重发只为补丢失，
+      按轮询频率重发就是控制面风暴 —— 万卡量级正是 C2 要避免的那类。
+
+      **「先排空再吊销」这个次序是承重的，不是说法上的。** 初版把 `in_flight`
+      的检查交给 `complete_leave`（即在整轮吊销**之后**），review 时发现这会
+      在读还在飞的时候就吊销 —— NIXL 的 `getXferStatus` 查的是同一个失效引用，
+      于是在飞的读会失败，**恰好破坏排空这一步要保护的那些传输**。
+      现在 `release_member` 在 `begin_leave` 之后、发出任何通告之前就拒绝，
+      并有一个测试断言「此时一条通告都没发出去」。
+
+      **同 agent 的多 client 必须一起失效。** `remove_remote_agent` 是 agent 级的，
+      而 `NIXLMultiStorageClients` 让 actor / critic 共用一个 agent。
+      只清自己那份缓存会让兄弟 client 仍以为「还连着」，
+      于是跳过 `_ensure_client_info_fetched` 直接对一个已被忘掉的远端发请求。
+      `_agent_siblings` 让吊销作用于该 agent 上的每个 client。
 
       **仍待做**：把两段式接到 `client_info` 的真实扇出路径上
       （当前 `meta=self.agent.get_agent_metadata()` 仍是全量），需与 E3 的事件驱动 join 同批。
@@ -1714,7 +1802,7 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 | 项 | 缺它会怎样 | 依赖 |
 |---|---|---|
 | D2 `holder_index` / D4 `holder_roles` | 没有「谁持有哪个版本的哪一段」的索引。多模型隔离改由客户端名承担（§11.1），它只剩「档位 B 的 CPU holder」这一个用途 | — |
-| E4 `partial_md` 下半 | 缩容缺 `invalidateLocalMD`，会留下可用的陈旧 descriptor | NIXL 缺绑定 |
+| E4 `partial_md` **上半** | join 扇出仍是全量 MD（`meta=get_agent_metadata()`）。万卡量级下单次 join 17 GB vs 16 MB。下半（缩容吊销）已接生产 | 需与 E3 的事件驱动 join 同批改 |
 | F1 `delta_plan` | 跨 DC / 慢链路的增量传输，设计上就是 opt-in | — |
 
 **(c) 完全没有实现**
@@ -1732,13 +1820,14 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 已覆盖：1（零额外存储）、2（流量与重叠率，含 235B）、5（注册有效性三条）、
 7（atomic group，FP8 的 weight 与 scale 同组）、8（等价性，量化器与 vLLM 逐位一致）、
 **9 与 17a（故障注入：源失效改读 DP 副本，整组失效不动权重）**、
+**13 的第三条（缩容：吊销后陈旧 descriptor 被拒，未确认时拒绝释放）**、
 10（扩散有效性，含 235B 的结构性上界）、**13 的前两条（后加入的 instance 被准入并拉到正确字节）**、
 14（精度矩阵，34 格）、16（后端对称性）、18（布局转换产物时效性）、
 19（并行度不匹配的 shard 代数）、**22（role 隔离：两个模型同名 key 互不串读）**。
 
 未覆盖：3（单源瓶颈随 replica 数的亚线性）、4（pause 窗口与冲突等待分布）、
 6（colocate 切换的 KV cache 可用量）、11（四条运行时断言各一个反例）、
-12（`is_rollout_mode_in_actor=True` 全流程）、13 的后两条（缩容与非整除 join）、
+12（`is_rollout_mode_in_actor=True` 全流程）、13 的最后一条（非整除 join）、
 15（LoRA 两条路径，按要求不做）、20（colocate buffer 上界）、21（多角色切换的生产编排）、
 23（epoch 与 version 两段校验）、24（档位 B 的 GPS 一致性）、25（长跑 logprob 不漂移）。
 
@@ -1751,7 +1840,7 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 |---|---|---|---|---|
 | W5 | cost model 对齐实测 | `BW_NIC` 取探测的节点聚合值，同节点带宽单列，descriptor 成本按约 2 µs 一个进入决策 | `test_cost_model.py` 按实测改写 | CPU |
 | W6 | 状态表与 import 图对齐 | §9 第三列由 CPU 测试按生产 import 图生成并断言 | 模块零生产 import 时测试要求表中标 ❌ | CPU |
-| W7 | D7/D8、E3 准入、E4 接入生产 | 现为纯模块 | 故障注入 | 多节点 |
+| W7 | D7/D8 接入生产；E4 **上半**（join 的 partial MD 扇出）接入 | E3 准入与 E4 下半（缩容吊销）已接生产并有真机测试；其余现为纯模块 | 故障注入 | 多节点 |
 | W8 | 删 PS（D3/T2） | 需项目主人定迁移节奏 | — | — |
 | W9 | ~~block FP8 的细化 scale 网格~~ | ✅ rollout 在 scale sharding 上声明 scale tile，trainer 按 128 tile 量化后复制 scale（与 vLLM loader 的 `repeat_interleave` 逐位相同） | MoE Megatron TP2·EP2 → vLLM TP4（EP1）FP8 格通过 | 已完成 |
 | W11 | ~~MoE 下 vLLM DP > 1 的 L2 覆盖~~ | ✅ 根因是 NCCL 2.28.9 让 vLLM 禁用 pynccl，改用 2.29.7，harness 的 EP 规则改为 EP = DP × TP | EP4 跨 DP 的三格通过 | 已完成 |

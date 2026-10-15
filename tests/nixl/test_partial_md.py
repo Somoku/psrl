@@ -16,7 +16,6 @@ import pytest
 
 from psrl.utils.nixl.partial_md import (
     MetadataPlan,
-    describe_leave_gap,
     plan_metadata_fanout,
 )
 
@@ -95,21 +94,29 @@ class TestFanoutDoesNotGrowWithClusterSize:
         assert len(large.conn_info_peers) > len(small.conn_info_peers)
 
 
-class TestLeavePathGapIsStated:
-    def test_the_gap_names_the_missing_binding(self):
-        """A blocked dependency must be findable, not rediscovered by whoever tries next."""
-        gap = describe_leave_gap()
+class TestTheLeaveHalfIsNotBlocked:
+    """Guards against re-deriving the "NIXL has no binding" conclusion a third time.
 
-        assert "invalidate_local_md" in gap
+    Two rounds of this design recorded E4's leave half as blocked upstream, on the
+    strength of `hasattr(nixl_agent, 'invalidate_local_md')` being False. The attribute
+    is `invalidate_local_metadata`, so the probe could only ever answer False, and the
+    sentinel test that was supposed to fire when NIXL "gained" the binding could only
+    ever pass. A wrong name is indistinguishable from a missing feature unless something
+    checks the real one.
+    """
 
-    def test_the_binding_is_still_absent(self):
-        """Fails when NIXL gains the binding, which is the signal to finish E4's leave path."""
+    def test_both_revocation_bindings_exist(self):
         from nixl._api import nixl_agent
 
-        assert not hasattr(nixl_agent, "invalidate_local_md"), (
-            "NIXL now exposes invalidate_local_md; the shrink path in E4 can be completed "
-            "and describe_leave_gap should be removed"
-        )
+        for name in ("invalidate_local_metadata", "remove_remote_agent"):
+            assert hasattr(nixl_agent, name), f"NIXL no longer exposes {name}"
+
+    def test_the_leave_half_lives_in_its_own_module(self):
+        """The join/leave split is why `describe_leave_gap` is gone rather than renamed."""
+        from psrl.utils.nixl import leave_protocol, partial_md
+
+        assert not hasattr(partial_md, "describe_leave_gap")
+        assert hasattr(leave_protocol, "revoke_descriptors")
 
 
 class TestControlPlaneScaling:

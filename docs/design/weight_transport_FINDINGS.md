@@ -237,6 +237,37 @@ FSDP2 一格只有 2.05 GB 走拷贝，因为它多数 region 不是 caching all
 跨进程导入自己导出的句柄会被 CUDA 拒绝，所以地址算术单独做纯函数测试（`locate`），
 映射与拷贝由另一个进程验证（`test_device_ipc_gpu.py`）。
 
+## 5c. 缩容吊销：驱逐之后陈旧 descriptor 会被拒绝
+
+设计（§3.4.5）担心的是：成员退出后远端仍持有可用的 descriptor，
+retry 路径发起读会**读到已释放显存并成功**，与缺 `registration_epoch` 同构的静默损坏。
+实测（H20，两 agent 一 region，先做一次成功的 READ，再在读方执行 `remove_remote_agent`）：
+
+| 用法 | 结果 |
+|---|---|
+| 用驱逐前的 prepped dlist 新建请求 | `makeXferReq` 拒绝，`NIXL_ERR_NOT_FOUND` |
+| 驱逐前已建好的 req 句柄 repost | `postXferReq` 拒绝，`NIXL_ERR_NOT_FOUND` |
+
+机制是 NIXL 对 remote section 持弱引用并做 generation 校验
+（`nixl_agent.cpp` 在 `makeXferReq` / `postXferReq` / `getXferStatus` 三处查
+`remoteSection.expired()`）。**所以这条路径不需要我们再加一层 epoch**，
+要保证的只是「每个持有者都确实执行过驱逐」。
+
+**吊销不走 NIXL 的 `invalidateLocalMD`。** 读 `nixl_p2p_metadata_backend.cpp` 后，
+它的全部语义是「给该 peer 发一条 `NIXLCOMM:INVL`，让它执行 `invalidateRemoteMD(我)`」——
+干活的始终是持有者本地那次驱逐。它不是广播（广播形式要中心 MD 存储，PSRL 没有）、
+需要对端监听端口（`NIXLClientInfo` 不发布）、且 fire-and-forget 无法确认。
+而第四步释放显存的安全性恰恰取决于这个确认，所以真正的缺口是确认而非调用，
+吊销改走 PSRL 已有的 notif 通道（`MEMBER_LEAVE` / `LEAVE_ACK`）。
+
+此前两轮把这一项记为「NIXL 缺 `invalidateLocalMD` 绑定」是**探测名写错**：
+真名是 `invalidate_local_metadata`，而 PSRL 的 `server.shutdown` 一直在调它。
+那个「等 NIXL 补绑定就失败」的哨兵测试因此永远不会触发。
+
+**`remove_remote_agent` 在本构建上从不报错**：对已驱逐过的 peer、
+甚至对从未加载过的名字都正常返回。所以「这次驱逐是否忘掉了什么」在 NIXL 层无法回答，
+接口不返回布尔值；重复吊销天然幂等，丢 ack 后的重试安全。
+
 ## 6. block FP8 的数值
 
 - `block_fp8.quantize_blockwise` 与 vLLM 的 `per_block_cast_to_fp8` 逐位一致（CPU）。

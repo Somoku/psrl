@@ -73,4 +73,16 @@ if [ -z "${VLLM_NCCL_SO_PATH:-}" ] && [ -f "${_PSRL_NCCL_SO}" ]; then
     export VLLM_NCCL_SO_PATH="${_PSRL_NCCL_SO}"
 fi
 
-unset _PSRL_CONDA_LIB _PSRL_NIXL_PLUGINS _PSRL_CLUSTER_ENV _PSRL_NCCL_SO
+# transformers 5.12 requires huggingface-hub <2.0, and the shared conda was moved to 2.2.0
+# (2026-10-13), so every `import transformers` -- and with it verl, the converters and
+# both workers -- raises at import time. A staged 1.33.0 is prepended rather than the
+# shared environment being changed under everyone else
+# (`pip install --no-deps --target <dir> "huggingface-hub>=1.5,<2"`).
+_PSRL_HFHUB="${PSRL_HFHUB_DIR:-/apdcephfs_zwfy10_303541817/share_303541817/ls/psrl-wip/.pydeps_hfhub}"
+if [ -d "${_PSRL_HFHUB}/huggingface_hub" ]; then
+    case ":${PYTHONPATH:-}:" in
+        *":${_PSRL_HFHUB}:"*) ;;
+        *) export PYTHONPATH="${_PSRL_HFHUB}${PYTHONPATH:+:${PYTHONPATH}}" ;;
+    esac
+fi
+unset _PSRL_CONDA_LIB _PSRL_NIXL_PLUGINS _PSRL_CLUSTER_ENV _PSRL_NCCL_SO _PSRL_HFHUB

@@ -600,6 +600,11 @@ class NIXLClientInfo:
     # CUDA IPC handle per registered region, keyed by the region's base address in this process.
     # A reader on the same device maps these and copies instead of reading through NIXL (3.7.2.1).
     ipc_regions: dict[int, object] = dc_field(default_factory=dict)
+    # Connection-info-only bytes: same agent identity without region descriptors (~401 B, constant
+    # regardless of region count). Non-readers load only this at add_remote_agent time, which keeps
+    # join cost at O(members) instead of O(members x regions). Readers load this first, then `meta`.
+    # Empty until the field is populated by register_local_tensors (E4, design §9c-c).
+    conn_info_meta: bytes = dc_field(default=b"")
 
     def get_tensor_info(self, key):
         """Get tensor descriptor info for specific key"""

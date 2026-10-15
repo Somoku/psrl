@@ -408,8 +408,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.async_rollout_mode = False
 
         # Indicate whether current mode is rollout mode in actor
+        # Under direct supply the run boots in trainer mode even with `val_before_train`:
+        # the rollout-mode boot sleeps an *empty* actor and lets a parameter server fill
+        # the validate instances, and with no PS there is nothing to fill them from. The
+        # first `_validate` then performs an ordinary switch, which reads the trainer
+        # before offloading it (`colocate_switch.to_rollout_steps`).
         self.is_rollout_mode_in_actor = (
-            self.config.psrl.colocate_validate_and_train and self.config.trainer.val_before_train
+            self.config.psrl.colocate_validate_and_train
+            and self.config.trainer.val_before_train
+            and has_ps_data_plane(self.config.psrl.ps_mode)
         )
         # One-way marker for "this trainer has held real weights at some point" (item D4).
         #
@@ -2582,21 +2589,48 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             return
         psrl_logger.warning("Switching to rollout mode...")
 
-        psrl_logger.info("Step 1: Deregistering actor clients from NIXL...")
-        # actor_wg nixl client deregister weight memory
-        release_futures = self.actor_wg.execute_all_async("nixl_sleep", "full")
-        ray.get(release_futures)
+        from psrl.trainer.ppo.colocate_switch import Step, check_order, to_rollout_steps
 
-        psrl_logger.info("Step 2: Waking up validation instances...")
-        # Allocate rollout space and register
-        ray.get(
-            [self.tag_to_server_handles["validate"][i].nixl_wake_up.remote() for i in range(self.n_validate_instances)]
-        )
+        has_ps = has_ps_data_plane(self.config.psrl.ps_mode)
+        steps = to_rollout_steps(has_ps_data_plane=has_ps)
+        check_order(steps, trainer_is_source=not has_ps)
+        validate_handles = [self.tag_to_server_handles["validate"][i] for i in range(self.n_validate_instances)]
+        actions = {
+            # Deregister, then move off the GPU. Weights are kept on host under direct
+            # supply, where the trainer is their only copy (`stage_offload.stage_policy`).
+            Step.TRAINER_OFFLOAD: lambda: ray.get(self.actor_wg.execute_all_async("nixl_sleep", "full")),
+            Step.VALIDATE_WAKE_ALL: lambda: ray.get([h.nixl_wake_up.remote() for h in validate_handles]),
+            Step.VALIDATE_WAKE_WEIGHTS: lambda: ray.get([h.nixl_wake_up.remote(["weights"]) for h in validate_handles]),
+            Step.VALIDATE_WAKE_KV: lambda: ray.get([h.wake_up.remote(["kv_cache"]) for h in validate_handles]),
+            Step.VALIDATE_PUBLISH: self._publish_validate_client_infos,
+            # Blocking: under direct supply the next step deregisters the source, so the
+            # pull must have landed, not merely been issued.
+            Step.VALIDATE_PULL: lambda: ray.get(
+                self.rollout_coordinator.sync_with_ps.remote(self._validate_instance_ids(), wait_model_sync=not has_ps)
+            ),
+            Step.VALIDATE_RESUME: lambda: self._post_gateway_worker_routing_control(
+                "resume", self.tag_to_base_worker_ids.get("validate", [])
+            ),
+        }
+        for index, step in enumerate(steps, start=1):
+            psrl_logger.info(f"Step {index}/{len(steps)}: {step.value}")
+            actions[step]()
 
-        psrl_logger.info("Step 3: Syncing with PS manager...")
-        # sync with server
-        updated_client_names = []  # to collect all updated client names for broadcasting
+        self.is_rollout_mode_in_actor = True
+
+    def _validate_instance_ids(self) -> list:
+        validate_dp_size = self.config.train_actor_rollout_ref.rollout.data_parallel_size
+        return [
+            (base_worker_id, i)
+            for base_worker_id in self.tag_to_base_worker_ids.get("validate", [])
+            for i in range(validate_dp_size)
+        ]
+
+    def _publish_validate_client_infos(self) -> None:
+        """Send the woken validate instances' new addresses through the meta server."""
+        updated_client_names = []
         futures = []
+        tp_size = 0
         for i in range(self.n_validate_instances):
             tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "validate" and k.instance_id == i)
             for rank in range(tp_size):
@@ -2606,30 +2640,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             futures.append(
                 self.tag_to_server_handles["validate"][i].nixl_send_local_info_to.remote(NIXL_META_SERVER_NAME)
             )
-        # wait for ps manager to collect all infos
         futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.n_validate_instances * tp_size))
         ray.get(futures)
-
-        # broadcast to other clients
-        psrl_logger.info("Step 4: PS manager broadcasting updated client infos...")
         self._broadcast_updated_client_infos_from_ps_manager(updated_client_names)
-
-        psrl_logger.info("Step 5: Syncing validation instances' model weights and status with PS...")
-        # sync validation instances with ps
-        # the generation will be resumed in the rollout coordinator
-        resumed_instance_ids = []
-        validate_dp_size = self.config.train_actor_rollout_ref.rollout.data_parallel_size
-        for base_worker_id in self.tag_to_base_worker_ids.get("validate", []):
-            resumed_instance_ids.extend((base_worker_id, i) for i in range(validate_dp_size))
-
-        ray.get(self.rollout_coordinator.sync_with_ps.remote(resumed_instance_ids))
-
-        psrl_logger.info("Step 6: Resuming validation instances...")
-        # resume validation instances in router and coordinator
-        resumed_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
-        self._post_gateway_worker_routing_control("resume", resumed_base_worker_ids)
-
-        self.is_rollout_mode_in_actor = True
 
     def switch_to_trainer_mode(self):
         """Switch the PSRL colocate part to trainer mode for training.

@@ -237,6 +237,32 @@ class MetaServerActor:
         self.print("protocol done.")
         return self.server.client_unified_sharding_dicts
 
+    def republish(self, n_agents, dst_agent_names, client_names, timeout=None):
+        """Collect re-registered infos and rebroadcast them, as a colocate switch does.
+
+        Returns what the server saw, because the failure this can have is silent from the
+        driver's side: a sender that never reported and a receiver that never heard both
+        present as one timeout, and which one it was decides whether the bug is in the
+        switch or in the test's own fan-out.
+        """
+        print(f"[SERVER] republish: waiting for {n_agents} updated client infos", flush=True)
+        self.server.wait_for_update_infos(n_agents, timeout=timeout)
+        reached = {
+            name: self.server.client_infos[name].agent_name
+            for name in client_names
+            if name in self.server.client_infos
+        }
+        missing = [name for name in client_names if name not in reached]
+        print(f"[SERVER] republish: reporting senders {sorted(reached)}, missing {missing}", flush=True)
+        errors = {}
+        for dst in dst_agent_names:
+            try:
+                self.server.broadcast_update_client_infos([dst], client_names)
+            except Exception as exc:  # reported rather than masking the senders' state
+                errors[dst] = repr(exc)
+        print(f"[SERVER] republish: broadcast errors {errors}", flush=True)
+        return {"reached": reached, "missing": missing, "errors": errors}
+
     def shutdown(self):
         self.server.shutdown()
 
@@ -589,6 +615,89 @@ class TrainClientActor:
         """
         return self.coord_offsets
 
+    def build_optimizer(self):
+        """An Adam with materialised state, so a switch has optimizer bytes to carry.
+
+        `lr=0` so the step that creates the moments leaves the weights -- and therefore
+        the layout judge's expectations -- untouched. The moments themselves are
+        perturbed to known nonzero values, because zeros would survive a lost offload.
+        """
+        params = [p for p in self._model_parameters() if p.requires_grad]
+        self.optimizer = torch.optim.Adam(params, lr=0.0)
+        for p in params:
+            p.grad = torch.zeros_like(p)
+        self.optimizer.step()
+        for p in params:
+            p.grad = None
+        torch.manual_seed(1234 + self.rank)
+        for state in self.optimizer.state.values():
+            for key in ("exp_avg", "exp_avg_sq"):
+                state[key].copy_(torch.rand_like(state[key]))
+        self._opt_checksum = self._optimizer_checksum()
+        return sum(s["exp_avg"].numel() * 2 * s["exp_avg"].element_size() for s in self.optimizer.state.values())
+
+    def _model_parameters(self):
+        if self.engine_type == "megatron":
+            return [p for chunk in self.model for p in chunk.parameters()]
+        return list(self.model.parameters())
+
+    def _optimizer_checksum(self) -> float:
+        """A single number over all optimizer state, for a bit-exactness comparison.
+
+        Unwrapped to local shards first: under FSDP2 the state tensors are DTensors, and
+        arithmetic on one outside its mesh's dispatch raises rather than computing.
+        """
+        total = torch.zeros((), dtype=torch.float64, device="cuda")
+        for state in self.optimizer.state.values():
+            for key in ("exp_avg", "exp_avg_sq"):
+                tensor = state[key]
+                local = tensor._local_tensor if hasattr(tensor, "_local_tensor") else tensor
+                total += local.detach().double().sum()
+        return float(total)
+
+    def stage_offload(self, preserve_weights: bool):
+        """The trainer half of a colocate switch, through the code production runs."""
+        from psrl.utils.nixl.stage_offload import (
+            TrainerStage,
+            fsdp_weight_tensors,
+            megatron_weight_tensors,
+            optimizer_tensors,
+            stage_policy,
+        )
+
+        if not hasattr(self, "_stage"):
+            self._stage = TrainerStage()
+        self.client.deregister_local_tensors()
+        weights = megatron_weight_tensors(self.model) if self.engine_type == "megatron" else fsdp_weight_tensors(self.model)
+        policy = stage_policy(has_ps_data_plane=not preserve_weights, offload_optimizer=True, tms_pause=False)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        free_before = torch.cuda.mem_get_info()[0]
+        kept, dropped = self._stage.offload(
+            weights=weights, grads=[], optimizer=optimizer_tensors(getattr(self, "optimizer", None)), policy=policy
+        )
+        freed = torch.cuda.mem_get_info()[0] - free_before
+        self.print(
+            f"[MEASURE] stage offload: kept {kept.bytes / 2**30:.2f} GiB in {kept.seconds:.3f}s "
+            f"({kept.gbps:.1f} GB/s), dropped {dropped.bytes / 2**30:.2f} GiB, device freed {freed / 2**30:.2f} GiB"
+        )
+        return {"kept": kept.bytes, "kept_s": kept.seconds, "dropped": dropped.bytes, "freed": freed}
+
+    def stage_restore(self, server_name):
+        """Bring the weights back, re-register at the new addresses, and announce them."""
+        restored = self._stage.restore()
+        self.client.register_local_tensors(self.state_dict, self.unified_sharding)
+        self.client.publish_version(self.judge_version)
+        self.client.send_local_info_to([server_name])
+        checksum_ok = True
+        if getattr(self, "optimizer", None) is not None:
+            checksum_ok = self._optimizer_checksum() == self._opt_checksum
+        self.print(
+            f"[MEASURE] stage restore: {restored.bytes / 2**30:.2f} GiB in {restored.seconds:.3f}s "
+            f"({restored.gbps:.1f} GB/s), optimizer intact={checksum_ok}"
+        )
+        return {"restored": restored.bytes, "restored_s": restored.seconds, "optimizer_intact": checksum_ok}
+
     def get_nixl_names(self):
         """This rank's (agent, client) names, for rollouts reading it directly (T2).
 
@@ -910,6 +1019,12 @@ class GenClientActor:
         self.print("step8: wait_for_server_temp_mappings")
         self.client.wait_for_server_temp_mappings()
         self.print("protocol done.")
+
+    def wait_for_update_infos(self, n_agents, timeout=None):
+        """Absorb re-registered source infos; drops the pull engine built on the old ones."""
+        self.client.wait_for_update_infos(n_agents, timeout=timeout)
+        self.engine = None
+        return True
 
     def pull(self, epoch, participants=None):
         """Pull through the production engine and return its report."""
@@ -1365,6 +1480,42 @@ def test_nixl_e2e(cfg: DictConfig):
 
     _judge_all_gen(gen_actors, coord_offsets, version=0, label="")
     print("[PASS] All GenClientActor parameters match the coordinate function.")
+
+    # A colocate switch cycle between rounds (design §3.7.3). Under direct supply the
+    # trainer is the only copy of the weights, so they must survive the offload; the
+    # proof is a pull of the *same* version after the switch, judged against round 1's
+    # expectations. Advancing the version first would refill every byte and hide a lost
+    # one, which is why this runs before round 2 rather than as part of it.
+    if cfg.test.get("stage_switch", False):
+        assert direct_supply, "stage_switch checks weight survival, which only means something under direct supply"
+        check_optimizer = bool(cfg.test.get("stage_switch_optimizer", False))
+        if check_optimizer:
+            opt_bytes = ray.get([t.build_optimizer.remote() for t in train_actors])
+            print(f"[CHECK] optimizer state per rank: {max(opt_bytes) / 2**30:.2f} GiB")
+        else:
+            print("[CHECK] optimizer not built (`test.stage_switch_optimizer=true` to include it)")
+        offloads = ray.get([t.stage_offload.remote(True) for t in train_actors])
+        republish = server.republish.remote(
+            num_train, gen_names, [train_client_name(i) for i in range(num_train)]
+        )
+        gen_waits = [g.wait_for_update_infos.remote(1) for g in gen_actors]
+        restores = ray.get([t.stage_restore.remote(server_name) for t in train_actors])
+        republished, _ = ray.get([republish, *gen_waits])
+        print(f"[CHECK] republish saw {republished}")
+        kept = max(o["kept"] for o in offloads)
+        down = max(o["kept_s"] for o in offloads)
+        up = max(r["restored_s"] for r in restores)
+        freed = min(o["freed"] for o in offloads)
+        print(
+            f"[MEASURE] stage switch: per rank kept {kept / 2**30:.2f} GiB, slowest offload {down:.3f}s "
+            f"({kept / down / 1e9:.1f} GB/s), slowest restore {up:.3f}s ({kept / up / 1e9:.1f} GB/s), "
+            f"least device memory freed {freed / 2**30:.2f} GiB"
+        )
+        assert all(r["optimizer_intact"] for r in restores), "optimizer state changed across the switch"
+        assert freed >= 0.9 * kept, f"only {freed / 2**30:.2f} of {kept / 2**30:.2f} GiB went back to the device"
+        _timed_pull(gen_actors, epoch=10, label="pull after stage switch", expect_peers=diffusion_planned)
+        _judge_all_gen(gen_actors, coord_offsets, version=0, label=" (after stage switch)")
+        print("[PASS] Stage switch: weights and optimizer survived, readers found the new addresses.")
 
     # Second round: a new version must actually arrive (item D4).
     #

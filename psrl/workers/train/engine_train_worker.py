@@ -143,6 +143,12 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         else:
             self.memory_logger = None
 
+        # Colocate stage-boundary offload (design §3.7.3). Lives for the process so its
+        # pinned host buffers are allocated once, not per switch.
+        from psrl.utils.nixl.stage_offload import TrainerStage  # noqa: PLC0415
+
+        self._stage = TrainerStage()
+
     @property
     def is_train_representative_rank(self) -> bool:
         """Return True for rank 0 (the rank that pushes to PS)."""
@@ -283,59 +289,103 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         self.unified_sharding_dict = unified_sharding_dict
 
     def nixl_sleep(self, mode: str = "full"):
-        """Deregister NIXL tensors and release GPU memory."""
-        self.sleep_model()
-        if mode == "meta":
-            return
-        self.nixl_storage_client.deregister_local_tensors()
+        """Deregister NIXL tensors and move the trainer off the GPU (design §3.7.3).
+
+        Deregistration comes first: the addresses are about to stop being valid, and the
+        prepped handles built from them must go before the memory does.
+        """
+        if mode != "meta":
+            self.nixl_storage_client.deregister_local_tensors()
+        self.sleep_model(mode)
 
     def nixl_wake_up(self):
-        """Restore GPU memory and re-register NIXL tensors after sleep."""
+        """Bring the trainer back and re-register at whatever addresses it now has."""
         self.wake_up_model()
         self.nixl_storage_client.register_local_tensors(self.unified_state_dict, self.unified_sharding_dict)
 
-    def sleep_model(self):
-        """Release GPU memory for model weights (metadata preserved for wake_up).
+    def _stage_policy(self, mode: str):
+        from psrl.utils.nixl.stage_offload import stage_policy  # noqa: PLC0415
 
-        Uses torch_memory_saver.pause() when TMS range covers training,
-        otherwise falls back to manual storage-resize helpers.
+        offload_cfg = self.psrl_config.get("colocate_offload", {}) or {}
+        # `meta` is the boot path: the actor was built empty and a parameter server will
+        # fill it, so there is nothing to keep. Under direct supply there is no `meta`
+        # sleep at all (the actor holds real weights from boot); see `ray_trainer`.
+        has_ps = has_ps_data_plane(self.psrl_config.ps_mode) or mode == "meta"
+        return stage_policy(
+            has_ps_data_plane=has_ps,
+            offload_optimizer=bool(offload_cfg.get("optimizer", True)),
+            tms_pause=self.psrl_config.tms.range in ["train", "all"],
+        )
+
+    def _stage_tensors(self):
+        """(weights, grads, optimizer) tensors whose storages a switch moves."""
+        from psrl.utils.nixl.stage_offload import (  # noqa: PLC0415
+            fsdp_weight_tensors,
+            megatron_grad_tensors,
+            megatron_weight_tensors,
+            optimizer_tensors,
+        )
+
+        module = self.actor.engine.module
+        strategy = self.config.actor.strategy
+        if strategy in {"fsdp", "fsdp2"}:
+            weights = fsdp_weight_tensors(module)
+            grads = [p.grad for p in module.parameters() if p.grad is not None]
+        elif strategy == "megatron":
+            weights = megatron_weight_tensors(module)
+            grads = megatron_grad_tensors(module)
+        else:
+            raise NotImplementedError(f"stage offload does not support strategy '{strategy}'.")
+        return weights, grads, optimizer_tensors(self.actor.engine.optimizer)
+
+    def sleep_model(self, mode: str = "full"):
+        """Free the trainer's GPU memory for the rollout, keeping what has no other home.
+
+        Weights are copied to host under direct supply (the trainer is the only copy) and
+        released under a parameter server (the switch-back pulls them). Optimizer state
+        is copied to host in every mode: fp32 masters and Adam moments exist nowhere else.
+        Both used to be dropped -- the weights by the storage resize, the optimizer by a
+        TMS pause configured without CPU backup.
         """
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"Before TrainWorker_R{self.rank} sleep")
 
+        policy = self._stage_policy(mode)
+        weights, grads, opt_tensors = self._stage_tensors()
+
         # NOTE(lhy): Empty the PyTorch cache before pausing TMS to prevent duplicate
         # `cuMemRelease` calls from the mempool and pause paths.
         aggressive_empty_cache(force_sync=True)
-        if self.psrl_config.tms.range in ["train", "all"]:
+        kept, dropped = self._stage.offload(weights=weights, grads=grads, optimizer=opt_tensors, policy=policy)
+        if policy.tms_pause:
             torch_memory_saver.pause()
-        else:
-            strategy = self.config.actor.strategy
-            if strategy in {"fsdp", "fsdp2"}:
-                self._sleep_fsdp_model(self.actor.engine.module)
-            elif strategy == "megatron":
-                self._sleep_megatron_model(self.actor.engine.module)
-            else:
-                raise NotImplementedError(f"sleep_model does not support strategy '{strategy}'.")
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
+        psrl_logger.info(
+            f"Stage offload ({policy.describe()}): kept {kept.bytes / 2**30:.2f} GiB on host "
+            f"in {kept.seconds:.3f}s ({kept.gbps:.1f} GB/s), released "
+            f"{dropped.bytes / 2**30:.2f} GiB; device free +{(kept.freed + dropped.freed) / 2**30:.2f} GiB"
+        )
 
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"After TrainWorker_R{self.rank} sleep")
 
     def wake_up_model(self):
-        """Restore GPU memory allocation without restoring data (NIXL fills it)."""
+        """Reallocate, then copy back whatever `sleep_model` kept.
+
+        Kept storages are restored before dropped ones so the weights a parameter-server
+        pull is about to overwrite do not compete with the bytes nobody can recreate.
+        """
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"Before TrainWorker_R{self.rank} wake_up")
 
         if self.psrl_config.tms.range in ["train", "all"]:
             torch_memory_saver.resume()
-        else:
-            strategy = self.config.actor.strategy
-            if strategy in {"fsdp", "fsdp2"}:
-                self._wake_up_fsdp_model(self.actor.engine.module)
-            elif strategy == "megatron":
-                self._wake_up_megatron_model(self.actor.engine.module)
-            else:
-                raise NotImplementedError(f"wake_up_model does not support strategy '{strategy}'.")
+        restored = self._stage.restore()
+        if restored is not None:
+            psrl_logger.info(
+                f"Stage restore: {restored.bytes / 2**30:.2f} GiB from host in "
+                f"{restored.seconds:.3f}s ({restored.gbps:.1f} GB/s)"
+            )
 
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"After TrainWorker_R{self.rank} wake_up")
@@ -398,97 +448,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             raise NotImplementedError(
                 f"_restore_non_persistent_buffers_from_ps does not support strategy '{strategy}'."
             )
-
-    def _sleep_fsdp_model(self, model):
-        """Release GPU memory for FSDP model by resizing local shard storage to 0."""
-        from torch.distributed.tensor import DTensor as _DTensor
-
-        for _, param in model.named_parameters():
-            local_tensor = param._local_tensor if isinstance(param, _DTensor) else param
-            if local_tensor.untyped_storage().size() > 0:
-                param._sleep_storage_size = local_tensor.untyped_storage().size()
-                local_tensor.untyped_storage().resize_(0)
-        for _, buffer in model.named_buffers():
-            if buffer is not None and buffer.untyped_storage().size() > 0:
-                buffer._sleep_storage_size = buffer.untyped_storage().size()
-                buffer.untyped_storage().resize_(0)
-
-    def _wake_up_fsdp_model(self, model):
-        """Restore GPU memory allocation for FSDP model (no data copy)."""
-        from torch.distributed.tensor import DTensor as _DTensor
-
-        for _, param in model.named_parameters():
-            local_tensor = param._local_tensor if isinstance(param, _DTensor) else param
-            if hasattr(param, "_sleep_storage_size") and local_tensor.untyped_storage().size() == 0:
-                local_tensor.untyped_storage().resize_(param._sleep_storage_size)
-        for _, buffer in model.named_buffers():
-            if buffer is not None and hasattr(buffer, "_sleep_storage_size") and buffer.untyped_storage().size() == 0:
-                buffer.untyped_storage().resize_(buffer._sleep_storage_size)
-
-    def _sleep_megatron_model(self, models):
-        """
-        Release Megatron DDP buffer storage.
-
-        Parameters and gradients are views into contiguous DDP buffers, so resizing
-        those buffers releases the underlying allocation.
-        """
-        try:
-            from megatron.core import DistributedDataParallel as DDP  # noqa: PLC0415
-        except ImportError:
-            DDP = None
-
-        for model_chunk in models:
-            if DDP is not None and isinstance(model_chunk, DDP):
-                for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
-                    for buf in buffers:
-                        if buf.param_data is not None and buf.param_data.untyped_storage().size() > 0:
-                            buf._sleep_param_data_size = buf.param_data.untyped_storage().size()
-                            buf.param_data.untyped_storage().resize_(0)
-                        if buf.grad_data is not None and buf.grad_data.untyped_storage().size() > 0:
-                            buf._sleep_grad_data_size = buf.grad_data.untyped_storage().size()
-                            buf.grad_data.untyped_storage().resize_(0)
-            else:
-                unwrapped = unwrap_model(model_chunk)
-                for _, param in unwrapped.named_parameters():
-                    if param.data.untyped_storage().size() > 0:
-                        param._sleep_storage_size = param.data.untyped_storage().size()
-                        param.data.untyped_storage().resize_(0)
-                    if param.grad is not None and param.grad.untyped_storage().size() > 0:
-                        param._sleep_grad_storage_size = param.grad.untyped_storage().size()
-                        param.grad.untyped_storage().resize_(0)
-
-    def _wake_up_megatron_model(self, models):
-        """
-        Restore Megatron DDP buffer storage without copying data.
-
-        Existing parameter views remain valid. The subsequent NIXL pull restores weights.
-        """
-        try:
-            from megatron.core import DistributedDataParallel as DDP  # noqa: PLC0415
-        except ImportError:
-            DDP = None
-
-        for model_chunk in models:
-            if DDP is not None and isinstance(model_chunk, DDP):
-                for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
-                    for buf in buffers:
-                        if hasattr(buf, "_sleep_param_data_size") and buf.param_data.untyped_storage().size() == 0:
-                            buf.param_data.untyped_storage().resize_(buf._sleep_param_data_size)
-                        if hasattr(buf, "_sleep_grad_data_size") and buf.grad_data.untyped_storage().size() == 0:
-                            buf.grad_data.untyped_storage().resize_(buf._sleep_grad_data_size)
-                            buf.grad_data.zero_()
-            else:
-                unwrapped = unwrap_model(model_chunk)
-                for _, param in unwrapped.named_parameters():
-                    if hasattr(param, "_sleep_storage_size") and param.data.untyped_storage().size() == 0:
-                        param.data.untyped_storage().resize_(param._sleep_storage_size)
-                    if (
-                        param.grad is not None
-                        and hasattr(param, "_sleep_grad_storage_size")
-                        and param.grad.untyped_storage().size() == 0
-                    ):
-                        param.grad.untyped_storage().resize_(param._sleep_grad_storage_size)
-                        param.grad.zero_()
 
     def ray_push_model(self) -> None:
         """Push model weights to the parameter server via CPU Ray object store.

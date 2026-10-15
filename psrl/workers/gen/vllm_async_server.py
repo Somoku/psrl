@@ -121,6 +121,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # Async event management
         self._is_init_model = asyncio.Event()
         self._is_init_nixl_client = asyncio.Event()
+        #: vLLM memory tags currently released, tracked here because vLLM only reports
+        #: "sleeping" as a whole. See `weights_resident`.
+        self._asleep_tags: set[str] = set()
 
         # NIXL
         self.nixl_storage_client = None
@@ -722,17 +725,34 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
     async def is_sleeping(self) -> bool:
         return await self.engine.is_sleeping()
 
+    async def weights_resident(self) -> bool:
+        """Whether a pull has somewhere to land.
+
+        Not `not is_sleeping()`: vLLM keeps reporting sleeping until *every* tag is
+        awake, so an instance woken for weights only -- the direct-supply colocate
+        switch, which defers the KV cache until the trainer has left -- would be skipped
+        by the sync and then serve whatever its weight memory held.
+        """
+        return "weights" not in self._asleep_tags
+
     async def sleep(self, level: int):
+        self._asleep_tags = {"weights", "kv_cache"}
         await self.engine.sleep(level)
         await self.engine.reset_encoder_cache()
         if self.psrl_config.tms.range in ["rollout", "all"]:
             # NOTE(linsh): TMS requires an explicit aggressive cache clear.
             aggressive_empty_cache(force_sync=True)
 
-    async def wake_up(self):
+    async def wake_up(self, tags: list[str] | None = None):
         # The TMS backend resumes its "graph" region implicitly, so "graph" is
         # not requested here. Executor.wake_up rejects tags it did not record.
-        await self.engine.wake_up(tags=["weights", "kv_cache"])
+        #
+        # `tags` lets a colocate switch under direct supply wake weights while the
+        # trainer is still resident (it is the source being read) and the KV cache only
+        # after the trainer has left; see `psrl.trainer.ppo.colocate_switch`.
+        woken = tags or ["weights", "kv_cache"]
+        await self.engine.wake_up(tags=woken)
+        self._asleep_tags -= set(woken)
 
     async def clear_kv_cache(self):
         await self.engine.reset_prefix_cache(reset_connector=True)
@@ -951,10 +971,13 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             args=(self.model_config, mode),
         )
 
-    async def nixl_wake_up(self):
+    async def nixl_wake_up(self, tags: list[str] | None = None):
         await self._is_init_nixl_client.wait()
-        await self.wake_up()
-        await self.collective_rpc(method="nixl_register_after_wake_up")
+        await self.wake_up(tags)
+        # Only the weights are registered with NIXL; waking the KV cache alone changes
+        # no address anyone reads.
+        if tags is None or "weights" in tags:
+            await self.collective_rpc(method="nixl_register_after_wake_up")
 
     async def nixl_sleep(self, level: int):
         await self._is_init_nixl_client.wait()

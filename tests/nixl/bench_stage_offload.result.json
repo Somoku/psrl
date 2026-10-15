@@ -1,0 +1,172 @@
+{
+ "local_numa_1proc": [
+  {
+   "device": 0,
+   "gpu_numa": 0,
+   "host_numa": 0,
+   "d2h_gbps": 53.660057269690796,
+   "h2d_gbps": 57.40808141761342,
+   "realloc_s": 0.003094315528869629,
+   "realloc_cached_s": 8.519738912582397e-06
+  }
+ ],
+ "local_numa_8proc": [
+  {
+   "device": 0,
+   "gpu_numa": 0,
+   "host_numa": 0,
+   "d2h_gbps": 53.67778463855553,
+   "h2d_gbps": 57.434505179475345,
+   "realloc_s": 0.01443774625658989,
+   "realloc_cached_s": 1.3269484043121338e-05
+  },
+  {
+   "device": 1,
+   "gpu_numa": 0,
+   "host_numa": 0,
+   "d2h_gbps": 35.568836113824254,
+   "h2d_gbps": 36.393171134798564,
+   "realloc_s": 0.014528654515743256,
+   "realloc_cached_s": 1.528114080429077e-05
+  },
+  {
+   "device": 2,
+   "gpu_numa": 0,
+   "host_numa": 0,
+   "d2h_gbps": 53.64776809831141,
+   "h2d_gbps": 36.38928462418055,
+   "realloc_s": 0.014568611979484558,
+   "realloc_cached_s": 1.082010567188263e-05
+  },
+  {
+   "device": 3,
+   "gpu_numa": 0,
+   "host_numa": 0,
+   "d2h_gbps": 53.686033670831634,
+   "h2d_gbps": 57.431979578968125,
+   "realloc_s": 0.014569874852895737,
+   "realloc_cached_s": 1.8708407878875732e-05
+  },
+  {
+   "device": 4,
+   "gpu_numa": 1,
+   "host_numa": 1,
+   "d2h_gbps": 53.717659169666554,
+   "h2d_gbps": 57.47056013967578,
+   "realloc_s": 0.014303039759397507,
+   "realloc_cached_s": 1.0458752512931824e-05
+  },
+  {
+   "device": 5,
+   "gpu_numa": 1,
+   "host_numa": 1,
+   "d2h_gbps": 53.72228858537158,
+   "h2d_gbps": 57.4658007036001,
+   "realloc_s": 0.014475824311375618,
+   "realloc_cached_s": 9.71183180809021e-06
+  },
+  {
+   "device": 6,
+   "gpu_numa": 1,
+   "host_numa": 1,
+   "d2h_gbps": 33.81253685613902,
+   "h2d_gbps": 36.395087414825106,
+   "realloc_s": 0.014332234859466553,
+   "realloc_cached_s": 9.547919034957886e-06
+  },
+  {
+   "device": 7,
+   "gpu_numa": 1,
+   "host_numa": 1,
+   "d2h_gbps": 34.936190320622416,
+   "h2d_gbps": 36.391382559091475,
+   "realloc_s": 0.015577152371406555,
+   "realloc_cached_s": 1.0309740900993347e-05
+  }
+ ],
+ "remote_numa_1proc": [
+  {
+   "device": 0,
+   "gpu_numa": 0,
+   "host_numa": 1,
+   "d2h_gbps": 50.76661339545601,
+   "h2d_gbps": 57.47511621559801,
+   "realloc_s": 0.0031173676252365112,
+   "realloc_cached_s": 8.009374141693115e-06
+  }
+ ],
+ "remote_numa_8proc": [
+  {
+   "device": 0,
+   "gpu_numa": 0,
+   "host_numa": 1,
+   "d2h_gbps": 46.309747227940335,
+   "h2d_gbps": 37.652584123921784,
+   "realloc_s": 0.013723339885473251,
+   "realloc_cached_s": 8.560717105865479e-06
+  },
+  {
+   "device": 1,
+   "gpu_numa": 0,
+   "host_numa": 1,
+   "d2h_gbps": 33.47116878266991,
+   "h2d_gbps": 24.48672691569509,
+   "realloc_s": 0.014379909262061119,
+   "realloc_cached_s": 8.899718523025513e-06
+  },
+  {
+   "device": 2,
+   "gpu_numa": 0,
+   "host_numa": 1,
+   "d2h_gbps": 33.68275645453712,
+   "h2d_gbps": 24.48610713805498,
+   "realloc_s": 0.014600194990634918,
+   "realloc_cached_s": 9.996816515922546e-06
+  },
+  {
+   "device": 3,
+   "gpu_numa": 0,
+   "host_numa": 1,
+   "d2h_gbps": 22.192204012151052,
+   "h2d_gbps": 31.719352508552156,
+   "realloc_s": 0.013673081994056702,
+   "realloc_cached_s": 9.139999747276306e-06
+  },
+  {
+   "device": 4,
+   "gpu_numa": 1,
+   "host_numa": 0,
+   "d2h_gbps": 30.77835865528944,
+   "h2d_gbps": 37.6033016057172,
+   "realloc_s": 0.013884318992495537,
+   "realloc_cached_s": 9.799376130104065e-06
+  },
+  {
+   "device": 5,
+   "gpu_numa": 1,
+   "host_numa": 0,
+   "d2h_gbps": 36.6791574521962,
+   "h2d_gbps": 37.100635837554506,
+   "realloc_s": 0.013729620724916458,
+   "realloc_cached_s": 1.0658055543899536e-05
+  },
+  {
+   "device": 6,
+   "gpu_numa": 1,
+   "host_numa": 0,
+   "d2h_gbps": 31.0382507634125,
+   "h2d_gbps": 22.383247815500305,
+   "realloc_s": 0.014183202758431435,
+   "realloc_cached_s": 1.130811870098114e-05
+  },
+  {
+   "device": 7,
+   "gpu_numa": 1,
+   "host_numa": 0,
+   "d2h_gbps": 31.62973734925419,
+   "h2d_gbps": 22.384474636347473,
+   "realloc_s": 0.013563815504312515,
+   "realloc_cached_s": 9.410083293914795e-06
+  }
+ ]
+}

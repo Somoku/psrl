@@ -23,6 +23,7 @@ from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.device_ipc import RegionMapper, device_uuid, export_region
 from psrl.utils.nixl.handshake_notif import NotifKind, decode, encode
 from psrl.utils.nixl.leave_protocol import encode_leave_ack, revoke_descriptors
+from psrl.utils.nixl.partial_md import conn_info_only
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.moe_grouping import GroupedShards, entry_is_empty, local_shards_of
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
@@ -1472,6 +1473,10 @@ class NIXLStorageClient:
                 type=self.client_type,
                 tensor_infos=tensor_infos,
                 meta=self.agent.get_agent_metadata(),
+                # conn_info_meta is the same identity without region descriptors (~401 B,
+                # constant). Non-readers load only this; readers load this then `meta`.
+                # See design §9c-c (E4) and `_ensure_client_info_fetched`.
+                conn_info_meta=conn_info_only(self.agent),
                 client_group_id=self.client_group_id,
                 is_registered=not meta_only,
                 agent_name=self.agent.name,
@@ -1635,6 +1640,13 @@ class NIXLStorageClient:
         self._ipc_regions = {}
         # Deregister all registered regions.
         self._deregister_all_descs()
+        # Publish copies and derived FP8 scales are GPU tensors this client owns, rebuilt
+        # by the next `register_local_tensors`. Holding them across a colocate switch
+        # kept the publish copies -- 20 GB per rank at 235B FP8 -- out of the rollout's KV
+        # cache while nothing could read them, since their registrations are gone.
+        self._publish_copies = {}
+        self.publish_copy_bytes = 0
+        self._fp8_pairs = {}
         if not self.enable_tms_for_temp_buffers:
             self.release_temp_memory()
 
@@ -1923,19 +1935,62 @@ class NIXLStorageClient:
         for dst_agent_name in dst_agent_names:
             self.agent.send_notif(dst_agent_name, payload)
 
+    def _is_reader_of(self, source: str) -> bool:
+        """Whether this client reads from ``source`` according to the comm plan.
+
+        Used to decide whether to load full descriptors or only connection info
+        (E4, design §9c-c). Falls back to True when no plan is present so every
+        unknown caller gets the full metadata and no transfer silently fails.
+        """
+        if self._comm_plan is None:
+            return True
+        from psrl.utils.nixl.registration_policy import readers_by_source  # noqa: PLC0415
+
+        rbs = readers_by_source(self._comm_plan)
+        for key_readers in rbs.get(source, {}).values():
+            if self.client_name in key_readers:
+                return True
+        return False
+
     def _ensure_client_info_fetched(self, target_client: str):
-        """Ensure connection to target client is established."""
+        """Ensure connection to target client is established.
+
+        Two-stage load (E4, design §9c-c): every client loads only the
+        connection-info bytes (~401 B, constant) to establish the link; only
+        actual readers of `target_client` follow up with the full descriptor
+        bytes. This keeps join cost O(members) instead of O(members × regions).
+
+        Falls back to the full metadata when `conn_info_meta` is empty (old
+        clients or meta-only registrations) so the new code is backward-
+        compatible with existing traffic.
+        """
         if target_client in self._target_client_connected:
             return
         assert target_client in self._all_client_infos, (
             f"Target client {target_client} not found in client infos: {self._all_client_infos.keys()}"
         )
-        meta = self._all_client_infos[target_client].meta
-        try:
-            self.agent.add_remote_agent(meta)
-        except Exception as e:
-            psrl_logger.error(f"Error adding remote agent {target_client}: {e}")
-            raise e
+        info = self._all_client_infos[target_client]
+        if info.conn_info_meta:
+            # Stage 1: every client loads the link bytes.
+            try:
+                self.agent.add_remote_agent(info.conn_info_meta)
+            except Exception as e:
+                psrl_logger.error(f"Error adding remote agent (conn-info) {target_client}: {e}")
+                raise e
+            # Stage 2: only readers load the full descriptor bytes.
+            if self._is_reader_of(target_client):
+                try:
+                    self.agent.add_remote_agent(info.meta)
+                except Exception as e:
+                    psrl_logger.error(f"Error adding remote agent (descriptors) {target_client}: {e}")
+                    raise e
+        else:
+            # Backward-compatible path: old client or meta-only registration.
+            try:
+                self.agent.add_remote_agent(info.meta)
+            except Exception as e:
+                psrl_logger.error(f"Error adding remote agent {target_client}: {e}")
+                raise e
         self._target_client_connected[target_client] = True
 
     def client_read(

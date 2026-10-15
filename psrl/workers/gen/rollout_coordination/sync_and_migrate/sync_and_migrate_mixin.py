@@ -145,10 +145,13 @@ class SyncAndMigrateMixin:
         ):
             instance_ids = self._expand_replica_instance_ids(instance_ids)
             replica_ids = sorted({instance_id[0] for instance_id in instance_ids})
-            sleeping = await asyncio.gather(
-                *[self.server_handles[replica_id].is_sleeping.remote() for replica_id in replica_ids]
+            # "Can a pull land here", not "is it fully awake": a colocate switch under
+            # direct supply wakes weights first and the KV cache only after the trainer
+            # has left, and vLLM reports such an instance as sleeping throughout.
+            resident = await asyncio.gather(
+                *[self.server_handles[replica_id].weights_resident.remote() for replica_id in replica_ids]
             )
-            replica_ids = [replica_id for replica_id, is_sleeping in zip(replica_ids, sleeping) if not is_sleeping]
+            replica_ids = [replica_id for replica_id, ok in zip(replica_ids, resident) if ok]
             instance_ids = [instance_id for instance_id in instance_ids if instance_id[0] in replica_ids]
             if not replica_ids:
                 return

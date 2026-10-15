@@ -590,6 +590,48 @@ def test_a_designate_that_dies_sends_its_followers_upstream():
     assert sum(r.fallback_keys for r in reports.values()) > 0
 
 
+def test_a_mid_pull_failure_is_promoted_to_unavailable_for_the_next_pull():
+    # D7 production wiring: report.failed_sources from a mid-pull failure must be promoted
+    # into mark_unavailable so the next pull skips the dead source rather than
+    # re-discovering the failure through another timed-out read.
+    #
+    # This test validates the contract that nixl_pull_model_core relies on: calling
+    # mark_unavailable(report.failed_sources) after a pull causes subsequent pulls to
+    # skip the dead source entirely, without any reads against it.
+    cluster = _replicated_cluster(train_tp=2, dp=2, gen_tp=2, instances=1)
+    victim, _twin = _planned_source(cluster, train_tp=2)
+
+    # Kill but do not announce: the engine learns the failure from the read itself.
+    _kill(cluster, {victim})
+    reports = cluster.pull(epoch=1)
+    cluster.judge(cluster.gen, version=7)
+
+    hit = [r for r in reports.values() if r.failed_sources]
+    assert hit, "no reader was planned against the failed source"
+    assert all(victim in r.failed_sources for r in hit)
+
+    # Simulate what nixl_pull_model_core does: promote failed_sources to unavailable.
+    # Only engines that were planned against the dead source encounter the failure.
+    for name, report in reports.items():
+        if report.failed_sources:
+            cluster.engines[name].mark_unavailable(report.failed_sources)
+
+    # Engines that encountered the failure must have the dead source in unavailable.
+    readers_that_hit = [name for name, report in reports.items() if victim in report.failed_sources]
+    assert readers_that_hit, "no engine recorded the failed source"
+    for name in readers_that_hit:
+        assert victim in cluster.engines[name].unavailable, (
+            f"{name}: dead source {victim!r} not in unavailable after promotion"
+        )
+
+    # Epoch 2 must still succeed (served by the twin) and must not touch the dead source.
+    reports2 = cluster.pull(epoch=2)
+    cluster.judge(cluster.gen, version=7)
+    assert all(victim not in r.sources for r in reports2.values()), (
+        "dead source was used in epoch 2 despite being in unavailable"
+    )
+
+
 def _multi_role_cluster(roles, train_tp, gen_tp):
     """One cluster carrying several models at once, their keys named identically."""
     cluster = Cluster.__new__(Cluster)

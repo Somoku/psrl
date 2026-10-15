@@ -923,7 +923,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | D4 `holder_roles` / bootstrap | ✅ | ❌ 零 import | L1 |
 > | D5 `chunk_offset` | ✅ | ❌ 零 import | L1 |
 > | D6 降级继续生成 | ✅ | ✅ | L2 ✅ |
-> | D7/D8 `chunk_availability` | ✅ 判定 | ✅ 逻辑在 `pull_engine.py` | L1 四条故障注入：源失效改读 DP 副本，整组失效抛 `ChunkUnavailable` 且不动权重 |
+> | D7/D8 `chunk_availability` | ✅ 判定 | ✅ 逻辑在 `pull_engine.py`；`nixl_pull_model_core` 将 `failed_sources` 提升到 `unavailable` | L1 五条故障注入：源失效改读 DP 副本，整组失效抛 `ChunkUnavailable` 且不动权重，mid-pull 失效下次 pull 直接跳过 |
 > | E1 版本级等待 | ✅ | ✅ `ps_manager` + `vllm_async_server` | L2 ✅ |
 > | E2 `staleness` | ✅ | ⚠️ 仅类型被引用 | L1 |
 > | E3 握手解复用 | ✅ | ✅ `server.py` / `client.py` | L2 ✅ |

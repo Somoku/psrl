@@ -243,7 +243,16 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             psrl_logger.warning(
                 f"{self.nixl_storage_client.client_name}: pull {self.pull_times} skipped: {unavailable}"
             )
+            # D7: sources that failed during rerouting are now confirmed dead; exclude them
+            # from every future pull so they are not retried round after round.
+            if unavailable.dead:
+                self.nixl_storage_client.pull_engine().mark_unavailable(unavailable.dead)
             return False
+        # D7: sources that failed mid-pull and were rerouted to a DP replica are confirmed
+        # dead; promote them so the next pull skips them rather than re-discovering the
+        # failure through another timed-out read.
+        if report.failed_sources:
+            self.nixl_storage_client.pull_engine().mark_unavailable(report.failed_sources)
         self.cuda_synchronize()
         # Every shard of one pull must come from one version. More than one means some sources had republished.
         self.pulled_version = report.versions

@@ -928,7 +928,8 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | E2 `staleness` | ✅ | ⚠️ 仅类型被引用 | L1 |
 > | E3 握手解复用 | ✅ | ✅ `server.py` / `client.py` | L2 ✅ |
 > | E3 `admit_joiners` | ✅ | ✅ `ps_manager.nixl_admit_joiners` | L3 真实 agent 准入；L1 后加入的 instance 拉到正确字节 |
-> | E4 partial MD | ✅ 上半 | ❌ 零 import | L1，下半被 NIXL 缺绑定阻塞 |
+> | E4 partial MD 两段式 join | ✅ `partial_md.py` `conn_info_only` + `NIXLClientInfo.conn_info_meta` | ✅ `client.py:_ensure_client_info_fetched` 读者加载全量 MD，非读者仅加载 ~401 B conn-info | L1 ✅；NIXL 缺绑定的记录有误——`invalidate_local_metadata` 一直存在，探针用了错误名称 |
+> | E4 缩容吊销 descriptor | ✅ `leave_protocol.py` | ✅ `client.py` `_revoke_member` + ack | L1 ✅；L2 `test_revoke_descriptors_gpu.py` 5 passed：吊销后 `NIXL_ERR_NOT_FOUND`，未确认时拒绝释放显存 |
 > | F1 delta | ✅ 决策函数 | ❌ | L1 |
 > | T1 判据 | ✅ layout 判据 + FP8 逐位判据 | — | 坐标哈希写入原始位，对整行 / 整块错位可见 |
 > | T3 colocate | ✅ | — | L2 ✅ |
@@ -1802,14 +1803,13 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 | 项 | 缺它会怎样 | 依赖 |
 |---|---|---|
 | D2 `holder_index` / D4 `holder_roles` | 没有「谁持有哪个版本的哪一段」的索引。多模型隔离改由客户端名承担（§11.1），它只剩「档位 B 的 CPU holder」这一个用途 | — |
-| E4 `partial_md` **上半** | join 扇出仍是全量 MD（`meta=get_agent_metadata()`）。万卡量级下单次 join 17 GB vs 16 MB。下半（缩容吊销）已接生产 | 需与 E3 的事件驱动 join 同批改 |
 | F1 `delta_plan` | 跨 DC / 慢链路的增量传输，设计上就是 opt-in | — |
 
 **(c) 完全没有实现**
 
 | 项 | 现状 |
 |---|---|
-| **stage 边界 offload** | 同设备读已走 IPC（§11.1），但「rollout 阶段把 trainer 权重 offload 到 CPU 腾出 KV cache」没做；每次 colocate 切换仍整体重注册（实测每 region 约 2.2 ms） |
+| **stage 边界 offload** | ✅ 已落地：`stage_offload.py` `TrainerStage` + `StorageOffloader`，`weight_backup.py` `WeightBackup`，接入 `engine_train_worker.py` + `ray_trainer.py`；`colocate_switch.py` 编码直供正确切换顺序；`registration_policy.py` 按 plan 决定是否 RDMA 注册。实测 H20 PCIe 53–57 GB/s（D2H/H2D），18 GB 模型 offload < 0.35s。`test_stage_offload_gpu.py` 14 passed，`test_weight_backup_gpu.py` 9 passed，`test_colocate_switch.py` 14 passed，`test_registration_policy.py` 17 passed，`test_colocate_switchback.py` 8 passed。 |
 | **3.10 多角色的生产接线** | 数据面已按模型隔离并有 CPU 测试（§11.1），但生产只有 actor 一个模型走 NIXL，critic / ref / RM 仍各自读 checkpoint |
 | **3.11 LoRA 合并路径** | 只做了「`merge=false` 拒绝」这一半，`merge=true` 的端到端没跑过 |
 | **3.8.1 FP4 / MXFP8** | 只有 blockwise FP8。MXFP8 需要 SM100+ |
@@ -1840,12 +1840,12 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 |---|---|---|---|---|
 | W5 | cost model 对齐实测 | `BW_NIC` 取探测的节点聚合值，同节点带宽单列，descriptor 成本按约 2 µs 一个进入决策 | `test_cost_model.py` 按实测改写 | CPU |
 | W6 | 状态表与 import 图对齐 | §9 第三列由 CPU 测试按生产 import 图生成并断言 | 模块零生产 import 时测试要求表中标 ❌ | CPU |
-| W7 | D7/D8 接入生产；E4 **上半**（join 的 partial MD 扇出）接入 | E3 准入与 E4 下半（缩容吊销）已接生产并有真机测试；其余现为纯模块 | 故障注入 | 多节点 |
+| W7 | D7/D8 接入生产 | E3 准入已接生产并有真机测试；E4 两半（join 扇出 + 缩容吊销）均已接生产，`test_revoke_descriptors_gpu.py` 5 passed；其余（D7/D8 生产故障注入）为纯模块 | 故障注入 | 多节点 |
 | W8 | 删 PS（D3/T2） | 需项目主人定迁移节奏 | — | — |
 | W9 | ~~block FP8 的细化 scale 网格~~ | ✅ rollout 在 scale sharding 上声明 scale tile，trainer 按 128 tile 量化后复制 scale（与 vLLM loader 的 `repeat_interleave` 逐位相同） | MoE Megatron TP2·EP2 → vLLM TP4（EP1）FP8 格通过 | 已完成 |
 | W11 | ~~MoE 下 vLLM DP > 1 的 L2 覆盖~~ | ✅ 根因是 NCCL 2.28.9 让 vLLM 禁用 pynccl，改用 2.29.7，harness 的 EP 规则改为 EP = DP × TP | EP4 跨 DP 的三格通过 | 已完成 |
 | ~~W10~~ | ~~规模验证~~ | ✅ Qwen3-235B-A22B（470 GB bf16，94 层，128 experts）4 节点通过，见 `weight_transport_FINDINGS.md` §4b。**1TB 级仍未测**，需要更多节点 | — | 已完成（235B 档） |
-| W12 | 提高大 MoE 的拉取并发度 | 235B 稳态每节点入口约 107 GB/s，是探测带宽 386 GB/s 的 28%。**已排除两条：波数（1 / 4 / 8 实测无差别）与 planner 选源（推向一一匹配反而慢 1.6 倍，已回滚，见 FINDINGS §1b）**。剩下的候选是每对连接的协议开销与 train 侧并行度 | 入口 ≥ 探测带宽的 60% | 2 节点可复现 |
+| W12 | 大 MoE 的拉取并发度 | 235B 稳态每节点入口约 107 GB/s，是探测带宽 386 GB/s 的 28%。**已排除三条：波数（1/4/8 实测无差别）、planner 选源（推向一一匹配反而慢 1.6 倍，已回滚，见 FINDINGS §1b）、以及提交开销（strided 下 0.001ms/desc，对 579 key 仅 0.58ms，与 158ms 传输时间不成比例）**。根因是结构性的：MoE EP16 下每个 gen GPU 的专家只有一个 train 源，导致每对链路只有 1 个 gen GPU 在读，而 gen 侧的非连续 per-expert 读取被合并进单 prepped handle 后，每对带宽仍受限于「1 gen 读 1 train」的拓扑（49 GB/s 单对上界）而非节点聚合（386 GB/s）。13.4/49 = 27% 的剩余差距来自 rollout EP 下每专家段较小导致的单次传输利用率不足，可通过增大 expert 合并粒度或增大 vLLM EP→更大 expert 组缓解 | 入口 ≥ 探测带宽的 60% | 2 节点可复现 |
 | W15 | FP8 发布点的重量化成本 | 235B FP8 下每 train rank 的发布刷新 513 ms、副本 20 GB，与一次稳态 sync 同量级。候选：只重量化变化过的 key、把量化与 optimizer step 重叠、或按专家分批 | 发布刷新 ≤ 稳态 sync 的 20% | 4 节点 |
 | W13 | colocate 走 CUDA IPC（设计项 2 / A8） | 机制有 GPU 测试但未接切换路径，大 MoE 下的 `register_memory` 次数没省掉 | colocate 切换路径上 `register_memory` 调用数 == 0，KV cache 可用量不降 | 单节点 |
 | W14 | 多角色与 role 隔离（设计 §3.10） | holder 表加 role 维度，actor 与 critic 并发发布版本 | 两个角色各自推进版本而互不影响 | 单节点 |

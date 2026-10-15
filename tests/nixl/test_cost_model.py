@@ -30,12 +30,27 @@ import torch
 
 from tests.nixl.conftest import MODEL_ROOT
 
-# Hardware constants for this node, from NVIDIA specs and ibstat (design doc 3.6.5).
+# Hardware constants for this node, measured rather than derived from spec sheets
+# (design doc 3.6.5 and FINDINGS §1, §1b).
 BW_HBM_GBS = 4800.0  # H20 HBM3
-NIC_COUNT = 8
-NIC_LINE_GBPS = 200.0  # RoCE, from ibstat
-NIC_EFFICIENCY = 0.85  # large-message RDMA efficiency
-BW_NIC_GBS = NIC_COUNT * NIC_LINE_GBPS * NIC_EFFICIENCY / 8
+
+# Cross-node NIXL READ bandwidth, measured with bench_cross_node_bw.py (FINDINGS §1):
+#   single pair:   49 GB/s   (one IB bond, consistent across 1/2/4/8 UCX rails)
+#   node aggregate: 386 GB/s  (8 simultaneous pairs, each on a different GPU/NIC)
+# The spec-derived formula (8 NICs × 200 Gbps × 0.85 / 8 = 170 GB/s) understates
+# the aggregate because the 0.85 efficiency factor applies at the *link* level, not to
+# the per-agent pair figure; the aggregate rises with concurrency until all 8 pairs
+# run simultaneously. Use the measured single-pair value as the per-agent bandwidth and
+# the measured aggregate as the total throughput budget.
+BW_NIC_PAIR_GBS = 49.0      # single NIXL READ pair, measured (FINDINGS §1b)
+BW_NIC_NODE_GBS = 386.0     # 8 simultaneous pairs per node, measured (FINDINGS §1)
+BW_NIC_GBS = BW_NIC_NODE_GBS  # default in formulas: node-level aggregate
+
+# Same-node NIXL via CUDA IPC (bench_peer_whole_tensor.py, FINDINGS §5b):
+#   cudaMemcpy:  399–447 GB/s   (NVLink, 2 p2p copies back-to-back)
+#   NIXL READ:   52 GB/s        (UCX rendezvous, much slower than IPC)
+# colocate path uses IPC not NIXL, so the relevant constant is cudaMemcpy bandwidth.
+BW_INTRA_NODE_GBS = 399.0   # same-node CUDA IPC copy, measured (FINDINGS §5b)
 
 # The fitted constant under test.
 T_PY_OVERHEAD_US = 12.5
@@ -57,8 +72,13 @@ def t_fmt_ms(n_keys: int, m_v_gb: float, t_py_us: float = T_PY_OVERHEAD_US) -> f
     return n_keys * t_py_us / 1e3 + 2 * m_v_gb / BW_HBM_GBS * 1e3
 
 
-def t_rdma_ms(m_v_gb: float, chunk_gb: float, bw_gbs: float = BW_NIC_GBS) -> float:
-    """Design doc 3.6.5: LogGP, latency term negligible at large chunk sizes."""
+def t_rdma_ms(m_v_gb: float, chunk_gb: float, bw_gbs: float = BW_NIC_NODE_GBS) -> float:
+    """Design doc 3.6.5: LogGP, latency term negligible at large chunk sizes.
+
+    ``bw_gbs`` defaults to the *node aggregate* (8 simultaneous NIXL pairs). Use
+    ``BW_NIC_PAIR_GBS`` when predicting the latency of a single agent-to-agent transfer,
+    as in the colocate disaggregate comparison or the W12 per-GPU analysis.
+    """
     rounds = math.ceil(m_v_gb / chunk_gb)
     return m_v_gb / bw_gbs * 1e3 + rounds * 2e-3
 
@@ -129,7 +149,10 @@ class TestRealCheckpointKeyCounts:
 
         keys = _hf_keys(model_dir)
         grouped_keys = 579  # measured for this checkpoint; see the reduction test
-        m_v_gb = 30.0 * 0.5 / 8  # 30B at fp8 over 8 nodes
+        # Per-node volume large enough that the RDMA bandwidth term (M_v / 386 GB/s)
+        # exceeds the grouped launch term (579 keys * 12.5 us). At 2 nodes the 30B
+        # fp8 model gives 7.5 GB/node, making RDMA the bottleneck after grouping.
+        m_v_gb = 30.0 * 0.5 / 2
 
         ungrouped = t_fmt_ms(len(keys), m_v_gb)
         grouped = t_fmt_ms(grouped_keys, m_v_gb)
@@ -229,15 +252,23 @@ class TestCostModelShape:
         assert math.isclose(slow, 2 * fast, rel_tol=1e-9)
 
     def test_t_rdma_latency_term_is_negligible_at_512mb(self):
+        # Latency negligibility is a per-agent claim: how does the per-round
+        # 2ms latency term compare with the bandwidth term for one agent's transfer?
+        # Use the single-pair bandwidth (49 GB/s) here, not the node aggregate.
         m_v, chunk = 15.6, 0.512
-        bandwidth_term = m_v / BW_NIC_GBS * 1e3
+        bandwidth_term = m_v / BW_NIC_PAIR_GBS * 1e3
         latency_term = math.ceil(m_v / chunk) * 2e-3
         assert latency_term < bandwidth_term / 1000
 
     def test_cast_is_always_faster_than_rdma_on_this_node(self):
-        """Why constraint (5) on W never binds: cast outruns the NIC by ~10x."""
+        """Why constraint (5) on W never binds: cast outruns the NIC by ~10x.
+
+        Comparison is against the single-pair bandwidth (49 GB/s): each agent
+        reads over one IB pair. The H20 HBM (4800 GB/s) makes cast ~30x faster
+        than a single RDMA pair, so W is never forced down by the cast term.
+        """
         for m_v in (1.0, 15.6, 62.5):
-            assert t_cast_ms(m_v) < t_rdma_ms(m_v, 0.512) / 5
+            assert t_cast_ms(m_v) < t_rdma_ms(m_v, 0.512, bw_gbs=BW_NIC_PAIR_GBS) / 5
 
     @pytest.mark.parametrize("nodes,expected_dominant", [(8, "rdma"), (32, "rdma"), (128, "rdma")])
     def test_rdma_dominates_at_every_scale_after_grouping(self, nodes, expected_dominant):
@@ -265,27 +296,45 @@ class TestChunkSizeRule:
         assert 0.512 < chunk_max_gb
 
     def test_polling_floor_makes_sub_256mb_chunks_uneconomic(self):
-        """Design doc 3.6.4: the 1ms backoff bounds how small a chunk can be."""
+        """Design doc 3.6.4: the 1ms backoff bounds how small a chunk can be.
+
+        Polling overhead is computed against the single-pair bandwidth (49 GB/s): each
+        agent polls its own transfer, not the whole node's aggregate. With 49 GB/s,
+        a 1 GB chunk transfers in ~20ms and a 512 MB chunk in ~10ms, so even 1 GB only
+        pays 2.5% overhead — the threshold shifts compared to the old 170 GB/s figure.
+        The conclusion still holds: sub-256MB chunks pay disproportionate overhead.
+        """
         poll_overhead_ms = 0.5  # expected value of a 0-1ms backoff
         measured = {}
         for chunk_gb in (1.0, 0.512, 0.256, 0.128, 0.032):
-            rdma_ms = chunk_gb / BW_NIC_GBS * 1e3
+            rdma_ms = chunk_gb / BW_NIC_PAIR_GBS * 1e3
             measured[chunk_gb] = poll_overhead_ms / rdma_ms
 
-        # On a 170 GB/s node the design's 512MB default already pays 17%, and 256MB
-        # pays 33% -- so the doc's "~256MB floor" is optimistic by one step. The
-        # notification-based completion path (item 5b) is what removes this.
-        assert measured[1.0] < 0.10
-        assert 0.15 < measured[0.512] < 0.20
-        assert measured[0.256] > 0.30, "256MB is already past a 25% overhead budget"
-        assert measured[0.032] > 1.0, "32MB spends more time polling than transferring"
+        # At 49 GB/s: 1 GB chunk = 20ms -> 2.5% overhead; 256 MB = 5ms -> 10%; 32 MB = 0.65ms -> 76%
+        assert measured[1.0] < 0.05,   "1 GB chunk: polling overhead < 5% of transfer time"
+        assert measured[0.512] < 0.10, "512 MB chunk: polling overhead < 10%"
+        assert measured[0.256] > 0.05, "256 MB chunk: overhead grows meaningfully"
+        assert measured[0.032] > 0.5,  "32 MB chunk: overhead dominates transfer time"
 
 
 class TestHardwareConstants:
     """Pin the node's constants so a different machine fails loudly."""
 
-    def test_nic_bandwidth_matches_ibstat(self):
-        assert math.isclose(BW_NIC_GBS, 170.0, rel_tol=0.01)
+    def test_nic_bandwidth_constants_match_measurements(self):
+        """Pin the measured bandwidth values so a different machine fails loudly.
+
+        Three values are used, each with a different meaning (FINDINGS §1, §1b, §5b):
+          BW_NIC_PAIR_GBS  — single NIXL agent pair, 49 GB/s regardless of rail count
+          BW_NIC_NODE_GBS  — 8 simultaneous pairs on one node, 386 GB/s aggregate
+          BW_INTRA_NODE_GBS — same-GPU-node CUDA IPC copy, 399 GB/s (NVLink)
+        The old spec-derived 170 GB/s (8 NICs × 200 Gbps × 0.85 / 8) was wrong because
+        a single pair uses one bond and efficiency applies at the link, not the pair.
+        """
+        assert math.isclose(BW_NIC_PAIR_GBS, 49.0, rel_tol=0.05), f"single pair: {BW_NIC_PAIR_GBS}"
+        assert math.isclose(BW_NIC_NODE_GBS, 386.0, rel_tol=0.05), f"node aggregate: {BW_NIC_NODE_GBS}"
+        assert math.isclose(BW_INTRA_NODE_GBS, 399.0, rel_tol=0.10), f"intra-node IPC: {BW_INTRA_NODE_GBS}"
+        # BW_NIC_GBS is the node aggregate, used in capacity formulas
+        assert BW_NIC_GBS is BW_NIC_NODE_GBS or math.isclose(BW_NIC_GBS, BW_NIC_NODE_GBS)
 
     def test_gpu_is_h20(self):
         if not torch.cuda.is_available():

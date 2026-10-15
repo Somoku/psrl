@@ -149,6 +149,10 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
         self._stage = TrainerStage()
 
+        # Host-side ref-policy snapshot (design §3.10.2). Built lazily by
+        # capture_ref_backup() once the actor is initialised; None until then.
+        self._ref_backup = None
+
     @property
     def is_train_representative_rank(self) -> bool:
         """Return True for rank 0 (the rank that pushes to PS)."""
@@ -573,6 +577,9 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         """Train the actor for one step, then push updated weights to the PS."""
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
+        # The actor's parameters changed; any cached ref snapshot is now stale.
+        if self._ref_backup is not None:
+            self._ref_backup.mark_modified()
         push_model = tu.pop(data, key="push_model", default=True)
         if not push_model:
             return output
@@ -586,6 +593,56 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         with context_manager:
             with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
                 PSRL_BaseTrainWorker.push_model(self)
+        return output
+
+    def capture_ref_backup(self) -> None:
+        """Snapshot the actor's current weights as the frozen reference policy.
+
+        Called once after init_model() when the actor holds the initial checkpoint.
+        After this, compute_ref_log_prob() can restore the initial weights in place for
+        a forward pass without a separate model copy (design §3.10.2).
+
+        WeightBackup.capture() is idempotent: if called again it re-captures only when
+        the weights are marked dirty (i.e., after an optimizer step). So calling this
+        after a warm-start load is safe and simply refreshes the snapshot.
+        """
+        if not (self._is_actor and self.actor is not None):
+            return
+        from psrl.utils.nixl.weight_backup import WeightBackup  # noqa: PLC0415
+
+        if self._ref_backup is None:
+            params = self.actor.engine.module.parameters()
+            self._ref_backup = WeightBackup(params)
+            psrl_logger.info(
+                f"{self.log_prefix}: WeightBackup built, "
+                f"nbytes={self._ref_backup.nbytes / 1e9:.2f} GB"
+            )
+        nbytes = self._ref_backup.capture("ref")
+        psrl_logger.info(
+            f"{self.log_prefix}: ref snapshot captured, {nbytes / 1e9:.2f} GB"
+        )
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @gpu_memory_logger_decorator(log_only_rank_0=False)
+    def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        """Compute reference-policy log-probs using the frozen host snapshot.
+
+        Swaps the initial-checkpoint weights into the actor's storages in place,
+        runs the forward pass, then swaps the current training weights back.
+        Cost: one D2H + two H2D at ~46 GB/s per rank, replacing a second GPU copy
+        of the model (design §3.10.2).
+        """
+        if self._ref_backup is None:
+            raise RuntimeError(
+                "capture_ref_backup() must be called before compute_ref_log_prob(). "
+                "Call it once after init_model() completes."
+            )
+        with self._ref_backup.swapped("ref") as stats:
+            output = ActorRolloutRefWorker.compute_log_prob(self, data)
+        psrl_logger.info(
+            f"{self.log_prefix}: ref forward done — swap {stats.seconds * 1e3:.0f}ms, "
+            f"load {stats.loaded_bytes / 1e9:.2f} GB"
+        )
         return output
 
     def reload_optimizer_after_pull(self):

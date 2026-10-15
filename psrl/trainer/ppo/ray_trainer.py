@@ -2133,6 +2133,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
+        elif self.use_reference_policy and self.ref_in_actor:
+            # LoRA path: no separate ref worker; capture the base weights now as the
+            # frozen reference. The backup is cheaper than a second GPU copy of the
+            # model (design §3.10.2): one D2H at init, one H2D + one H2D per ref pass.
+            ray.get(self.actor_wg.execute_all_async("capture_ref_backup"))
 
         if not (self.use_critic or (self.use_reference_policy and not self.ref_in_actor)):
             # NOTE(linsh): A dummy worker prevents Ray from treating the fused worker as asynchronous.
@@ -3409,7 +3414,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             metadata["no_lora_adapter"] = True
         batch.extra_info.update(metadata)
         if self.ref_in_actor:
-            output = self.actor_wg.compute_log_prob(batch)
+            # LoRA: ref is base model without adapter. Use WeightBackup swap rather
+            # than a second GPU copy -- swaps initial weights in, forward, swaps back.
+            output = self.actor_wg.compute_ref_log_prob(batch)
         else:
             output = self.ref_policy_wg.compute_ref_log_prob(batch)
         assert len(output) == len(batch), (

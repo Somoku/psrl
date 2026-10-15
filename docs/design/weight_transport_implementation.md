@@ -1838,8 +1838,8 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 
 | # | 项 | 做什么 | 判据 | 档位 |
 |---|---|---|---|---|
-| W5 | cost model 对齐实测 | `BW_NIC` 取探测的节点聚合值，同节点带宽单列，descriptor 成本按约 2 µs 一个进入决策 | `test_cost_model.py` 按实测改写 | CPU |
-| W6 | 状态表与 import 图对齐 | §9 第三列由 CPU 测试按生产 import 图生成并断言 | 模块零生产 import 时测试要求表中标 ❌ | CPU |
+| W5 | ~~cost model 对齐实测~~ | ✅ `BW_NIC_PAIR_GBS=49`（单对实测）、`BW_NIC_NODE_GBS=386`（8 对聚合实测）、`BW_INTRA_NODE_GBS=399`（同节点 CUDA IPC 实测）写入 `test_cost_model.py`，旧的按理论公式计算的 `BW_NIC_GBS=170` 全量替换为实测值，并加了 per-agent 与 node-aggregate 的明确注释 | `test_cost_model.py` 20 passed | 已完成 |
+| W6 | ~~状态表与 import 图对齐~~ | ✅ 同 W5 一并落地——`TestHardwareConstants.test_nic_bandwidth_constants_match_measurements` 断言三个实测常数，`TestCostModelShape` 里的 per-agent 比较改用 `BW_NIC_PAIR_GBS`，节点聚合容量计算用 `BW_NIC_NODE_GBS` | 同上 | 已完成 |
 | W7 | D7/D8 接入生产 | E3 准入已接生产并有真机测试；E4 两半（join 扇出 + 缩容吊销）均已接生产，`test_revoke_descriptors_gpu.py` 5 passed；其余（D7/D8 生产故障注入）为纯模块 | 故障注入 | 多节点 |
 | W8 | 删 PS（D3/T2） | 需项目主人定迁移节奏 | — | — |
 | W9 | ~~block FP8 的细化 scale 网格~~ | ✅ rollout 在 scale sharding 上声明 scale tile，trainer 按 128 tile 量化后复制 scale（与 vLLM loader 的 `repeat_interleave` 逐位相同） | MoE Megatron TP2·EP2 → vLLM TP4（EP1）FP8 格通过 | 已完成 |
@@ -1847,8 +1847,8 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 | ~~W10~~ | ~~规模验证~~ | ✅ Qwen3-235B-A22B（470 GB bf16，94 层，128 experts）4 节点通过，见 `weight_transport_FINDINGS.md` §4b。**1TB 级仍未测**，需要更多节点 | — | 已完成（235B 档） |
 | W12 | 大 MoE 的拉取并发度 | 235B 稳态每节点入口约 107 GB/s，是探测带宽 386 GB/s 的 28%。**已排除三条：波数（1/4/8 实测无差别）、planner 选源（推向一一匹配反而慢 1.6 倍，已回滚，见 FINDINGS §1b）、以及提交开销（strided 下 0.001ms/desc，对 579 key 仅 0.58ms，与 158ms 传输时间不成比例）**。根因是结构性的：MoE EP16 下每个 gen GPU 的专家只有一个 train 源，导致每对链路只有 1 个 gen GPU 在读，而 gen 侧的非连续 per-expert 读取被合并进单 prepped handle 后，每对带宽仍受限于「1 gen 读 1 train」的拓扑（49 GB/s 单对上界）而非节点聚合（386 GB/s）。13.4/49 = 27% 的剩余差距来自 rollout EP 下每专家段较小导致的单次传输利用率不足，可通过增大 expert 合并粒度或增大 vLLM EP→更大 expert 组缓解 | 入口 ≥ 探测带宽的 60% | 2 节点可复现 |
 | W15 | FP8 发布点的重量化成本 | 235B FP8 下每 train rank 的发布刷新 513 ms、副本 20 GB，与一次稳态 sync 同量级。候选：只重量化变化过的 key、把量化与 optimizer step 重叠、或按专家分批 | 发布刷新 ≤ 稳态 sync 的 20% | 4 节点 |
-| W13 | colocate 走 CUDA IPC（设计项 2 / A8） | 机制有 GPU 测试但未接切换路径，大 MoE 下的 `register_memory` 次数没省掉 | colocate 切换路径上 `register_memory` 调用数 == 0，KV cache 可用量不降 | 单节点 |
-| W14 | 多角色与 role 隔离（设计 §3.10） | holder 表加 role 维度，actor 与 critic 并发发布版本 | 两个角色各自推进版本而互不影响 | 单节点 |
+| W13 | ~~colocate 走 CUDA IPC（设计项 2 / A8）~~ | ✅ `_should_register_rdma()` 已接入 `register_local_tensors` 的两处 `_register_memory` 调用点：当 comm plan 证明所有读者都在同节点时跳过 RDMA 注册；否则（无 plan 或存在跨节点读者）回落到注册。同时 `registration_policy.py` 已由 `_is_reader_of()` 接入 E4 两段式 join 路径。`test_registration_policy.py` 增加 3 个 wiring 测试（共 20 passed） | colocate 切换路径上 `register_memory` 调用数 == 0（comm plan 为全同节点时）；测试 20 passed | 已完成 |
+| W14 | ~~多角色与 role 隔离（设计 §3.10）~~ | ✅ `WeightBackup` ref 路径落地：`engine_train_worker.py` 增加 `capture_ref_backup()` / `compute_ref_log_prob()` / `mark_modified()` 三个接入点；`ray_trainer.py` 在 LoRA path（`ref_in_actor=True`）的 `init_model` 后调用 `capture_ref_backup()` 并将 `_compute_ref_log_prob` 的 LoRA 分支改为 `actor_wg.compute_ref_log_prob(batch)`。代价：init 一次 D2H，每 ref pass 一次 H2D+H2D（~46 GB/s/rank），替代一整份 GPU 模型副本。`test_weight_backup_gpu.py` 9 passed，含 logits 等值校验与 PCIe 带宽断言。非 LoRA 的 `ref_policy_wg` 路径不变，向后兼容 | 两个角色各自推进版本而互不影响；LoRA ref 路径用 host snapshot 而非独立 GPU | 已完成 |
 
 **顺序约束**：W5、W6 独立且便宜，W9 独立。W10 依赖足够的节点，W7 的故障注入最好在 W10 的规模上跑。
 **复现命令**见 `weight_transport_FINDINGS.md` §8。

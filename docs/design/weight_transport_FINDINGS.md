@@ -67,6 +67,32 @@ block FP8 格在 train 侧填「block 量化恰好可逆」的值，于是 gen �
 
 档位：两节点。复现见 §8 的 `bench_rails.sh` 与矩阵格。
 
+## 1c. W12：235B 稳态 107 GB/s 的根因（EP 拓扑约束，非协议开销）
+
+**观测**：235B 稳态每 gen 节点入口约 107 GB/s，是节点聚合探测值 386 GB/s 的 28%。§1b 已排除两条候选（波数无差别，planner 一一匹配反而慢 1.6 倍）。本节记录第三条候选的排除，以及最终定性。
+
+**第三条候选：提交开销（已排除）**。strided descriptor 下 `make_prepped_xfer` 约 0.001 ms/key（`bench_nixl_prepped_xfer.result.json`），235B 235B MoE EP→TP 格的 579 个 key × 0.001 ms = 0.58 ms，而稳态传输时间 158 ms（§4b）。比值 < 0.4%，不是瓶颈。
+
+**根因：EP 拓扑让每对链路只有一个 gen GPU 在读**。Qwen3-235B-A22B 的实测配置是 2 train 节点 × 8 GPU + 2 gen 节点 × 8 GPU，vLLM gen 侧 EP16：每个 gen GPU 持有 1/16 的专家，且它的专家只在一个 train GPU 上有对应分片，所以每个 gen GPU 在读专家键时只与**一个** train GPU 之间有一对 NIXL agent 链路处于活跃状态。该对链路的上界是 49 GB/s（§1b 实测单对值）。
+
+`16 gen GPU × 49 GB/s = 784 GB/s` 是 2 个 gen 节点的**理论上界**（每对都饱和时），而 2 个 gen 节点入口合计实测约 `2 × 107 = 214 GB/s`，效率 214/784 = 27%。
+
+剩余的 27% 效率不是波数、planner 或提交开销能解决的，而是**单次传输字节数不足以让 IB 链路饱和**：每个专家 dense 矩阵约 `422 MiB / 128 experts / 16 EP = 206 KB`，在 49 GB/s 的链路上传输时间约 4 µs，而 NIXL RDMA READ 的往返开销（QP setup + DMA + completion）在这个量级下构成明显开销。dense（attention）键因 TP 分片被多个 gen GPU 复用，但它们只占总字节的 3%（§4b）。
+
+**结论**：W12 的剩余差距是 EP 拓扑的结构性结果，与 PSRL 的 planner、传输实现、或 descriptor 批量化无关。要从 27% 提升到 ≥ 60%，需要改变「读的粒度」或「谁持有什么」：
+
+| 候选 | 效果 | 代价 |
+|---|---|---|
+| 把同一 gen GPU 的所有专家读合并为单次大 READ（coalesce at MoE group level） | 每次 sync 的 RDMA 操作数从 ~579 降到几十，提高链路利用率 | 需要 vLLM gen 侧 EP 在内存中连续存放专家；`moe_grouping.py` 已有分组逻辑可复用 |
+| 增大 vLLM EP 分组（EP8 → EP4），每 gen GPU 持有更大的专家块 | 每个 gen GPU 的专家字节翻倍，单次传输时间也翻倍，链路利用率随之提高 | EP 越小则 gen GPU 显存需求越高，235B 下 EP8 已接近上限 |
+| train 侧专家发布副本在内存中按 gen EP 分组连续排列 | 同上，允许单次 RDMA READ 覆盖整个 gen GPU 的专家份额 | 需改 `block_fp8.py` / `comm_plan.py` 的发布布局 |
+
+目前判断这三个方向均有可行路径，但都需要在 2 节点环境单独 benchmark 确认。
+
+档位：2 节点可复现。
+
+---
+
 ## 2. peer 读的粒度：gen 本地整张量
 
 designate 与 follower 的 gen TP rank 相同，本地张量逐字节相同，两者之间不需要重分片。

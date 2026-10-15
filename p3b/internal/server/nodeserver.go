@@ -111,6 +111,10 @@ func (n *Node) CreateOn(ctx context.Context, req *v1.CreateOnRequest) (*v1.Creat
 			"lease %q was not granted by this node or has already been used, "+
 				"so a sandbox created against it would not be charged", leaseID)
 	}
+	// The record is held in flight for as long as this runs, so the sweep's clock cannot
+	// reap a create that is still pulling its image.
+	release := n.lifecycle.BeginCreate(leaseID)
+	defer release()
 	hosted, hosts := n.hosted(req.GetBackend())
 	if !hosts {
 		// No sandbox exists, so the reserved budget must not stay held.

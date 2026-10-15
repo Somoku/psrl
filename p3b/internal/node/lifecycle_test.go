@@ -139,6 +139,93 @@ func TestAZeroSweepIntervalIsRefused(t *testing.T) {
 	}
 }
 
+// startCreate reserves and claims a grant, leaving the record where a create that
+// is provisioning holds it. The caller brackets it with BeginCreate when the create
+// is meant to be running.
+func startCreate(t *testing.T, life *Lifecycle, gate *Admission) string {
+	t.Helper()
+	grant, refusal, ok := gate.Reserve("rollout", "worker", Resources{MemoryMB: 10})
+	if !ok {
+		t.Fatalf("reserve: %q", refusal)
+	}
+	life.Reserve(grant, "worker", "", testLifetime)
+	if _, ok := life.Claim(grant.LeaseID); !ok {
+		t.Fatalf("claim: the grant was already spent")
+	}
+	return grant.LeaseID
+}
+
+func TestACreateInFlightOutlivesItsReservationDeadline(t *testing.T) {
+	// The create is provisioning, which includes an image pull. Elapsed time is not
+	// evidence that its record is a grant nobody claimed.
+	gate := mustGate(t, envelope())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
+	clock := time.Now()
+	life.SetClock(func() time.Time { return clock })
+	leaseID := startCreate(t, life, gate)
+	done := life.BeginCreate(leaseID)
+
+	clock = clock.Add(reserveDeadline + time.Minute)
+	report := life.Sweep(context.Background())
+
+	if report.Released() != 0 {
+		t.Fatalf("a create in flight was reaped: %+v", report)
+	}
+	if report.SkippedBusy != 1 {
+		t.Fatalf("skipped %d in-flight creates, want 1", report.SkippedBusy)
+	}
+
+	// Once the create ends without adopting, the record is a claim again and the
+	// backstop clears it.
+	done()
+	report = life.Sweep(context.Background())
+	if len(report.ReclaimedOrphan) != 1 || report.ReclaimedOrphan[0] != leaseID {
+		t.Fatalf("the reservation deadline did not clear an abandoned claim: %+v", report)
+	}
+}
+
+func TestACreateInFlightSurvivesASilentOwner(t *testing.T) {
+	// The owner's renewal is the evidence that a sandbox is abandoned, and a create
+	// that is mid-flight is not an abandoned one. Waiting for it to end costs one
+	// create, and reclaiming it destroys the container it is about to hand back.
+	gate := mustGate(t, envelope())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
+	clock := time.Now()
+	life.SetClock(func() time.Time { return clock })
+	life.SetOwnerLiveness(func(string) bool { return false })
+	leaseID := startCreate(t, life, gate)
+	done := life.BeginCreate(leaseID)
+
+	report := life.Sweep(context.Background())
+
+	if report.Released() != 0 {
+		t.Fatalf("a create in flight was reclaimed: %+v", report)
+	}
+
+	done()
+	report = life.Sweep(context.Background())
+	if len(report.ReclaimedOrphan) != 1 || report.ReclaimedOrphan[0] != leaseID {
+		t.Fatalf("a silent owner's finished create must be reclaimed: %+v", report)
+	}
+}
+
+func TestAGrantClaimedButAbandonedIsStillReaped(t *testing.T) {
+	// A create that ends without adopting or failing its record leaves the record
+	// behind, and the reservation deadline is what keeps it from holding budget.
+	gate := mustGate(t, envelope())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
+	clock := time.Now()
+	life.SetClock(func() time.Time { return clock })
+	leaseID := startCreate(t, life, gate)
+
+	clock = clock.Add(reserveDeadline + time.Second)
+	report := life.Sweep(context.Background())
+
+	if len(report.ReclaimedOrphan) != 1 || report.ReclaimedOrphan[0] != leaseID {
+		t.Fatalf("an abandoned claim must be reaped: %+v", report)
+	}
+}
+
 func TestABusySandboxIsNeverReclaimed(t *testing.T) {
 	// A long command runs in flight, and the lifetime backstop has not been
 	// reached, so the sweep must leave it alone and report it as busy.

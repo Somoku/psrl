@@ -239,6 +239,33 @@ func (l *Lifecycle) Begin(sandboxID string) func() {
 	}
 }
 
+// BeginCreate marks a create as running, so the sweep cannot read its record as a
+// grant that was never claimed. The returned function marks it finished.
+//
+// A create includes an image pull, which is the slowest thing a node does and the
+// one an operator can do least about, so elapsed time says nothing about whether
+// the create is alive. Holding the record in flight is what says it.
+func (l *Lifecycle) BeginCreate(leaseID string) func() {
+	l.mu.Lock()
+	held, known := l.allocations[leaseID]
+	marked := known && held.state == allocCreating
+	if marked {
+		held.inFlight++
+		held.lastActivity = l.now()
+	}
+	l.mu.Unlock()
+	if !marked {
+		return func() {}
+	}
+	return func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if held.inFlight > 0 {
+			held.inFlight--
+		}
+	}
+}
+
 // Release destroys one sandbox and returns its capacity.
 //
 // The sandbox is destroyed before its reservation is returned, and the
@@ -361,6 +388,13 @@ func (l *Lifecycle) Sweep(ctx context.Context) SweepReport {
 	for _, held := range l.allocations {
 		if held.inFlight > 0 {
 			busy++
+		}
+		// A create holds its record in flight while it provisions, and provisioning
+		// includes an image pull. Reaping it there destroys the container the create is
+		// about to hand back. A resident sandbox is not exempt, because ownership and
+		// lifetime stay the right reasons to reclaim it even while it works.
+		if held.state == allocCreating && held.inFlight > 0 {
+			continue
 		}
 		reportID := held.sandboxID
 		if reportID == "" {

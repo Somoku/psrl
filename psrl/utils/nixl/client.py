@@ -1969,9 +1969,11 @@ class NIXLStorageClient:
         """
         if self._comm_plan is None:
             return True
-        from psrl.utils.nixl.registration_policy import readers_by_source  # noqa: PLC0415
+        from psrl.utils.nixl.registration_policy import descriptor_readers_by_source  # noqa: PLC0415
 
-        rbs = readers_by_source(self._comm_plan)
+        # Peer-diffusion followers read their designate too, and `readers_by_source` does not
+        # count them, so a follower would hold only connection info for its designate.
+        rbs = descriptor_readers_by_source(self._comm_plan)
         for key_readers in rbs.get(source, {}).values():
             if self.client_name in key_readers:
                 return True

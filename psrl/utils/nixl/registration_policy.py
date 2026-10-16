@@ -69,6 +69,29 @@ def readers_by_source(plan: "NIXLCommPlan") -> dict[str, dict[str, set[str]]]:
     return inverted
 
 
+def descriptor_readers_by_source(plan: "NIXLCommPlan") -> dict[str, dict[str, set[str]]]:
+    """Who needs ``source``'s full descriptors: `readers_by_source` plus peer-diffusion readers.
+
+    A same-node follower reads its designate's tensors directly, and that read does not
+    appear in any of the three plan directions -- it lives in `peer_groups`. Loading only
+    connection info for the designate (the E4 two-stage join) then leaves the follower
+    unable to prepare a transfer: `prep_xfer_dlist` raises NIXL_ERR_NOT_FOUND, on the
+    second pull, because the first pull never exercised the peer path.
+
+    Kept separate from `readers_by_source` on purpose. That function answers "does a
+    remote NIC need this memory registered", and the module docstring ignores delegation
+    there because over-counting readers is the safe direction. This one answers "who must
+    hold descriptors", where leaving a reader out is the *unsafe* direction.
+    """
+    inverted = {source: {key: set(readers) for key, readers in keys.items()} for source, keys in readers_by_source(plan).items()}
+    for client, per_key in (getattr(plan, "peer_groups", None) or {}).items():
+        for key, group in per_key.items():
+            designate = group[0]
+            if client != designate:
+                inverted.setdefault(designate, {}).setdefault(key, set()).add(client)
+    return inverted
+
+
 def keys_read_across_nodes(
     plan: "NIXLCommPlan",
     client_infos: Mapping[str, "NIXLClientInfo"],

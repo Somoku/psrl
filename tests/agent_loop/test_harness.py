@@ -503,11 +503,28 @@ async def test_prepare_fails_clearly_when_runtime_tree_is_missing() -> None:
     sandbox = FakeSandbox(runtime_available=False)
     config = HarnessConfig(kind="codex", executable="codex")
 
-    with pytest.raises(RuntimeError, match="unavailable in the sandbox"):
+    with pytest.raises(RuntimeError, match="not executable in the sandbox"):
         await create_harness(config, sandbox).prepare(_runtime())
 
     # The explicit probe is the only setup command. There is no install path.
     assert all("npm" not in command for command, _, _ in sandbox.commands)
+
+
+@pytest.mark.asyncio
+async def test_prepare_probes_the_mount_without_running_the_cli() -> None:
+    # Running the CLI once per trajectory put a several-hundred-megabyte read and its
+    # dynamic linking on the critical path of every episode, in the same moment that step
+    # was creating its whole batch of sandboxes. The probe only has to answer what the
+    # mount owns, and whether the binary runs is answered by the first real invocation.
+    sandbox = FakeSandbox()
+    config = HarnessConfig(kind="codex", executable="codex")
+
+    await create_harness(config, sandbox).prepare(_runtime())
+
+    probes = [command for command, _, _ in sandbox.commands if command.startswith("mkdir -p /root/.psrl-harness")]
+    assert len(probes) == 1
+    assert "test -x" in probes[0]
+    assert "--version" not in probes[0]
 
 
 @pytest.mark.asyncio

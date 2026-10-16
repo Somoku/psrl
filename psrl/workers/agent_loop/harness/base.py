@@ -258,14 +258,23 @@ class Harness(ABC):
         network fetch and no mutation of the task image's global toolchain. All
         directories are created in the same probe, so per-trajectory setup stays
         to one round trip.
+
+        What the probe checks is what the mount owns: that the executable is present
+        and executable in this sandbox. Running it is not the probe's job, because a
+        CLI is hundreds of megabytes and this ran once per trajectory, so every step
+        paid for that read and its dynamic linking on the critical path of its whole
+        batch, at the moment that step was also creating all of its sandboxes. Whether
+        the binary runs in this image is answered by the first real invocation, which
+        reports the CLI's own diagnostics when it does not.
         """
         exe = executable_path(self.config.runtime_mount, self.config.executable)
         directories = [self._log_dir, self.config_dir()]
         mkdir = "mkdir -p " + " ".join(shlex.quote(d) for d in directories if d)
-        check = await self.sandbox.exec(f"{mkdir} && {shlex.quote(exe)} --version", timeout_s=60)
+        check = await self.sandbox.exec(f"{mkdir} && test -x {shlex.quote(exe)}", timeout_s=60)
         if check.exit_code != 0:
             raise RuntimeError(
-                f"Harness executable {exe!r} is unavailable in the sandbox (exit {check.exit_code}). "
+                f"Harness executable {exe!r} is missing or not executable in the sandbox "
+                f"(exit {check.exit_code}). "
                 f"Mount the {self.config.kind!r} runtime tree at {self.config.runtime_mount!r} and ensure "
                 f"<runtime-root>/{self.config.kind}/bin/{self.config.executable} exists on the worker. "
                 f"stdout={check.stdout[-self.config.output_tail_chars :]!r}, "

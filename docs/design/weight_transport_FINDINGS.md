@@ -365,6 +365,21 @@ python tests/nixl/bench_fp8_logprob_gap.py --model <ckpt> --mode fp8 --out /tmp/
 绕过 `use_dcp_save=True` 的断言并强制进度线程常开，每步保存，2 步）：训练与两次保存完成，
 日志里没有 UCX / NIXL 传输错误。
 
+**fork 式异步保存归 verl 上游所有，且在当前环境里走不通。** `actor.checkpoint.async_save`
+（默认 `False`）与调用链都在 verl（上游提交 `9d772002`），PSRL 只在 `ray_trainer.py:2904`
+读它、在逐 rank 保存里拒绝它，不创建任何 fork。fork 来自 Megatron 的 `TemporalAsyncCaller`
+（`async_utils.py:277`，`mp.get_context('fork')`）。但 verl 的异步路径在 Megatron 0.19 下先于 fork
+就失败：
+
+- `megatron_checkpoint_manager.py:1144` 导入 `strategies.base.async_calls`，该名字在 Megatron 0.19 的
+  `base.py` 里已不存在，实测 `ImportError`；
+- verl 保存时不传 `async_strategy`，Megatron 0.19 的默认值是 `"nvrx"`，需要
+  `nvidia-resiliency-ext`，本环境未安装。
+
+所以今天打开 `async_save` 会在导入处报错，不会走到上表里 fork 损坏 NIXL 的那一步；
+上表的 fork 结果是绕开 verl、直接调 Megatron 并指定 `async_strategy="mcore"` 得到的。
+风险在于将来升级 verl 或 Megatron 让这条路径重新可用且仍用 fork 策略。
+
 没有覆盖的：多节点、更多步数、真实栈上的异步保存、训练端与读者跨节点的布局。
 这些没测之前，不能据此删除逐 rank 保存路径。
 

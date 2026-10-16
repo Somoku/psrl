@@ -121,11 +121,18 @@ type BackendConfig struct {
 
 	// Container runtime, driven directly. Shared by the docker backend and by
 	// any backend running in direct mode, because both drive the same daemon.
-	Socket               string `json:"socket"`
-	APIVersion           string `json:"api_version"`
-	Runtime              string `json:"runtime"`
-	NetworkMode          string `json:"network_mode"`
-	MaxCreateConcurrency int    `json:"max_create_concurrency"`
+	Socket      string `json:"socket"`
+	APIVersion  string `json:"api_version"`
+	Runtime     string `json:"runtime"`
+	NetworkMode string `json:"network_mode"`
+	// Bound on concurrent creates, because a daemon serializes parts of container
+	// setup in the kernel and an unbounded burst turns latency into timeouts rather
+	// than throughput. Zero leaves it unbounded, which is only right on a small
+	// node: a many-core machine reports a GOMAXPROCS far above what the create path
+	// can schedule at once, so size this from the daemon instead. Sixteen is the
+	// value the OpenSandbox deployment documents. Applies to every backend that
+	// drives a daemon: docker, opensandbox, and cubesandbox.
+	MaxCreateConcurrency int `json:"max_create_concurrency"`
 
 	// OpenSandbox in direct mode. The agent image carries execd, bootstrap.sh,
 	// and bubblewrap; it is staged once at startup into stage_dir and then
@@ -703,7 +710,8 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 				return nil, fmt.Errorf("backend %q preflight: %w", declared.Type, err)
 			}
 		}
-		log.Info("sandbox backend ready", "type", declared.Type, "mode", mode)
+		log.Info("sandbox backend ready", "type", declared.Type, "mode", mode,
+			"max_create_concurrency", declared.MaxCreateConcurrency)
 		built = append(built, b)
 	}
 	return built, nil

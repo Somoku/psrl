@@ -185,6 +185,11 @@ func newDirectRuntime(
 		requestTimeout: requestTimeout,
 		createTimeout:  createTimeout,
 	}
+	if maxCreateConcurrency < 0 {
+		return nil, fmt.Errorf(
+			"cubesandbox max create concurrency %d is negative, and zero is what means unbounded",
+			maxCreateConcurrency)
+	}
 	if maxCreateConcurrency > 0 {
 		runtime.createSem = make(chan struct{}, maxCreateConcurrency)
 	}

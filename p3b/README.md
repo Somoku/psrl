@@ -88,7 +88,7 @@ the mechanism, not of the deployment, so it is a constant rather than a knob.
     "prepare": { "guaranteed_share": 0.1 }
   },
   "backends": [
-    { "type": "docker", "mode": "direct", "socket": "/var/run/docker.sock", "api_version": "v1.40" }
+    { "type": "docker", "mode": "direct", "socket": "/var/run/docker.sock", "api_version": "v1.40", "max_create_concurrency": 16 }
   ],
   "default_backend": "docker"
 }
@@ -104,6 +104,7 @@ the mechanism, not of the deployment, so it is a constant rather than a knob.
 | `classes.*.guaranteed_share` | — | must sum below one, or a guarantee is unsatisfiable |
 | `classes.*.max_share` | unset | a ceiling, even on an idle fleet |
 | `backends[].mode` | `direct` | `direct`: this service places and drives the runtime. `provider`: the backend’s own scheduler does |
+| `backends[].max_create_concurrency` | unset, which is unbounded | bounds concurrent container creates. A daemon serializes parts of container setup in the kernel, so an unbounded burst turns latency into timeouts rather than throughput. Size it from the daemon, not the machine: `16` is the value the OpenSandbox deployment documents |
 
 A sandbox's lifetime is not a service setting: the caller states it on the create
 (`lifetime_s`), because the caller knows what the sandbox is for. The service

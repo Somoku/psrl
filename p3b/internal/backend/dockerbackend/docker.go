@@ -70,10 +70,14 @@ type Config struct {
 	// Leave empty for the daemon default (bridge).
 	NetworkMode string
 	// MaxCreateConcurrency caps the number of concurrent /containers/create +
-	// /start pairs in-flight to dockerd. Zero means unlimited. Setting this to
-	// match dockerd's own internal worker count (typically GOMAXPROCS) prevents
-	// the daemon's create queue from growing unboundedly under burst creates,
-	// which causes the long-tail latency observed at high concurrency.
+	// /start pairs in-flight to dockerd. It is the `max_create_concurrency`
+	// deployment switch, and zero means unbounded.
+	//
+	// A daemon serializes parts of container setup in the kernel, so an unbounded
+	// burst turns latency into timeouts rather than throughput. Size it from the
+	// daemon rather than from the machine: a many-core node reports a GOMAXPROCS
+	// far above what the create path can schedule at once, so leaving this unset on
+	// a large node is what produced the create and exec timeouts it exists to stop.
 	MaxCreateConcurrency int
 	// RequestTimeout bounds one Engine call. A create that pulls an image can
 	// legitimately exceed it, so the pull is a separate call with its own budget.
@@ -131,6 +135,11 @@ func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 	}
 	if !mode.Valid() {
 		return nil, fmt.Errorf("docker backend scheduling mode %q is not direct or provider", mode)
+	}
+	if cfg.MaxCreateConcurrency < 0 {
+		return nil, fmt.Errorf(
+			"docker backend max create concurrency %d is negative, and zero is what means unbounded",
+			cfg.MaxCreateConcurrency)
 	}
 	var createSem chan struct{}
 	if cfg.MaxCreateConcurrency > 0 {
@@ -505,14 +514,18 @@ func (b *Backend) ReadFile(ctx context.Context, handle backend.Handle, path stri
 // breaks the old printf-base64 approach for files larger than ~96 KiB (e.g.
 // a large model patch). The data travels as a tar stream in the request body.
 func (b *Backend) WriteFile(ctx context.Context, handle backend.Handle, path string, data []byte) error {
-	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
-	defer cancel()
 	tarBytes, err := singleFileTar(path, data)
 	if err != nil {
 		return fmt.Errorf("docker archive put %q: build tar: %w", path, err)
 	}
 	dir := parentDir(path)
 	// Ensure the directory exists first so the archive upload lands cleanly.
+	//
+	// The command runs on the caller's context, not on the Engine budget that bounds
+	// the upload below. How long a command takes is the command's own business, and
+	// its bounds are the caller's own command timeout and the sandbox's lifetime.
+	// Charging it to the request timeout makes a daemon too busy to start a process
+	// report a stalled mkdir as a dead write, which is a fault in the wrong place.
 	mkdirCmd := "mkdir -p " + shellescape(dir)
 	code, out, execErr := b.execOneShot(ctx, handle, mkdirCmd, "", nil)
 	if execErr != nil {
@@ -521,7 +534,9 @@ func (b *Backend) WriteFile(ctx context.Context, handle backend.Handle, path str
 	if code != 0 {
 		return fmt.Errorf("docker archive put %q: mkdir exited %d: %s", path, code, out)
 	}
-	if err := b.putArchive(ctx, handle.SandboxID, dir, tarBytes); err != nil {
+	putCtx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	if err := b.putArchive(putCtx, handle.SandboxID, dir, tarBytes); err != nil {
 		return fmt.Errorf("docker archive put %q: %w", path, err)
 	}
 	return nil

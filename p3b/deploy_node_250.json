@@ -28,7 +28,8 @@
       "type": "docker",
       "mode": "direct",
       "socket": "/var/run/docker.sock",
-      "api_version": "v1.40"
+      "api_version": "v1.40",
+      "max_create_concurrency": 16
     }
   ],
   "default_backend": "docker",

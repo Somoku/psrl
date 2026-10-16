@@ -197,6 +197,11 @@ func newDirectRuntime(ctx context.Context, cfg directConfig) (*directRuntime, er
 			MaxIdleConns: 256, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second,
 		}},
 	}
+	if cfg.MaxCreateConcurrency < 0 {
+		return nil, fmt.Errorf(
+			"opensandbox max create concurrency %d is negative, and zero is what means unbounded",
+			cfg.MaxCreateConcurrency)
+	}
 	if cfg.MaxCreateConcurrency > 0 {
 		runtime.createSem = make(chan struct{}, cfg.MaxCreateConcurrency)
 	}

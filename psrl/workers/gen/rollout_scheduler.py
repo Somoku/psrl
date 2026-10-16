@@ -40,8 +40,10 @@ class RolloutScheduler(AsyncScheduler):
             self._pcomp_logger.setLevel(logging.INFO)
             self._pcomp_logger.addHandler(FileOnlyHandler(logging_path, f"Prefill_I{replica_idx}"))
 
-    def schedule(self) -> SchedulerOutput:
-        sched_out = super().schedule()
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # vLLM's EngineCore calls `schedule(self._should_throttle_prefills())`; dropping the
+        # argument here kills the engine on its first scheduling step.
+        sched_out = super().schedule(throttle_prefills)
         if self._pcomp_enable:
             self._pcomp_pending[id(sched_out)] = (sched_out, time.perf_counter())
         return sched_out

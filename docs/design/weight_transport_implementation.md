@@ -725,12 +725,13 @@ per-chunk 写屏障（始终是优化）：
 
 **做什么**：A7 判定为 `WARN_RESHARD` 时，重分片必须在版本边界进行：
 ```
-撤销 holder → 等在飞读者归零 → 重分片 → 推进 registration_epoch → 重新广播
+撤销 holder → 等在飞读者归零 → 全体按新 finest mesh 重切重注册 → UPDATE_INFO 广播 → 重编 plan
 ```
-**epoch 必须推进**，尽管地址没变——「同一地址的不同切分」对远端同样是陈旧描述。
+「同一地址的不同切分」对远端同样是陈旧描述，所以每个既有成员都必须重新加载对端 info。
+单边 RDMA 下源端无处校验 epoch，失效由驱逐 + 重广播保证（主文档 §3.7.3.0a 更正）。
 
-**判据**：构造「version 匹配但 epoch 陈旧」的请求，必须返回 `DESC_STALE` 而非通过；
-`CHUNK_STALE` 与 `DESC_STALE` 触发**不同的恢复路径**（换源 vs 重取 descriptor）
+**判据**：reshard 前后所有成员坐标判据全过；reshard 期间没有读者读到混合切法；
+收到 `UPDATE_INFO` 前用旧 descriptor 发起的读失败而非读到错误字节
 
 **验证**：L3（两段校验）
 
@@ -923,11 +924,11 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | D4 `holder_roles` / bootstrap | ✅ | ❌ 零 import | L1 |
 > | D5 `chunk_offset` | ✅ | ❌ 零 import | L1 |
 > | D6 降级继续生成 | ✅ | ✅ | L2 ✅ |
-> | D7/D8 `chunk_availability` | ✅ 判定 | ✅ 逻辑在 `pull_engine.py`；`nixl_pull_model_core` 将 `failed_sources` 提升到 `unavailable` | L1 五条故障注入：源失效改读 DP 副本，整组失效抛 `ChunkUnavailable` 且不动权重，mid-pull 失效下次 pull 直接跳过 |
+> | D7/D8 DP 副本接管 | ✅ `pull_engine._replica_of` / `_reroute` | ✅ `nixl_pull_model_core` 将 `failed_sources` 提升到 `unavailable`；`chunk_availability.py` 是零 import 的重复实现 | L1 五条故障注入：源失效改读 DP 副本，整组失效抛 `ChunkUnavailable` 且不动权重，mid-pull 失效下次 pull 直接跳过 |
 > | E1 版本级等待 | ✅ | ✅ `ps_manager` + `vllm_async_server` | L2 ✅ |
-> | E2 `staleness` | ✅ | ⚠️ 仅类型被引用 | L1 |
+> | E2 运行中 reshard | ❌ `staleness.py` 只有纯函数 | ❌ 零调用 | 原设计不可行（单边 RDMA，源端无法比对 epoch），见 §9 阶段 E 的 E2 |
 > | E3 握手解复用 | ✅ | ✅ `server.py` / `client.py` | L2 ✅ |
-> | E3 `admit_joiners` | ✅ | ✅ `ps_manager.nixl_admit_joiners` | L3 真实 agent 准入；L1 后加入的 instance 拉到正确字节 |
+> | E3 `admit_joiners` | ✅ | ❌ 生产无调用方（`nixl_admit_joiners` 不存在） | L3 真实 agent 准入（测试直接调用）；RESHARD 分支对既有成员无效，见 E2 |
 > | E4 partial MD 两段式 join | ✅ `partial_md.py` `conn_info_only` + `NIXLClientInfo.conn_info_meta` | ✅ `client.py:_ensure_client_info_fetched` 读者加载全量 MD，非读者仅加载 ~401 B conn-info | L1 ✅；NIXL 缺绑定的记录有误——`invalidate_local_metadata` 一直存在，探针用了错误名称 |
 > | E4 缩容吊销 descriptor | ✅ `leave_protocol.py` | ✅ `client.py` `_revoke_member` + ack | L1 ✅；L2 `test_revoke_descriptors_gpu.py` 5 passed：吊销后 `NIXL_ERR_NOT_FOUND`，未确认时拒绝释放显存 |
 > | F1 delta | ✅ 决策函数 | ❌ | L1 |
@@ -1523,14 +1524,31 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       **这不能证明的事**：FSDP2 的 optimizer step 与真实 NIXL 拉取在真机上确实重叠。
       那是关于集群时序的论断,也正因如此拦截的必要性由配置决定(`requires_version_barrier`)
       而不是靠实测。这里证明的是:**一旦**重叠,结果就是撕裂,而拦截消除它。
-- [x] **E2 已落地并验证**：`psrl/utils/nixl/staleness.py`，`test_staleness.py` 13 passed。
-      两种陈旧的恢复路径**互为无效**，这正是必须分开的理由：
-      descriptor 陈旧时换源只是把错地址带到新 peer；版本陈旧时重取 descriptor
-      只会拿到「正确地址指向没人持有的字节」。混为一谈得到的是**收敛不了的重试循环**，
-      表现为挂起而非报错。
-      **两者同时陈旧时优先报 `DESC_STALE`**，否则客户端修完源还会被同一批坏地址再废一次。
-      `RegistrationEpoch` 在**重分片时也推进**（地址没变、含义变了）——
-      仅做地址相等检查会通过，然后读到邻居分片的字节且不报错。
+- [ ] **E2 未落地，按原设计也无法落地**。`psrl/utils/nixl/staleness.py` 只是一组纯函数
+      （`classify` / `recovery_for` / `RegistrationEpoch`），生产零调用，`test_staleness.py`
+      测的是这些函数本身，不是任何读路径。
+
+      **原设计的前提不成立。** 「源端比对请求携带的 epoch，陈旧则拒绝」要求源能看到读请求，
+      而 NIXL 读是单边 RDMA：源进程不参与，没有任何地方可以比对 epoch。
+      `DESC_STALE` / `CHUNK_STALE` 在读失败时也分不开 —— 两者都表现为 `ERR` / `NOT_FOUND`。
+
+      **「重取 descriptor」这条恢复路径已经存在，只是不叫这个名字**：客户端收到
+      `UPDATE_INFO` 时（`client.py` 的 `wait_for_update_infos`）重载对端 info、
+      `remove_remote_agent` 并 `_drop_pull_engine`。正确的 reshard 不是让读者事后发现陈旧，
+      而是在版本边界把所有成员一起推到新切法：
+      排空读者 → 全体按新 finest mesh 重注册 → `UPDATE_INFO` 广播 → 新 plan。
+      地址失效靠 `remove_remote_agent` 的弱引用（E4 实测 `NIXL_ERR_NOT_FOUND`）兜底，
+      不需要 PSRL 自己的 epoch。
+
+      **现状下 RESHARD 准入是坏的**：既有成员的 `wait_for_server_sharding` 因
+      `_unified_sharding_dict_fetched` 已为真而直接返回，收不到新切法；服务端
+      `notify_all_client_shardings` 发的是未带 kind 的裸 pickle。结果是 joiner 按细网格加入、
+      既有成员仍按粗网格注册，plan 按细网格生成。目前不触发，因为 `admit_joiners`
+      在生产中无调用方（见 E3）。
+
+      **决策**：先让 `admit_joiners` 只接受 FAST_PATH、拒绝 RESHARD，并删除 `staleness.py`；
+      运行中 reshard 作为独立功能按上面的版本边界协议实现，判据是「reshard 前后所有成员
+      坐标判据全过、期间无读者读到混合切法」。
 - [ ] **E3 成员状态机已落地并单测通过（14 passed），接线待握手循环改造**：
       `psrl/utils/nixl/membership.py`。
       准入复用 A7 的 `classify_join`（不新造一套「是否允许」），

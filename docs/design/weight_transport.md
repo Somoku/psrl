@@ -621,8 +621,12 @@ else:
 **(1) 非整除 join 必须在版本边界执行,不能在传输中途。**
 重分片改变的是「同一块内存被切成几份」,在飞读者持有的是旧切分下的 descriptor。
 这与 §3.7.3.0a 的陈旧 descriptor 完全同构,**所以必须复用同一套保护**:
-撤销 holder → 等在飞读者归零 → 重分片 → 推进 `registration_epoch` → 重新广播。
-**epoch 必须推进**,尽管地址没变——因为「同一地址的不同切分」对远端同样是陈旧描述。
+撤销 holder → 等在飞读者归零 → **全体成员**按新 finest mesh 重切并重注册 →
+`UPDATE_INFO` 广播 → 重编 plan。「同一地址的不同切分」对远端同样是陈旧描述,
+所以每个既有成员都必须收到新切法并重新加载对端 info;按 §3.7.3.0a 的更正,
+这由驱逐 + 重广播保证,不靠 `registration_epoch`（单边读无处校验 epoch）。
+**现状**:`admit_joiners` 的 RESHARD 分支只把新切法发出去,既有成员的
+`wait_for_server_sharding` 已缓存不再接收,所以该分支目前不可用,应在协议实现前拒绝 RESHARD。
 
 **(2) 整除性是运行时约束,不只是性能问题——它可能让 join 直接失败。**
 `get_local_sharded_tensors`（`nixl_spec.py:166`）要求
@@ -2924,6 +2928,24 @@ generation 相等（因为 version 没变），于是**校验通过、RDMA 读�
 `CHUNK_STALE` 要重新走选源（可能换 holder），
 `DESC_STALE` 只需重新取同一个 holder 的 descriptor，不必换源。
 
+###### 更正：上面的「准入校验」没有执行点，epoch 由失效 + 重广播取代
+
+上面三段假定「远端发起传输时带上 epoch，本地校验」。**NIXL 读是单边 RDMA**：
+源进程不参与读，没有任何代码能看到请求携带的 epoch，也就无处拒绝。
+读失败时 `CHUNK_STALE` 与 `DESC_STALE` 同样表现为 `ERR` / `NIXL_ERR_NOT_FOUND`，读者也分不开。
+
+两个保证改由已有机制给出，不需要 epoch：
+
+| 保证 | 机制 |
+|---|---|
+| 没有在飞读者 | 地址变更前排空（§3.4.5 holder 协议、E1 的在飞计数） |
+| 没有陈旧 descriptor 被使用 | 变更方重注册后经 `UPDATE_INFO` 广播；接收方 `remove_remote_agent` 旧对端并丢弃 pull engine。NIXL 对 remote section 是弱引用，驱逐后用旧 dlist 或旧 handle 发起读返回 `NIXL_ERR_NOT_FOUND`（E4 实测），不会读到错误地址 |
+| 版本相等 | 每分片的版本戳（`shard_version.py`），读完即校验，撕裂读与陈旧读都会报错 |
+
+「version 匹配、epoch 旧」那一格因此被收敛为：要么 descriptor 已被驱逐（读失败，重新取 info），
+要么还没收到 `UPDATE_INFO`（变更方在排空前不得改地址，所以旧地址仍然有效）。
+**正确性前提从「读时校验」移到「变更方必须先排空、再改地址、再广播」这个顺序上**。
+
 **关于约束 (c)：这条路径不需要 TMS。** 核实了 pinned 的 vLLM
 （`third_party/vllm`）后发现它已经有正好合适的原语：
 
@@ -3998,7 +4020,7 @@ train step v 完成
 | 9 | trainer 直供，删除 PS worker，新建 bootstrap | 额外 CPU 存储 `N×M → 0`，train 出口 `N×M → M` | 否，需 6+7+8 |
 | 9b | **holder 语义对称化 + bootstrap 走 rollout 代表读盘** | `is_rollout_mode_in_actor=True` 的**正确性前置**，无此项该场景不成立 | 否，需 index |
 | **9c-a** | **join 的三级判定：整除→快路径；非整除但可表达→告警放行；不可表达→拒绝**（§3.3.1d 第二层） | 第三级是**正确性**:`new_finest` 不整除某张量的相应维度时,`get_local_sharded_tensors` 会让**所有既有 client** 在重注册时抛 `ValueError`——一次扩容变成全链路故障。前两级是性能告警。**必须最先定,它决定弹性的语义边界** | **是**，与 1-5 同批 |
-| 9c-a2 | **非整除 join 的重分片走版本边界 + 推进 `registration_epoch`** | 「同一地址的不同切分」对远端同样是陈旧描述,与 §3.7.3.0a 同构。复用撤 holder → 等读者归零 → 重分片 → 推 epoch 的既有协议,**不新建机制** | 否，依赖 8 |
+| 9c-a2 | **非整除 join 的重分片走版本边界,全体重注册 + `UPDATE_INFO` 重广播** | 「同一地址的不同切分」对远端同样是陈旧描述,与 §3.7.3.0a 同构。复用撤 holder → 等读者归零 → 全体重切重注册 → 驱逐旧对端并重广播;单边 RDMA 无处校验 epoch,见 §3.7.3.0a 更正 | 否，依赖 8 |
 | 9c-b | **握手协议从一次性屏障改为事件驱动 join / leave** | `ps_manager.py:907` 的八步直线没有「中途加入」状态（§3.3.1d 第一层）。工作量项,非难题 | 否，依赖 6b |
 | 9c-c | **join / leave 走 partial MD 两段式 + 缩容吊销 descriptor（带确认）** | 实测 **1884x** 压缩（conn-info 401B vs 全量 1.6MB @4096 区）。缩容不吊销会留下可用的陈旧 descriptor,与缺 epoch 同构的静默损坏（§3.3.1d 第三层与末段） | 否，依赖 9c-b |
 | **9d-a** | **配置期防御五项**：`model_dtype` 真实读取（不再按后端硬分流，§3.8.0）、offload 双 flag 校验拒绝、uneven sharding 断言、finest mesh 可观测、**LoRA `merge=false` 拒绝**（§3.11） | **纯防御性**，不做则以难归因的方式失败（传输期报错而非校验期、按错 dtype 准备缓冲、**LoRA 下静默同步基座模型**） | **是**，与 1-5 同批 |
@@ -4478,11 +4500,10 @@ colocate 需要：同一组 GPU 上先跑 train client、再跑 gen client，
 22. **role 维度隔离**（§3.10.3）：actor 与 critic 同时发布版本，
     各自的 holder 表项不得互相覆盖。故意用相同版本号（v3 / c3）跑一次，
     确认两者解析到不同的 holder。
-23. **epoch 与 version 的两段校验**（§3.7.3.0a）：构造
-    「version 匹配但 epoch 陈旧」的请求（让 trainer 做一次 offload+reload
-    但不推进版本），**必须返回 `DESC_STALE` 而非通过**。
-    这一格是「合并成单一代次」会漏掉的那个，**不测它等于没有这条保护**。
-    另测 `CHUNK_STALE` 与 `DESC_STALE` 触发不同的恢复路径（换源 vs 重取 descriptor）。
+23. **地址变更后不读到错误地址**（§3.7.3.0a 更正）：让 trainer 做一次 offload+reload
+    但不推进版本，读者在收到 `UPDATE_INFO` 前用旧 descriptor 发起读，
+    **必须失败（`NIXL_ERR_NOT_FOUND`）而非读到 reload 后地址上的字节**；
+    收到后重新加载对端 info，下一次 pull 坐标判据全过。
 24. **档位 B 的 GPS 一致性**（§3.10.4a）：CPU holder 在版本推进后
     必须自动退出候选集，**不得因链路成本低被选中**。
     故意让 GPS 停留在 v 而发布 v+1，确认选源不会命中它。

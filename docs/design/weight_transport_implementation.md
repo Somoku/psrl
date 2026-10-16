@@ -1081,6 +1081,25 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
          沿用全局 finest cell 时 descriptor 数随行数增长，扩散因此净亏。
       4. **designate 不响应时 follower 在 `peer_timeout_s` 后改读上游**，不让同组卡住。
 
+- **D1 peer 读的版本保证：现状是时序，不是断言。** 设计 §3.5.2 要求 `version(peer) == v`，
+      实现里没有对应检查。实测（CPU 假集群，`peer_diffusion=True`）：
+
+      | 观测 | 值 |
+      |---|---|
+      | rollout 报告的拉取版本（第 1、2 次） | 均为 `[-1]`，包括第 2 次已读到 v8 字节时 |
+      | rollout 缓存的另一个 rollout（designate）的版本戳 | `[-1]` |
+
+      `publish_version` 只对 trainer 调用，rollout 的分片戳从不更新，所以 peer 读上
+      `vllm_extension.py` 的 `assert len(pulled_version) <= 1` 恒通过，对 peer 读什么也没校验。
+      读到的字节是对的，靠的是：designate 先完成该波上游读并 `cuda.synchronize`，之后才发
+      `(epoch, wave, sender)` 就绪信号；follower 读完发 `_DONE`，designate 返回前 `_await(_DONE)`。
+      正常路径下 designate 不会在 follower 读完前进入下一轮。
+
+      **已知缺口**：`_DONE` 屏障有 `peer_timeout_s`（默认 120 s）的超时，超时只打 warning 就放行，
+      之后下一轮可能在慢 follower 仍在读时改写缓冲区。另外若 designate 自己读到了旧版本
+      （真实栈上读者缓存的 trainer 戳只在握手或 colocate 切换时刷新），follower 会跟着拿到旧版本，
+      版本集合仍是单元素，不报错。后一条依赖真实栈的缓存陈旧，假集群测不出，**未验证**。
+
 - [x] **D1 选源模块已落地**：`psrl/utils/nixl/source_resolution.py`。
       trainer 出口 == 节点数（4 节点 × 8 reader 实测为 4 次而非 32 次）；
       出口随「每节点 reader 数」增长保持不变；无链式结构（逐轮断言源不是二手 holder）；

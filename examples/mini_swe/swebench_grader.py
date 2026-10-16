@@ -31,7 +31,14 @@ from typing import Any
 
 from examples.mini_swe.grading.runtime import run_grading
 from examples.mini_swe.grading.schema import GradingPlan, GradingResult
-from psrl.sandbox import ExecResult, SandboxSpec, SnapshotRef, SyncSandboxManager, SyncSandboxSession
+from psrl.sandbox import (
+    ExecResult,
+    SandboxCapacityTimeout,
+    SandboxSpec,
+    SnapshotRef,
+    SyncSandboxManager,
+    SyncSandboxSession,
+)
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -526,6 +533,12 @@ def grade_fresh_container(
                 output_tail=out2.stdout[-_OUTPUT_TAIL_BYTES:],
             ).to_dict()
 
+    except SandboxCapacityTimeout:
+        # No grader sandbox existed, so this episode was never measured and it is not a
+        # verdict. Folding it into one anyway is what turns an infrastructure fault into a
+        # scored zero, which trains the absence of a measurement as a measured failure and
+        # moves the episode's whole GRPO group on something the policy cannot influence.
+        raise
     except Exception as exc:
         psrl_logger.error(f"{log_prefix} Container error: {exc}.")
         verdict = GradingResult(

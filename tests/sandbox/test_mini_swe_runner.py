@@ -15,7 +15,7 @@ from examples.mini_swe.runner import (
     parse_duration_seconds,
     resolve_container_config,
 )
-from psrl.sandbox import ExecMode, ExecResult, SandboxRef, SandboxSource, SandboxSpec
+from psrl.sandbox import ExecMode, ExecResult, SandboxCapacityTimeout, SandboxRef, SandboxSource, SandboxSpec
 
 
 def _payload() -> dict[str, Any]:
@@ -299,6 +299,65 @@ def test_fresh_grader_runs_vendored_driver_inside_sandbox() -> None:
     assert sandbox.session.writes["/tmp/psrl-model.patch"].startswith(b"diff --git")
     assert json.loads(sandbox.session.writes[grading_payload.INPUT_PATH])["repo"] == "django/django"
     assert sandbox.session.closed
+
+
+def test_fresh_grader_does_not_turn_a_capacity_refusal_into_a_verdict() -> None:
+    """No sandbox existed, so nothing was measured and the grader has no verdict to give.
+
+    Folding the fault into a verdict of 0 is what trains the absence of a measurement as a
+    measured failure, and it moves the episode's whole GRPO group on an infrastructure fault.
+    """
+    from examples.mini_swe import swebench_grader
+
+    class RefusingSyncSandbox:
+        def create(self, spec: SandboxSpec) -> Any:
+            raise SandboxCapacityTimeout("every capable sandbox node is full")
+
+    swe_problem = {
+        "instance_id": "task",
+        "FAIL_TO_PASS": ["t.py::a"],
+        "PASS_TO_PASS": [],
+        "eval_script": "#!/bin/bash\necho hi\n",
+    }
+
+    with pytest.raises(SandboxCapacityTimeout):
+        swebench_grader.grade_fresh_container(
+            swe_problem,
+            "diff --git a/a.py b/a.py\n",
+            "verified",
+            "image",
+            sandbox=RefusingSyncSandbox(),
+            sandbox_spec=SandboxSpec(source=SandboxSource.image("image"), workdir="/testbed"),
+        )
+
+
+def test_a_capacity_refusal_survives_the_runner_wrapper() -> None:
+    """The wrapper is the second place a broad clause would have swallowed the fault."""
+    payload = _payload()
+    payload["observation"].update(
+        {
+            "swe_grader": "swebench_fresh_container",
+            "swe_problem_image": "swe-image",
+            "swe_problem": {
+                "instance_id": "task",
+                "FAIL_TO_PASS": ["t.py::a"],
+                "PASS_TO_PASS": [],
+                "eval_script": "#!/bin/bash\necho hi\n",
+            },
+        }
+    )
+
+    class RefusingSyncSandbox:
+        def create(self, spec: SandboxSpec) -> Any:
+            raise SandboxCapacityTimeout("every capable sandbox node is full")
+
+    with pytest.raises(SandboxCapacityTimeout):
+        grade_patch(
+            payload,
+            "diff --git a/a.py b/a.py\n",
+            RefusingSyncSandbox(),
+            grader_spec=SandboxSpec(source=SandboxSource.image("swe-image"), workdir="/testbed"),
+        )
 
 
 def test_fresh_grader_fails_closed_without_eval_script() -> None:

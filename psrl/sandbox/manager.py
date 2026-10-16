@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import secrets
 import time
 import uuid
@@ -18,6 +19,7 @@ from psrl.sandbox.core import (
     ResourceSpec,
     SandboxBackend,
     SandboxCapabilityError,
+    SandboxCapacityTimeout,
     SandboxFeature,
     SandboxProvisionError,
     SandboxRef,
@@ -44,6 +46,14 @@ _RELEASE_ATTEMPT_ALERT = 5
 # states the real value, and this only keeps a spec that omits it from becoming
 # unbounded. It matches the service's own default so both paths reclaim alike.
 DEFAULT_LIFETIME_S = 4 * 60 * 60.0
+
+# How long a create waits out a capacity refusal before giving up, and the shape of
+# that wait. A service that cannot hold the request right now refuses it rather than
+# queueing it, and the refusal clears as other sandboxes are released, so waiting is
+# the caller's answer instead of failing the work that needed the sandbox.
+DEFAULT_CAPACITY_WAIT_S = 600.0
+_CAPACITY_RETRY_BASE_S = 0.5
+_CAPACITY_RETRY_MAX_S = 15.0
 
 # The resource class a fork parent is admitted under. It is not a trajectory, so it
 # must not be able to consume a class share a grader or a rollout is waiting for.
@@ -236,9 +246,11 @@ class SandboxManager:
         capacity_coordinator=None,
         capacity_owner_id: str | None = None,
         capacity_heartbeat_interval_s: float | None = None,
+        capacity_wait_s: float = DEFAULT_CAPACITY_WAIT_S,
     ) -> None:
         self._backends = dict(backends)
         self.default_backend = default_backend
+        self._capacity_wait_s = capacity_wait_s
         if default_backend not in self._backends:
             raise ValueError(f"Default sandbox backend {default_backend!r} is not configured.")
         for name, backend in self._backends.items():
@@ -895,6 +907,55 @@ class SandboxManager:
             required=required,
         )
 
+    async def _create_with_capacity_wait(
+        self,
+        create: Callable[[CapacityGrant | None], Awaitable[SandboxSession]],
+        grant: CapacityGrant | None,
+        resource_class: str,
+        deadline_s: float | None,
+    ) -> SandboxSession:
+        """
+        Create the sandbox, waiting out a capacity refusal until the budget runs out.
+
+        A backend that cannot hold the request right now refuses it rather than queueing
+        it, and that refusal clears as other sandboxes are released. A burst that outruns
+        the fleet would otherwise shed its overflow as work that never ran, so the wait
+        lives here rather than in each caller that wants a sandbox.
+
+        Args:
+            create (Callable[[CapacityGrant | None], Awaitable[SandboxSession]]): The
+                backend's create, taking the grant admission produced.
+            grant (CapacityGrant | None): What admission granted, or None for a backend
+                that keeps its own ledger.
+            resource_class (str): The class the request is charged to, for the log.
+            deadline_s (float | None): A caller's own bound. None takes the configured one.
+
+        Returns:
+            SandboxSession: The created session.
+
+        Raises:
+            SandboxCapacityTimeout: When the budget elapses with the request still refused.
+        """
+        budget = self._capacity_wait_s if deadline_s is None else min(deadline_s, self._capacity_wait_s)
+        started = time.monotonic()
+        delay = _CAPACITY_RETRY_BASE_S
+        while True:
+            try:
+                return await create(grant)
+            except SandboxCapacityTimeout:
+                remaining = budget - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise
+                # Jittered, so a batch refused together does not come back in lockstep, and
+                # bounded by what is left, so the wait never outlives the budget it is on.
+                wait_s = min(delay, remaining) * (0.5 + random.random() / 2)
+                psrl_logger.info(
+                    f"No room for class {resource_class!r} yet, retrying in {wait_s:.1f}s "
+                    f"with {remaining:.1f}s of the wait left."
+                )
+                await asyncio.sleep(wait_s)
+                delay = min(delay * 2, _CAPACITY_RETRY_MAX_S)
+
     async def _provision(
         self,
         backend: SandboxBackend,
@@ -923,7 +984,9 @@ class SandboxManager:
             grant = await self._acquire_capacity(backend, resources, resource_class, deadline_s=deadline_s)
             machine.transition(LeaseState.PROVISIONING)
             try:
-                creation = asyncio.ensure_future(create(grant))
+                creation = asyncio.ensure_future(
+                    self._create_with_capacity_wait(create, grant, resource_class, deadline_s)
+                )
                 cancelled = False
                 try:
                     session = await asyncio.shield(creation)

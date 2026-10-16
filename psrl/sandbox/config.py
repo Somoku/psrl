@@ -7,7 +7,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from psrl.sandbox.capacity import SandboxCapacityConfig
 from psrl.sandbox.core import SandboxBackend
-from psrl.sandbox.manager import SandboxManager
+from psrl.sandbox.manager import DEFAULT_CAPACITY_WAIT_S, SandboxManager
 
 
 @dataclass
@@ -17,6 +17,10 @@ class SandboxManagerConfig:
     default_backend: str = "docker"
     backends: dict[str, Any] = field(default_factory=dict)
     capacity: SandboxCapacityConfig = field(default_factory=SandboxCapacityConfig)
+    # How long a create waits out a capacity refusal. Unlike the capacity block, this binds
+    # every backend: one that keeps its own ledger refuses rather than queues, so there is
+    # no client-side gate to hold the request and the wait is the caller's only lever.
+    capacity_wait_s: float = DEFAULT_CAPACITY_WAIT_S
 
 
 def _config_section(config: DictConfig | SandboxManagerConfig, name: str):
@@ -79,6 +83,14 @@ def assert_lifecycle_fits_capacity(
         )
 
 
+def _capacity_wait_s(config: DictConfig | SandboxManagerConfig) -> float:
+    """Read how long a create may wait out a capacity refusal, defaulting an unstated one."""
+    value = _config_section(config, "capacity_wait_s")
+    if value is None:
+        return DEFAULT_CAPACITY_WAIT_S
+    return float(value)
+
+
 def placement_manager_config(
     config: DictConfig | SandboxManagerConfig,
     *,
@@ -94,6 +106,7 @@ def placement_manager_config(
         default_backend=backend_name,
         backends={},
         capacity=resolve_capacity(config),
+        capacity_wait_s=_capacity_wait_s(config),
     )
 
 
@@ -154,4 +167,5 @@ def build_sandbox_manager(
         capacity_coordinator=capacity_coordinator,
         capacity_owner_id=owner_id,
         capacity_heartbeat_interval_s=capacity.heartbeat_interval_s if capacity_coordinator is not None else None,
+        capacity_wait_s=_capacity_wait_s(config),
     )

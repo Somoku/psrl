@@ -16,6 +16,7 @@ from psrl.sandbox import (
     ExecMode,
     MountSpec,
     ResourceSpec,
+    SandboxCapacityTimeout,
     SandboxFeature,
     SandboxSource,
     SandboxSpec,
@@ -375,6 +376,10 @@ def grade_patch(
             sandbox_snapshot=verifier_snapshot,
             grading_plan=GradingPlan.from_swe_problem(swe_problem),
         )
+    except SandboxCapacityTimeout:
+        # Nothing was measured without a sandbox, so this is not a grading result. The
+        # caller keeps the trajectory and reports it ungraded instead of training a zero.
+        raise
     except Exception as exc:
         return _grader_failure(swe_problem, str(exc))
 

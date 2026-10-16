@@ -337,3 +337,36 @@ python tests/nixl/test_nixl_e2e.py --config-name nixl_e2e_5node_direct test.num_
 python tests/nixl/bench_fp8_logprob_gap.py --model <ckpt> --mode bf16 --out /tmp/bf16.pt
 python tests/nixl/bench_fp8_logprob_gap.py --model <ckpt> --mode fp8 --out /tmp/fp8.pt --ref /tmp/bf16.pt
 ```
+
+## 9. DCP 保存与 NIXL 进度线程
+
+结论：**进度线程常开时，同步 DCP 保存与直供读不冲突；会损坏 NIXL 的是 fork 式异步保存。**
+原先「`all_gather_object` 破坏 UCX endpoint」的归因没有复现。
+
+合成负载（`tests/nixl/repro_dcp_ucx.py`）：单节点 8 rank，每个 rank 注册一块 256 MB 的显存、
+开进度线程，后台线程循环读邻居 rank 并逐字节校验，主线程同时做被测动作。
+
+| 被测动作 | 读次数 / rank | 错误 | 不一致 |
+|---|---|---|---|
+| 无（基线，60 s） | 约 4.4 万 | 0 | 0 |
+| `all_gather_object`，64 MB 负载，40 s | 约 1.7 千 | 0 | 0 |
+| 同步 DCP 保存，约 8 次，每次 512 MB / rank | 约 5.5 万 | 0 | 0 |
+| 同上，每卡另占 70 GB（余约 25 GB） | 约 4.5 万 | 0 | 0 |
+| 异步 DCP，fork（`mcore`） | 约 2.4 万后失效 | 之后全部 `NIXL_ERR_REMOTE_DISCONNECT` | 0 |
+| 同上加 `RDMAV_FORK_SAFE`、`IBV_FORK_SAFE` | 同上 | 同上 | 0 |
+| 异步 DCP，spawn 持久进程（`persistent=True`） | 约 8 万～17 万 | 0 | 0 |
+
+- fork 失败的形态：UCX 报 `local work queue catastrophic error`，此后读全部失败且不恢复。
+- `all_gather_object` 一行的读次数低，是 64 MB 负载下 GIL 与 NCCL 争用，不是错误。
+- 测试脚本的一个陷阱：读线程默认在 0 号卡上，`torch.cuda.synchronize()` 同步错了卡，
+  `zero_()` 晚于网卡写入，表现为大面积「不一致」且字节全为 0。已修，规则是读线程先 `set_device`。
+
+真实栈（`examples/grpo_trainer/qwen3_8b_megatron_direct.sh`，单节点，4 train + 4 rollout，
+绕过 `use_dcp_save=True` 的断言并强制进度线程常开，每步保存，2 步）：训练与两次保存完成，
+日志里没有 UCX / NIXL 传输错误。
+
+没有覆盖的：多节点、更多步数、真实栈上的异步保存、训练端与读者跨节点的布局。
+这些没测之前，不能据此删除逐 rank 保存路径。
+
+另一个发现：同一次真实栈运行里，**第二次拉取在 peer 读处抛 `NIXL_ERR_NOT_FOUND`**，
+4 个 rollout 被摘除。关掉 DCP 且不保存的对照同样失败，所以与保存无关，见实现文档。

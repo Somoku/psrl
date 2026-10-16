@@ -1266,17 +1266,23 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 
       - 直供要求 train rank 上的 **NIXL progress thread 常开**，
         因为 rollout 在它计算的同时 RDMA 读它，而那条路径要等 `DONE`；
-      - Megatron 的 `dist_checkpointing` 的 `all_gather_object`
-        会破坏该线程读取的 UCX endpoint 地址 ——
-        这正是 `checkpoint.use_dcp_save` 把线程关掉的原因。
+      - 原先的判断是：Megatron 的 `dist_checkpointing` 的 `all_gather_object`
+        会破坏该线程读取的 UCX endpoint 地址，所以 `checkpoint.use_dcp_save`
+        在 DCP 保存时把线程关掉。
 
-      NIXL **没有暂停/恢复 progress thread 的 API**（已查 `nixl_agent` 的全部方法），
-      所以二者无法在一次 save 期间轮流让路，冲突是结构性的。
-
-      症状极具迷惑性：传输**提交成功**然后永远停在 `PROC`，
+      症状是：传输**提交成功**然后永远停在 `PROC`，
       最终报在**读方**身上（`Timeout waiting for transfer ... to NIXLTrainClient_N`），
       而真正没能服务的那个 rank **什么都不打**。
       而且**第 1 步能过、第 2 步才挂** —— 首次 pull 发生在 trainer 空闲时。
+
+      **这个归因没有被复现，且症状有一个更简单的解释。** 进度线程关闭时，
+      传输同样是「提交成功、停在 `PROC`」（`conftest_agents.py` 记录了同一现象），
+      而 `use_dcp_save=True` 恰恰就是关线程的开关。症状与「线程被关掉」吻合，
+      不需要「DCP 破坏了 UCX」这个假设。这是推断，不是已证实的因果。
+
+      实测见 `weight_transport_FINDINGS.md` §9：进度线程常开时，同步 DCP 保存与 NIXL 读
+      并发，没有出现传输错误或字节不一致；`addr_version` 断言没有复现。
+      **能确认存在的冲突只有一个：fork 式异步保存。**
 
       **解法**：`psrl/utils/checkpoint/megatron_manager.py` 新增
       `PSRL_PerRankMegatronCheckpointManager`，用逐 rank `torch.save` 取代

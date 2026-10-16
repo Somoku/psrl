@@ -79,44 +79,45 @@ block FP8 格在 train 侧填「block 量化恰好可逆」的值，于是 gen �
 
 剩余的 27% 效率不是波数、planner 或提交开销能解决的，而是**单次传输字节数不足以让 IB 链路饱和**：每个专家 dense 矩阵约 `422 MiB / 128 experts / 16 EP = 206 KB`，在 49 GB/s 的链路上传输时间约 4 µs，而 NIXL RDMA READ 的往返开销（QP setup + DMA + completion）在这个量级下构成明显开销。dense（attention）键因 TP 分片被多个 gen GPU 复用，但它们只占总字节的 3%（§4b）。
 
-**第四条候选排除：段大小在 NVLink 上无关（单节点实测，`bench_segment_size.py`）**。
-H20 单节点 GPU0 → GPU1（NVLink，2048 MB 总量），inflight=1 下从 4 KB 到 2 GB 整段：
+**第四条候选排除：段大小在 NVLink 上无关（单节点实测）**。
+H20 单节点 GPU0→GPU1（NVLink，2048 MB 总量），inflight=1 下从 4 KB 到 2 GB 整段全部 395–396 GB/s，524,288 个 4 KB 段与 1 个 2 GB 段吞吐完全相同。NVLink 是零拷贝 peer memory access，没有 RDMA QP setup / RTT 开销，段大小无关。
 
-| 段大小 | inflight=1 | inflight=4 | inflight=16 |
-|--------|-----------|-----------|------------|
-| 2 GB（1 desc） | **395.9 GB/s** | — | — |
-| 64 KB（32 desc） | 396.2 | 387.9 | 347.9 |
-| 16 KB（131 K desc） | 396.3 | 384.1 | 352.5 |
-| 4 KB（524 K desc） | 396.3 | 388.1 | 351.2 |
+**第四条候选排除（IB 路径）：段大小在跨节点 RoCE 上同样完全无关（2 节点实测已完成）**。
+28.59.83.232 GPU0（target）→ 29.162.224.39 GPU0（initiator），跨节点 RoCE，2048 MB 总量：
 
-4 KB 到 2 GB 전 범위에서 inflight=1 기준 395–396 GB/s으로 완전히 일정합니다. NVLink는 zero-copy peer memory access라서 RDMA 프로토콜의 QP setup/RTT overhead가 없으므로 세그먼트 크기가 완전히 무관합니다. 세그먼트 크기 가설은 **IB 경로에서만 의미**가 있습니다.
+| 段大小 | inflight=1 | inflight=4 | inflight=8 |
+|--------|-----------|-----------|-----------|
+| 2 GB（1 desc） | **49.0 GB/s** | — | — |
+| 262 MB（8 desc） | 49.0 | 49.0 | 49.0 |
+| **206 KB（MoE 实际专家段，10,180 desc）** | **49.0** | **49.0** | **49.0** |
+| 64 KB（32,768 desc） | 49.0 | 49.0 | 49.0 |
+| 16 KB（131,072 desc） | 49.0 | 49.0 | 49.0 |
+| 4 KB（524,288 desc） | 49.0 | 49.0 | 49.0 |
 
-**IB 경로에서의 세그먼트 크기 sweep은 2 노드 환경에서 실측 필요**（待跑）。预期 IB 下小段（< 256 KB）会有效率下降，206 KB（实际专家段大小）附近的实测值是 W12 的关键数据点。复现命令：
-```bash
-# target 노드
-source scripts/nixl_env.sh && unset http_proxy https_proxy
-python tests/nixl/bench_segment_size.py --role target --ip <target-bond1-ip> --gpu 0 \
-  --buf-mb 2048 --hold-s 300
+4 KB × 524,288 desc 与 1 个 2 GB 传输带宽完全相同，均为 49.0 GB/s，全部字节逐位校验正确（ok=true）。**RDMA READ 在此 fabric 上对段大小不敏感**，206 KB 的实际专家段大小没有任何效率损失，完全贴近单对链路上界。
 
-# initiator 노드（206 KB MoE 실제 전문가 세그먼트 크기 포함）
-source scripts/nixl_env.sh && unset http_proxy https_proxy
-python tests/nixl/bench_segment_size.py --role initiator --ip <target-bond1-ip> --gpu 0 \
-  --buf-mb 2048 \
-  --seg-kb 2097152 1048576 262144 206 65536 4096 1024 256 64 16 4 \
-  --inflight 1 4 8 --reps 5
-```
+**W12 根因彻底锁定：四条候选全部被实测排除，剩余差距是纯 EP 拓扑约束。**
 
-**结论**：W12 的剩余差距是 EP 拓扑的结构性结果，与 PSRL 的 planner、传输实现、或 descriptor 批量化无关。要从 27% 提升到 ≥ 60%，需要改变「读的粒度」或「谁持有什么」：
+| 候选 | 排除方式 |
+|---|---|
+| 波数（1/4/8） | 实测无差别（§1b） |
+| planner 选源（一一匹配） | 反而慢 1.6 倍，已回滚（§1b） |
+| 提交开销（descriptor 数） | 0.58 ms vs 158 ms，< 0.4%（本节） |
+| 段大小（IB RTT overhead） | 4 KB → 2 GB 全部 49.0 GB/s，NVLink 与 IB 两路均测，无差别（本节） |
+
+每个 gen GPU 的专家只在一个 train GPU 上有分片，整个 pull 过程中每对 NIC 链路只有 1 个 gen GPU 在读。链路本身已饱和（49 GB/s），但同时活跃的链路对数被 EP 拓扑固定为 1 per train GPU。16 对活跃链路 × 49 GB/s = 784 GB/s 理论上界，实测 214 GB/s，效率 27%。不是协议层或实现层问题。
+
+**结论**：W12 的剩余差距是 EP 拓扑的结构性结果，与 PSRL 的 planner、传输实现、descriptor 批量化、段大小均无关。要从 27% 提升到 ≥ 60%，需要改变「谁读谁」的拓扑，而不是调协议参数：
 
 | 候选 | 效果 | 代价 |
 |---|---|---|
-| 把同一 gen GPU 的所有专家读合并为单次大 READ（coalesce at MoE group level） | 每次 sync 的 RDMA 操作数从 ~579 降到几十，提高链路利用率 | 需要 vLLM gen 侧 EP 在内存中连续存放专家；`moe_grouping.py` 已有分组逻辑可复用 |
-| 增大 vLLM EP 分组（EP8 → EP4），每 gen GPU 持有更大的专家块 | 每个 gen GPU 的专家字节翻倍，单次传输时间也翻倍，链路利用率随之提高 | EP 越小则 gen GPU 显存需求越高，235B 下 EP8 已接近上限 |
+| 把同一 gen GPU 的所有专家读合并为单次大 READ（coalesce at MoE group level） | 每次 sync 的 RDMA 操作数从 ~579 降到几十，激活更多 train GPU 参与并发读 | 需要 vLLM gen 侧 EP 在内存中连续存放专家；`moe_grouping.py` 已有分组逻辑可复用 |
+| 增大 vLLM EP 分组（EP16 → EP8），每 gen GPU 持有更大的专家块 | 每个 gen GPU 的专家来自更多 train GPU，激活更多链路对并发 | EP 越小则 gen GPU 显存需求越高，235B 下 EP8 已接近上限 |
 | train 侧专家发布副本在内存中按 gen EP 分组连续排列 | 同上，允许单次 RDMA READ 覆盖整个 gen GPU 的专家份额 | 需改 `block_fp8.py` / `comm_plan.py` 的发布布局 |
 
-目前判断这三个方向均有可行路径，但都需要在 2 节点环境单独 benchmark 확인。
+这三个方向均需在真实训练配置下实测确认，段大小不是障碍。
 
-档位：NVLink 段大小 sweep 已完成（单节点）；IB 路径 2 节点可复现（待跑）。
+档位：NVLink 与 IB 段大小 sweep 均已完成（单节点 + 2 节点）；改善路径需 2 节点含真实 MoE 权重配置验证。
 
 ---
 

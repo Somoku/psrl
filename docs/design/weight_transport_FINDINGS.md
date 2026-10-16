@@ -352,9 +352,10 @@ python tests/nixl/bench_fp8_logprob_gap.py --model <ckpt> --mode fp8 --out /tmp/
 | `all_gather_object`，64 MB 负载，40 s | 约 1.7 千 | 0 | 0 |
 | 同步 DCP 保存，约 8 次，每次 512 MB / rank | 约 5.5 万 | 0 | 0 |
 | 同上，每卡另占 70 GB（余约 25 GB） | 约 4.5 万 | 0 | 0 |
-| 异步 DCP，fork（`mcore`） | 约 2.4 万后失效 | 之后全部 `NIXL_ERR_REMOTE_DISCONNECT` | 0 |
+| 异步 DCP，fork（`mcore` 默认） | 约 2.4 万后失效 | 之后全部 `NIXL_ERR_REMOTE_DISCONNECT` | 0 |
 | 同上加 `RDMAV_FORK_SAFE`、`IBV_FORK_SAFE` | 同上 | 同上 | 0 |
-| 异步 DCP，spawn 持久进程（`persistent=True`） | 约 8 万～17 万 | 0 | 0 |
+| 异步 DCP，mcore spawn 持久进程（`persistent=True`） | 约 8 万～17 万（96-99 GB/s） | 0 | 0 |
+| 异步 DCP，nvrx 策略（`AsyncCallsQueue persistent=True`） | 约 7 万（113-119 GB/s） | 0 | 0 |
 
 - fork 失败的形态：UCX 报 `local work queue catastrophic error`，此后读全部失败且不恢复。
 - `all_gather_object` 一行的读次数低，是 64 MB 负载下 GIL 与 NCCL 争用，不是错误。
@@ -378,10 +379,19 @@ python tests/nixl/bench_fp8_logprob_gap.py --model <ckpt> --mode fp8 --out /tmp/
 
 所以今天打开 `async_save` 会在导入处报错，不会走到上表里 fork 损坏 NIXL 的那一步；
 上表的 fork 结果是绕开 verl、直接调 Megatron 并指定 `async_strategy="mcore"` 得到的。
-风险在于将来升级 verl 或 Megatron 让这条路径重新可用且仍用 fork 策略。
+
+**装上 `nvidia-resiliency-ext` 0.7.0 后，nvrx 路径与 NIXL 并发不冲突。** 上表新增的 nvrx 行
+（`repro_dcp_nvrx.py`）用 `AsyncCallsQueue(persistent=True)`，persistent worker 以 `spawn` 启动，
+不继承父进程的 UCX context，30 s 内完成 1 次 checkpoint，reader 线程 113–119 GB/s、0 错误。
+单独跑 nvrx（无 NIXL）也 PASS，所以之前的 SIGABRT 是测试脚本自身没有用
+`if __name__ == "__main__":` 保护初始化代码导致 spawn 子进程递归 import 触发的，不是 nvrx 与 NIXL 的冲突。
+
+**结论：冲突在 fork，不在版本或环境。** fork 继承 CUDA context / UCX endpoint / 注册显存，
+是 OS 层面约束，不会因 Megatron 或 verl 升级而改变。spawn（mcore persistent 或 nvrx persistent）
+都能与 NIXL 共存。真实栈要跑通 async save 需要：装 nvrx >= 0.6.0、修 verl 的接口适配、
+确保 spawn worker 不会递归运行初始化代码。`PSRL_PerRankMegatronCheckpointManager` 暂不删。
 
 没有覆盖的：多节点、更多步数、真实栈上的异步保存、训练端与读者跨节点的布局。
-这些没测之前，不能据此删除逐 rank 保存路径。
 
 另一个发现：同一次真实栈运行里，**第二次拉取在 peer 读处抛 `NIXL_ERR_NOT_FOUND`**，
 4 个 rollout 被摘除。关掉 DCP 且不保存的对照同样失败，所以与保存无关，见实现文档。

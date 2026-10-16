@@ -149,10 +149,19 @@ bash "$PSRL_PATH/patch/apply_patch.sh" vllm
 bash "$PSRL_PATH/patch/apply_patch.sh" verl
 bash "$PSRL_PATH/patch/apply_patch.sh" transfer_queue
 
-echo "9. Install torch_memory_saver"
-python -m uv pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@d64a6394d1e09c613fab90260054cecc2684586d --no-cache-dir --force-reinstall
+echo "9. Install nvidia-resiliency-ext (nvrx) for async DCP checkpointing"
+# nvrx >= 0.6.0 is required by Megatron 0.19's nvrx async checkpoint strategy.
+# It provides AsyncCallsQueue with persistent=True (spawn-based, not fork), which is
+# safe alongside the NIXL progress thread.  The PyPI wheel (nvidia-resiliency-ext) ships
+# a 0.0.0a0 placeholder; install from the GitHub v0.7.0 tag instead.
+pushd "$THIRD_PARTY_PATH"
+git clone --depth 1 --branch v0.7.0 https://github.com/NVIDIA/nvidia-resiliency-ext.git
+pushd nvidia-resiliency-ext
+python -m uv pip install -e .
+popd
+popd
 
-echo "10. Install flashinfer"
+echo "10. Install torch_memory_saver"
 mkdir -p flashinfer_src
 pushd flashinfer_src
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive --branch v0.6.11.post3

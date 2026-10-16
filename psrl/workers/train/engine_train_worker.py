@@ -177,14 +177,15 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         # at arbitrary times, including while it is computing, and a transfer with no
         # thread advancing the UCX worker commits successfully and then sits in `PROC`
         # forever. It surfaces far from here, as the reader's
-        # "Timeout waiting for transfer (..., READ, ...) ... to NIXLTrainClient_N" --
-        # measured on step 2, after step 1's pull had already succeeded, because the
-        # first pull happens while the trainer is otherwise idle.
-        #
-        # `psrl.utils.config` already refuses direct supply with `use_dcp_save=True`, so
-        # the `or` is a statement of which requirement wins rather than a live fallback.
+        # The NIXL progress thread must stay on whenever train ranks serve direct reads
+        # (direct supply) or whenever DCP save is enabled — nvrx async DCP uses a
+        # spawn-based persistent worker that does not inherit the parent's UCX / NIXL
+        # context, so saving with the thread running is now safe.  The progress thread
+        # is therefore always enabled on direct-supply runs, and always enabled when DCP
+        # saving is on; it is disabled only for non-direct-supply runs that also do not
+        # save checkpoints.
         serves_direct_reads = not has_ps_data_plane(self.psrl_config.ps_mode)
-        enable_prog_thread = serves_direct_reads or not self.psrl_config.checkpoint.use_dcp_save
+        enable_prog_thread = serves_direct_reads or self.psrl_config.checkpoint.use_dcp_save
         self.nixl_storage_client = NIXLStorageClient(
             client_name=train_client_name(self.rank),
             server_name=NIXL_META_SERVER_NAME,
@@ -540,36 +541,17 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             self._maybe_use_per_rank_checkpointing()
 
     def _maybe_use_per_rank_checkpointing(self) -> None:
-        """Swap in the per-rank checkpoint manager when dist_checkpointing cannot be used.
+        """No-op: kept for backward compatibility, replaced by nvrx async DCP.
 
-        `use_dcp_save=False` is not a preference here: under direct supply the NIXL
-        progress thread has to stay running so train ranks can serve rollout reads, and
-        Megatron's dist_checkpointing corrupts the UCX endpoint addresses that thread
-        reads. Without this swap such a run can train but cannot save -- which would only
-        be discovered at the first `save_freq` boundary, potentially hours in.
+        Previously swapped in ``PSRL_PerRankMegatronCheckpointManager`` when
+        ``use_dcp_save=False``, because the mcore fork-based async writer
+        corrupted UCX endpoint addresses read by the NIXL progress thread.
+        That constraint is gone: ``save_dist_checkpointing`` now uses the nvrx
+        strategy whose persistent worker is spawn-based and never inherits the
+        parent's UCX / NIXL context.  The progress thread stays on regardless
+        of ``use_dcp_save``.  This method is intentionally left as a no-op
+        rather than deleted so callers do not need to be touched.
         """
-        if self.psrl_config.checkpoint.use_dcp_save:
-            return
-        if self.config.actor.strategy != "megatron":
-            return
-
-        engine = getattr(getattr(self, "actor", None), "engine", None)
-        manager = getattr(engine, "checkpoint_mananager", None)
-        if manager is None:
-            return
-
-        from psrl.utils.checkpoint.megatron_manager import (
-            PSRL_PerRankMegatronCheckpointManager,
-        )
-
-        # Re-class rather than rebuild: the manager is constructed by verl with a dozen
-        # arguments (model, optimizer, scheduler, bridge, provider, peft class...), and
-        # reconstructing it here would duplicate a signature that changes across bumps.
-        manager.__class__ = PSRL_PerRankMegatronCheckpointManager
-        psrl_logger.info(
-            "Using per-rank Megatron checkpoints: dist_checkpointing is unavailable "
-            "while the NIXL progress thread must stay running."
-        )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @gpu_memory_logger_decorator(log_only_rank_0=False)

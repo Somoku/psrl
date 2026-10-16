@@ -82,6 +82,44 @@ async def test_downstream_timeout_is_an_error_not_a_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_rollout_that_never_started_keeps_its_reason() -> None:
+    """A setup deadline is the loop's own verdict and must survive the wrapper.
+
+    The loop returns no output for reasons that need no retry and no traceback -- a
+    provisioning deadline, a sandbox that was never admitted -- and the wrapper used to
+    replace those with a bare "no output" error. The worker can then only infer a reason
+    from the exception chain, which erases the difference between a rollout that never
+    ran and one whose harness is broken, in the manager's breaker and in the logs.
+    """
+    loop = _loop()
+
+    async def run(request):
+        return None, TerminateReason.ROLLOUT_DEADLINE_EXCEEDED
+
+    loop.run = run
+    output, reason = await loop.run_with_termination_handling(_request(), raise_on_error=True)
+
+    assert output is None
+    assert reason is TerminateReason.ROLLOUT_DEADLINE_EXCEEDED
+    assert reason.needs_manager_retry() is True
+    assert reason.needs_worker_retry() is False
+
+
+@pytest.mark.asyncio
+async def test_a_successful_reason_without_output_is_still_refused() -> None:
+    # The guard that the branch above narrows: a loop claiming success with no output is
+    # a bug, and must not be reported to the manager as a completed rollout.
+    loop = _loop()
+
+    async def run(request):
+        return None, TerminateReason.FINISHED
+
+    loop.run = run
+    with pytest.raises(RuntimeError, match="did not return a valid TokenOutput"):
+        await loop.run_with_termination_handling(_request(), raise_on_error=True)
+
+
+@pytest.mark.asyncio
 async def test_episode_budget_expiry_is_reported_separately() -> None:
     loop = _loop(trajectory_timeout=0.05)
 

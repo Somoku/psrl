@@ -787,6 +787,19 @@ class AgentLoopBase(ABC):
                         self.last_error_traceback or "<no underlying exception was captured>",
                     )
                 return None, terminate_reason
+            elif output is None and terminate_reason.needs_manager_retry():
+                # Reached only for a reason that needs no in-place retry, since the branch
+                # above takes every reason that does: the group must still be replaced, but
+                # re-running the episode cannot help. The loop already knows why and this
+                # keeps that reason intact -- the manager's breaker names the cause from it,
+                # whereas a bare "no output" error erases it, because the worker's classifier
+                # can only infer a reason from the exception chain.
+                psrl_logger.error(
+                    "Agent loop run for request %s produced no output: %s.",
+                    request_ids,
+                    terminate_reason.value,
+                )
+                return None, terminate_reason
             elif not raise_on_error:
                 return None, TerminateReason.UNKNOWN
             else:

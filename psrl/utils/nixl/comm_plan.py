@@ -220,8 +220,24 @@ class CommunicationPlanner:
         Group same node pull clients that need byte identical shards of a key (D1).
 
         Peers read each other's whole local tensors, so a group is keyed by the exact shard
-        set. The designate order spreads upstream bytes evenly over the group, which spreads
-        NIC ingress over every instance on the node instead of one instance's NICs.
+        set.  The first member of every group is the designate: it reads the key upstream
+        and the rest read it from the designate over NVLink.
+
+        Designate ordering uses a three-level sort key:
+
+        1. **Trainer link quality** (primary, descending): the instance with the best
+           network path to its upstream trainer source becomes the designate.
+           LOCAL > NVLINK > IB > PCIE > IB_PCIE > ETH.  This puts the fastest link on
+           the critical path (trainer → designate) and preserves scarce IB bandwidth for
+           cross-node hops that have no NVLink alternative.
+
+        2. **Accumulated upstream load** (secondary, ascending): within instances that
+           share the same link tier, pick the one that has been assigned the least data
+           so far.  This spreads NIC ingress across the node instead of concentrating it
+           on one instance's NICs.
+
+        3. **Client name** (tertiary, ascending): deterministic tie-break so plans are
+           reproducible regardless of dict-iteration order.
         """
         if not self.peer_diffusion:
             return {}
@@ -241,13 +257,46 @@ class CommunicationPlanner:
 
         upstream_load: dict[str, int] = {}
         groups: dict[str, dict[str, tuple[str, ...]]] = {}
+
+        # Pre-compute per-(client, key) trainer link priority once, outside the sort.
+        # get_link_priority is already O(1) (cached after first call), but calling it
+        # inside a sort key closure re-invokes it O(G log G) times per group per key.
+        # With 512 rollout instances and 200 keys that adds up. Computing once per
+        # (client, key) pair keeps the overall complexity O(N × K).
+        _trainer_priority_cache: dict[tuple[str, str], int] = {}
+
+        def _trainer_link_priority(client: str, key: str) -> int:
+            cache_key = (client, key)
+            if cache_key in _trainer_priority_cache:
+                return _trainer_priority_cache[cache_key]
+            sources = pull_plan.get(client, {}).get(key, {})
+            priority = (
+                max(GLOBAL_TOPOLOGY.get_link_priority(client, trainer) for trainer in sources)
+                if sources
+                else 0
+            )
+            _trainer_priority_cache[cache_key] = priority
+            return priority
+
         # Largest keys first so the greedy balance has small keys left to even out the tail.
         for (_node, key, _shards), wanters in sorted(
             wanted.items(), key=lambda item: (-key_bytes[(item[1][0], item[0][1])], item[0][1], item[0][0])
         ):
             if len(wanters) < 2:
                 continue
-            ordered = tuple(sorted(wanters, key=lambda client: (upstream_load.get(client, 0), client)))
+
+            # Pre-fetch priorities for this key's wanters so the sort key is a pure dict
+            # lookup — no function call overhead inside Python's sort comparisons.
+            priorities = {c: _trainer_link_priority(c, key) for c in wanters}
+
+            # Sort by: best trainer link first (NVLink beats IB), then least accumulated
+            # upstream load (spread NIC ingress within the same tier), then name for
+            # determinism. This ensures the designate is always the instance closest to
+            # its trainer source, leaving scarce IB slots for cross-node hops only.
+            ordered = tuple(sorted(
+                wanters,
+                key=lambda client: (-priorities[client], upstream_load.get(client, 0), client),
+            ))
             upstream_load[ordered[0]] = upstream_load.get(ordered[0], 0) + key_bytes[(ordered[0], key)]
             for client in ordered:
                 groups.setdefault(client, {})[key] = ordered

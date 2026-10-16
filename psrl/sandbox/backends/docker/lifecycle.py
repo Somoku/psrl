@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import atexit
 import logging
-import os
-import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -17,6 +15,9 @@ from psrl.sandbox.backends.docker.cli import (
     force_remove_containers_by_label,
 )
 from psrl.sandbox.reclaimer import (
+    DEFAULT_GC_INTERVAL_S,
+    DEFAULT_HEARTBEAT_DIR,
+    DEFAULT_LEASE_TTL_S,
     NodeReclaimer,
     remove_owner_heartbeat,
     spawn_node_reclaimer,
@@ -24,8 +25,6 @@ from psrl.sandbox.reclaimer import (
 )
 
 psrl_logger = logging.getLogger(__file__)
-
-_DEFAULT_HEARTBEAT_DIR = os.path.join(tempfile.gettempdir(), "psrl-sandbox-heartbeats")
 
 # How many heartbeats an owner may miss before the node treats it as gone and
 # reclaims everything it holds. The budget exists because a heartbeat can be late
@@ -40,16 +39,16 @@ _MIN_LEASE_TTL_BEATS = 8
 class DockerLifecycleConfig:
     """Configuration for graceful cleanup and node-level crash recovery."""
 
-    heartbeat_dir: str = _DEFAULT_HEARTBEAT_DIR
+    heartbeat_dir: str = DEFAULT_HEARTBEAT_DIR
     # The tolerance is beats, not seconds: lease_ttl_s must cover
     # `_MIN_LEASE_TTL_BEATS` of them, so a worker survives a run of late beats
     # instead of being reclaimed for one. Raising `lease_ttl_s` is bounded from
     # above by the node's capacity lease — a sandbox lease that outlives the
     # capacity reservation frees memory while the container still holds it — so
     # the tolerance is widened by beating more often, not by waiting longer.
-    lease_ttl_s: float = 120.0
+    lease_ttl_s: float = DEFAULT_LEASE_TTL_S
     heartbeat_interval_s: float = 15.0
-    gc_interval_s: float = 30.0
+    gc_interval_s: float = DEFAULT_GC_INTERVAL_S
     gc_idle_exit_cycles: int = 10
     gc_enabled: bool = True
     # A stopped container is reaped despite a live owner once it stays stopped this long.

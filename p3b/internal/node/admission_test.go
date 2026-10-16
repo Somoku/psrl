@@ -76,15 +76,17 @@ func TestMeasuredPressureRefusesEvenWhenTheEnvelopeWouldAllowIt(t *testing.T) {
 	}
 }
 
-func TestADrainingNodeRefusesEverything(t *testing.T) {
-	// It holds containers it could not destroy, so its returned memory is not free.
+func TestADrainingNodeStillAdmitsWhatFits(t *testing.T) {
+	// Draining reports a container the node could not destroy. That container is
+	// still charged, so the room read here already excludes its memory, and
+	// refusing the whole node would cost the fleet a machine for one container.
 	gate := mustGate(t, envelope())
 	gate.SetDraining(true)
 
 	_, refusal, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1})
 
-	if ok || refusal != RefusedDraining {
-		t.Fatalf("a draining node admitted work: ok=%v refusal=%q", ok, refusal)
+	if !ok {
+		t.Fatalf("a draining node refused work that fits: refusal=%q", refusal)
 	}
 }
 

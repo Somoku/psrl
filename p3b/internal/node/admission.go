@@ -184,9 +184,6 @@ const (
 	RefusedPressure Refusal = "node_pressure"
 	// RefusedDevices means no free device index of the kind asked for.
 	RefusedDevices Refusal = "no_free_devices"
-	// RefusedDraining means the node still holds containers it could not destroy,
-	// so its returned memory is not actually free.
-	RefusedDraining Refusal = "draining"
 )
 
 // Grant is an accepted admission and the devices it reserved.
@@ -214,6 +211,9 @@ type Admission struct {
 	owners   map[string]time.Time
 	freeGPUs []int32
 	pressure Pressure
+	// draining reports that a container could not be destroyed and is still
+	// charged. It is a condition for an operator to read, not a gate: the charge
+	// already keeps its memory out of headroom.
 	draining bool
 	now      func() time.Time
 
@@ -297,14 +297,15 @@ func (a *Admission) Dequeue(class string) {
 //
 // The caller owns the grant it returns. Budget comes back only through Return,
 // which the lifecycle calls once it has confirmed the runtime object is gone.
+//
+// A container the node failed to destroy is not refused here: its grant was never
+// returned, so it is still charged to its class and the headroom below already
+// excludes the memory it holds. Refusing the whole node on top of that would cost
+// the fleet a node per stuck container and buy nothing.
 func (a *Admission) Reserve(class, owner string, want Resources) (Grant, Refusal, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if a.draining {
-		a.refuse(RefusedDraining)
-		return Grant{}, RefusedDraining, false
-	}
 	// Measured pressure first: the envelope is an accounting of reservations, and
 	// a machine already swapping must refuse even when its accounting says yes.
 	if a.cfg.LocalCPUCeiling > 0 && a.pressure.CPUUsedPct > a.cfg.LocalCPUCeiling {

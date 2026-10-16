@@ -344,10 +344,11 @@ func (s *Service) refreshPendingLocked(view *NodeView) {
 // and a container daemon satisfies a full-state resume only through the former,
 // and the chosen name travels in the decision so the node provisions on the
 // runtime that was actually matched.
+//
+// A draining node is a candidate. Its stuck container is still charged to its
+// class, so the room this reads already excludes it, and dropping the node here
+// would take a whole machine out of the fleet for one container.
 func (s *Service) satisfies(view *NodeView, req Request) (string, bool) {
-	if view.Draining {
-		return "", false
-	}
 	if req.GPUCount > view.GPUFree {
 		return "", false
 	}

@@ -49,8 +49,9 @@ func TestTheSweepDoesNotWaitForDestruction(t *testing.T) {
 
 func TestACleanupFailureDrainsAndARetryClearsIt(t *testing.T) {
 	// A container the runtime refused to remove still holds its memory, so the
-	// node must stop admitting rather than over-commit the host, and it must
-	// recover on its own once the runtime will remove it.
+	// record keeps its charge rather than returning budget the host cannot back.
+	// The flag is the report of that condition, and it must clear on its own once
+	// the runtime will remove the container.
 	gate := mustGate(t, envelope())
 	cfg := fastCleanup()
 	life, _ := NewLifecycleWithCleanup("node-a", gate, time.Second, cfg)
@@ -66,7 +67,7 @@ func TestACleanupFailureDrainsAndARetryClearsIt(t *testing.T) {
 	life.WaitCleanup()
 
 	if !gate.Draining() {
-		t.Fatal("a refused removal must drain the node: its memory is still in use")
+		t.Fatal("a refused removal must be reported as draining: its memory is still in use")
 	}
 	if snapshot := life.Snapshot(); snapshot.CleanupFailed != 1 {
 		t.Fatalf("cleanup failures %d, want 1: %+v", snapshot.CleanupFailed, snapshot)

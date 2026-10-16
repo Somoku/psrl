@@ -141,15 +141,20 @@ func TestAFullFleetIsSeparateFromAnIncapableOne(t *testing.T) {
 	}
 }
 
-func TestADrainingNodeIsNeverChosen(t *testing.T) {
-	// It still holds the memory of what it could not destroy.
+func TestADrainingNodeIsStillChosenWhenItHasRoom(t *testing.T) {
+	// The container it could not destroy is charged to its class, so the room read
+	// here already excludes it. Dropping the node would take a whole machine out of
+	// the fleet for one container.
 	monitor := &fakeMonitor{nodes: []NodeView{node("a", 500, draining)}}
 	service := mustService(t, monitor)
 
-	_, err := service.Choose(request(10))
+	decision, err := service.Choose(request(10))
 
-	if !errors.Is(err, ErrNoCandidate) {
-		t.Fatalf("a draining node must not be a candidate, got %v", err)
+	if err != nil {
+		t.Fatalf("a draining node with room must be a candidate, got %v", err)
+	}
+	if decision.NodeID != "a" {
+		t.Fatalf("chose %q, want the only node", decision.NodeID)
 	}
 }
 

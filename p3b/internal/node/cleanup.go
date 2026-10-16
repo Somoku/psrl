@@ -246,11 +246,13 @@ func (l *Lifecycle) finishDestroy(leaseID string, destroyed bool, failure string
 	l.noteCleanupFailureLocked()
 }
 
-// noteCleanupFailureLocked marks the node as draining while it holds a container
-// it could not destroy.
+// noteCleanupFailureLocked records that the node holds a container it could not
+// destroy.
 //
-// Admitting against that memory would over-commit the host, so the node refuses
-// new work until it is gone. This is the one place draining is set.
+// The host stays protected by the record itself: a failed removal keeps its
+// charge, so the memory this container holds is already out of headroom and no
+// further admission is needed to stay within the machine. The flag is reported
+// for an operator, not consulted to refuse work. This is the one place it is set.
 func (l *Lifecycle) noteCleanupFailureLocked() {
 	if l.draining {
 		return

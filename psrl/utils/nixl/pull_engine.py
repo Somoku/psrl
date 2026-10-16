@@ -38,8 +38,8 @@ BYTES_PER_SECOND = 25e9
 DIRECT_DESCRIPTORS_PER_SHARD = 64
 # Staged items start on this alignment so every dtype view of the pool is legal.
 _ALIGN = 256
-# Signal chunks carried by the per pull notifications. Wave `w` is ready as chunk `_READY + w`.
-_DONE, _READY = 0, 1
+# Signal chunk carried by per-pull notifications. Wave `w` is ready as chunk `_READY + w`.
+_READY = 1
 
 _NIXL_MEM = {"cuda": "VRAM", "cpu": "DRAM", "VRAM": "VRAM", "DRAM": "DRAM"}
 
@@ -835,15 +835,11 @@ class NIXLPullEngine:
             self._run(fallback)
         if self.client.device.type == "cuda":
             torch.cuda.synchronize(self.client.device)
-        if peer:
-            publisher.publish(epoch, _DONE, sorted(peer))
-        if followers:
-            done = self._await(waiter, epoch, _DONE, followers)
-            if done != followers:
-                psrl_logger.warning(
-                    f"{self.client.client_name}: followers {sorted(followers - done)} did not confirm "
-                    f"epoch {epoch} within {self.peer_timeout_s}s."
-                )
+        # _DONE was removed: it notified peers "I finished reading your buffer" but did not
+        # unlock any operation on either side. Followers finish their own peer reads
+        # (self._finish(pending_peer)) before waiting for _DONE, so the signal had no
+        # consumer. Buffer lifetime is controlled by the external sync scheduler, not by
+        # an in-pull barrier, so _DONE never protected against overwrites either.
         waiter.forget_versions_before(epoch)
         end = time.time()
         return PullReport(

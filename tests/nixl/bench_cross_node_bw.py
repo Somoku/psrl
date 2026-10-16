@@ -44,6 +44,14 @@ def parse_args():
     p.add_argument("--mode", choices=["target", "initiator"], default="initiator")
     p.add_argument("--cuda", type=int, default=0)
     p.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="unique name suffix for the agent pair, e.g. '0' or 'gpu3'. "
+             "Allows multiple concurrent pairs on the same node without NIXL name collisions. "
+             "Defaults to the cuda index.",
+    )
+    p.add_argument(
         "--total-gib",
         type=float,
         default=4.0,
@@ -75,7 +83,12 @@ def main() -> None:
 
     # The target listens on a fixed port; the initiator takes an ephemeral one.
     listen_port = args.port if args.mode == "target" else 0
-    agent = nixl_agent(args.mode, nixl_agent_config(True, True, listen_port))
+    # Unique name per pair so multiple pairs can run on the same node without
+    # NIXL name collisions.  Defaults to the cuda index if --name is not given.
+    suffix = args.name if args.name is not None else str(args.cuda)
+    my_name = f"{args.mode}-{suffix}"
+    peer_name = f"{'initiator' if args.mode == 'target' else 'target'}-{suffix}"
+    agent = nixl_agent(my_name, nixl_agent_config(True, True, listen_port))
 
     elems = int(args.total_gib * GIB) // 2 // args.tensors  # bfloat16
     fill = 0.0 if args.mode == "target" else 1.0
@@ -86,25 +99,19 @@ def main() -> None:
     assert reg, "register_memory failed"
 
     if args.mode == "target":
-        # `send_notif` raises NIXL_ERR_NOT_FOUND unless the peer is already known, so
-        # the target must block on check_remote_metadata first -- the initiator pushes
-        # its metadata via send_local_metadata below. Ordering taken from
-        # test_send_recv.py, which is the reference for this handshake.
         target_descs = reg.trim()
         desc_blob = agent.get_serialized_descs(target_descs)
         print(f"target: serving {payload_bytes / GIB:.2f} GiB, waiting for peer", flush=True)
-        while not agent.check_remote_metadata("initiator"):
+        while not agent.check_remote_metadata(peer_name):
             time.sleep(0.1)
-        agent.send_notif("initiator", desc_blob)
+        agent.send_notif(peer_name, desc_blob)
         print("target: descriptors published, waiting for reads", flush=True)
-        # A READ is one-sided: the target sees no completion, so it just stays alive
-        # long enough for every repetition to finish.
         time.sleep(args.serve_s)
         print("target: done", flush=True)
         return
 
     # --- initiator ---
-    agent.fetch_remote_metadata("target", args.ip, args.port)
+    agent.fetch_remote_metadata(peer_name, args.ip, args.port)
     agent.send_local_metadata(args.ip, args.port)
 
     notifs = agent.get_new_notifs()
@@ -114,9 +121,9 @@ def main() -> None:
         waited += 0.2
         notifs = agent.get_new_notifs()
     assert notifs, "no descriptor notification from target within 120s"
-    remote_descs = agent.deserialize_descs(notifs["target"][0])
+    remote_descs = agent.deserialize_descs(notifs[peer_name][0])
 
-    while not agent.check_remote_metadata("target"):
+    while not agent.check_remote_metadata(peer_name):
         time.sleep(0.1)
     local_descs = reg.trim()
 
@@ -127,7 +134,7 @@ def main() -> None:
         assert delay > 0, f"--start-at is {-delay:.1f}s in the past because agent setup overran it."
         time.sleep(delay)
     for rep in range(args.reps):
-        handle = agent.initialize_xfer("READ", local_descs, remote_descs, "target", b"bw")
+        handle = agent.initialize_xfer("READ", local_descs, remote_descs, peer_name, b"bw")
         assert handle, "initialize_xfer failed"
         start = time.perf_counter()
         state = agent.transfer(handle)

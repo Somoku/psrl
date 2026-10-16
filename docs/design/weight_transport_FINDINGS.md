@@ -79,6 +79,33 @@ block FP8 格在 train 侧填「block 量化恰好可逆」的值，于是 gen �
 
 剩余的 27% 效率不是波数、planner 或提交开销能解决的，而是**单次传输字节数不足以让 IB 链路饱和**：每个专家 dense 矩阵约 `422 MiB / 128 experts / 16 EP = 206 KB`，在 49 GB/s 的链路上传输时间约 4 µs，而 NIXL RDMA READ 的往返开销（QP setup + DMA + completion）在这个量级下构成明显开销。dense（attention）键因 TP 分片被多个 gen GPU 复用，但它们只占总字节的 3%（§4b）。
 
+**第四条候选排除：段大小在 NVLink 上无关（单节点实测，`bench_segment_size.py`）**。
+H20 单节点 GPU0 → GPU1（NVLink，2048 MB 总量），inflight=1 下从 4 KB 到 2 GB 整段：
+
+| 段大小 | inflight=1 | inflight=4 | inflight=16 |
+|--------|-----------|-----------|------------|
+| 2 GB（1 desc） | **395.9 GB/s** | — | — |
+| 64 KB（32 desc） | 396.2 | 387.9 | 347.9 |
+| 16 KB（131 K desc） | 396.3 | 384.1 | 352.5 |
+| 4 KB（524 K desc） | 396.3 | 388.1 | 351.2 |
+
+4 KB 到 2 GB 전 범위에서 inflight=1 기준 395–396 GB/s으로 완전히 일정합니다. NVLink는 zero-copy peer memory access라서 RDMA 프로토콜의 QP setup/RTT overhead가 없으므로 세그먼트 크기가 완전히 무관합니다. 세그먼트 크기 가설은 **IB 경로에서만 의미**가 있습니다.
+
+**IB 경로에서의 세그먼트 크기 sweep은 2 노드 환경에서 실측 필요**（待跑）。预期 IB 下小段（< 256 KB）会有效率下降，206 KB（实际专家段大小）附近的实测值是 W12 的关键数据点。复现命令：
+```bash
+# target 노드
+source scripts/nixl_env.sh && unset http_proxy https_proxy
+python tests/nixl/bench_segment_size.py --role target --ip <target-bond1-ip> --gpu 0 \
+  --buf-mb 2048 --hold-s 300
+
+# initiator 노드（206 KB MoE 실제 전문가 세그먼트 크기 포함）
+source scripts/nixl_env.sh && unset http_proxy https_proxy
+python tests/nixl/bench_segment_size.py --role initiator --ip <target-bond1-ip> --gpu 0 \
+  --buf-mb 2048 \
+  --seg-kb 2097152 1048576 262144 206 65536 4096 1024 256 64 16 4 \
+  --inflight 1 4 8 --reps 5
+```
+
 **结论**：W12 的剩余差距是 EP 拓扑的结构性结果，与 PSRL 的 planner、传输实现、或 descriptor 批量化无关。要从 27% 提升到 ≥ 60%，需要改变「读的粒度」或「谁持有什么」：
 
 | 候选 | 效果 | 代价 |
@@ -87,9 +114,9 @@ block FP8 格在 train 侧填「block 量化恰好可逆」的值，于是 gen �
 | 增大 vLLM EP 分组（EP8 → EP4），每 gen GPU 持有更大的专家块 | 每个 gen GPU 的专家字节翻倍，单次传输时间也翻倍，链路利用率随之提高 | EP 越小则 gen GPU 显存需求越高，235B 下 EP8 已接近上限 |
 | train 侧专家发布副本在内存中按 gen EP 分组连续排列 | 同上，允许单次 RDMA READ 覆盖整个 gen GPU 的专家份额 | 需改 `block_fp8.py` / `comm_plan.py` 的发布布局 |
 
-目前判断这三个方向均有可行路径，但都需要在 2 节点环境单独 benchmark 确认。
+目前判断这三个方向均有可行路径，但都需要在 2 节点环境单独 benchmark 확인。
 
-档位：2 节点可复现。
+档位：NVLink 段大小 sweep 已完成（单节点）；IB 路径 2 节点可复现（待跑）。
 
 ---
 

@@ -30,6 +30,7 @@ ARG LMCACHE_REF=v0.4.6
 ARG MEGATRON_REF=c049020
 ARG MEGATRON_BRIDGE_REF=94d1870
 ARG TMS_REF=d64a6394d1e09c613fab90260054cecc2684586d
+ARG NVRX_REF=v0.7.0
 ARG SMG_REF=psrl-dev
 ARG PSRL_COMMIT=main
 ARG APEX_REF=10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
@@ -420,6 +421,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     TMS_CUDA_MAJOR="${CUDA_VERSION%%.*}" \
         uv pip install --no-build-isolation -e ${PSRL_THIRD_PARTY}/torch_memory_saver
 
+# nvidia-resiliency-ext: provides AsyncCallsQueue(persistent=True) for nvrx async DCP.
+# The spawn-based persistent worker does not inherit the parent's UCX / NIXL context,
+# making async checkpointing safe alongside the NIXL progress thread.
+# PyPI only ships a 0.0.0a0 placeholder; install from source.
+ARG NVRX_REF
+RUN --mount=type=cache,target=/root/.cache/uv \
+    git clone --depth 1 --branch ${NVRX_REF} \
+        https://github.com/NVIDIA/nvidia-resiliency-ext.git ${PSRL_THIRD_PARTY}/nvidia-resiliency-ext && \
+    uv pip install -e ${PSRL_THIRD_PARTY}/nvidia-resiliency-ext && \
+    python -c "from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue; print('nvrx OK')"
+
 # Install the two patched data/control-plane dependencies before PSRL.
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/volcengine/verl.git ${PSRL_THIRD_PARTY}/verl && \
@@ -488,7 +500,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         "import torch; expected='${expected_cuda}'; assert torch.version.cuda == expected, \
         f'Expected PyTorch CUDA {expected}, got {torch.version.cuda}.'" && \
     python -c "import psrl, smg.router, torch, transfer_queue, verl, vllm, vllm_patches" && \
-    python -c "import lmcache, nixl, torch_memory_saver"
+    python -c "import lmcache, nixl, torch_memory_saver" && \
+    python -c "from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue; print('nvrx OK')"
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     CUDA_MAJOR="${CUDA_VERSION%%.*}" && \

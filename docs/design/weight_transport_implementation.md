@@ -918,6 +918,9 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | C3 发布边界 | ✅ | ✅ | L2 ✅ |
 > | **D1 去冗余** | ✅ | ✅ `pull_engine.py`，默认开 | L3 ✅ 4 节点 16 rollout：出口 131 → 32.8 GB，稳态 0.178 s |
 > | D1 选源 `source_resolution` | ✅ | ❌ 零 import | L1，选源由 planner 的 designate 次序承担 |
+> | **D1 版本感知选源** | ✅ `ps_manager._nixl_version_holders` | ✅ `pull_engine.pull(version_holders=...)` + `vllm_async_server.nixl_pull_model` | L1 16 单元测试（`tests/unit/test_version_aware_source_selection.py`）；PSManager 维护 `(version, frozenset[trainer_names])`，每步一次 O(1) RPC，pull_engine 在搬字节前按集合过滤 upstream，`version_holders=None` 时旧行为保持不变 |
+> | **D1 拓扑感知 designate** | ✅ `comm_plan._make_peer_groups` | ✅ planner 建立 peer group 时使用 | L1 15 单元测试（`tests/nixl/test_topology_aware_designate.py`）；sort key 从 `(upstream_load, name)` 改为 `(-trainer_link_priority, upstream_load, name)`，和 trainer 有 NVLink 的 instance 优先成为 designate，O(G log G) 每组（G 通常 4-8），总复杂度不变 |
+> | **D1 _DONE barrier 删除** | ✅ | ✅ `pull_engine.py` | L1 60 tests pass；`_DONE` 信号不解锁任何操作（follower 在收到 `_DONE` 前已完成自己所有 peer 读，buffer 生命周期由外部调度控制）；`peer_timeout_s` 保留用于 `_READY` 等待 |
 > | D2 `holder_index` | ✅ | ❌ 零 import | L1；多模型隔离改由客户端名承担（§11.1） |
 > | D3 `nixl_direct` | ✅ | ✅ | L2 ✅ 31 格，L3 ✅，**PS 未删** |
 > | D4 单向标记 | ✅ | ✅ `ray_trainer.py` | L2 ✅ |
@@ -1303,31 +1306,35 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       并发，没有出现传输错误或字节不一致；`addr_version` 断言没有复现。
       **能确认存在的冲突只有一个：fork 式异步保存。**
 
-      **解法**：`psrl/utils/checkpoint/megatron_manager.py` 新增
-      `PSRL_PerRankMegatronCheckpointManager`，用逐 rank `torch.save` 取代
-      `dist_checkpointing`。这同样是把一处 vendored verl 补丁前移到 PSRL
-      —— 旧版是在 verl 内部 `import psrl.utils.checkpoint`。
+      **当前解法（已落地，commit c1ffe51）**：nvrx 异步 DCP——`nvidia-resiliency-ext`
+      0.7.0 的 `AsyncCallsQueue(persistent=True)` 以 `spawn`（非 fork）启动 persistent
+      worker，worker 进程不继承父进程的 UCX context 和已注册显存，因此与 NIXL 进度线程
+      完全兼容。落地改动：
 
-      **必须前移而不能只是禁止保存**：75 个生产脚本里 **65 个 `save_freq > 0`**。
-      如果直供强制 `save_freq=-1`，等于这些脚本全都不能用直供。
+      - `patch/verl/3efe38c7.patch`：`_dispatch_finalize` 从
+        `megatron.core.strategies.base.async_calls`（Megatron 0.19 不存在）改为 nvrx
+        `AsyncCallsQueue`；`save_dist_checkpointing` 用 `async_strategy="nvrx"` 而非
+        `async_sharded_save=True`（后者触发 fork）
+      - `psrl/utils/config.py`：移除 `nixl_direct + use_dcp_save=True` 的 assert，
+        nvrx spawn 路径安全
+      - `psrl/workers/train/engine_train_worker.py`：`_maybe_use_per_rank_checkpointing`
+        改为 no-op；进度线程始终开启（不再被 `use_dcp_save` 关掉）
+      - `scripts/install_basic.sh`、`docker/Dockerfile`：step 9 安装 nvrx 0.7.0 from source
+        （PyPI 只有 0.0.0a0 占位包）
 
-      **代价要写明**：逐 rank checkpoint **不可 reshard**，
-      只能用相同 world size 与并行布局恢复。这是直供的真实代价，不是实现细节。
+      nvrx + NIXL 并发 30 s 实测（`repro_dcp_nvrx.py`）：113–119 GB/s，0 错误，PASS。
+      nvrx 独立（无 NIXL）同样 PASS。fork 路径实测 FAIL（`NIXL_ERR_REMOTE_DISCONNECT`），
+      是 OS 层面约束，版本升级无法修复。
 
-      **实跑验证**（`SAVE_FREQ=1`，`/tmp/prod_direct27.log`）：
-      2 个 step 各存一次，0 错误，磁盘上确有
-      `{optimizer,extra}/dist_ckpt/rank_{0..3}.pt`，4 个 train rank 全部走了新 manager。
+      **`PSRL_PerRankMegatronCheckpointManager` 的状态**：已保留但不再激活。
+      `_maybe_use_per_rank_checkpointing` 是 no-op，该 manager 作为后备保留直到真实栈
+      的 nvrx async save 端到端验证完成（需 Ray 集群跑到 `save_freq` 边界，确认
+      `.distcp` 目录完整、NIXL 0 错误、能 resume）。
 
-      **但有一处必须讲清楚，否则会高估覆盖面**：`model/dist_ckpt/` 是**空的**，
-      模型权重走了 `model/huggingface/`（verl 在有 bridge 时的默认路径），
-      因此**只有 optimizer 与 extra 实际经过了逐 rank 保存**。
-      模型权重那一路没有碰 `dist_checkpointing`，所以不与 progress thread 冲突 ——
-      换言之这个配置能跑通，但它**没有**验证"模型权重的逐 rank 保存"。
-      若将来有配置让模型也走 `dist_ckpt`（无 bridge 时），需要重新验证那条路径。
-
-      **可复现性**：不含 checkpoint 的配置连续两次实跑
-      （`/tmp/prod_direct26.log`、`/tmp/prod_direct28.log`）结果一致 ——
-      2 步、0 错误、pull 1.38–1.78 s。
+      **旧的临时方案（已废弃，但代码保留）**：`psrl/utils/checkpoint/megatron_manager.py`
+      中的 `PSRL_PerRankMegatronCheckpointManager` 用逐 rank `torch.save` 取代
+      `dist_checkpointing`，绕开了 UCX 兼容问题，但**不可 reshard**（只能用相同
+      world size 与并行布局恢复）。nvrx 方案落地后，该 manager 不再被激活。
 
       **§3.4「版本相等性」已落地**，但走了一段弯路，值得记下来。
 
@@ -1892,6 +1899,11 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 | W15 | ~~FP8 发布点的重量化成本~~ | ✅ 融合 Triton kernel（`fp8_kernels.quantize_into`）单遍读 bf16、写 FP8 + scale，3169 GB/s，235B 下每 rank 从 513 ms 降到约 35 ms（14.8×）。已达目标（≤ 稳态 sync 的 20%；稳态 ~1.5 s，20% = 300 ms，35 ms = 2.3%）。`test_fp8_kernels_gpu.py` 22 passed，含 roofline 断言。选择性重量化（只重量化变化过的 key）可在此基础上进一步优化，但已超出当前目标，按需实施 | 发布刷新 ≤ 稳态 sync 的 20% | 已完成 |
 | W13 | ~~colocate 走 CUDA IPC（设计项 2 / A8）~~ | ✅ `_should_register_rdma()` 已接入 `register_local_tensors` 的两处 `_register_memory` 调用点：当 comm plan 证明所有读者都在同节点时跳过 RDMA 注册；否则（无 plan 或存在跨节点读者）回落到注册。同时 `registration_policy.py` 已由 `_is_reader_of()` 接入 E4 两段式 join 路径。`test_registration_policy.py` 增加 3 个 wiring 测试（共 20 passed） | colocate 切换路径上 `register_memory` 调用数 == 0（comm plan 为全同节点时）；测试 20 passed | 已完成 |
 | W14 | ~~多角色与 role 隔离（设计 §3.10）~~ | ✅ `WeightBackup` ref 路径落地：`engine_train_worker.py` 增加 `capture_ref_backup()` / `compute_ref_log_prob()` / `mark_modified()` 三个接入点；`ray_trainer.py` 在 LoRA path（`ref_in_actor=True`）的 `init_model` 后调用 `capture_ref_backup()` 并将 `_compute_ref_log_prob` 的 LoRA 分支改为 `actor_wg.compute_ref_log_prob(batch)`。代价：init 一次 D2H，每 ref pass 一次 H2D+H2D（~46 GB/s/rank），替代一整份 GPU 模型副本。`test_weight_backup_gpu.py` 9 passed，含 logits 等值校验与 PCIe 带宽断言。非 LoRA 的 `ref_policy_wg` 路径不变，向后兼容 | 两个角色各自推进版本而互不影响；LoRA ref 路径用 host snapshot 而非独立 GPU | 已完成 |
+| ~~W16~~ | ~~DCP async save 与 NIXL 共存（nvrx 集成）~~ | ✅ nvrx 0.7.0 `AsyncCallsQueue(persistent=True)` spawn 路径与 NIXL 进度线程共存；verl patch 修 `_dispatch_finalize` + `save_dist_checkpointing`；config 移除阻断断言；进度线程始终开启；`scripts/install_basic.sh` 和 `docker/Dockerfile` 均加入安装步骤。实测 30s：113–119 GB/s，0 错误，PASS。真实栈端到端验证（Ray 集群到 `save_freq` 边界）待完成后可删 `PSRL_PerRankMegatronCheckpointManager` | `repro_dcp_nvrx.py` PASS；真实栈 e2e 待验 | 合成层已完成，真实栈待验 |
+| ~~W17~~ | ~~rollout 版本感知选源~~ | ✅ PSManager 维护 `(version, frozenset[trainer_names])`（`_nixl_version_holders`），`push_model_state_dict_nixl` 每步刷新，新增 `get_nixl_version_holders()` 原子 RPC；`vllm_async_server.nixl_pull_model` 拉取持有者集合并透传；`pull_engine.pull(version_holders=...)` 在任何字节搬动前按集合过滤 upstream，`version_holders=None` 时旧行为保持。每步一次 O(1) 新 RPC，选源时 O(S) 集合查找（S=每 key 的 source 数，通常 1-2），与集群规模无关 | `tests/unit/test_version_aware_source_selection.py` 16 passed | 已完成 |
+| ~~W18~~ | ~~peer diffusion 拓扑感知 designate 选择~~ | ✅ `_make_peer_groups` sort key 从 `(upstream_load, name)` 改为 `(-trainer_link_priority, upstream_load, name)`：和 trainer 有 NVLink 的 instance 优先成为 designate，IB 带宽只用于必须的跨节点流量，NVLink 在节点内自由使用；负载均衡作为同优先级内的第二排序键保留；规划期 O(G log G) 每组，总复杂度不变，无运行时开销 | `tests/nixl/test_topology_aware_designate.py` 15 passed；scale test：1024 instance × 200 key 的 `_make_peer_groups` < 1.15s（< 3s 限制） | 已完成 |
+| ~~W19~~ | ~~删除 `_DONE` barrier~~ | ✅ 从第一性原理确认 `_DONE` 不解锁任何操作（follower 在 `_await(_DONE)` 前已完成自己所有 peer 读，buffer 生命周期由外部调度控制），删除 `_DONE` 常量、designate 侧 `publish(_DONE)` 和 follower 侧 `_await(_DONE)` 及超时 warning；`peer_timeout_s` 保留用于 `_READY` 等待 | 60 tests pass（`test_pull_engine.py` + `test_version_aware_source_selection.py`） | 已完成 |
+| W16-真实栈 | nvrx async save 真实栈 e2e 验证 | Ray 集群跑到 `save_freq` 边界：确认 `.distcp` 目录完整、NIXL 0 错误、能 resume；通过后删 `PSRL_PerRankMegatronCheckpointManager` | resume 后训练继续、权重与保存前一致 | 多节点 |
 
 **顺序约束**：W5、W6 独立且便宜，W9 独立。W10 依赖足够的节点，W7 的故障注入最好在 W10 的规模上跑。
 **复现命令**见 `weight_transport_FINDINGS.md` §8。

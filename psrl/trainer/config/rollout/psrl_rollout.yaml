@@ -253,6 +253,20 @@ agent:
       docker:
         _target_: psrl.sandbox.backends.DockerBackend
 
+        # Concurrent create+start pairs in flight to this node's daemon. Zero leaves it
+        # unbounded, which is only right where nothing else shares the node.
+        #
+        # The rollout admits a whole step's sandboxes at once, and past a handful of
+        # concurrent creates the daemon's queue grows: measured on an otherwise idle node,
+        # 8 concurrent creates took 3.3s each, 32 took 7.2s, and 64 took 10.7s at the median
+        # and 20.8s at the p95, while an exec on an unrelated container went from 90ms to
+        # 295ms. The node was at 96% iowait, so the pair is waiting on storage metadata, not
+        # on CPU, and no amount of memory or networking tuning shortens that queue. Bounding
+        # the pair is what keeps it short for everyone else, and it is also the pace at which
+        # a warm pool refills. Sixteen is the value p3b's `max_create_concurrency` documents
+        # for the same reason.
+        create_concurrency: 16
+
         # One exec interface, two strategies. An interactive shell agent keeps a login
         # shell, because its actions are single commands whose `cd`, `source`, and
         # exported variables must survive into the next one. A workload whose commands are

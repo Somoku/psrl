@@ -51,16 +51,24 @@ def _summarise(samples: list[float]) -> str:
     )
 
 
-def create_burst(image: str, burst: int, network: str | None) -> list[float]:
-    """Create and start `burst` containers at once, and time each one."""
+def create_burst(image: str, burst: int, network: str | None, gate: int | None = None) -> tuple[list[float], float]:
+    """Create `burst` containers, at most `gate` of them in flight at a time.
+
+    Without a gate the whole burst goes at once, which is what an unbounded deployment
+    does. With one it is what a bounded deployment does. The per-create samples say how
+    long each one waited; the aggregate wall time says what the bound costs, and if it
+    costs nothing then bounding is free.
+    """
     extra = ["--network", network] if network else []
 
     def one(index: int) -> float:
         # `--rm` tears the container down too, which both modes pay equally.
         return _run(["run", "--rm", "--name", f"bench-{index}", *extra, image, "true"])
 
-    with ThreadPoolExecutor(max_workers=burst) as pool:
-        return list(pool.map(one, range(burst)))
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=gate or burst) as pool:
+        samples = list(pool.map(one, range(burst)))
+    return samples, time.monotonic() - started
 
 
 def exec_latency(target: str, samples: int) -> list[float]:
@@ -75,6 +83,7 @@ def main() -> int:
     parser.add_argument("--bursts", type=int, default=2, help="How many create bursts to run.")
     parser.add_argument("--exec-samples", type=int, default=15)
     parser.add_argument("--network", default=None, help="Docker network mode for the burst, if any.")
+    parser.add_argument("--gate", type=int, default=None, help="At most this many creates in flight at once.")
     args = parser.parse_args()
 
     idle = _run(["run", "-d", "--rm", "--name", "bench-idle", args.image, "sleep", "900"])
@@ -86,17 +95,19 @@ def main() -> int:
 
         for burst_index in range(args.bursts):
             print(f"\n== create burst {burst_index + 1}: {args.burst} concurrent creates ==")
-            created: list[list[float]] = []
+            created: list[tuple[list[float], float]] = []
             burst = threading.Thread(
-                target=lambda sink=created: sink.append(create_burst(args.image, args.burst, args.network))
+                target=lambda sink=created: sink.append(create_burst(args.image, args.burst, args.network, args.gate))
             )
             burst.start()
             # Sample exec while the burst is in flight, which is the whole point: this is
             # what a probe or a file write experiences at a step boundary.
             loaded = exec_latency("bench-idle", args.exec_samples)
             burst.join()
-            create_samples = created[0]
+            create_samples, wall_s = created[0]
+            rate = args.burst / wall_s
             print("   create  " + _summarise(create_samples))
+            print(f"   burst   {wall_s:.1f}s wall for {args.burst} creates = {rate:.1f} creates/s")
             print("   exec    " + _summarise(loaded))
             slowdown = _percentile(loaded, 0.50) / max(_percentile(quiet, 0.50), 0.001)
             print(f"   exec p50 is {slowdown:.2f}x its idle value")

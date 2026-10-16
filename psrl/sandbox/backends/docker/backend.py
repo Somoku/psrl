@@ -138,6 +138,12 @@ class DockerBackend(SandboxBackend):
         container_watch_interval_s: float = 15.0,
         connection_limit: int = 128,
         image_pull_concurrency: int = 2,
+        # Bounds concurrent create+start pairs in flight to this node's daemon, and zero is
+        # unbounded. Size it from measurement: past a handful of concurrent creates the
+        # daemon's queue grows, every create's latency rises with the burst, and an unrelated
+        # exec on the same node waits several times as long. This is the in-process twin of
+        # p3b's `max_create_concurrency`.
+        create_concurrency: int = 0,
         max_exec_output_bytes: int = 16 * 1024 * 1024,
         max_observation_chars: int = 0,
         silence_timeout_s: float | None = None,
@@ -247,14 +253,19 @@ class DockerBackend(SandboxBackend):
             registry_auth=self.registry_auth,
         )
         self.metrics = SandboxMetrics()
-        self.container_events = ContainerEventWatcher(
-            self.engine, lambda cid: self.engine.inspect_container(cid)
-        )
+        self.container_events = ContainerEventWatcher(self.engine, lambda cid: self.engine.inspect_container(cid))
         self._rootless_checked = False
         self._rootless_lock = asyncio.Lock()
         if image_pull_concurrency < 1:
             raise ValueError("Docker image_pull_concurrency must be positive.")
         self._image_pull_slots = asyncio.Semaphore(image_pull_concurrency)
+        if create_concurrency < 0:
+            raise ValueError(
+                f"Docker create_concurrency must not be negative, got {create_concurrency}, "
+                "and zero is what means unbounded."
+            )
+        # nil means unbounded, which is right only where nothing else shares the node.
+        self._create_slots = asyncio.Semaphore(create_concurrency) if create_concurrency > 0 else None
         self._image_tasks: dict[str, asyncio.Task[None]] = {}
         self._closed = False
         self._close_event: asyncio.Event | None = None
@@ -1202,6 +1213,25 @@ class DockerBackend(SandboxBackend):
         raise create_error
 
     async def _create_and_start(self, name: str, config: Mapping[str, Any]) -> str:
+        """
+        Create and start a container, bounded by the deployment's create concurrency.
+
+        Create and start are the pair that saturates the daemon: measured on a node with
+        nothing else running, 64 concurrent creates took 10.7s each at the median and 20.8s
+        at the p95, and an exec on an unrelated container waited 3.4x its idle time. Bounding
+        the pair is what keeps the daemon's queue short for everything else, and it is also
+        what paces a warm pool's refill, which creates through this same call.
+        """
+        if self._create_slots is None:
+            return await self._spawn_container(name, config)
+        if self._create_slots.locked():
+            # A create that had to wait is the burst's signature, and the counter is how a
+            # run reports that it asked its node for more than the node can create at once.
+            self.metrics.count("create_contended")
+        async with self._create_slots:
+            return await self._spawn_container(name, config)
+
+    async def _spawn_container(self, name: str, config: Mapping[str, Any]) -> str:
         """
         Create and start a container without leaking a failed start.
         """

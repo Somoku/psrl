@@ -627,3 +627,51 @@ def test_a_container_that_vanished_is_not_an_unexplained_stop():
     from psrl.sandbox.core import SandboxExitReason
 
     assert _STOP_REASONS["removed"] is SandboxExitReason.RECLAIMED_ORPHAN
+
+
+class CountingEngine(FakeDockerEngine):
+    """A fake engine that reports how many creates it saw in flight at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_flight = 0
+        self.peak = 0
+        self.created = 0
+
+    async def create_container(self, name: str, config) -> str:
+        self.created += 1
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            # Long enough that two overlapping creates show up as a higher peak.
+            await asyncio.sleep(0.01)
+            return f"container-{self.created}"
+        finally:
+            self.in_flight -= 1
+
+
+class TestCreateConcurrency:
+    """A bounded create pair, because the daemon's queue is shared with everything else."""
+
+    @pytest.mark.asyncio
+    async def test_the_gate_bounds_creates_in_flight(self) -> None:
+        engine = CountingEngine()
+        backend = DockerBackend(create_concurrency=2, engine=engine)
+
+        await asyncio.gather(*(backend._create_and_start(f"c{index}", {}) for index in range(6)))
+
+        assert engine.created == 6
+        assert engine.peak <= 2
+
+    @pytest.mark.asyncio
+    async def test_zero_leaves_creates_unbounded(self) -> None:
+        engine = CountingEngine()
+        backend = DockerBackend(engine=engine)
+
+        await asyncio.gather(*(backend._create_and_start(f"c{index}", {}) for index in range(6)))
+
+        assert engine.peak > 2
+
+    def test_a_negative_create_concurrency_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="must not be negative"):
+            DockerBackend(create_concurrency=-1, engine=FakeDockerEngine())

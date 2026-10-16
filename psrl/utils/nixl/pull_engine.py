@@ -667,7 +667,13 @@ class NIXLPullEngine:
             acc += nbytes
         return waves
 
-    def pull(self, epoch: int, participants: set[str] | None = None) -> PullReport:
+    def pull(
+        self,
+        epoch: int,
+        participants: set[str] | None = None,
+        version_holders: frozenset[str] | None = None,
+        target_version: int = -1,
+    ) -> PullReport:
         """
         Read this client's weights for one sync.
 
@@ -677,11 +683,37 @@ class NIXLPullEngine:
         Args:
             epoch (int): Identifier of this sync, shared by every participant and never reused.
             participants (set[str] | None): Pull clients syncing together. None means all of them.
+            version_holders (frozenset[str] | None): Trainer client names that have published
+                ``target_version``.  When provided, upstream sources for each key are filtered to
+                this set before any byte moves (D1 version-aware source selection).  Sources not
+                in the set are skipped; if filtering would leave a key with no source the original
+                source list is kept as a fallback so the pull never deadlocks.  None means no
+                filtering (backward-compatible default for non-direct-supply modes).
+            target_version (int): The model version this pull is acquiring. Used only for logging
+                when version_holders is set.  -1 means unknown / not applicable.
         """
         start = time.time()
         self.source_trace = {}
         self.failed = set()
         upstream, peer, followers = self._assign(lambda c: participants is None or c in participants)
+        # D1 version-aware source selection: keep only trainer sources that have published
+        # target_version.  An empty holder set (startup, or non-direct-supply mode) is treated
+        # as "no filter" so the caller never has to check whether filtering is applicable.
+        if version_holders:
+            filtered_upstream: dict[str, dict[str, list]] = {}
+            for key, per_source in upstream.items():
+                allowed = {s: shards for s, shards in per_source.items() if s in version_holders}
+                if allowed:
+                    filtered_upstream[key] = allowed
+                else:
+                    # All sources for this key are at an older version — keep original and warn.
+                    filtered_upstream[key] = per_source
+                    psrl_logger.warning(
+                        f"{self.client.client_name}: no source for key {key!r} holds "
+                        f"target_version={target_version}; falling back to unfiltered sources "
+                        f"{sorted(per_source)}."
+                    )
+            upstream = filtered_upstream
         # Resolve known dead sources before any byte moves, so a missing key leaves the weights untouched.
         upstream, takeover, missing = self._reroute(upstream)
         if missing:

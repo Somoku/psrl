@@ -216,7 +216,13 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """Stop reading from train ranks the coordinator has declared dead (design 3.5.7, D7)."""
         self.nixl_storage_client.pull_engine().mark_unavailable(sources)
 
-    def nixl_pull_model_core(self, epoch: int, participant_instances: list[int] | None = None) -> bool:
+    def nixl_pull_model_core(
+        self,
+        epoch: int,
+        participant_instances: list[int] | None = None,
+        version_holders: frozenset[str] | None = None,
+        target_version: int = -1,
+    ) -> bool:
         """
         Pull the latest weights through the NIXL pull engine.
 
@@ -227,6 +233,10 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         Args:
             epoch (int): Identifier of this sync, shared by every syncing replica and never reused.
             participant_instances (list[int] | None): Replica indices syncing together. None means all.
+            version_holders (frozenset[str] | None): Trainer client names that have published
+                ``target_version``.  Forwarded to ``pull_engine.pull`` for D1 version-aware source
+                filtering.  None means no filtering (backward-compatible default).
+            target_version (int): Model version being pulled, for logging.  -1 means unknown.
         """
         self.pull_times = getattr(self, "pull_times", 0) + 1
         allowed = None if participant_instances is None else set(participant_instances)
@@ -237,7 +247,12 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             participants = {name for name in peers if gen_client_instance(name) in allowed}
             participants.add(self.nixl_storage_client.client_name)
         try:
-            report = self.nixl_storage_client.pull_engine().pull(epoch, participants)
+            report = self.nixl_storage_client.pull_engine().pull(
+                epoch,
+                participants,
+                version_holders=version_holders,
+                target_version=target_version,
+            )
         except ChunkUnavailable as unavailable:
             # Nothing was written, so the instance is still consistent at its current version.
             psrl_logger.warning(

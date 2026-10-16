@@ -146,6 +146,12 @@ class PSManager(RequestStatusTracker):
         self.ps_nixl_gen_storage_client_names: list[str] | None = None
         # NOTE(claude): Worker handles stay rank ordered so broadcast coordination can index them by rank.
         self.ps_worker_handles_by_rank: list = []
+        # D1 version-aware source selection: the set of trainer client names that have
+        # published the current version.  Populated by `push_model_state_dict_nixl` from
+        # `ps_nixl_train_storage_client_names`, which is set at handshake time and never
+        # changes.  Rollouts read this set before selecting upstream sources so they only
+        # pull from ranks that have already completed `publish_version(v)`.
+        self._nixl_version_holders: frozenset[str] = frozenset()
 
         self._exclusive_push_locked = False
         self._shared_pull_count = 0
@@ -1089,6 +1095,11 @@ class PSManager(RequestStatusTracker):
         psrl_logger.info(
             f"Direct supply: pull sources are the {train_world_size} train ranks {self.ps_nixl_agent_names}"
         )
+        # All direct-supply trainer clients are holders from the moment the comm plan is set.
+        # `push_model_state_dict_nixl` refreshes this to the same set; it is pre-populated here
+        # so that any pull that races the first publish sees a valid (if empty) holder set rather
+        # than a fallback to unfiltered sources.
+        self._nixl_version_holders = frozenset(self.ps_nixl_agent_names)
 
     def enable_broadcast_init_on_server(self) -> None:
         """
@@ -1159,6 +1170,20 @@ class PSManager(RequestStatusTracker):
             "The PS worker group must be initialized before calling get_ps_nixl_train_storage_client_name."
         )
         return self.ps_nixl_train_storage_client_names
+
+    def get_nixl_version_holders(self) -> tuple[int, frozenset[str]]:
+        """Return the current model version and the set of trainer client names that hold it.
+
+        D1 version-aware source selection: rollouts call this once per pull to build the
+        allowed-source filter.  The returned set is the same set that `_nixl_version_holders`
+        carries, which is refreshed by `push_model_state_dict_nixl` on every publish.
+
+        An empty frozenset means no version has been published yet (startup) or direct supply
+        has not been configured.  `pull_engine` treats an empty set as "no filter" so existing
+        behaviour is preserved for non-direct-supply ps_modes.
+        """
+        version = self.model_store.version_tag if self.model_store is not None else 0
+        return version, self._nixl_version_holders
 
     def get_ps_nixl_gen_storage_client_names(self) -> list[str]:
         """Get the NIXL gen storage client name of the PS worker group."""
@@ -1359,6 +1384,13 @@ class PSManager(RequestStatusTracker):
         self.model_store = ModelStore(
             version_tag=version_tag,
         )
+        # D1 version-aware source selection: record that all known trainer ranks now hold
+        # this version.  The holder set is the full trainer client list — every rank ran
+        # `publish_version(v)` before rank 0 reached here (the barrier in
+        # `direct_supply_publish` guarantees it).  Rollouts read this with
+        # `get_nixl_version_holders` before choosing upstream sources.
+        if self.ps_nixl_train_storage_client_names:
+            self._nixl_version_holders = frozenset(self.ps_nixl_train_storage_client_names)
         if version_tag > 0:
             self.maybe_delete_buffer(version_tag - 1)
         self.rollout_coordinator.set_ps_model_version.remote(version_tag)

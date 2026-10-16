@@ -1199,8 +1199,17 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             # A pull outside a coordinated sync has no peers to wait for, so it reads everything upstream.
             self._solo_pulls = getattr(self, "_solo_pulls", 0) + 1
             epoch, participants = -self._solo_pulls, [self.get_replica_idx()]
+        # D1 version-aware source selection: fetch which trainer ranks hold the current
+        # version.  One Ray call, O(1), no extra round trips — the result is attached to
+        # the collective_rpc args so every vLLM engine worker receives it without a
+        # per-worker lookup.  For non-direct-supply ps_modes the manager returns an empty
+        # frozenset and pull_engine treats that as "no filter", preserving old behaviour.
+        target_version, version_holders = await ps_manager_handle.get_nixl_version_holders.remote()
         if not self.psrl_config.profile.fix_weight:
-            reached = await self.engine.collective_rpc("nixl_pull_model_core", args=(epoch, participants))
+            reached = await self.engine.collective_rpc(
+                "nixl_pull_model_core",
+                args=(epoch, participants, version_holders, target_version),
+            )
             if not all(reached):
                 # D6/D7: some key had no live train source, so the weights were left untouched. The
                 # version is not committed and the caller keeps generating at the one it already has.

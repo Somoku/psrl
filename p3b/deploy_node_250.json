@@ -18,7 +18,7 @@
     "sample_interval_s": 5,
     "sandbox_memory_safety": 0.05,
     "elastic": {
-      "enabled": false,
+      "enabled": true,
       "min_reserve_mb": 512,
       "percentile": 95,
       "growth_margin": 0.25,

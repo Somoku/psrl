@@ -70,6 +70,35 @@ func (m *Monitor) Report(view placement.NodeView) {
 	m.rebuildLocked()
 }
 
+// ClassReserveMB is the per-sandbox charge the live nodes published for a class, and
+// whether any of them published one.
+//
+// The largest of them, not the smallest: each node states what a sandbox costs *it*, and
+// charging the least optimistic is the direction that cannot over-admit a fleet whose
+// nodes priced themselves differently. No node publishing means the deployment has not
+// enabled elastic pricing, and the caller keeps charging the request's maximum.
+func (m *Monitor) ClassReserveMB(class string) (int64, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	now := m.now()
+	var largest int64
+	known := false
+	for _, view := range m.view {
+		if m.nodeTTL > 0 && now.Sub(view.SeenAt) > m.nodeTTL {
+			continue
+		}
+		reserve, published := view.ClassReserve[class]
+		if !published || reserve <= 0 {
+			continue
+		}
+		if !known || reserve > largest {
+			largest = reserve
+		}
+		known = true
+	}
+	return largest, known
+}
+
 // Forget drops a node, for an agent that is shutting down cleanly. Waiting for
 // its TTL would send work to a node that has already said it is leaving.
 func (m *Monitor) Forget(nodeID string) {

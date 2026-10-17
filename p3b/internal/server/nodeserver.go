@@ -109,6 +109,13 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 			classBySandbox: map[string]string{},
 			shrunk:         map[string]bool{},
 		}
+		// Seed one estimate per declared class, so the node's first report already
+		// publishes a price. Without it the batch admitted before the first report -- which
+		// is every batch after a restart -- is charged the request's maximum, the
+		// reservation this exists to remove.
+		for class := range cfg.Admission.Snapshot().ClassHeadroom {
+			agent.footprintFor(class)
+		}
 	}
 	return agent, nil
 }
@@ -360,6 +367,7 @@ func (n *Node) View() placement.NodeView {
 		ImageDigests:    map[string]struct{}{},
 		ImageReferences: map[string]struct{}{},
 		Labels:          map[string]struct{}{},
+		ClassReserve:    n.classReserves(),
 	}
 	if envelope := proto.GetEnvelope(); envelope != nil {
 		view.Envelope = placement.Headroom{

@@ -181,12 +181,13 @@ func (c *Control) create(ctx context.Context, req *v1.CreateRequest) (*v1.Create
 	// identity the caller heartbeats. ownerOf reads it the way the node does.
 	owner := ownerOf(spec)
 	grantID := fmt.Sprintf("grant-%d", time.Now().UnixNano())
-	amount := quotaAmount(spec)
+	charged := c.charged(spec)
+	amount := quotaAmount(charged)
 	if err := c.admit(ctx, grantID, spec.ResourceClass, owner, amount); err != nil {
 		return nil, err
 	}
 
-	created, err := c.place(ctx, selected, spec, req.GetCallbackTarget(), owner)
+	created, err := c.place(ctx, selected, spec, charged, req.GetCallbackTarget(), owner)
 	if err != nil {
 		c.ledger.Release(grantID)
 		return nil, err
@@ -196,6 +197,29 @@ func (c *Control) create(ctx context.Context, req *v1.CreateRequest) (*v1.Create
 		grantID: grantID, reservationID: created.reservationID, class: spec.ResourceClass,
 	})
 	return createdToProto(created.created), nil
+}
+
+// charged is the spec admission should charge for.
+//
+// A node publishes what one sandbox of a class actually costs it, measured from its own
+// sandboxes. Charging that instead of the request's declared maximum is what lets the
+// fleet and placement admit a burst the node has room for: the maximum is a protection
+// bound for one sandbox, and summing it across a batch reserves memory nobody is using.
+//
+// Only memory is repriced. CPU, disk and devices are stated requirements rather than
+// measured costs, and a node that has not enabled the pricing publishes nothing, which
+// leaves the request as it was.
+func (c *Control) charged(spec backend.Spec) backend.Spec {
+	if c.monitor == nil || spec.Resources.MemoryMB <= 0 {
+		return spec
+	}
+	reserve, published := c.monitor.ClassReserveMB(spec.ResourceClass)
+	if !published || reserve <= 0 || reserve >= spec.Resources.MemoryMB {
+		return spec
+	}
+	charged := spec
+	charged.Resources.MemoryMB = reserve
+	return charged
 }
 
 // admit charges one request against its class, waiting for room when the class
@@ -298,7 +322,9 @@ type placed struct {
 // A node refusal is information rather than an error: it knows its own pressure
 // and placement only knows what the node last reported, so the right response is
 // to ask placement again with that node now charged.
-func (c *Control) place(ctx context.Context, selected backend.Backend, spec backend.Spec, callback, owner string) (placed, error) {
+func (c *Control) place(
+	ctx context.Context, selected backend.Backend, spec, charged backend.Spec, callback, owner string,
+) (placed, error) {
 	if selected.Mode() == backend.SchedulingProvider {
 		// The backend's own control plane chooses the node, so this service does
 		// quota only and passes an empty node id.
@@ -311,7 +337,10 @@ func (c *Control) place(ctx context.Context, selected backend.Backend, spec back
 
 	var lastRefusal string
 	for attempt := 0; attempt < c.placementAttempts; attempt++ {
-		decision, err := c.placement.Choose(placementRequest(spec, selected.Name(), owner))
+		// Charge what the node says a sandbox costs, not what the caller asked for as a
+		// maximum: placement's promises are cleared by the node's own report, so a promise
+		// of the maximum would refuse a batch the node is willing to hold.
+		decision, err := c.placement.Choose(placementRequest(charged, selected.Name(), owner))
 		if err != nil {
 			if errors.Is(err, placement.ErrExhausted) {
 				return placed{}, status.Error(codes.ResourceExhausted, err.Error())

@@ -105,6 +105,13 @@ type NodeView struct {
 	// A node that cannot destroy what it holds still holds its memory, so
 	// admitting against it would over-commit the host.
 	Draining bool
+	// ClassReserve is what the node says one sandbox of each class costs it, in MB.
+	//
+	// It is the only number admission can charge that is not the caller's maximum, and
+	// the node is the only place it can come from: the cost is measured from that node's
+	// own sandboxes. A node that has not enabled elastic pricing publishes nothing, which
+	// leaves callers charging the request's maximum as before.
+	ClassReserve map[string]int64
 }
 
 // Request is what a caller needs from a node.

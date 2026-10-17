@@ -353,6 +353,7 @@ type nodeViewWire struct {
 	MemUsedPct      float64                 `json:"mem_used_pct"`
 	GPUFree         int32                   `json:"gpu_free"`
 	Draining        bool                    `json:"draining"`
+	ClassReserve    map[string]int64        `json:"class_reserve_mb"`
 	ImageDigests    []string                `json:"image_digests"`
 	ImageReferences []string                `json:"image_references"`
 	Labels          []string                `json:"labels"`
@@ -385,6 +386,7 @@ func nodeViewToWire(view placement.NodeView) nodeViewWire {
 			GPUCount: view.Envelope.GPUCount, DiskMB: view.Envelope.DiskMB,
 		},
 		ClassHeadroom: make(map[string]headroomWire, len(view.ClassHeadroom)),
+		ClassReserve:  view.ClassReserve,
 	}
 	for class, h := range view.ClassHeadroom {
 		w.ClassHeadroom[class] = headroomWire{
@@ -420,6 +422,7 @@ func nodeViewFromWire(w nodeViewWire) placement.NodeView {
 		GPUFree:         w.GPUFree,
 		Draining:        w.Draining,
 		ClassHeadroom:   make(map[string]placement.Headroom, len(w.ClassHeadroom)),
+		ClassReserve:    w.ClassReserve,
 		ImageDigests:    make(map[string]struct{}, len(w.ImageDigests)),
 		ImageReferences: make(map[string]struct{}, len(w.ImageReferences)),
 		Labels:          make(map[string]struct{}, len(w.Labels)),

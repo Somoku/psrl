@@ -216,6 +216,26 @@ func (n *Node) restoreMemory(child cgroup.Child, restored []string) []string {
 	return append(restored, child.ID)
 }
 
+// classReserves is what this node publishes about the cost of a sandbox.
+//
+// It is reported rather than kept to itself because admission above this node -- the fleet
+// quota and placement -- charges a request before this node ever sees it. A node that
+// prices a sandbox from measurement but does not say so leaves every caller charging the
+// maximum, which is the whole reservation this exists to remove.
+func (n *Node) classReserves() map[string]int64 {
+	if n.elastic == nil {
+		return nil
+	}
+	reserves := make(map[string]int64, len(n.elastic.footprints))
+	for class, footprint := range n.elastic.footprints {
+		reserves[class] = footprint.ReserveMB()
+	}
+	if len(reserves) == 0 {
+		return nil
+	}
+	return reserves
+}
+
 // footprintFor returns a class's estimate, creating it on first use.
 func (n *Node) footprintFor(class string) *node.Footprint {
 	if footprint, ok := n.elastic.footprints[class]; ok {

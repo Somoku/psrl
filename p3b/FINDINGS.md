@@ -83,36 +83,37 @@ The measurements also found three defects that no unit test covered:
 3. A pool that cannot build its entries was silent: it simply never served a claim. It
    now warns with the create error.
 
-## 3. Elastic admission: the node prices a sandbox, but three ledgers still charge its maximum
+## 3. Elastic admission: the node prices a sandbox, and the fleet charges that price
 
-Implemented (`internal/node/footprint.go`, `internal/server/elastic.go`, `Admission.SetObserved/Adjust`):
-a class's per-sandbox charge is estimated from the trimmed maximum of what its sandboxes are
-resident (fast grow, slow shrink, clamped to the largest declared maximum), the ledger is
-bounded by `max(reservations, measured usage)`, and a sandbox holding reclaimable memory while
-the subtree is at `shrink_above` has its kernel limit lowered to `resident + margin` -- never
-while a command is in flight -- and restored at `restore_below`.
+Implemented: a class's per-sandbox charge is estimated from the trimmed maximum of what its
+sandboxes are resident (fast grow, slow shrink, clamped to the largest declared maximum); the
+node's ledger is bounded by `max(reservations, measured usage)`; a sandbox holding reclaimable
+memory while the subtree is at `shrink_above` has its kernel limit lowered to `resident +
+margin` (never while a command is in flight) and restored at `restore_below`; and the node
+**publishes** the resulting per-class price on its node-plane report, which the control charges
+for both the fleet quota and placement's promises.
 
-Measured on the deployment:
+Measured on the deployment, same binary, same 34 requests of a 128 GiB spec:
 
-| Observation | Number |
-| --- | --- |
-| Static admission ceiling, 128 GiB spec, two nodes | **27 of 34** admitted; refused with "every capable sandbox node is full" |
-| 27 x 128 GiB | 3.46 TB of reservations against the nodes' 1.65 TB + 2.04 TB overcommitted envelopes |
-| Lowering one sandbox's limit from 4 GiB to 265 MiB | 3.08 GiB used -> 263 MiB, i.e. **2.8 GiB of cache reclaimed**; the process answered `docker exec` afterwards; the limit restored cleanly |
-| Elastic admission enabled, same 34 requests | **27 of 34 again** |
+| Admission | Admitted | Refused with |
+| --- | --- | --- |
+| declared maximum (elastic off) | **27 of 34** | "every capable sandbox node is full" |
+| published reserve (elastic on) | **34 of 34**, in 2.7 s | — |
 
-The last row is the result worth recording. Admission has *three* ledgers, and all three charge
-the request's maximum: the fleet quota, placement's short-term promise accounting (`canHold`
-against the headroom the node last reported), and the node's own ledger. The node's ledger is
-now the only one that prices a sandbox from measurement, which is not enough to admit one more
-sandbox. Raising the fleet total did not change the outcome either, which is how placement's
-accounting was identified as the second layer.
+27 x 128 GiB is 3.46 TB against the nodes' 1.65 TB + 2.04 TB overcommitted envelopes, which is
+where the static number comes from. With the reserve published the fleet and placement charge
+512 MiB per sandbox instead, and the batch fits.
 
-The next increment is therefore not more controller code but an admission-contract change: the
-per-class reserve has to become a fact the node *publishes*, and both the fleet quota and
-placement have to charge it instead of the request's maximum. The design says as much in §6.2 --
-"if the control plane still sums each request's maximum, even a node that supports elasticity
-cannot admit more" -- and the measurement says the same about placement.
+The release mechanism, measured against the kernel: a sandbox holding 3.08 GiB (3.07 GiB of it
+file cache) kept its process and dropped to 263 MiB when its limit was lowered to 265 MiB -- 2.8
+GiB reclaimed -- answered `docker exec` afterwards, and restored to 4 GiB cleanly.
+
+Two things had to change before the pricing was worth anything, and the second is the one the
+design does not name. The control had to charge the published price for both the fleet quota and
+placement's short-term promises: charging the request's maximum in either place refused the
+batch the node was willing to hold. The first measurement of the change -- node ledger repriced,
+control unchanged -- admitted exactly as many sandboxes as before, and raising the fleet total
+did not move it either, which is how placement's accounting was identified.
 
 ## 4. Limits of these results
 
@@ -142,6 +143,12 @@ cannot admit more" -- and the measurement says the same about placement.
 - **The release path is verified at test scale, not at workload scale.** Filling a 1.65 TB
   subtree needs a workload this deployment does not run, so the shrink is proven by the
   integration test above rather than by a training run.
+- **The growth model assumes sandboxes grow independently, and a GRPO group's do not.** The
+  reservation follows a class's observed resident memory, so a batch that grows *after* it was
+  admitted is only bounded by each sandbox's own hard limit and by the node's measured ceiling
+  for new work. §6.2 asks for the correlated burst to be calibrated against real failure rates;
+  that calibration and an A/B over full training steps are the gate before this is trusted for a
+  long run, and they are not done here. The switch is one field per node (`node.elastic.enabled`).
 - The RL-level metrics the design asks for -- successful rollouts/s, complete groups/s,
   resident byte-seconds during model waits -- are not measured here. They need an A/B of
   full training steps, not these microbenchmarks.

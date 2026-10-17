@@ -629,6 +629,11 @@ func readable(path string) bool {
 	return true
 }
 
+// parseInt reads an integer field from a "key value" file.
+func parseInt(value string) (int64, error) {
+	return strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+}
+
 // readIntFile reads one integer from a one-value file.
 func readIntFile(path string) (int64, error) {
 	raw, err := os.ReadFile(path)

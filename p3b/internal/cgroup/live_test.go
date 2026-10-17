@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+// testParent is a subtree of its own, never the deployment's: these tests create and
+// remove it, and removing the subtree a running node reads would take that node's
+// admission down with it.
+const testParent = "psrl-test-sandboxes"
+
 // These tests run on a deployment, because what they check depends on the topology:
 // which hierarchies are mounted, whether the process's own path is visible under them,
 // and whether Docker's driver places a container where the subtree says. A unit test can
@@ -24,7 +29,7 @@ func TestSetupCreatesTheTreeAndMovesThisProcess(t *testing.T) {
 		t.Skipf("no readable cgroup hierarchy on this host: %v", err)
 	}
 	t.Logf("domain: %s", domain)
-	budget, err := domain.Setup(SandboxParent, HostLeaf, Request{
+	budget, err := domain.Setup(testParent, HostLeaf, Request{
 		MemoryMB: 1024, Overcommit: 1, CPUMillis: 1000,
 	})
 	if err != nil {
@@ -32,7 +37,7 @@ func TestSetupCreatesTheTreeAndMovesThisProcess(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		for _, hierarchy := range domain.Hierarchies {
-			_ = os.Remove(filepath.Join(hierarchy.Root, SandboxParent))
+			_ = os.Remove(filepath.Join(hierarchy.Root, testParent))
 			_ = os.Remove(filepath.Join(hierarchy.Root, HostLeaf))
 		}
 	})
@@ -43,7 +48,7 @@ func TestSetupCreatesTheTreeAndMovesThisProcess(t *testing.T) {
 	if !ok {
 		t.Fatal("the domain has no memory hierarchy")
 	}
-	subtree := filepath.Join(memory.Root, SandboxParent)
+	subtree := filepath.Join(memory.Root, testParent)
 	if _, err := os.Stat(subtree); err != nil {
 		t.Fatalf("the subtree was not created: %v", err)
 	}
@@ -72,18 +77,18 @@ func TestSetupTwiceIsIdempotent(t *testing.T) {
 		t.Skipf("no readable cgroup hierarchy on this host: %v", err)
 	}
 	request := Request{MemoryMB: 1024, Overcommit: 1, CPUMillis: 1000}
-	first, err := domain.Setup(SandboxParent, HostLeaf, request)
+	first, err := domain.Setup(testParent, HostLeaf, request)
 	if err != nil {
 		t.Fatalf("first Setup: %v", err)
 	}
 	t.Cleanup(func() {
 		for _, hierarchy := range domain.Hierarchies {
-			_ = os.Remove(filepath.Join(hierarchy.Root, SandboxParent))
+			_ = os.Remove(filepath.Join(hierarchy.Root, testParent))
 			_ = os.Remove(filepath.Join(hierarchy.Root, HostLeaf))
 		}
 	})
 
-	second, err := domain.Setup(SandboxParent, HostLeaf, request)
+	second, err := domain.Setup(testParent, HostLeaf, request)
 	if err != nil {
 		t.Fatalf("second Setup: %v", err)
 	}
@@ -97,19 +102,19 @@ func TestAnExistingSubtreeWithAnotherLimitIsRefused(t *testing.T) {
 	if err != nil {
 		t.Skipf("no readable cgroup hierarchy on this host: %v", err)
 	}
-	if _, err := domain.Setup(SandboxParent, HostLeaf, Request{MemoryMB: 1024, Overcommit: 1, CPUMillis: 1000}); err != nil {
+	if _, err := domain.Setup(testParent, HostLeaf, Request{MemoryMB: 1024, Overcommit: 1, CPUMillis: 1000}); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
 	t.Cleanup(func() {
 		for _, hierarchy := range domain.Hierarchies {
-			_ = os.Remove(filepath.Join(hierarchy.Root, SandboxParent))
+			_ = os.Remove(filepath.Join(hierarchy.Root, testParent))
 			_ = os.Remove(filepath.Join(hierarchy.Root, HostLeaf))
 		}
 	})
 
 	// A running node must be restarted to change the limit, so a preflight that would
 	// silently accept a different one would report a service that is not what runs.
-	if _, err := domain.SetupReadOnly(SandboxParent, Request{MemoryMB: 512, Overcommit: 1, CPUMillis: 1000}); err == nil {
+	if _, err := domain.SetupReadOnly(testParent, Request{MemoryMB: 512, Overcommit: 1, CPUMillis: 1000}); err == nil {
 		t.Fatal("a subtree whose limit differs from the resolved one must be refused")
 	}
 }
@@ -126,16 +131,16 @@ func TestTheDomainIsExclusiveOfContainersOutsideIt(t *testing.T) {
 		t.Fatal("the domain has no memory hierarchy")
 	}
 	// A subtree large enough that 2GiB of test containers fit inside it.
-	if _, err := domain.Setup(SandboxParent, HostLeaf, Request{MemoryMB: 4096, Overcommit: 1, CPUMillis: 1000}); err != nil {
+	if _, err := domain.Setup(testParent, HostLeaf, Request{MemoryMB: 4096, Overcommit: 1, CPUMillis: 1000}); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
 	t.Cleanup(func() {
 		for _, hierarchy := range domain.Hierarchies {
-			_ = os.Remove(filepath.Join(hierarchy.Root, SandboxParent))
+			_ = os.Remove(filepath.Join(hierarchy.Root, testParent))
 			_ = os.Remove(filepath.Join(hierarchy.Root, HostLeaf))
 		}
 	})
-	subtree := filepath.Join(memory.Root, SandboxParent)
+	subtree := filepath.Join(memory.Root, testParent)
 	before := subtreeBytes(t, subtree)
 
 	runChargingContainer(t, "" /* the daemon's default parent */)
@@ -147,7 +152,7 @@ func TestTheDomainIsExclusiveOfContainersOutsideIt(t *testing.T) {
 			delta/(1<<20))
 	}
 
-	runChargingContainer(t, SandboxParent)
+	runChargingContainer(t, testParent)
 	time.Sleep(3 * time.Second)
 	inside := subtreeBytes(t, subtree)
 

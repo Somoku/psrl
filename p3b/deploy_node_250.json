@@ -16,7 +16,20 @@
     "utilization_target": 0.75,
     "cgroup_parent": "psrl-sandboxes",
     "sample_interval_s": 5,
-    "sandbox_memory_safety": 0.05
+    "sandbox_memory_safety": 0.05,
+    "elastic": {
+      "enabled": false,
+      "min_reserve_mb": 512,
+      "percentile": 95,
+      "growth_margin": 0.25,
+      "shrink_after": 3,
+      "shrink_step": 0.25,
+      "shrink_above": 0.85,
+      "restore_below": 0.6,
+      "release_margin_mb": 256,
+      "min_limit_mb": 256,
+      "sample_interval_s": 5
+    }
   },
   "classes": {
     "rollout": {

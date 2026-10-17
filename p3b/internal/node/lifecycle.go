@@ -347,6 +347,26 @@ func (l *Lifecycle) Touch(sandboxID string) {
 	}
 }
 
+// Busy reports whether a command is running in this sandbox.
+//
+// The controller uses it as the phase hint the design asks for: an in-flight command is
+// the one moment a sandbox's page cache is certainly its working set, so it must not be
+// asked to release memory then.
+func (l *Lifecycle) Busy(sandboxID string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	held, known := l.bySandbox[sandboxID]
+	return known && held.inFlight > 0
+}
+
+// Running reports whether this node still holds an allocation for the sandbox.
+func (l *Lifecycle) Running(sandboxID string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, known := l.bySandbox[sandboxID]
+	return known
+}
+
 // Sweep decides once for every record this node holds.
 //
 // A sandbox goes for exactly one of three reasons, checked in order: its owner

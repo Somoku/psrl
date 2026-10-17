@@ -10,6 +10,7 @@ import (
 
 	v1 "psrl.dev/sandboxd/api/v1"
 	"psrl.dev/sandboxd/internal/backend"
+	"psrl.dev/sandboxd/internal/cgroup"
 	"psrl.dev/sandboxd/internal/node"
 	"psrl.dev/sandboxd/internal/placement"
 )
@@ -39,6 +40,17 @@ type Node struct {
 	// would only know its own accounting, which is a record of reservations
 	// rather than of load.
 	pressure func() node.Pressure
+
+	// elastic prices a sandbox from what its class actually costs and asks idle sandboxes
+	// for their reclaimable memory. nil when the deployment has not enabled it, which
+	// leaves admission on declared maxima.
+	elastic *elastic
+	// elasticDomain and elasticParent are where the controller reads per-sandbox usage and
+	// lowers a limit. Without a domain it cannot do either, so it does nothing.
+	elasticDomain cgroup.Domain
+	elasticParent string
+	// elasticBudget is the subtree's memory limit, the number every fraction is taken of.
+	elasticBudget int64
 }
 
 // NodeConfig is what a node agent needs to run.
@@ -49,6 +61,15 @@ type NodeConfig struct {
 	// Backends are every runtime this machine hosts, in declaration order.
 	Backends []backend.Backend
 	Pressure func() node.Pressure
+	// Elastic turns on usage-based admission and the pressure-driven release. Disabled is
+	// the previous behaviour: charge each sandbox its declared maximum.
+	Elastic ElasticConfig
+	// Domain and SandboxParent are the cgroup subtree the sandboxes live in. Without them
+	// the controller has nothing to measure and stays inert.
+	Domain        cgroup.Domain
+	SandboxParent string
+	// SandboxBudgetMB is that subtree's memory limit.
+	SandboxBudgetMB int64
 }
 
 // NewNode returns the node-level server.
@@ -69,14 +90,27 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if cfg.Pressure == nil {
 		cfg.Pressure = func() node.Pressure { return node.Pressure{} }
 	}
-	return &Node{
-		nodeID:    cfg.NodeID,
-		admission: cfg.Admission,
-		lifecycle: cfg.Lifecycle,
-		backends:  backends,
-		order:     order,
-		pressure:  cfg.Pressure,
-	}, nil
+	agent := &Node{
+		nodeID:        cfg.NodeID,
+		admission:     cfg.Admission,
+		lifecycle:     cfg.Lifecycle,
+		backends:      backends,
+		order:         order,
+		pressure:      cfg.Pressure,
+		elasticDomain: cfg.Domain,
+		elasticParent: cfg.SandboxParent,
+		elasticBudget: cfg.SandboxBudgetMB,
+	}
+	if cfg.Elastic.Enabled {
+		agent.elastic = &elastic{
+			cfg:            ElasticConfigWithDefaults(cfg.Elastic),
+			footprints:     map[string]*node.Footprint{},
+			maxBySandbox:   map[string]int64{},
+			classBySandbox: map[string]string{},
+			shrunk:         map[string]bool{},
+		}
+	}
+	return agent, nil
 }
 
 // Admit accepts or refuses one request against this node's live state.
@@ -87,7 +121,17 @@ func (n *Node) Admit(ctx context.Context, req *v1.AdmitRequest) (*v1.AdmitRespon
 	spec := specFromProto(req.GetSpec())
 	n.admission.SetPressure(n.pressure())
 	owner := ownerOf(spec)
-	grant, refusal, ok := n.admission.Reserve(spec.ResourceClass, owner, nodeResources(spec))
+	charge := nodeResources(spec)
+	if n.elastic != nil {
+		// Charge what a sandbox of this class actually costs rather than its declared
+		// maximum. The maximum stays as the kernel's hard bound for this sandbox; the
+		// ledger's job is to know what the node has promised, and nothing has promised the
+		// maximum.
+		if reserve := n.footprintFor(spec.ResourceClass).ReserveMB(); reserve < charge.MemoryMB {
+			charge.MemoryMB = reserve
+		}
+	}
+	grant, refusal, ok := n.admission.Reserve(spec.ResourceClass, owner, charge)
 	if !ok {
 		return &v1.AdmitResponse{Admitted: false, Refusal: string(refusal)}, nil
 	}
@@ -142,6 +186,12 @@ func (n *Node) CreateOn(ctx context.Context, req *v1.CreateOnRequest) (*v1.Creat
 		// The sandbox does not exist, so its admission must not stay charged.
 		n.lifecycle.FailCreate(leaseID)
 		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	if n.elastic != nil {
+		// The kernel limit is the declared maximum even though the ledger charges the
+		// class's estimate, so the controller needs both numbers.
+		n.elastic.maxBySandbox[created.Handle.SandboxID] = spec.Resources.MemoryMB
+		n.elastic.classBySandbox[created.Handle.SandboxID] = spec.ResourceClass
 	}
 	if !n.lifecycle.AdoptCreated(leaseID, created.Handle, hosted) {
 		// The record was reclaimed while the create was in flight, so this

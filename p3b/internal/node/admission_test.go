@@ -471,3 +471,69 @@ func TestReleasingMorePoolThanWasAcquiredDoesNotCreateHeadroom(t *testing.T) {
 		t.Errorf("headroom: got %d, want %d", got, before)
 	}
 }
+
+func TestMeasuredUsageAboveTheReservationsBoundsTheNode(t *testing.T) {
+	// Reservations are an estimate. When the pages have already taken more than the
+	// estimate says, the measurement is what the node has left -- not the promise.
+	gate := mustGate(t, envelope())
+	gate.SetPressure(Pressure{MemUsedPct: 0.1, Valid: true})
+	if _, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 100}); !ok {
+		t.Fatal("the test needs a reservation")
+	}
+	if got := gate.Headroom("rollout").MemoryMB; got != 900 {
+		t.Fatalf("headroom with a 100MB reservation: got %d, want 900", got)
+	}
+
+	gate.SetObserved(Resources{MemoryMB: 700}, true)
+
+	if got := gate.Headroom("rollout").MemoryMB; got != 300 {
+		t.Errorf("headroom with 700MB measured: got %d, want 300 (the measurement bounds it)", got)
+	}
+}
+
+func TestAnUnusableObservationLeavesTheLedgerOnItsReservations(t *testing.T) {
+	// A reading that cannot be trusted must not make the node admit more, and it must not
+	// make it refuse either: the reservations are the only information there is.
+	gate := mustGate(t, envelope())
+
+	gate.SetObserved(Resources{MemoryMB: 900}, false)
+
+	if got := gate.Headroom("rollout").MemoryMB; got != 1000 {
+		t.Errorf("headroom: got %d, want the full 1000", got)
+	}
+}
+
+func TestAdjustingAClassChargeMovesItsHeadroom(t *testing.T) {
+	// This is how a reservation follows what its sandboxes use: up when one turns out to
+	// need more, down when a quiet batch gives some back.
+	gate := mustGate(t, envelope())
+	if _, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 200}); !ok {
+		t.Fatal("the test needs a reservation")
+	}
+	before := gate.Headroom("rollout").MemoryMB
+
+	gate.Adjust("rollout", Resources{MemoryMB: 300})
+	if got := gate.Headroom("rollout").MemoryMB; got != before-300 {
+		t.Errorf("after growing, headroom is %d, want %d", got, before-300)
+	}
+
+	gate.Adjust("rollout", Resources{MemoryMB: -300})
+	if got := gate.Headroom("rollout").MemoryMB; got != before {
+		t.Errorf("after shrinking back, headroom is %d, want %d", got, before)
+	}
+}
+
+func TestAShrinkBelowZeroIsCorrectedRatherThanCarried(t *testing.T) {
+	// A release without a matching charge would let the node promise the same memory
+	// twice, so the class's charge is floored at zero.
+	gate := mustGate(t, envelope())
+	if _, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 100}); !ok {
+		t.Fatal("the test needs a reservation")
+	}
+
+	gate.Adjust("rollout", Resources{MemoryMB: -500})
+
+	if got := gate.Snapshot().Granted.MemoryMB; got != 0 {
+		t.Errorf("granted: got %d, want 0", got)
+	}
+}

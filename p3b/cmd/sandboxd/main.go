@@ -115,6 +115,22 @@ type Config struct {
 		// SandboxMemorySafety is the share of the ancestor's memory limit kept free for
 		// page cache growth and work that is not a sandbox. Zero takes 5%.
 		SandboxMemorySafety float64 `json:"sandbox_memory_safety"`
+		// Elastic prices a sandbox from what its class actually costs, and asks idle sandboxes
+		// for their reclaimable memory when the node is near its budget. Disabled charges each
+		// sandbox its declared maximum, which is the shape every deployment had before.
+		Elastic struct {
+			Enabled         bool    `json:"enabled"`
+			MinReserveMB    int64   `json:"min_reserve_mb"`
+			Percentile      float64 `json:"percentile"`
+			GrowthMargin    float64 `json:"growth_margin"`
+			ShrinkAfter     int     `json:"shrink_after"`
+			ShrinkStep      float64 `json:"shrink_step"`
+			ShrinkAbove     float64 `json:"shrink_above"`
+			RestoreBelow    float64 `json:"restore_below"`
+			ReleaseMarginMB int64   `json:"release_margin_mb"`
+			MinLimitMB      int64   `json:"min_limit_mb"`
+			SampleIntervalS float64 `json:"sample_interval_s"`
+		} `json:"elastic"`
 	} `json:"node"`
 
 	Classes map[string]struct {
@@ -385,12 +401,13 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	if len(local) == 0 {
 		return fmt.Errorf("role \"node\" requires at least one direct backend")
 	}
-	budget, pressureFn, err := nodeDomain(ctx, cfg, log)
+	prepared, err := nodeDomain(ctx, cfg, log)
 	if err != nil {
 		return err
 	}
+	pressureFn := prepared.pressure
 	gate, err := node.NewAdmission(node.Config{
-		Envelope:          nodeEnvelope(cfg, budget),
+		Envelope:          nodeEnvelope(cfg, prepared.budget),
 		Classes:           nodeClasses(cfg),
 		GPUIndices:        cfg.Node.GPUIndices,
 		LocalCPUCeiling:   cfg.Node.LocalCPUCeiling,
@@ -417,9 +434,20 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	// The sweep reads owner liveness from this gate: a caller that stops
 	// heartbeating has its sandboxes reclaimed as orphans.
 	life.SetOwnerLiveness(gate.OwnerAlive)
+	if cfg.Node.Elastic.Enabled {
+		log.Info("elastic admission enabled",
+			"min_reserve_mb", cfg.Node.Elastic.MinReserveMB,
+			"growth_margin", cfg.Node.Elastic.GrowthMargin,
+			"shrink_above", cfg.Node.Elastic.ShrinkAbove,
+			"restore_below", cfg.Node.Elastic.RestoreBelow)
+	}
 	agent, err := server.NewNode(server.NodeConfig{
 		NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backends: local,
-		Pressure: pressureFn,
+		Pressure:        pressureFn,
+		Elastic:         elasticConfig(cfg),
+		Domain:          prepared.domain,
+		SandboxParent:   prepared.parent,
+		SandboxBudgetMB: prepared.budget.SubtreeLimitBytes / (1024 * 1024),
 	})
 	if err != nil {
 		return err
@@ -439,6 +467,7 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	defer life.Stop()
 	startBackends(ctx, local, gate, log)
 	defer stopBackends(local)
+	go elasticLoop(ctx, agent, seconds(cfg.Node.Elastic.SampleIntervalS), log)
 
 	listener, err := listen(cfg.NodeListen)
 	if err != nil {
@@ -552,12 +581,13 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		gate  *node.Admission
 	)
 	if len(local) > 0 {
-		budget, pressureFn, err := nodeDomain(ctx, cfg, log)
+		prepared, err := nodeDomain(ctx, cfg, log)
 		if err != nil {
 			return err
 		}
+		pressureFn := prepared.pressure
 		gate, err = node.NewAdmission(node.Config{
-			Envelope:          nodeEnvelope(cfg, budget),
+			Envelope:          nodeEnvelope(cfg, prepared.budget),
 			Classes:           nodeClasses(cfg),
 			GPUIndices:        cfg.Node.GPUIndices,
 			LocalCPUCeiling:   cfg.Node.LocalCPUCeiling,
@@ -582,7 +612,11 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		life.SetOwnerLiveness(gate.OwnerAlive)
 		agent, err = server.NewNode(server.NodeConfig{
 			NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backends: local,
-			Pressure: pressureFn,
+			Pressure:        pressureFn,
+			Elastic:         elasticConfig(cfg),
+			Domain:          prepared.domain,
+			SandboxParent:   prepared.parent,
+			SandboxBudgetMB: prepared.budget.SubtreeLimitBytes / (1024 * 1024),
 		})
 		if err != nil {
 			return err
@@ -637,6 +671,7 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		// later gets the same treatment without this file naming it.
 		startBackends(ctx, local, gate, log)
 		defer stopBackends(local)
+		go elasticLoop(ctx, agent, seconds(cfg.Node.Elastic.SampleIntervalS), log)
 		go republish(ctx, agent, fleet, spans.LoadReportInterval())
 
 		// If node_listen is set in combined mode, also serve the node-plane
@@ -953,6 +988,55 @@ func seconds(value float64) time.Duration {
 // Only a backend that has something to run implements this, so the assertion is
 // an interface check rather than a flag: a backend with no pool and no loop is
 // simply skipped.
+// elasticConfig turns the deployment's declaration into the controller's configuration.
+func elasticConfig(cfg Config) server.ElasticConfig {
+	declared := cfg.Node.Elastic
+	return server.ElasticConfig{
+		Enabled: declared.Enabled,
+		Footprint: node.FootprintConfig{
+			MinReserveMB: declared.MinReserveMB,
+			Percentile:   declared.Percentile,
+			GrowthMargin: declared.GrowthMargin,
+			ShrinkAfter:  declared.ShrinkAfter,
+			ShrinkStep:   declared.ShrinkStep,
+		},
+		ShrinkAbove:     declared.ShrinkAbove,
+		RestoreBelow:    declared.RestoreBelow,
+		ReleaseMarginMB: declared.ReleaseMarginMB,
+		MinLimitMB:      declared.MinLimitMB,
+	}
+}
+
+// elasticLoop runs the controller on its own cadence, which is the sampling cadence: a
+// faster loop would decide on a sample that has not changed, and a slower one would react
+// after the burst it is meant to absorb.
+func elasticLoop(ctx context.Context, agent *server.Node, interval time.Duration, log *slog.Logger) {
+	if interval <= 0 {
+		interval = seconds(0) // zero means the sampler's default
+	}
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			report := agent.ElasticTick(ctx)
+			if len(report.Shrunk) == 0 && len(report.Restored) == 0 && report.OOMKills == 0 {
+				continue
+			}
+			log.Warn("elastic admission changed sandbox limits",
+				"observed_mib", report.ObservedMB, "budget_mib", report.BudgetMB,
+				"reserved_mib", report.ReservedMB, "reserves_mib", report.Reserves,
+				"shrunk", len(report.Shrunk), "restored", len(report.Restored),
+				"oom_kills", report.OOMKills)
+		}
+	}
+}
+
 func startBackends(ctx context.Context, backends []backend.Backend, gate *node.Admission, log *slog.Logger) {
 	for _, b := range backends {
 		// A backend that prefetches containers borrows the node's budget for them, and
@@ -1029,7 +1113,16 @@ func stopBackends(backends []backend.Backend) {
 // nothing by running without a domain, so an unreadable cgroup warns instead of
 // refusing to start. Every deployment that did configure one is refused: admitting
 // against capacity it cannot see is the failure the domain exists to prevent.
-func nodeDomain(ctx context.Context, cfg Config, log *slog.Logger) (cgroup.Budget, func() node.Pressure, error) {
+// sandboxDomain is everything the node learns about its subtree: the tree itself, the
+// budget it resolved, and the sampler that reads it.
+type sandboxDomain struct {
+	domain   cgroup.Domain
+	parent   string
+	budget   cgroup.Budget
+	pressure func() node.Pressure
+}
+
+func nodeDomain(ctx context.Context, cfg Config, log *slog.Logger) (sandboxDomain, error) {
 	parent := cfg.Node.CgroupParent
 	if parent == "" {
 		parent = cgroup.SandboxParent
@@ -1040,38 +1133,42 @@ func nodeDomain(ctx context.Context, cfg Config, log *slog.Logger) (cgroup.Budge
 		CPUMillis:  cfg.Node.CPUMillis,
 		Safety:     cfg.Node.SandboxMemorySafety,
 	}
-	budget, pressureFn, err := prepareDomain(ctx, parent, request, seconds(cfg.Node.SampleIntervalS), log)
+	prepared, err := prepareDomain(ctx, parent, request, seconds(cfg.Node.SampleIntervalS), log)
 	if err == nil {
-		return budget, pressureFn, nil
+		return prepared, nil
 	}
 	measured := cfg.Node.LocalCPUCeiling > 0 || cfg.Node.LocalMemCeiling > 0
-	if measured || cfg.Node.Overcommit > 1 || cfg.Node.CgroupParent != "" {
-		return cgroup.Budget{}, nil, fmt.Errorf("sandbox domain: %w", err)
+	if measured || cfg.Node.Overcommit > 1 || cfg.Node.CgroupParent != "" || cfg.Node.Elastic.Enabled {
+		return sandboxDomain{}, fmt.Errorf("sandbox domain: %w", err)
 	}
-	log.Warn("no sandbox cgroup domain; measured ceilings and overcommit stay off", "reason", err)
-	return cgroup.Budget{DeclaredMB: cfg.Node.MemoryMB}, func() node.Pressure { return node.Pressure{} }, nil
+	log.Warn("no sandbox cgroup domain; measured ceilings, overcommit and elasticity stay off", "reason", err)
+	return sandboxDomain{
+		parent:   parent,
+		budget:   cgroup.Budget{DeclaredMB: cfg.Node.MemoryMB},
+		pressure: func() node.Pressure { return node.Pressure{} },
+	}, nil
 }
 
 // prepareDomain creates the subtree, moves this process out of it, and starts the
 // sampler that reads it.
 func prepareDomain(
 	ctx context.Context, parent string, request cgroup.Request, interval time.Duration, log *slog.Logger,
-) (cgroup.Budget, func() node.Pressure, error) {
+) (sandboxDomain, error) {
 	domain, err := cgroup.Resolve()
 	if err != nil {
-		return cgroup.Budget{}, nil, err
+		return sandboxDomain{}, err
 	}
 	budget, err := domain.Setup(parent, cgroup.HostLeaf, request)
 	if err != nil {
-		return cgroup.Budget{}, nil, err
+		return sandboxDomain{}, err
 	}
 	reader, err := pressure.NewDomainReader(parent)
 	if err != nil {
-		return cgroup.Budget{}, nil, err
+		return sandboxDomain{}, err
 	}
 	sampler, err := pressure.NewSampler(reader, interval)
 	if err != nil {
-		return cgroup.Budget{}, nil, err
+		return sandboxDomain{}, err
 	}
 	sampler.Start(ctx)
 	log.Info("sandbox domain ready",
@@ -1089,7 +1186,7 @@ func prepareDomain(
 			"unreclaimable_mib", budget.UnreclaimableBytes/(1024*1024),
 			"reason", "the ancestor cgroup cannot hold the declared envelope plus what it already holds")
 	}
-	return budget, sampler.Pressure(), nil
+	return sandboxDomain{domain: domain, parent: parent, budget: budget, pressure: sampler.Pressure()}, nil
 }
 
 // nodeEnvelope is the envelope admission uses: the resolved one when a domain exists.

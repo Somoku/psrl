@@ -83,7 +83,38 @@ The measurements also found three defects that no unit test covered:
 3. A pool that cannot build its entries was silent: it simply never served a claim. It
    now warns with the create error.
 
-## 3. Limits of these results
+## 3. Elastic admission: the node prices a sandbox, but three ledgers still charge its maximum
+
+Implemented (`internal/node/footprint.go`, `internal/server/elastic.go`, `Admission.SetObserved/Adjust`):
+a class's per-sandbox charge is estimated from the trimmed maximum of what its sandboxes are
+resident (fast grow, slow shrink, clamped to the largest declared maximum), the ledger is
+bounded by `max(reservations, measured usage)`, and a sandbox holding reclaimable memory while
+the subtree is at `shrink_above` has its kernel limit lowered to `resident + margin` -- never
+while a command is in flight -- and restored at `restore_below`.
+
+Measured on the deployment:
+
+| Observation | Number |
+| --- | --- |
+| Static admission ceiling, 128 GiB spec, two nodes | **27 of 34** admitted; refused with "every capable sandbox node is full" |
+| 27 x 128 GiB | 3.46 TB of reservations against the nodes' 1.65 TB + 2.04 TB overcommitted envelopes |
+| Lowering one sandbox's limit from 4 GiB to 265 MiB | 3.08 GiB used -> 263 MiB, i.e. **2.8 GiB of cache reclaimed**; the process answered `docker exec` afterwards; the limit restored cleanly |
+| Elastic admission enabled, same 34 requests | **27 of 34 again** |
+
+The last row is the result worth recording. Admission has *three* ledgers, and all three charge
+the request's maximum: the fleet quota, placement's short-term promise accounting (`canHold`
+against the headroom the node last reported), and the node's own ledger. The node's ledger is
+now the only one that prices a sandbox from measurement, which is not enough to admit one more
+sandbox. Raising the fleet total did not change the outcome either, which is how placement's
+accounting was identified as the second layer.
+
+The next increment is therefore not more controller code but an admission-contract change: the
+per-class reserve has to become a fact the node *publishes*, and both the fleet quota and
+placement have to charge it instead of the request's maximum. The design says as much in §6.2 --
+"if the control plane still sums each request's maximum, even a node that supports elasticity
+cannot admit more" -- and the measurement says the same about placement.
+
+## 4. Limits of these results
 
 - **The pool serves one image, and this workload uses one image per task.** The mini_swe
   rollout resolves a per-problem base image (`psrl/swebench-harness:<digest>` of that
@@ -102,6 +133,15 @@ The measurements also found three defects that no unit test covered:
   reservation-based, so concurrency is still bounded by the declared envelope.
 - **Only the docker backend on this host was measured**, and only cgroup v1 with the
   cgroupfs driver. The v2 path is covered by unit tests, not by a deployment.
+- **cgroup v1 has no `memory.high`.** `memory.soft_limit_in_bytes` is a hint the kernel consults
+  only when the whole host is under pressure, so the release mechanism here is a hard-limit
+  write: it reclaims clean pages and throttles the sandbox by making it wait for reclaim, rather
+  than by applying the soft throttle `memory.high` gives on v2. The controller's policy is
+  written against the limit for that reason; a v2 host should write `memory.high` and keep the
+  limit as the hard bound.
+- **The release path is verified at test scale, not at workload scale.** Filling a 1.65 TB
+  subtree needs a workload this deployment does not run, so the shrink is proven by the
+  integration test above rather than by a training run.
 - The RL-level metrics the design asks for -- successful rollouts/s, complete groups/s,
   resident byte-seconds during model waits -- are not measured here. They need an A/B of
   full training steps, not these microbenchmarks.

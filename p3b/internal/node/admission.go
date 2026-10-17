@@ -225,6 +225,12 @@ type Admission struct {
 	owners   map[string]time.Time
 	freeGPUs []int32
 	pressure Pressure
+	// observed is what the measured domain is actually using, and observedValid says
+	// whether that reading can be trusted. The ledger charges reservations, which are an
+	// estimate; when the estimate is low the measurement is the truth, so headroom is
+	// computed against whichever is larger.
+	observed      Resources
+	observedValid bool
 	// pool is the memory held by warm-pool entries that no caller has claimed yet.
 	// It is not a class: an entry exists before any episode does, so charging it to
 	// a class would let prefetching starve the work it exists to accelerate. It is
@@ -268,6 +274,34 @@ func (a *Admission) SetClock(now func() time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.now = now
+}
+
+// SetObserved records what the measured domain is actually using.
+//
+// It is a floor on the charge, not a replacement for it: reservations say what the node
+// has promised, and a promise the measurement has already exceeded is no longer the bound
+// that matters. An invalid reading leaves the ledger on its reservations, which is the
+// conservative direction -- it cannot make the node admit more.
+func (a *Admission) SetObserved(used Resources, valid bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.observed = used
+	a.observedValid = valid
+}
+
+// Adjust changes a class's charge by a delta.
+//
+// It is how a reservation follows reality: a sandbox that turns out to need more raises
+// its class's charge, and one that goes quiet lowers it. The class is the unit because
+// the ledger holds aggregates and no per-grant table, which is what keeps one fact in one
+// place.
+func (a *Admission) Adjust(class string, delta Resources) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.used[class] = a.used[class].Add(delta)
+	if a.used[class].MemoryMB < 0 || a.used[class].CPUMillis < 0 || a.used[class].DiskMB < 0 {
+		a.used[class] = Resources{}
+	}
 }
 
 // SetPressure records what the node measures about itself.
@@ -518,7 +552,13 @@ func (a *Admission) Headroom(class string) Resources {
 
 func (a *Admission) headroomLocked(class string) Resources {
 	effective := a.effectiveEnvelopeLocked()
-	free := effective.Sub(a.totalUsedLocked()).Sub(a.pool).Sub(a.reservedForOthersLocked(class))
+	// The charge is the larger of what was promised and what is measured: reservations
+	// that the measurement has outgrown are no longer what bounds the node.
+	bound := a.totalUsedLocked()
+	if a.observedValid && a.observed.MemoryMB > bound.MemoryMB {
+		bound.MemoryMB = a.observed.MemoryMB
+	}
+	free := effective.Sub(bound).Sub(a.pool).Sub(a.reservedForOthersLocked(class))
 	share, declared := a.cfg.Classes[class]
 	if !declared || share.Max == 0 {
 		return free
@@ -700,6 +740,11 @@ type Report struct {
 	// is admitting at its declared envelope, either because overcommit is off or
 	// because measurement has withdrawn all of it.
 	Overcommit float64
+	// Observed is what the measured domain is using, and ObservedValid says whether the
+	// reading can be trusted. A report that omitted them would hide the number admission
+	// is bounded by when it exceeds the reservations.
+	Observed      Resources
+	ObservedValid bool
 	// Pooled is the memory held by warm-pool entries that no caller has claimed.
 	// It is inside Granted's envelope but outside every class's charge, which is
 	// why a report that omitted it would show headroom the node does not have.
@@ -733,6 +778,8 @@ func (a *Admission) Snapshot() Report {
 		Overcommit:        overcommit,
 		ClassHeadroom:     headroom,
 		Granted:           a.totalUsedLocked(),
+		Observed:          a.observed,
+		ObservedValid:     a.observedValid,
 		Pooled:            a.pool,
 		FreeGPUs:          len(a.freeGPUs),
 		Draining:          a.draining,

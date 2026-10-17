@@ -15,11 +15,14 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"sort"
 	"strconv"
@@ -64,6 +67,15 @@ type Config struct {
 	OwnerID    string
 	// Runtime selects a stronger isolation boundary when the node provides one.
 	Runtime string
+	// CgroupParent is the cgroup subtree every sandbox is created in, relative to the
+	// daemon's own cgroup root. It is what makes the measured memory domain describe
+	// sandboxes rather than everything the daemon's host happens to be doing, so an
+	// empty value means the sampler has nothing narrower than the root to read.
+	//
+	// The cgroupfs driver places a container at <parent>/<id>; the systemd driver
+	// treats the value as a slice name instead, which is why preflight refuses a
+	// daemon that would interpret it differently.
+	CgroupParent string
 	// NetworkMode is the Docker network mode for new containers.
 	// "host" removes per-container veth/netns creation and iptables rule churn,
 	// which are the primary kernel-lock bottlenecks under concurrent creates.
@@ -249,11 +261,8 @@ func (b *Backend) Create(ctx context.Context, nodeID string, spec backend.Spec, 
 		}
 	}
 	body := b.createBody(spec, nodeID)
-	var created struct {
-		ID       string   `json:"Id"`
-		Warnings []string `json:"Warnings"`
-	}
-	if err := b.call(ctx, http.MethodPost, "/containers/create", body, &created); err != nil {
+	created, err := b.createNamed(ctx, body)
+	if err != nil {
 		return backend.Created{}, fmt.Errorf("docker create: %w", err)
 	}
 	if err := b.call(ctx, http.MethodPost, "/containers/"+created.ID+"/start", nil, nil); err != nil {
@@ -272,6 +281,61 @@ func (b *Backend) Create(ctx context.Context, nodeID string, spec backend.Spec, 
 		// for it. Every provider backend reports a real address here instead.
 		Agent: backend.AgentEndpoint{Address: ""},
 	}, nil
+}
+
+// The prefixes every container this service creates carries.
+//
+// A warm-pool entry has to be distinguishable from a claimed sandbox, and the marker
+// has to be changeable when the entry is adopted: the label set is written at create
+// and immutable afterwards, so a label that said "inventory" would still say it about a
+// live sandbox. That is the state that made a restarting node refuse to serve, and the
+// state that would make it destroy a live sandbox if only the refusal were removed. A
+// name is the one attribute the daemon lets us change after creation, so inventory is
+// marked here and cleared by a rename at claim.
+const (
+	warmNamePrefix    = "psrl-warm-"
+	sandboxNamePrefix = "psrl-sbx-"
+)
+
+// createdContainer is the reply to a create.
+type createdContainer struct {
+	ID       string   `json:"Id"`
+	Warnings []string `json:"Warnings"`
+}
+
+// newContainerName returns a prefixed name with a random suffix.
+func newContainerName(prefix string) string {
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		// crypto/rand does not fail on Linux in practice. A timestamp keeps the
+		// function total, and a duplicate is retried by the caller as a conflict.
+		return prefix + strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return prefix + hex.EncodeToString(suffix[:])
+}
+
+// createNamed creates a container under a name this service chose.
+//
+// The name is not cosmetic: it is how pool inventory is told from a claimed sandbox,
+// and how an operator finds the container behind a sandbox id. A conflict means the
+// random suffix collided, which is cheap to retry and must not surface as a create
+// failure.
+func (b *Backend) createNamed(ctx context.Context, body map[string]any) (createdContainer, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		var created createdContainer
+		err := b.call(ctx, http.MethodPost,
+			"/containers/create?name="+url.QueryEscape(newContainerName(sandboxNamePrefix)), body, &created)
+		if err == nil {
+			return created, nil
+		}
+		lastErr = err
+		var apiErr *apiError
+		if !asAPIError(err, &apiErr) || apiErr.status != http.StatusConflict {
+			return createdContainer{}, err
+		}
+	}
+	return createdContainer{}, lastErr
 }
 
 func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
@@ -324,6 +388,9 @@ func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
 	}
 	if b.cfg.Runtime != "" {
 		hostConfig["Runtime"] = b.cfg.Runtime
+	}
+	if b.cfg.CgroupParent != "" {
+		hostConfig["CgroupParent"] = b.cfg.CgroupParent
 	}
 	if len(spec.AssignedGPUs) > 0 {
 		hostConfig["DeviceRequests"] = []map[string]any{{
@@ -924,14 +991,6 @@ func parseDeviceList(value string) []int32 {
 	return out
 }
 
-// Preflight refuses a node whose daemon this service cannot drive.
-//
-// Every check here is something that would otherwise fail inside an episode,
-// where it costs a sample and reads as a flaky rollout rather than as the
-// configuration error it is. The pinned API version is compared against what
-// the daemon will actually serve, and a configured runtime has to exist: both
-// are declared as capabilities, and a capability the node cannot honour is
-// worse than one it never claimed.
 // Start begins the warm pool's refill and sweep loops.
 //
 // It is separate from New because the pool creates containers, and construction
@@ -954,6 +1013,14 @@ func (b *Backend) WarmPool() WarmPoolReport {
 	return b.pool.Snapshot()
 }
 
+// Preflight refuses a node whose daemon this service cannot drive.
+//
+// Every check here is something that would otherwise fail inside an episode,
+// where it costs a sample and reads as a flaky rollout rather than as the
+// configuration error it is. The pinned API version is compared against what
+// the daemon will actually serve, and a configured runtime has to exist: both
+// are declared as capabilities, and a capability the node cannot honour is
+// worse than one it never claimed.
 func (b *Backend) Preflight(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
@@ -985,7 +1052,37 @@ func (b *Backend) Preflight(ctx context.Context) error {
 				"upgrade the daemon or set backends[].api_version to %s",
 			b.cfg.Socket, version.APIVersion, b.cfg.APIVersion, version.APIVersion)
 	}
+	if err := b.preflightCgroupDriver(ctx); err != nil {
+		return err
+	}
 	return b.preflightRuntime(ctx)
+}
+
+// preflightCgroupDriver refuses a daemon that would not put a container in the
+// configured subtree.
+//
+// Only the cgroupfs driver treats CgroupParent as a path. The systemd driver reads it as
+// a slice name, so the same configuration would place containers somewhere else and the
+// sampler would measure a domain they are not in -- a failure that otherwise shows up as
+// a ceiling that never moves.
+func (b *Backend) preflightCgroupDriver(ctx context.Context) error {
+	if b.cfg.CgroupParent == "" {
+		return nil
+	}
+	var info struct {
+		CgroupDriver string `json:"CgroupDriver"`
+	}
+	if err := b.call(ctx, http.MethodGet, "/info", nil, &info); err != nil {
+		return fmt.Errorf("docker daemon at %s did not report its cgroup driver: %w", b.cfg.Socket, err)
+	}
+	if info.CgroupDriver != "" && info.CgroupDriver != "cgroupfs" {
+		return fmt.Errorf(
+			"this backend sets cgroup_parent %q but the daemon at %s uses the %q cgroup driver, "+
+				"which reads that value as a slice name rather than a path; containers would not land in "+
+				"the sandbox subtree the sampler measures",
+			b.cfg.CgroupParent, b.cfg.Socket, info.CgroupDriver)
+	}
+	return nil
 }
 
 // preflightRuntime refuses a configured runtime the daemon does not have.

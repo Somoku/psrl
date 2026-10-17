@@ -98,8 +98,8 @@ the mechanism, not of the deployment, so it is a constant rather than a knob.
 |---|---|---|
 | `timing.node_ttl_s` | `120` | silence before a node is drained |
 | `timing.rpc_timeout_s` | `60` | bounds a coordination call, never a command |
-| `fleet.*` | required | the cross-backend ceiling, which no single backend can enforce |
-| `node.*` | required | this machine's envelope |
+| `fleet.*` | required | the cross-backend ceiling, which no single backend can enforce. Memory is the sum of what the nodes will grant: each node's declared envelope times its `overcommit`. Stating the declared envelopes alone caps the fleet below what the machines will admit, and a burst then queues behind the ledger rather than behind the machines |
+| `node.*` | required | this machine's envelope. Memory is what this node lends to the fleet, so keep `memory_mb × overcommit` at or below the host's memory: that keeps the configured density inside the machine, and leaves the measured ceiling below a second line rather than the only one |
 | `node.local_*_ceiling` | `0` (off) | measured pressure above which the node refuses regardless of its envelope |
 | `classes.*.guaranteed_share` | — | must sum below one, or a guarantee is unsatisfiable |
 | `classes.*.max_share` | unset | a ceiling, even on an idle fleet |
@@ -216,9 +216,12 @@ it retries.
 - **A node refusal is not a failure.** The control plane asks placement for
   another node. A fleet with one node turns the refusal into an error, which is
   why a single-node deployment reads `node_pressure` as a hard stop.
-- **`fleet.memory_mb` is not the sum of your nodes.** It is what the service may
-  admit in total. Setting it above the nodes' real capacity moves the refusal
-  from the ledger to the node, where it costs a round trip first.
+- **`fleet.memory_mb` is what the service may admit in total, not the sum of
+  your nodes' declared envelopes.** State the sum of what the nodes *will
+  grant* — each node's declared envelope times its `overcommit` — or the ledger
+  caps the fleet below what the machines would take and a burst queues behind
+  the ledger instead of behind the machines. Setting it above that moves the
+  refusal from the ledger to the node, where it costs a round trip first.
 - **Guarantees that sum to one leave no elastic pool.** A class can then never
   borrow, so an idle fleet still refuses a burst. Keep the sum below one.
 - **A stale socket blocks startup.** The service removes its own socket at

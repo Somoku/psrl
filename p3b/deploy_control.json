@@ -8,7 +8,7 @@
     "rpc_timeout_s": 60
   },
   "fleet": {
-    "memory_mb": 1920000,
+    "memory_mb": 2880000,
     "cpu_millis": 360000,
     "disk_mb": 8000000
   },
@@ -26,7 +26,7 @@
       "mode": "direct",
       "socket": "/var/run/docker.sock",
       "api_version": "v1.40",
-      "max_create_concurrency": 16
+      "max_create_concurrency": 64
     }
   ],
   "fleet_nodes": [

@@ -67,6 +67,18 @@ type Config struct {
 		RPCTimeoutS float64 `json:"rpc_timeout_s"`
 	} `json:"timing"`
 
+	// Fleet is the ceiling the cross-backend ledger admits against: the sum of
+	// what the nodes in FleetNodes will grant, which is each node's declared
+	// envelope times its overcommit. Stating the nodes' declared envelopes alone
+	// understates it by the overcommit factor, and then the ledger rather than
+	// the machines is what a burst queues behind.
+	//
+	// Over-declaring is not a way to raise the fleet's real capacity: a node
+	// still refuses once its measured pressure crosses its ceiling, so the cost
+	// of a total above what the nodes will grant is a round trip, not an OOM.
+	// It is declared rather than derived from the nodes' reports because a
+	// control plane that starts empty must admit against a fleet it cannot yet
+	// see.
 	Fleet struct {
 		MemoryMB  int64 `json:"memory_mb"`
 		CPUMillis int64 `json:"cpu_millis"`

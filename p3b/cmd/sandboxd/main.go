@@ -403,6 +403,11 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	if err != nil {
 		return err
 	}
+	// Seed the gate with the sampler's first reading. Nothing else touches it until the
+	// first admit or the first report, and until then an unseeded gate is an "unusable
+	// sample": admission would refuse the node's first sandbox, and the warm pool would
+	// spend its first refill doing nothing.
+	gate.SetPressure(pressureFn())
 	life, err := node.NewLifecycle(cfg.NodeID, gate, timing.SweepInterval)
 	if err != nil {
 		return err
@@ -565,6 +570,7 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		if err != nil {
 			return err
 		}
+		gate.SetPressure(pressureFn())
 		life, err = node.NewLifecycle(cfg.NodeID, gate, timing.SweepInterval)
 		if err != nil {
 			return err
@@ -758,6 +764,12 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 				},
 			}, mode)
 		case "docker":
+			if declared.WarmPool.Size > 0 {
+				log.Info("warm pool declared",
+					"backend", "docker", "size", declared.WarmPool.Size,
+					"image", declared.WarmPool.Image, "class", declared.WarmPool.ResourceClass,
+					"memory_mb", declared.WarmPool.MemoryMB, "entry_ttl_s", declared.WarmPool.EntryTTLS)
+			}
 			b, err = dockerbackend.New(dockerbackend.Config{
 				Socket:               declared.Socket,
 				APIVersion:           declared.APIVersion,

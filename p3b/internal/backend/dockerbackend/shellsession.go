@@ -72,7 +72,7 @@ const (
 // The Backend owns one of these; it is created alongside the Backend and
 // never replaced.
 type shellSessions struct {
-	mu      sync.Mutex
+	mu       sync.Mutex
 	sessions map[string]*shellSession
 }
 

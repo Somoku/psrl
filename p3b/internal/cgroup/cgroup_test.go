@@ -285,25 +285,23 @@ func TestSetupCreatesTheSubtreeAndWritesItsLimits(t *testing.T) {
 	}
 }
 
-// TestTheMemswLimitIsWrittenBeforeTheMemoryLimit proves the order the kernel
-// requires: memory.limit_in_bytes cannot be raised above memory.memsw.limit_in_bytes,
-// so a subtree written memory-first fails on a swap-accounted v1 host. Both files are
-// made unwritable, so the error names whichever was attempted first.
-func TestTheMemswLimitIsWrittenBeforeTheMemoryLimit(t *testing.T) {
+// TestTheMemswLimitFollowsTheMemoryLimit pins the pair at the same bound. The order the
+// kernel requires cannot be asserted on plain files; the live test does that against a
+// real cgroup, where the wrong order returns EINVAL.
+func TestTheMemswLimitFollowsTheMemoryLimit(t *testing.T) {
 	domain, dirs := newFakeV1(t)
 	subtree := filepath.Join(dirs.memory, SandboxParent)
-	for _, name := range []string{"memory.memsw.limit_in_bytes", "memory.limit_in_bytes"} {
-		if err := os.MkdirAll(filepath.Join(subtree, name), 0o755); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.MkdirAll(subtree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, subtree, "memory.memsw.limit_in_bytes", "9223372036854771712\n")
+
+	if _, err := domain.Setup(SandboxParent, HostLeaf, request()); err != nil {
+		t.Fatalf("Setup: %v", err)
 	}
 
-	_, err := domain.Setup(SandboxParent, HostLeaf, request())
-	if err == nil {
-		t.Fatal("a hierarchy that refuses both writes must fail setup")
-	}
-	if !strings.Contains(err.Error(), "memory.memsw.limit_in_bytes") {
-		t.Errorf("memsw must be written first, got %v", err)
+	if got, want := readFile(t, subtree, "memory.memsw.limit_in_bytes"), "1572864000"; got != want {
+		t.Errorf("memsw: got %s, want %s (equal to the memory limit)", got, want)
 	}
 }
 

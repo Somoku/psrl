@@ -435,30 +435,37 @@ func ensureHierarchicalAccounting(root string) error {
 
 // writeMemoryLimits writes the subtree's memory bound.
 //
-// memsw is written first: on a v1 kernel with swap accounting, memory.limit_in_bytes
-// cannot be set above memory.memsw.limit_in_bytes, so writing memory first fails with
-// EINVAL on a subtree whose memsw is still at the parent's value.
+// On a v1 host with swap accounting the kernel requires
+// memory.limit_in_bytes <= memory.memsw.limit_in_bytes. A fresh cgroup is unlimited in
+// both, so the pair moves in the order that keeps the invariant at every step: memsw is
+// raised first if it is somehow below the target, memory is set, and memsw is then
+// brought down to match. Writing memsw down first fails with EINVAL, which is how this
+// was found.
 func writeMemoryLimits(dir string, bytes int64) error {
 	memsw := filepath.Join(dir, "memory.memsw.limit_in_bytes")
-	if _, err := os.Stat(memsw); err == nil {
-		if err := writeInt(memsw, bytes); err != nil {
-			return fmt.Errorf("cgroup: writing %s: %w", memsw, err)
+	hasMemsw := readable(memsw)
+	if hasMemsw {
+		if current, err := readIntFile(memsw); err == nil && current >= 0 && current < bytes {
+			if err := writeInt(memsw, bytes); err != nil {
+				return fmt.Errorf("cgroup: raising %s: %w", memsw, err)
+			}
 		}
 	}
 	limit := filepath.Join(dir, "memory.limit_in_bytes")
 	if err := writeInt(limit, bytes); err != nil {
 		return fmt.Errorf("cgroup: writing %s: %w", limit, err)
 	}
-	read, err := os.ReadFile(limit)
+	got, err := readIntFile(limit)
 	if err != nil {
 		return fmt.Errorf("cgroup: re-reading %s: %w", limit, err)
 	}
-	got, convErr := strconv.ParseInt(strings.TrimSpace(string(read)), 10, 64)
-	if convErr != nil {
-		return fmt.Errorf("cgroup: parsing %s: %w", limit, convErr)
-	}
 	if got != bytes {
 		return fmt.Errorf("cgroup: %s reports %d after writing %d", limit, got, bytes)
+	}
+	if hasMemsw {
+		if err := writeInt(memsw, bytes); err != nil {
+			return fmt.Errorf("cgroup: writing %s: %w", memsw, err)
+		}
 	}
 	return nil
 }
@@ -596,6 +603,25 @@ func readIntOrZero(path string) int64 {
 		return 0
 	}
 	return value
+}
+
+// readable reports whether a file can be opened.
+func readable(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	_ = file.Close()
+	return true
+}
+
+// readIntFile reads one integer from a one-value file.
+func readIntFile(path string) (int64, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
 }
 
 func writeInt(path string, value int64) error {

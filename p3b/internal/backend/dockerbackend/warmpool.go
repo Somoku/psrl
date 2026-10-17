@@ -26,6 +26,7 @@ package dockerbackend
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -386,6 +387,12 @@ func (p *warmPool) refill(ctx context.Context) {
 			p.mu.Lock()
 			p.failures++
 			p.mu.Unlock()
+			// Reported rather than swallowed: a pool that cannot build its entries is
+			// invisible from the outside -- it simply never serves a claim -- and the
+			// only symptom is a hit ratio of zero in a metric nobody had a reason to
+			// look at yet.
+			slog.Warn("warm pool could not build an entry; retrying on the next refill",
+				"backend", "docker", "image", spec.Source.Reference, "error", err)
 			// One failure stops this pass rather than retrying in a loop: a daemon
 			// that refused one create will refuse the next, and the next pass is
 			// the right place to try again.
@@ -640,7 +647,11 @@ func (b *Backend) verifyClaim(reply inspection, spec backend.Spec) error {
 	if reply.Config.Image != spec.Source.Reference {
 		return fmt.Errorf("image is %q, want %q", reply.Config.Image, spec.Source.Reference)
 	}
-	if reply.Config.WorkingDir != spec.Workdir {
+	// An empty request means "the image's default", and the inspect reports the resolved
+	// directory rather than the empty request, so there is nothing to compare it with. The
+	// case that would matter -- a template that states a directory and a caller that does
+	// not -- is already refused by matching, and a stated directory is verified here.
+	if spec.Workdir != "" && reply.Config.WorkingDir != spec.Workdir {
 		return fmt.Errorf("workdir is %q, want %q", reply.Config.WorkingDir, spec.Workdir)
 	}
 	// Env is a subset check rather than equality: the image's own ENV is merged into

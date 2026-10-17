@@ -59,6 +59,13 @@ type source interface {
 	memoryLimit() (int64, error)
 	// describe names the version and path, for the log line that says which is in use.
 	describe() string
+	// effectiveCores is the capacity a CPU fraction is relative to.
+	//
+	// It is the domain's own quota when it has one, because the ceilings these
+	// fractions feed are about what this node promised to run: a subtree quota'd to
+	// 180 cores on a 384-core machine is at 100% when it uses all 180, not at 47%.
+	// A domain without a quota falls back to its CPU set and then to the machine.
+	effectiveCores() (float64, error)
 }
 
 // Reader samples one cgroup subtree.
@@ -101,6 +108,93 @@ func NewReader() (*Reader, error) {
 		v2Err, v1Err)
 }
 
+// NewDomainReader returns a reader for a named subtree of this process's cgroup root.
+//
+// Unlike NewReader it does not fall back to the root after joining the subtree. A
+// configured domain that does not exist is a configuration error, because the root is
+// the over-broad domain this function exists to stop reading: measured on one of these
+// nodes, the root held 1100 GiB of which the containers were 109 GiB, so a ceiling
+// applied to it was mostly about memory no sandbox had touched.
+func NewDomainReader(subtree string) (*Reader, error) {
+	if subtree == "" {
+		return nil, fmt.Errorf("pressure: a domain reader needs a subtree name")
+	}
+	v2, v2Err := newV2DomainSource(subtree)
+	if v2Err == nil {
+		reader, err := newReaderFrom(v2)
+		if err == nil {
+			return reader, nil
+		}
+		v2Err = err
+	}
+	v1, v1Err := newV1DomainSource(subtree)
+	if v1Err != nil {
+		return nil, fmt.Errorf(
+			"pressure: the domain %q is not readable (v2: %v; v1: %v)", subtree, v2Err, v1Err)
+	}
+	return newReaderFrom(v1)
+}
+
+// newV2DomainSource resolves a subtree under the unified hierarchy.
+func newV2DomainSource(subtree string) (*v2Source, error) {
+	root, err := v2Dir()
+	if err != nil {
+		return nil, err
+	}
+	return v2Domain(root, subtree)
+}
+
+// v2Domain joins a subtree under a given root, without ever falling back to it.
+func v2Domain(root, subtree string) (*v2Source, error) {
+	dir := filepath.Join(root, subtree)
+	if !fileReadable(filepath.Join(dir, "cpu.stat")) || !fileReadable(filepath.Join(dir, "memory.current")) {
+		return nil, fmt.Errorf("%s is not a readable cgroup v2 subtree under %s", subtree, root)
+	}
+	return &v2Source{dir: dir}, nil
+}
+
+// newV1DomainSource resolves a subtree in each controller's separate hierarchy.
+func newV1DomainSource(subtree string) (*v1Source, error) {
+	cpuRoot, err := v1ControllerDir(
+		[]string{"cpuacct", "cpu,cpuacct", "cpu"},
+		[]string{"cpu,cpuacct", "cpuacct"},
+		"cpuacct.usage",
+	)
+	if err != nil {
+		return nil, err
+	}
+	memoryRoot, err := v1ControllerDir([]string{"memory"}, []string{"memory"}, "memory.usage_in_bytes")
+	if err != nil {
+		return nil, err
+	}
+	cpusetRoot := ""
+	if root, cpusetErr := v1ControllerDir([]string{"cpuset"}, []string{"cpuset"}, "cpuset.cpus"); cpusetErr == nil {
+		cpusetRoot = root
+	}
+	return v1Domain(cpuRoot, memoryRoot, cpusetRoot, subtree)
+}
+
+// v1Domain joins a subtree under resolved controller roots, without ever falling
+// back to a root: a domain that does not exist is a configuration error.
+func v1Domain(cpuRoot, memoryRoot, cpusetRoot, subtree string) (*v1Source, error) {
+	cpuDir := filepath.Join(cpuRoot, subtree)
+	memoryDir := filepath.Join(memoryRoot, subtree)
+	if !fileReadable(filepath.Join(cpuDir, "cpuacct.usage")) {
+		return nil, fmt.Errorf("%s has no cpuacct.usage for the domain %q", cpuRoot, subtree)
+	}
+	if !fileReadable(filepath.Join(memoryDir, "memory.usage_in_bytes")) {
+		return nil, fmt.Errorf("%s has no memory.usage_in_bytes for the domain %q", memoryRoot, subtree)
+	}
+	cpusetDir := ""
+	if cpusetRoot != "" {
+		candidate := filepath.Join(cpusetRoot, subtree)
+		if fileReadable(filepath.Join(candidate, "cpuset.cpus")) {
+			cpusetDir = candidate
+		}
+	}
+	return &v1Source{cpuDir: cpuDir, memoryDir: memoryDir, cpusetDir: cpusetDir}, nil
+}
+
 // Describe names the hierarchy this reader is using, so a deployment can confirm
 // which one was detected rather than inferring it from behaviour.
 func (r *Reader) Describe() string { return r.src.describe() }
@@ -139,9 +233,12 @@ func newReaderFrom(src source) (*Reader, error) {
 	if _, err := src.cpuUsage(); err != nil {
 		return nil, fmt.Errorf("pressure: %s has no readable cpu counter: %w", src.describe(), err)
 	}
-	cores := float64(hostCores())
+	cores, err := src.effectiveCores()
+	if err != nil || cores <= 0 {
+		cores = float64(hostCores())
+	}
 	if cores <= 0 {
-		return nil, fmt.Errorf("pressure: the machine reports no usable cores")
+		return nil, fmt.Errorf("pressure: the measured domain and the machine report no usable cores")
 	}
 	return &Reader{src: src, limit: limit, cores: cores}, nil
 }
@@ -153,14 +250,21 @@ func newReaderFrom(src source) (*Reader, error) {
 // deliberately not an estimate -- a fabricated first sample would be read by
 // admission as a real measurement and could refuse the node's first request.
 func (r *Reader) Read() node.Pressure {
-	var out node.Pressure
+	// A sample carries when it was taken and whether it can be trusted. A caller
+	// that cannot tell "idle" from "unreadable" decides the same way for both, and
+	// for a pressure ceiling that means admitting into a machine nobody can see.
+	out := node.Pressure{SampledAt: time.Now(), Valid: true}
 
-	if used, err := r.src.memoryUsage(); err == nil {
-		out.MemUsedPct = fraction(float64(used), float64(r.limit))
+	used, err := r.src.memoryUsage()
+	if err != nil {
+		out.Valid = false
+		return out
 	}
+	out.MemUsedPct = fraction(float64(used), float64(r.limit))
 
 	total, err := r.src.cpuUsage()
 	if err != nil {
+		out.Valid = false
 		return out
 	}
 	now := time.Now()
@@ -229,6 +333,17 @@ func newV2Source() (*v2Source, error) {
 
 func (s *v2Source) describe() string { return "cgroup v2 at " + s.dir }
 
+// effectiveCores is the quota, then the CPU set, then the machine.
+func (s *v2Source) effectiveCores() (float64, error) {
+	if cores, ok := quotaCoresV2(s.dir); ok {
+		return cores, nil
+	}
+	if cores, ok := cpusetCores(s.dir, "cpuset.cpus.effective", "cpuset.cpus"); ok {
+		return cores, nil
+	}
+	return float64(hostCores()), nil
+}
+
 // cpuUsage reads cpu.stat, whose usage_usec is the only cumulative field a rate
 // can be taken from.
 func (s *v2Source) cpuUsage() (time.Duration, error) {
@@ -293,6 +408,10 @@ func v2Dir() (string, error) {
 type v1Source struct {
 	cpuDir    string
 	memoryDir string
+	// cpusetDir is where this domain's CPU set lives, when the host mounts one.
+	// Only consulted when the domain carries no quota, and empty when the host has
+	// no cpuset mount.
+	cpusetDir string
 }
 
 func newV1Source() (*v1Source, error) {
@@ -314,7 +433,24 @@ func newV1Source() (*v1Source, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &v1Source{cpuDir: cpuDir, memoryDir: memoryDir}, nil
+	// The CPU set is optional: a host without a cpuset mount has no set to read, and
+	// the quota or the machine's count then answers the same question.
+	cpusetDir, cpusetErr := v1ControllerDir([]string{"cpuset"}, []string{"cpuset"}, "cpuset.cpus")
+	if cpusetErr != nil {
+		cpusetDir = ""
+	}
+	return &v1Source{cpuDir: cpuDir, memoryDir: memoryDir, cpusetDir: cpusetDir}, nil
+}
+
+// effectiveCores is the quota, then the CPU set, then the machine.
+func (s *v1Source) effectiveCores() (float64, error) {
+	if cores, ok := quotaCores(s.cpuDir); ok {
+		return cores, nil
+	}
+	if cores, ok := cpusetCores(s.cpusetDir, "cpuset.effective_cpus", "cpuset.cpus"); ok {
+		return cores, nil
+	}
+	return float64(hostCores()), nil
 }
 
 func (s *v1Source) describe() string {

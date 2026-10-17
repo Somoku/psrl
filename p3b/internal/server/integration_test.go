@@ -262,7 +262,9 @@ func TestANodeUnderPressureSendsTheRequestElsewhere(t *testing.T) {
 	// The node keeps the last word: placement compares a headroom reported
 	// seconds ago, and the machine knows its pressure now.
 	s := newStack(t, 4096)
-	s.node.pressure = func() node.Pressure { return node.Pressure{MemUsedPct: 0.99} }
+	s.node.pressure = func() node.Pressure {
+		return node.Pressure{MemUsedPct: 0.99, SampledAt: time.Now(), Valid: true}
+	}
 	s.node.admission = mustPressureGate(t)
 
 	_, err := s.control.Create(context.Background(), &v1.CreateRequest{Spec: createSpec(64)})
@@ -538,5 +540,23 @@ func TestExecOnAReleasedSandboxIsReportedAsALostSession(t *testing.T) {
 	} else if reported.ExitReason != string(node.ExitReleased) {
 		t.Fatalf("the attribution is %q, want %q so a post mortem reads why it went",
 			reported.ExitReason, node.ExitReleased)
+	}
+}
+
+func TestTheReportSamplesPressureOnce(t *testing.T) {
+	// A report is not a measurement. Calling the sampler twice per report made the
+	// CPU figure a rate over the microseconds between two calls inside one RPC, which
+	// is noise, and it disagreed with the sample admission had just stored.
+	s := newStack(t, 4096)
+	calls := 0
+	s.node.pressure = func() node.Pressure {
+		calls++
+		return node.Pressure{MemUsedPct: 0.1, SampledAt: time.Now(), Valid: true}
+	}
+
+	s.node.View()
+
+	if calls != 1 {
+		t.Errorf("a report sampled pressure %d times, want 1", calls)
 	}
 }

@@ -82,9 +82,21 @@ type ClassShare struct {
 //
 // This is the input placement cannot have: a reported headroom is seconds old,
 // and a node under memory pressure has to refuse before it starts swapping.
+//
+// Valid and SampledAt exist because "zero pressure" and "no reading" are different
+// states and must not decide the same way. A reader whose cgroup files vanished, or a
+// sampler that stopped, used to look exactly like an idle machine, so the ceilings it
+// feeds were silently unenforced. An invalid sample now refuses when a measured
+// ceiling is configured, and withdraws overcommit otherwise: the conservative answer
+// is not to guess in the permissive direction.
 type Pressure struct {
 	CPUUsedPct float64
 	MemUsedPct float64
+	// SampledAt is when the reading was taken. Zero means never.
+	SampledAt time.Time
+	// Valid is false when the files could not be read or the sample is too old to
+	// describe the machine now.
+	Valid bool
 }
 
 // Config is the node's envelope and the limits it enforces locally.
@@ -211,6 +223,12 @@ type Admission struct {
 	owners   map[string]time.Time
 	freeGPUs []int32
 	pressure Pressure
+	// pool is the memory held by warm-pool entries that no caller has claimed yet.
+	// It is not a class: an entry exists before any episode does, so charging it to
+	// a class would let prefetching starve the work it exists to accelerate. It is
+	// subtracted from every class's headroom instead, because it is real memory the
+	// node cannot also promise to a caller.
+	pool Resources
 	// draining reports that a container could not be destroyed and is still
 	// charged. It is a condition for an operator to read, not a gate: the charge
 	// already keeps its memory out of headroom.
@@ -255,6 +273,53 @@ func (a *Admission) SetPressure(p Pressure) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pressure = p
+}
+
+// MemoryPressure reports the measured memory fraction and whether it is usable.
+//
+// A warm pool asks this before creating another entry: prefetching is an
+// optimization, and one that keeps building containers into a node already at its
+// measured ceiling is an optimization that causes the failures it exists to avoid.
+func (a *Admission) MemoryPressure() (float64, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.pressure.MemUsedPct, a.pressure.Valid
+}
+
+// AcquirePool reserves one warm-pool entry's footprint.
+//
+// It is checked against the *declared* envelope rather than the overcommitted one: an
+// entry is memory that exists before any caller is charged, so measurement must not
+// expand what the pool may hold. Overcommit is about reservations overstating use;
+// a pool entry has no use to overstate.
+func (a *Admission) AcquirePool(want Resources) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	free := a.cfg.Envelope.Sub(a.totalUsedLocked()).Sub(a.pool)
+	if !want.FitsIn(free) {
+		return false
+	}
+	a.pool = a.pool.Add(want)
+	return true
+}
+
+// ReleasePool returns a pool entry's footprint once it is claimed or destroyed.
+func (a *Admission) ReleasePool(want Resources) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pool = a.pool.Sub(want)
+	if a.pool.MemoryMB < 0 || a.pool.CPUMillis < 0 || a.pool.DiskMB < 0 {
+		// A release without a matching acquire would let the node promise the same
+		// memory twice, so it is corrected rather than carried.
+		a.pool = Resources{}
+	}
+}
+
+// Pooled reports what the warm pool currently holds.
+func (a *Admission) Pooled() Resources {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.pool
 }
 
 // SetDraining marks the node as refusing work because it holds containers it
@@ -308,6 +373,15 @@ func (a *Admission) Reserve(class, owner string, want Resources) (Grant, Refusal
 
 	// Measured pressure first: the envelope is an accounting of reservations, and
 	// a machine already swapping must refuse even when its accounting says yes.
+	//
+	// An unusable sample refuses here too, when a ceiling is configured. The
+	// alternative is what this used to do -- read zero and admit -- so a node whose
+	// cgroup files vanished would accept work until the host filled, which is the
+	// one direction a pressure check must never fail in.
+	if measured := a.cfg.LocalCPUCeiling > 0 || a.cfg.LocalMemCeiling > 0; measured && !a.pressure.Valid {
+		a.refuse(RefusedPressure)
+		return Grant{}, RefusedPressure, false
+	}
 	if a.cfg.LocalCPUCeiling > 0 && a.pressure.CPUUsedPct > a.cfg.LocalCPUCeiling {
 		a.refuse(RefusedPressure)
 		return Grant{}, RefusedPressure, false
@@ -377,11 +451,11 @@ func (a *Admission) effectiveEnvelopeLocked() Resources {
 	if a.cfg.Overcommit <= 1 || a.cfg.UtilizationTarget <= 0 {
 		return envelope
 	}
-	// A pressure reader that found no cgroup hierarchy reports zero, which must not
-	// read as "idle, expand freely". Treating an absent measurement as full
-	// utilization means a node with no readable cgroup behaves exactly as it did
-	// before overcommit was configured.
-	if a.pressure.MemUsedPct <= 0 {
+	// An unusable sample withdraws the expansion rather than reading as idle: the
+	// node then admits exactly its declared envelope, which is the behaviour it had
+	// before overcommit existed. A *valid* zero is different and is not special-cased
+	// -- it means the measured domain is empty, which is the case the feature is for.
+	if !a.pressure.Valid {
 		return envelope
 	}
 	// headroomFraction is how far below the target measurement sits: 1.0 when the
@@ -425,7 +499,7 @@ func (a *Admission) Headroom(class string) Resources {
 
 func (a *Admission) headroomLocked(class string) Resources {
 	effective := a.effectiveEnvelopeLocked()
-	free := effective.Sub(a.totalUsedLocked()).Sub(a.reservedForOthersLocked(class))
+	free := effective.Sub(a.totalUsedLocked()).Sub(a.pool).Sub(a.reservedForOthersLocked(class))
 	share, declared := a.cfg.Classes[class]
 	if !declared || share.Max == 0 {
 		return free
@@ -607,6 +681,10 @@ type Report struct {
 	// is admitting at its declared envelope, either because overcommit is off or
 	// because measurement has withdrawn all of it.
 	Overcommit float64
+	// Pooled is the memory held by warm-pool entries that no caller has claimed.
+	// It is inside Granted's envelope but outside every class's charge, which is
+	// why a report that omitted it would show headroom the node does not have.
+	Pooled Resources
 }
 
 // Snapshot returns the gate's state. The planes report and never log.
@@ -636,6 +714,7 @@ func (a *Admission) Snapshot() Report {
 		Overcommit:        overcommit,
 		ClassHeadroom:     headroom,
 		Granted:           a.totalUsedLocked(),
+		Pooled:            a.pool,
 		FreeGPUs:          len(a.freeGPUs),
 		Draining:          a.draining,
 		Admitted:          a.admitted,

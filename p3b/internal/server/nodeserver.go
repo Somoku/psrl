@@ -255,10 +255,13 @@ func (n *Node) Report(context.Context, *v1.Empty) (*v1.NodeView, error) {
 }
 
 func (n *Node) view() *v1.NodeView {
-	n.admission.SetPressure(n.pressure())
+	// One sample per report, used for both admission and the wire fields. Calling it
+	// twice made the reported CPU figure a rate over the microseconds between two
+	// RPC-internal calls, which is noise, and it disagreed with what admission stored.
+	pressure := n.pressure()
+	n.admission.SetPressure(pressure)
 	report := n.admission.Snapshot()
 	life := n.lifecycle.Snapshot()
-	pressure := n.pressure()
 	out := &v1.NodeView{
 		NodeId:        n.nodeID,
 		ClassHeadroom: map[string]*v1.Headroom{},

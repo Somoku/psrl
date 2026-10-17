@@ -26,6 +26,11 @@ func mustGate(t *testing.T, cfg Config) *Admission {
 	if err != nil {
 		t.Fatalf("new admission: %v", err)
 	}
+	// A gate in these tests stands for a node whose sampler is running and whose
+	// measured domain is empty. Without a sample every measured ceiling would refuse,
+	// which is the production behaviour for a node that cannot measure itself and not
+	// what these tests are about.
+	gate.SetPressure(Pressure{SampledAt: time.Now(), Valid: true})
 	return gate
 }
 
@@ -64,7 +69,7 @@ func TestMeasuredPressureRefusesEvenWhenTheEnvelopeWouldAllowIt(t *testing.T) {
 	// This is the whole reason the node keeps final authority: placement compares
 	// a headroom reported seconds ago, and a machine already swapping must refuse.
 	gate := mustGate(t, envelope())
-	gate.SetPressure(Pressure{MemUsedPct: 0.97})
+	gate.SetPressure(Pressure{MemUsedPct: 0.97, Valid: true})
 
 	_, refusal, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1})
 
@@ -370,4 +375,99 @@ func BenchmarkAdmitRelease(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestAnInvalidSampleRefusesWhenACeilingIsConfigured(t *testing.T) {
+	// A sampler that stopped, or cgroup files that vanished, is not an idle node.
+	// The gate has no way to tell those apart from measurement, so it refuses.
+	gate := mustGate(t, envelope())
+	gate.SetPressure(Pressure{Valid: false})
+
+	_, refusal, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1})
+
+	if ok {
+		t.Fatal("a node that cannot measure itself must refuse rather than assume it is idle")
+	}
+	if refusal != RefusedPressure {
+		t.Fatalf("refusal is %q, want %q", refusal, RefusedPressure)
+	}
+}
+
+func TestAnInvalidSampleDoesNotRefuseAnUnmeasuredNode(t *testing.T) {
+	// Without a configured ceiling nothing is being measured, so the sample cannot
+	// make the decision: this is a node that admits on its envelope alone.
+	cfg := envelope()
+	cfg.LocalCPUCeiling = 0
+	cfg.LocalMemCeiling = 0
+	gate := mustGate(t, cfg)
+	gate.SetPressure(Pressure{Valid: false})
+
+	if _, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 1}); !ok {
+		t.Fatal("a node with no measured ceiling must admit on its envelope")
+	}
+}
+
+func TestAPoolReservationReducesEveryClassHeadroom(t *testing.T) {
+	// A warm-pool entry is memory the node has already spent, so no class may be
+	// promised it. Charging it to one class would let prefetching starve the work it
+	// exists to accelerate, so it is subtracted from all of them.
+	gate := mustGate(t, envelope())
+	before := gate.Headroom("rollout").MemoryMB
+
+	if !gate.AcquirePool(Resources{MemoryMB: 200}) {
+		t.Fatal("an entry inside the envelope must be acquired")
+	}
+
+	if got := gate.Headroom("rollout").MemoryMB; got != before-200 {
+		t.Errorf("rollout headroom: got %d, want %d", got, before-200)
+	}
+	if got := gate.Headroom("grader").MemoryMB; got != gate.Headroom("rollout").MemoryMB {
+		t.Errorf("every class must lose the same reservation, got rollout=%d grader=%d",
+			gate.Headroom("rollout").MemoryMB, got)
+	}
+	if got := gate.Pooled().MemoryMB; got != 200 {
+		t.Errorf("pooled: got %d, want 200", got)
+	}
+
+	gate.ReleasePool(Resources{MemoryMB: 200})
+	if got := gate.Headroom("rollout").MemoryMB; got != before {
+		t.Errorf("headroom after release: got %d, want the original %d", got, before)
+	}
+	if got := gate.Pooled().MemoryMB; got != 0 {
+		t.Errorf("pooled after release: got %d, want 0", got)
+	}
+}
+
+func TestPoolAcquireUsesTheDeclaredEnvelopeNotTheOvercommittedOne(t *testing.T) {
+	// Overcommit is about reservations overstating use. A pool entry has no use to
+	// overstate: it exists before any caller is charged, so it is bounded by the
+	// envelope the operator declared.
+	cfg := envelope()
+	cfg.Overcommit = 2
+	cfg.UtilizationTarget = 0.75
+	gate := mustGate(t, cfg)
+	gate.SetPressure(Pressure{MemUsedPct: 0.01, Valid: true})
+
+	if gate.Headroom("rollout").MemoryMB <= 1000 {
+		t.Fatalf("the test needs an expanded envelope, got %d", gate.Headroom("rollout").MemoryMB)
+	}
+	if gate.AcquirePool(Resources{MemoryMB: 1200}) {
+		t.Error("a pool entry above the declared envelope must be refused even when overcommit allows it")
+	}
+}
+
+func TestReleasingMorePoolThanWasAcquiredDoesNotCreateHeadroom(t *testing.T) {
+	// A double release would let the node promise the same memory twice, so the
+	// reservation is corrected rather than carried negative.
+	gate := mustGate(t, envelope())
+	before := gate.Headroom("rollout").MemoryMB
+
+	gate.ReleasePool(Resources{MemoryMB: 100})
+
+	if got := gate.Pooled().MemoryMB; got != 0 {
+		t.Errorf("pooled: got %d, want 0", got)
+	}
+	if got := gate.Headroom("rollout").MemoryMB; got != before {
+		t.Errorf("headroom: got %d, want %d", got, before)
+	}
 }

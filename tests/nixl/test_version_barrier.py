@@ -20,7 +20,6 @@ correctness bug rather than a slowdown.
 from __future__ import annotations
 
 import pytest
-
 from psrl.workers.ps.version_barrier import (
     PublishOutcome,
     VersionBarrier,
@@ -323,3 +322,86 @@ class TestTheReaderAnnouncesItsReads:
         start = source.index("await ps_manager_handle.begin_read.remote")
 
         assert "curr_rollout_instance_model_version" in source[max(0, start - 500) : start]
+
+
+class TestInvalidationIsVisibleToReaders:
+    """The set is the only thing that tells a reader its bytes were overwritten.
+
+    An invalidation nobody can read is a note left for nobody: the publish proceeds, the
+    reader's transfer succeeds, and the instance serves a mixture. These pin that the set
+    is reachable, bounded, and reports exactly the versions that expired.
+    """
+
+    def test_a_drained_version_is_not_reported(self):
+        barrier = VersionBarrier(count_readers=lambda _v: 0, budget_ms=1000.0)
+        barrier.publish(7)
+
+        assert barrier.invalidated_versions() == frozenset()
+
+    def test_an_expired_version_is_reported(self):
+        barrier = VersionBarrier(count_readers=lambda _v: 2, budget_ms=5.0)
+        assert barrier.publish(7).outcome is PublishOutcome.INVALIDATED
+
+        assert barrier.invalidated_versions() == frozenset({7})
+
+    def test_the_report_is_a_snapshot(self):
+        """A caller holding the result must not see later expiries appear in it."""
+        barrier = VersionBarrier(count_readers=lambda _v: 1, budget_ms=1.0)
+        barrier.publish(7)
+        snapshot = barrier.invalidated_versions()
+        barrier.publish(8)
+
+        assert snapshot == frozenset({7})
+        assert barrier.invalidated_versions() == frozenset({7, 8})
+
+    def test_the_set_is_bounded(self):
+        """A long running actor holds it, so an unbounded set would leak slowly."""
+        from psrl.workers.ps.version_barrier import _INVALIDATED_HISTORY
+
+        barrier = VersionBarrier(count_readers=lambda _v: 1, budget_ms=0.0)
+        for version in range(_INVALIDATED_HISTORY + 10):
+            barrier.publish(version)
+
+        reported = barrier.invalidated_versions()
+        assert len(reported) == _INVALIDATED_HISTORY
+        # The oldest are dropped, not an arbitrary subset.
+        assert min(reported) == 10
+        assert max(reported) == _INVALIDATED_HISTORY + 9
+
+    def test_re_invalidating_does_not_grow_the_order(self):
+        barrier = VersionBarrier(count_readers=lambda _v: 1, budget_ms=0.0)
+        barrier.publish(7)
+        barrier.publish(7)
+
+        assert barrier.invalidated_versions() == frozenset({7})
+
+
+class TestTheBudgetComesFromTheNixlBlock:
+    """It was read off the `psrl` root, where the key does not live, so every run silently
+    used the 50 ms default and the yaml knob was inert. A structural assertion is the only
+    honest check: constructing the manager needs a Ray actor and the whole config tree."""
+
+    def _body(self) -> str:
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[2] / "psrl/workers/ps/ps_manager.py"
+        ).read_text()
+        start = source.index("self._publish_barrier = VersionBarrier(")
+        return source[start : source.index(")", start)]
+
+    def test_the_budget_is_read_from_the_nixl_block(self):
+        body = self._body()
+
+        assert 'self.psrl_config.nixl.get("conflict_wait_budget_ms"' in body
+        assert 'getattr(psrl_config, "conflict_wait_budget_ms"' not in body
+
+    def test_the_key_exists_in_the_shipped_config(self):
+        from pathlib import Path
+
+        text = (
+            Path(__file__).resolve().parents[2] / "psrl/trainer/config/psrl/nixl.yaml"
+        ).read_text()
+
+        assert "conflict_wait_budget_ms:" in text
+        assert "max_pull_attempts:" in text

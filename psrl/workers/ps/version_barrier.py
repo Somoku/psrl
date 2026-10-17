@@ -81,20 +81,29 @@ def requires_version_barrier(
     return backend in ("fsdp2", "fsdp_hybrid", "megatron")
 
 
+#: How many expired versions `invalidated_versions` keeps. A reader further behind than
+#: this re-pulls the current version regardless, so the bound is about memory.
+_INVALIDATED_HISTORY = 64
+
+
 @dataclass
 class VersionBarrier:
     """Drains readers of the previous version, within a budget, before publishing.
 
-    ``count_readers`` returns how many readers are currently in flight for a version --
-    `HolderIndex.total_in_flight` in production, a stub in tests. Injected rather than
-    reached for so the policy can be tested without an index, and so the barrier cannot
-    accidentally depend on anything else about the index.
+    ``count_readers`` returns how many readers are currently in flight for a version.
+    Injected rather than reached for so the policy can be tested without a manager.
+
+    The invalidation set is a signal, not bookkeeping. A version enters it only when the
+    publish deadline expired with readers still in flight, and
+    `PSManager.get_nixl_version_state` is what makes it reachable from the reader side.
     """
 
     count_readers: Callable[[int], int]
     budget_ms: float = 50.0
     poll_interval_s: float = 0.0005
     _invalidated: set[int] = field(default_factory=set)
+    #: Insertion order, so pruning drops the oldest rather than an arbitrary entry.
+    _invalidated_order: list[int] = field(default_factory=list)
     #: Reports in order, for assertions and for reporting wait time as a metric.
     history: list[PublishReport] = field(default_factory=list)
 
@@ -104,6 +113,22 @@ class VersionBarrier:
 
     def is_invalidated(self, version: int) -> bool:
         return version in self._invalidated
+
+    def invalidated_versions(self) -> frozenset[int]:
+        """Every version whose bytes may have been overwritten under a live reader.
+
+        Bounded to the most recent `_INVALIDATED_HISTORY` versions. A reader further
+        behind than that re-pulls the current version anyway.
+        """
+        return frozenset(self._invalidated)
+
+    def _record_invalidation(self, version: int) -> None:
+        if version in self._invalidated:
+            return
+        self._invalidated.add(version)
+        self._invalidated_order.append(version)
+        while len(self._invalidated_order) > _INVALIDATED_HISTORY:
+            self._invalidated.discard(self._invalidated_order.pop(0))
 
     def publish(self, previous_version: int) -> PublishReport:
         """Wait for readers of ``previous_version``, then allow the publish.
@@ -127,9 +152,7 @@ class VersionBarrier:
         waited_ms = (time.monotonic() - start) * 1000.0
         if remaining > 0:
             # Publishing over live readers is safe only because they are told to abandon.
-            # Skipping the invalidation here is the silent-corruption path this exists to
-            # close: the read would succeed and return half-written bytes.
-            self._invalidated.add(previous_version)
+            self._record_invalidation(previous_version)
             outcome = PublishOutcome.INVALIDATED
         else:
             outcome = PublishOutcome.DRAINED

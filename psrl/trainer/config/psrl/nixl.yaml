@@ -80,7 +80,23 @@ await_readers_before_publish: auto
 #
 # Bounded on purpose: a budget that can reach a step's duration would delay every publish
 # to close a race that lasts microseconds. Past the budget the publish proceeds and the
-# previous version is marked invalid, which readers detect and answer by re-pulling the
-# newer version -- a strictly better model, so the fallback is an algorithmic improvement
-# rather than a stall.
+# previous version is marked invalid, which readers observe through
+# `PSManager.get_nixl_version_state` and answer by re-pulling the newer version -- a
+# strictly better model, so the fallback is an algorithmic improvement rather than a stall.
+#
+# It bounds the trainer's stall, not the reader's window. The race itself lasts one
+# write-back under Megatron, but the whole optimizer step under FSDP2 at matched precision,
+# which is far longer than this: there the budget will usually expire, the version is
+# invalidated, and recovery is the reader-side re-pull. Size it from the write-back window,
+# not from a pull, when tuning.
 conflict_wait_budget_ms: 50.0
+
+# How many whole pulls a rollout may attempt within one sync before giving up.
+#
+# Each attempt re-reads the version state and transfers every key, so a retry costs one
+# full sync (35 ms for an 8B model on one node, 2.4 s for 235B across two). Attempts exist
+# for two cases that both mean the previous read cannot be served: shards from more than one
+# version, or a version the publisher declared invalid while it was being read. Exhausting
+# the bound raises, because the instance holds mixed bytes and generating from them is worse
+# than staying out of service for one sync.
+max_pull_attempts: 3

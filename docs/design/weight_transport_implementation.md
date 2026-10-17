@@ -928,7 +928,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | D5 `chunk_offset` | ✅ | ❌ 零 import | L1 |
 > | D6 降级继续生成 | ✅ | ✅ | L2 ✅ |
 > | D7/D8 DP 副本接管 | ✅ `pull_engine._replica_of` / `_reroute` | ✅ `nixl_pull_model_core` 将 `failed_sources` 提升到 `unavailable`；`chunk_availability.py` 是零 import 的重复实现 | L1 五条故障注入：源失效改读 DP 副本，整组失效抛 `ChunkUnavailable` 且不动权重，mid-pull 失效下次 pull 直接跳过 |
-> | E1 版本级等待 | ✅ | ✅ `ps_manager` + `vllm_async_server` | L2 ✅ |
+> | E1 版本级等待 | ✅ | ✅ `ps_manager` + `vllm_async_server` + `version_barrier` | L2 ✅，读者侧重拉已接线 |
 > | E2 运行中 reshard | ❌ `staleness.py` 只有纯函数 | ❌ 零调用 | 原设计不可行（单边 RDMA，源端无法比对 epoch），见 §9 阶段 E 的 E2 |
 > | E3 握手解复用 | ✅ | ✅ `server.py` / `client.py` | L2 ✅ |
 > | E3 `admit_joiners` | ✅ | ❌ 生产无调用方（`nixl_admit_joiners` 不存在） | L3 真实 agent 准入（测试直接调用）；RESHARD 分支对既有成员无效，见 E2 |
@@ -1556,6 +1556,27 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       **这不能证明的事**：FSDP2 的 optimizer step 与真实 NIXL 拉取在真机上确实重叠。
       那是关于集群时序的论断,也正因如此拦截的必要性由配置决定(`requires_version_barrier`)
       而不是靠实测。这里证明的是:**一旦**重叠,结果就是撕裂,而拦截消除它。
+
+      **读者侧恢复已接线**。此前 INVALID 标记只写不读,撕裂则直接抛异常,两者都
+      让一次超预算的发布停在「无法修复」上。现在:
+
+      - `VersionBarrier.invalidated_versions()` 暴露失效集合,有界保留最近 64 个版本。
+      - `PSManager.get_nixl_version_state()` 一次返回 `(版本, holder 集合, 失效集合)`,
+        替代原来的 `get_nixl_version_holders`。读者的两件事共用一次调用。
+      - `nixl_pull_model_core` 返回 `PullVerdict` 而不是 bool:区分「一个字节没写」
+        (可以继续用旧版本,设计 D6) 与「混了两个版本」(只能整轮重拉)。
+      - `_pull_until_consistent` 在 shared pull lock 内重拉,上限 `max_pull_attempts`
+        (默认 3)。重拉在锁内,所以与训练发布天然串行:push 持独占锁期间重拉等待,
+        发布完成后读到新版本。超限抛 `WeightRefreshFailed`,协调器隔离该副本。
+
+      重拉**不参与 peer diffusion**。epoch 是 peer 分块通知的键且不可复用,协调同步
+      的 epoch 所有副本共用,重拉若沿用会重放陈旧通知,若另造则各副本互不相同、
+      每个 follower 都要先等满 `peer_timeout_s`。重拉改走纯上游读取,代价只是放弃
+      一个本就罕见的路径上的扩散收益。
+
+      **`conflict_wait_budget_ms` 此前读错了层级**。`ps_manager.py` 用
+      `getattr(config.psrl, ...)` 读,而该键在 `psrl.nixl` 下,于是永远落到默认 50 ms,
+      yaml 改动不生效。现已改为 `config.psrl.nixl.get(...)`。
 - [ ] **E2 未落地，按原设计也无法落地**。`psrl/utils/nixl/staleness.py` 只是一组纯函数
       （`classify` / `recovery_for` / `RegistrationEpoch`），生产零调用，`test_staleness.py`
       测的是这些函数本身，不是任何读路径。
@@ -1900,7 +1921,7 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 | W13 | ~~colocate 走 CUDA IPC（设计项 2 / A8）~~ | ✅ `_should_register_rdma()` 已接入 `register_local_tensors` 的两处 `_register_memory` 调用点：当 comm plan 证明所有读者都在同节点时跳过 RDMA 注册；否则（无 plan 或存在跨节点读者）回落到注册。同时 `registration_policy.py` 已由 `_is_reader_of()` 接入 E4 两段式 join 路径。`test_registration_policy.py` 增加 3 个 wiring 测试（共 20 passed） | colocate 切换路径上 `register_memory` 调用数 == 0（comm plan 为全同节点时）；测试 20 passed | 已完成 |
 | W14 | ~~多角色与 role 隔离（设计 §3.10）~~ | ✅ `WeightBackup` ref 路径落地：`engine_train_worker.py` 增加 `capture_ref_backup()` / `compute_ref_log_prob()` / `mark_modified()` 三个接入点；`ray_trainer.py` 在 LoRA path（`ref_in_actor=True`）的 `init_model` 后调用 `capture_ref_backup()` 并将 `_compute_ref_log_prob` 的 LoRA 分支改为 `actor_wg.compute_ref_log_prob(batch)`。代价：init 一次 D2H，每 ref pass 一次 H2D+H2D（~46 GB/s/rank），替代一整份 GPU 模型副本。`test_weight_backup_gpu.py` 9 passed，含 logits 等值校验与 PCIe 带宽断言。非 LoRA 的 `ref_policy_wg` 路径不变，向后兼容 | 两个角色各自推进版本而互不影响；LoRA ref 路径用 host snapshot 而非独立 GPU | 已完成 |
 | ~~W16~~ | ~~DCP async save 与 NIXL 共存（nvrx 集成）~~ | ✅ nvrx 0.7.0 `AsyncCallsQueue(persistent=True)` spawn 路径与 NIXL 进度线程共存；verl patch 修 `_dispatch_finalize` + `save_dist_checkpointing`；config 移除阻断断言；进度线程始终开启；`scripts/install_basic.sh` 和 `docker/Dockerfile` 均加入安装步骤。实测 30s：113–119 GB/s，0 错误，PASS。真实栈端到端验证（Ray 集群到 `save_freq` 边界）待完成后可删 `PSRL_PerRankMegatronCheckpointManager` | `repro_dcp_nvrx.py` PASS；真实栈 e2e 待验 | 合成层已完成，真实栈待验 |
-| ~~W17~~ | ~~rollout 版本感知选源~~ | ✅ PSManager 维护 `(version, frozenset[trainer_names])`（`_nixl_version_holders`），`push_model_state_dict_nixl` 每步刷新，新增 `get_nixl_version_holders()` 原子 RPC；`vllm_async_server.nixl_pull_model` 拉取持有者集合并透传；`pull_engine.pull(version_holders=...)` 在任何字节搬动前按集合过滤 upstream，`version_holders=None` 时旧行为保持。每步一次 O(1) 新 RPC，选源时 O(S) 集合查找（S=每 key 的 source 数，通常 1-2），与集群规模无关 | `tests/unit/test_version_aware_source_selection.py` 16 passed | 已完成 |
+| ~~W17~~ | ~~rollout 版本感知选源~~ | ✅ PSManager 维护 `(version, frozenset[trainer_names])`（`_nixl_version_holders`），`push_model_state_dict_nixl` 每步刷新，新增 `get_nixl_version_state()` 原子 RPC（后扩展为同时返回失效集合）；`vllm_async_server.nixl_pull_model` 拉取持有者集合并透传；`pull_engine.pull(version_holders=...)` 在任何字节搬动前按集合过滤 upstream，`version_holders=None` 时旧行为保持。每步一次 O(1) 新 RPC，选源时 O(S) 集合查找（S=每 key 的 source 数，通常 1-2），与集群规模无关 | `tests/unit/test_version_aware_source_selection.py` 16 passed | 已完成 |
 | ~~W18~~ | ~~peer diffusion 拓扑感知 designate 选择~~ | ✅ `_make_peer_groups` sort key 从 `(upstream_load, name)` 改为 `(-trainer_link_priority, upstream_load, name)`：和 trainer 有 NVLink 的 instance 优先成为 designate，IB 带宽只用于必须的跨节点流量，NVLink 在节点内自由使用；负载均衡作为同优先级内的第二排序键保留；规划期 O(G log G) 每组，总复杂度不变，无运行时开销 | `tests/nixl/test_topology_aware_designate.py` 15 passed；scale test：1024 instance × 200 key 的 `_make_peer_groups` < 1.15s（< 3s 限制） | 已完成 |
 | ~~W19~~ | ~~删除 `_DONE` barrier~~ | ✅ 从第一性原理确认 `_DONE` 不解锁任何操作（follower 在 `_await(_DONE)` 前已完成自己所有 peer 读，buffer 生命周期由外部调度控制），删除 `_DONE` 常量、designate 侧 `publish(_DONE)` 和 follower 侧 `_await(_DONE)` 及超时 warning；`peer_timeout_s` 保留用于 `_READY` 等待 | 60 tests pass（`test_pull_engine.py` + `test_version_aware_source_selection.py`） | 已完成 |
 | W16-真实栈 | nvrx async save 真实栈 e2e 验证 | Ray 集群跑到 `save_freq` 边界：确认 `.distcp` 目录完整、NIXL 0 错误、能 resume；通过后删 `PSRL_PerRankMegatronCheckpointManager` | resume 后训练继续、权重与保存前一致 | 多节点 |

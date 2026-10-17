@@ -19,7 +19,7 @@ from psrl.utils.nixl import (
     NIXLClientType,
     NIXLStorageClient,
 )
-from psrl.utils.nixl.pull_engine import ChunkUnavailable
+from psrl.utils.nixl.pull_engine import ChunkUnavailable, PullVerdict, TornPull
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -222,13 +222,15 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         participant_instances: list[int] | None = None,
         version_holders: frozenset[str] | None = None,
         target_version: int = -1,
-    ) -> bool:
+    ) -> PullVerdict:
         """
         Pull the latest weights through the NIXL pull engine.
 
-        Returns whether the weights now hold the published version. False means no live train rank
-        holds some key, the weights were left untouched, and the caller keeps generating at its
-        current version (D6). A failure that leaves the weights mixing two versions raises instead.
+        Returns a `PullVerdict` rather than a bool, because a pull that did not land splits
+        into two cases the caller must answer differently. One wrote nothing, so the
+        instance is still consistent at its current version (D6). The other mixed versions,
+        so only another whole pull can repair it. The verdict carries the observed versions
+        so the caller can also test them against the publisher's invalid set.
 
         Args:
             epoch (int): Identifier of this sync, shared by every syncing replica and never reused.
@@ -262,18 +264,29 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             # from every future pull so they are not retried round after round.
             if unavailable.dead:
                 self.nixl_storage_client.pull_engine().mark_unavailable(unavailable.dead)
-            return False
+            self._sync_pulled_versions(set())
+            return PullVerdict(landed=False, versions=frozenset(), reason="unavailable")
+        except TornPull as torn:
+            # Earlier waves landed, so this instance now mixes versions. Reporting it lets
+            # the caller re-pull, which overwrites every key.
+            psrl_logger.warning(f"{self.nixl_storage_client.client_name}: pull {self.pull_times} torn: {torn}")
+            self._sync_pulled_versions(set())
+            return PullVerdict(landed=False, versions=frozenset(), reason="torn")
         # D7: sources that failed mid-pull and were rerouted to a DP replica are confirmed
         # dead; promote them so the next pull skips them rather than re-discovering the
         # failure through another timed-out read.
         if report.failed_sources:
             self.nixl_storage_client.pull_engine().mark_unavailable(report.failed_sources)
         self.cuda_synchronize()
-        # Every shard of one pull must come from one version. More than one means some sources had republished.
-        self.pulled_version = report.versions
-        assert len(self.pulled_version) <= 1, (
-            f"Torn read: pull {self.pull_times} assembled shards from versions {sorted(self.pulled_version)}."
-        )
+        self._sync_pulled_versions(report.versions)
+        # Every shard of one pull must come from one version. More than one means some
+        # sources had republished mid-pull. Not asserted here: the caller retries.
+        if len(report.versions) > 1:
+            psrl_logger.warning(
+                f"{self.nixl_storage_client.client_name}: pull {self.pull_times} assembled shards from "
+                f"versions {sorted(report.versions)}."
+            )
+            return PullVerdict(landed=False, versions=frozenset(report.versions), reason="torn")
         psrl_logger.info(
             f"{self.nixl_storage_client.client_name}: pull {self.pull_times} (epoch {epoch}) took "
             f"{report.seconds:.3f}s, upstream {report.upstream_bytes / 1e9:.2f} GB in {report.upstream_seconds:.3f}s, "
@@ -281,7 +294,15 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             f"{report.followers} follower(s), {report.fallback_keys} fallback key(s), "
             f"{report.takeover_keys} key(s) taken over from a replica."
         )
-        return True
+        return PullVerdict(landed=True, versions=frozenset(report.versions))
+
+    def _sync_pulled_versions(self, versions) -> None:
+        """Record what the last pull read, for `pulled_version_set`.
+
+        An empty set is stored for a torn or unavailable pull: nothing about that pull
+        should be compared against a version, and the caller already has the verdict.
+        """
+        self.pulled_version = set(versions)
 
     def get_total_kv_cache_tokens(self) -> int:
         """Total KV-cache token capacity of this instance, post-allocation.

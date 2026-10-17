@@ -114,12 +114,42 @@ class ChunkUnavailable(RuntimeError):
         )
 
 
+@dataclass(frozen=True)
+class PullVerdict:
+    """What one pull left the instance holding (design §3.4 version equality).
+
+    Returned across the `collective_rpc` boundary, so it holds primitives rather than a
+    tensor or a client. A caller distinguishes three ends because the response differs.
+    `landed` means one version arrived and is still valid. `torn` means shards came from
+    more than one version, which only another whole pull repairs. Neither means no byte
+    was written (D6), so the instance is consistent at the version it already had.
+    """
+
+    landed: bool
+    versions: frozenset[int]
+    #: Why this pull did not land: "torn", "invalidated", or "unavailable".
+    reason: str | None = None
+
+    @property
+    def torn(self) -> bool:
+        return self.reason == "torn"
+
+
 class TornPull(RuntimeError):
     """
     A source failed mid pull and no replica holds what it was serving.
 
     Earlier waves have already written the new version, so the weights mix two versions and
-    the instance must not generate until a later pull completes.
+    the instance must not generate until a later pull completes. `nixl_pull_model_core`
+    turns this into a `PullVerdict`, so the caller can re-pull instead of failing.
+    """
+
+
+class WeightRefreshFailed(RuntimeError):
+    """Bounded re-pulls did not leave the instance holding one live version.
+
+    Raised only when bytes have already been overwritten, so the weights are a mixture of
+    publications. The sync coordinator quarantines the replica and the next sync re-pulls.
     """
 
 

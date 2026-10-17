@@ -98,15 +98,13 @@ class PSManager(RequestStatusTracker):
         # during the initial pull before the first training push.
         self.model_store: ModelStore = ModelStore(version_tag=0)
 
-        # Bound to `self.count_readers`, which reads this actor's own registry -- so the
-        # barrier needs no messaging and cannot go stale relative to it.
+        # Bound to `self.count_readers`, so the barrier needs no messaging and cannot go
+        # stale relative to the registry. The budget is a fraction of a step by design.
         #
-        # The budget is a fraction of a step rather than a constant: waiting is only ever
-        # cheaper than the corruption it prevents, and a budget comparable to the step
-        # would delay every publish to fix a race that lasts microseconds.
+        # NOTE: it lives under `psrl.nixl`, so reading it off the `psrl` root left it inert.
         self._publish_barrier = VersionBarrier(
             count_readers=self.count_readers,
-            budget_ms=float(getattr(psrl_config, "conflict_wait_budget_ms", 50.0)),
+            budget_ms=float(self.psrl_config.nixl.get("conflict_wait_budget_ms", 50.0)),
         )
 
         self.staleness_inventory: StalenessInventory | None = None
@@ -1171,19 +1169,19 @@ class PSManager(RequestStatusTracker):
         )
         return self.ps_nixl_train_storage_client_names
 
-    def get_nixl_version_holders(self) -> tuple[int, frozenset[str]]:
-        """Return the current model version and the set of trainer client names that hold it.
+    def get_nixl_version_state(self) -> tuple[int, frozenset[str], frozenset[int]]:
+        """Return the model version, the trainer ranks holding it, and the invalid versions.
 
-        D1 version-aware source selection: rollouts call this once per pull to build the
-        allowed-source filter.  The returned set is the same set that `_nixl_version_holders`
-        carries, which is refreshed by `push_model_state_dict_nixl` on every publish.
+        One call, because a reader needs all three before it decides what to read. The
+        holder set drives D1 source filtering. The invalid set drives E1 recovery: a
+        version whose drain budget expired is marked here, and a reader that finds its own
+        version listed re-pulls the current one instead of leaving a stale mark unread.
 
-        An empty frozenset means no version has been published yet (startup) or direct supply
-        has not been configured.  `pull_engine` treats an empty set as "no filter" so existing
-        behaviour is preserved for non-direct-supply ps_modes.
+        An empty holder set means nothing has been published yet or direct supply is off.
+        `pull_engine` treats an empty set as "no filter", so other ps_modes are unaffected.
         """
         version = self.model_store.version_tag if self.model_store is not None else 0
-        return version, self._nixl_version_holders
+        return version, self._nixl_version_holders, self._publish_barrier.invalidated_versions()
 
     def get_ps_nixl_gen_storage_client_names(self) -> list[str]:
         """Get the NIXL gen storage client name of the PS worker group."""
@@ -1366,14 +1364,13 @@ class PSManager(RequestStatusTracker):
         if self.psrl_config.nixl.get("await_readers_before_publish", False):
             report = self._publish_barrier.publish(previous_version)
             if report.outcome is PublishOutcome.INVALIDATED:
-                # Past the budget with readers still live: the previous version's bytes
-                # are being overwritten under them, so it must not be read again. They
-                # find out from `is_invalidated` and re-pull the newer version, which is
-                # a strict improvement rather than a stalled run.
+                # Past the budget with readers still live, so the previous version's bytes
+                # are being overwritten under them. They see it in `get_nixl_version_state`
+                # and re-pull the newer version, which is an improvement rather than a stall.
                 psrl_logger.warning(
                     f"Version {previous_version} invalidated after waiting "
                     f"{report.waited_ms:.1f}ms with {report.readers_remaining} reader(s) "
-                    f"still in flight."
+                    f"still in flight. Readers of it will re-pull {version_tag}."
                 )
             elif report.outcome is PublishOutcome.DRAINED:
                 psrl_logger.debug(
@@ -1388,7 +1385,7 @@ class PSManager(RequestStatusTracker):
         # this version.  The holder set is the full trainer client list — every rank ran
         # `publish_version(v)` before rank 0 reached here (the barrier in
         # `direct_supply_publish` guarantees it).  Rollouts read this with
-        # `get_nixl_version_holders` before choosing upstream sources.
+        # `get_nixl_version_state` before choosing upstream sources.
         if self.ps_nixl_train_storage_client_names:
             self._nixl_version_holders = frozenset(self.ps_nixl_train_storage_client_names)
         if version_tag > 0:

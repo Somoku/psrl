@@ -55,6 +55,7 @@ from psrl.utils.logger import (
     get_worker_info,
     log_dual_events,
 )
+from psrl.utils.nixl.pull_engine import WeightRefreshFailed
 from psrl.utils.ps_mode import uses_nixl
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
@@ -1185,39 +1186,25 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         """
         Pull through the engine on every worker of this replica.
 
+        A torn pull, or one that read a version the publisher has since declared invalid,
+        is retried whole rather than propagated. The retry runs inside the shared pull
+        lock, so a push in progress makes it wait and then read what the push published.
+
         Args:
             epoch (int | None): Sync identifier from the coordinator. None pulls without peers.
             participants (list[int] | None): Replica indices syncing together.
         """
         assert self.gen_interface.ps_manager_handle is not None, "nixl_pull_model requires a PS manager handle"
         assert uses_nixl(self.psrl_config.ps_mode), (
-            f"nixl_pull_model needs a NIXL transport, got "
-            f"ps_mode={self.psrl_config.ps_mode!r}"
+            f"nixl_pull_model needs a NIXL transport, got ps_mode={self.psrl_config.ps_mode!r}"
         )
         ps_manager_handle = self.gen_interface.ps_manager_handle
         if epoch is None:
             # A pull outside a coordinated sync has no peers to wait for, so it reads everything upstream.
             self._solo_pulls = getattr(self, "_solo_pulls", 0) + 1
             epoch, participants = -self._solo_pulls, [self.get_replica_idx()]
-        # D1 version-aware source selection: fetch which trainer ranks hold the current
-        # version.  One Ray call, O(1), no extra round trips — the result is attached to
-        # the collective_rpc args so every vLLM engine worker receives it without a
-        # per-worker lookup.  For non-direct-supply ps_modes the manager returns an empty
-        # frozenset and pull_engine treats that as "no filter", preserving old behaviour.
-        target_version, version_holders = await ps_manager_handle.get_nixl_version_holders.remote()
         if not self.psrl_config.profile.fix_weight:
-            reached = await self.engine.collective_rpc(
-                "nixl_pull_model_core",
-                args=(epoch, participants, version_holders, target_version),
-            )
-            if not all(reached):
-                # D6/D7: some key had no live train source, so the weights were left untouched. The
-                # version is not committed and the caller keeps generating at the one it already has.
-                psrl_logger.warning(
-                    f"{self.base_worker_id}: {sum(not r for r in reached)} of {len(reached)} rank(s) found no "
-                    f"live source for some keys; keeping the current version."
-                )
-                return self.curr_rollout_instance_model_version[0]
+            await self._pull_until_consistent(epoch, participants)
         # C2: the version commit is not made here. It rides on the shared-pull lock
         # release (`finish_shared_pull`), which has to happen anyway -- so the commit
         # costs no round trip of its own. `_pull_commit_instance_ids` tells the lock
@@ -1239,6 +1226,67 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             if self._nixl_pulls_done == 1:
                 await self._assert_pulled_the_announced_version(self._last_pulled_model_version)
         psrl_logger.info("NIXL pull model done.")
+
+    async def _pull_until_consistent(self, epoch: int, participants: list[int] | None) -> None:
+        """Pull until the weights hold one live version, or give up loudly.
+
+        Each attempt is a whole pull, so each retry costs a full sync at steady state
+        (0.02 to 0.16 s for an 8B model on one node, 2.4 s for 235B across two, FINDINGS
+        §5 and §4b). Exhausting the bound raises because the instance holds mixed bytes.
+
+        A retry reads everything upstream itself. Epochs key peer diffusion signals and
+        must never be reused, and an invented epoch would differ per replica, so followers
+        would wait out the peer timeout before falling back anyway.
+        """
+        max_attempts = max(1, int(self.psrl_config.nixl.get("max_pull_attempts", 3)))
+        ps_manager_handle = self.gen_interface.ps_manager_handle
+        attempt_epoch, attempt_participants = epoch, participants
+        last_versions: frozenset[int] = frozenset()
+        last_reason: str | None = None
+        for attempt in range(1, max_attempts + 1):
+            # Re-read the state every attempt: the version moved, so the first set was wrong.
+            target_version, version_holders, invalidated = await ps_manager_handle.get_nixl_version_state.remote()
+            verdicts = await self.engine.collective_rpc(
+                "nixl_pull_model_core",
+                args=(attempt_epoch, attempt_participants, version_holders, target_version),
+            )
+            landed = [v for v in verdicts if v.landed]
+            if len(landed) == len(verdicts):
+                # Ranks landing different versions corrupt one instance just as mixing does.
+                landed_versions = frozenset().union(*(v.versions for v in landed))
+                # An empty set means the pull read no keys, which is a no-op rather than stale.
+                if not landed_versions or (len(landed_versions) == 1 and not landed_versions & invalidated):
+                    return
+                last_reason = "invalidated" if landed_versions & invalidated else "torn"
+                last_versions = landed_versions
+            else:
+                # A rank that wrote nothing is still consistent. Only `torn` needs a repair.
+                torn = [v for v in verdicts if not v.landed and v.reason == "torn"]
+                if not torn:
+                    # D6/D7: nothing was written, so keeping the current version is correct.
+                    psrl_logger.warning(
+                        f"{self.base_worker_id}: {sum(not v.landed for v in verdicts)} of "
+                        f"{len(verdicts)} rank(s) found no live source for some keys. Keeping "
+                        f"the current version."
+                    )
+                    return
+                last_reason = "torn"
+                last_versions = frozenset().union(*(v.versions for v in torn))
+
+            if attempt < max_attempts:
+                psrl_logger.warning(
+                    f"{self.base_worker_id}: pull attempt {attempt}/{max_attempts} did not land "
+                    f"({last_reason}, versions={sorted(last_versions)}, announced v{target_version}). "
+                    f"Re-pulling without peers."
+                )
+                self._solo_pulls = getattr(self, "_solo_pulls", 0) + 1
+                attempt_epoch, attempt_participants = -self._solo_pulls, [self.get_replica_idx()]
+
+        raise WeightRefreshFailed(
+            f"{self.base_worker_id}: {max_attempts} pull attempt(s) did not land a single live "
+            f"version (last {last_reason}, versions={sorted(last_versions)}). The weights mix "
+            f"versions and must not generate. The next sync will re-pull."
+        )
 
     async def _assert_pulled_the_announced_version(self, announced: int) -> None:
         """The bytes read must belong to the version the manager just handed out (§3.4).

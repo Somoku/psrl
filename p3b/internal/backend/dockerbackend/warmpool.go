@@ -13,9 +13,11 @@
 // An entry is built from a complete spec, not from an image and a size. Everything the
 // container will be -- image, footprint, environment, workdir, class, exec mode,
 // lifetime -- is written at create and cannot be changed afterwards, so an entry is
-// only safe to hand out when it already matches the caller exactly. A claim therefore
-// verifies the container against the caller's spec before it is handed over, and
-// destroys it rather than adopting a mismatch.
+// only safe to hand out when it already matches the caller. A claim therefore verifies
+// the container against the caller's spec before it is handed over, and destroys it
+// rather than adopting a mismatch. Lifetime is the one dimension where "at least as
+// long" is a match: it is a backstop rather than a charge, so an entry built to live
+// longer than the request serves it.
 //
 // Two properties keep the pool from being a leak. It has its own budget, separate from
 // the classes: an entry occupies memory the node has not promised to any episode, so
@@ -233,7 +235,16 @@ func (p *warmPool) matches(spec backend.Spec) bool {
 	if spec.ExecMode != template.ExecMode {
 		return false
 	}
-	if spec.Lifetime != template.Lifetime {
+	// Lifetime is a backstop rather than a charge, so an entry that lives at least as
+	// long as the request can serve it. Zero means "the deployment's default", which the
+	// pool cannot compare against: an entry that states a lifetime would *replace* that
+	// default with its own, so it only serves a request that states none either.
+	switch {
+	case template.Lifetime <= 0 || spec.Lifetime <= 0:
+		if spec.Lifetime != template.Lifetime {
+			return false
+		}
+	case spec.Lifetime > template.Lifetime:
 		return false
 	}
 	if len(spec.Env) != len(template.Env) {

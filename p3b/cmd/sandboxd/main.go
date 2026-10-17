@@ -139,9 +139,11 @@ type Config struct {
 // WarmPoolDeclared is a deployment's warm-pool declaration.
 //
 // The template fields are what every entry is built from, so they must describe the
-// containers this deployment actually creates. They are compared exactly: an entry
-// whose env, workdir, class, exec mode or lifetime differ is not handed over, because a
-// label or a limit written at create cannot be changed afterwards.
+// containers this deployment actually creates. They are compared exactly, because a
+// label or a limit written at create cannot be changed afterwards -- with one exception:
+// lifetime_s is the longest lifetime the deployment runs, and any request at or below it
+// is served, since a lifetime is a backstop rather than a charge. State zero only if the
+// callers state none too.
 type WarmPoolDeclared struct {
 	Image           string            `json:"image"`
 	Size            int               `json:"size"`

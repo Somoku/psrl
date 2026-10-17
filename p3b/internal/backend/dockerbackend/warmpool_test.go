@@ -263,7 +263,6 @@ func TestOnlyAnExactSpecMatches(t *testing.T) {
 		{"workdir", func(s *backend.Spec) { s.Workdir = "/elsewhere" }},
 		{"class", func(s *backend.Spec) { s.ResourceClass = "grader" }},
 		{"exec mode", func(s *backend.Spec) { s.ExecMode = "persistent" }},
-		{"lifetime", func(s *backend.Spec) { s.Lifetime = time.Hour }},
 		{"env value", func(s *backend.Spec) { s.Env = map[string]string{"A": "2"} }},
 		{"env key", func(s *backend.Spec) { s.Env = map[string]string{"B": "1"} }},
 		{"extra env", func(s *backend.Spec) { s.Env = map[string]string{"A": "1", "B": "2"} }},
@@ -279,6 +278,54 @@ func TestOnlyAnExactSpecMatches(t *testing.T) {
 
 	if !pool.matches(matchingSpec()) {
 		t.Error("the template as a caller states it must match")
+	}
+}
+
+func TestAShorterLifetimeIsServed(t *testing.T) {
+	// Lifetime is a backstop, not a charge: an entry built to live two hours is a valid
+	// sandbox for a request that only needs one.
+	pool, _ := newTestPool(t, poolConfig(), nil)
+
+	spec := matchingSpec()
+	spec.Lifetime = time.Hour
+
+	if !pool.matches(spec) {
+		t.Error("an entry that outlives the request must serve it")
+	}
+}
+
+func TestALongerLifetimeIsNotServed(t *testing.T) {
+	// The reverse is not a match: the container's label says the template's lifetime, so
+	// a request that needs longer would be reclaimed before its own budget expects.
+	pool, _ := newTestPool(t, poolConfig(), nil)
+
+	spec := matchingSpec()
+	spec.Lifetime = 3 * time.Hour
+
+	if pool.matches(spec) {
+		t.Error("an entry that cannot outlive the request must not serve it")
+	}
+}
+
+func TestAnUnstatedLifetimeOnlyMatchesAnUnstatedTemplate(t *testing.T) {
+	// Zero means "the deployment's default". An entry that states a lifetime would
+	// replace that default with its own, in whichever direction it happens to fall.
+	pool, _ := newTestPool(t, poolConfig(), nil)
+	unstated := matchingSpec()
+	unstated.Lifetime = 0
+	if pool.matches(unstated) {
+		t.Error("a request that states no lifetime must not take an entry that does")
+	}
+
+	cfg := poolConfig()
+	cfg.Template.Lifetime = 0
+	unstatedPool, _ := newTestPool(t, cfg, nil)
+	if !unstatedPool.matches(unstated) {
+		t.Error("a template that states no lifetime must serve a request that states none")
+	}
+	stated := matchingSpec()
+	if unstatedPool.matches(stated) {
+		t.Error("a template that states no lifetime must not serve a request that does")
 	}
 }
 

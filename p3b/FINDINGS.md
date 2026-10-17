@@ -81,12 +81,16 @@ The measurements also found three defects that no unit test covered:
 
 ## 3. Limits of these results
 
-- **The production rollout cannot use the pool yet.** Matching is exact, and the harness
-  derives each episode's `lifetime_s` from the rollout budgets. A template must therefore
-  state the same lifetime, which the recipe does not currently do. The safe follow-up is
-  to match lifetime as `request <= template` (an entry built for longer outlives the
-  request, and lifetime is a backstop rather than a charge), which needs the template to
-  state the maximum the deployment runs.
+- **The pool serves one image, and this workload uses one image per task.** The mini_swe
+  rollout resolves a per-problem base image (`psrl/swebench-harness:<digest>` of that
+  problem's image), so a pool built from a single image can only serve the tasks whose
+  image it names. That is the pool's design -- a pool across images divides a fixed
+  budget by the number of images and stops being a pool for any of them -- and it means
+  the mechanism is right but inapplicable to this rollout until the workload shares an
+  image (or the pool becomes per-image with a budget per key).
+- Lifetime is matched as `request <= template`, so a template states the longest lifetime
+  the deployment runs. For the codex recipe that number is the episode budget plus the
+  grading budget plus the lifetime slack, i.e. `7200 + 0 + 3600 = 10800` seconds.
 - **Coverage is `size/batch`.** A burst larger than the pool is mostly cold, and the
   budget is what bounds the depth (`memory_mb` of the declared envelope, not a class).
 - **The domain does not increase capacity by itself.** It makes the measurement describe

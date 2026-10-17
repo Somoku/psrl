@@ -24,6 +24,11 @@ type probeEngine struct {
 	createStatus  int
 	cgroupDriver  string
 	infoCalls     int
+	// inspectBody is the reply to /containers/{id}/json. Empty serves a running
+	// entry named as inventory.
+	inspectBody string
+	renameCalls []string
+	renameFails bool
 }
 
 func (e *probeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -63,6 +68,17 @@ func (e *probeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeBody(w, `{"Id":"c-1"}`)
 	case strings.HasSuffix(r.URL.Path, "/start"):
 		w.WriteHeader(http.StatusOK)
+	case strings.HasSuffix(r.URL.Path, "/rename"):
+		e.mu.Lock()
+		e.renameCalls = append(e.renameCalls, r.URL.Query().Get("name"))
+		fails := e.renameFails
+		e.mu.Unlock()
+		if fails {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"rename refused"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	case strings.Contains(r.URL.Path, "/archive"):
 		w.WriteHeader(http.StatusOK)
 	case strings.HasSuffix(r.URL.Path, "/exec"):
@@ -71,6 +87,14 @@ func (e *probeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	case strings.Contains(r.URL.Path, "/exec/exec-1/json"):
 		writeBody(w, `{"ExitCode":0,"Running":false}`)
+	case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+		e.mu.Lock()
+		body := e.inspectBody
+		e.mu.Unlock()
+		if body == "" {
+			body = `{"Name":"/psrl-warm-x","State":{"Running":true}}`
+		}
+		writeBody(w, body)
 	default:
 		http.NotFound(w, r)
 	}

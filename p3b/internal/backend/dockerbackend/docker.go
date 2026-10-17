@@ -180,6 +180,7 @@ func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 	pool, err := newWarmPool(cfg.WarmPool,
 		b.createPoolEntry,
 		b.remove,
+		nil, // installed by SetPoolBudget once the admission gate exists
 	)
 	if err != nil {
 		return nil, fmt.Errorf("docker warm pool: %w", err)
@@ -243,25 +244,24 @@ func (b *Backend) Create(ctx context.Context, nodeID string, spec backend.Spec, 
 	}
 	// Try the warm pool first. A cache hit skips image pull, container creation,
 	// and the start call — the three steps whose latency scales with concurrency.
-	if containerID, ok := b.pool.claim(ctx, spec); ok {
-		return b.adoptWarm(containerID, spec, nodeID), nil
+	// A claim that cannot be verified falls through rather than failing the create:
+	// the caller is already admitted, and a cold create is what it would have had.
+	if entry, ok := b.pool.claim(ctx, spec); ok {
+		if created, adopted := b.adoptWarm(ctx, entry, spec, nodeID); adopted {
+			return created, nil
+		}
 	}
 	if err := b.ensureImage(ctx, spec.Source.Reference); err != nil {
 		return backend.Created{}, err
 	}
-	// Acquire the create semaphore before touching the daemon. This bounds the
-	// number of concurrent /containers/create + /start pairs in-flight, preventing
-	// dockerd's internal queues from growing unboundedly and inflating p95 latency.
-	if b.createSem != nil {
-		select {
-		case b.createSem <- struct{}{}:
-			defer func() { <-b.createSem }()
-		case <-ctx.Done():
-			return backend.Created{}, ctx.Err()
-		}
+	release, err := b.acquireCreateSlot(ctx)
+	if err != nil {
+		return backend.Created{}, err
 	}
+	defer release()
+
 	body := b.createBody(spec, nodeID)
-	created, err := b.createNamed(ctx, body)
+	created, err := b.createNamed(ctx, sandboxNamePrefix, body)
 	if err != nil {
 		return backend.Created{}, fmt.Errorf("docker create: %w", err)
 	}
@@ -320,12 +320,12 @@ func newContainerName(prefix string) string {
 // and how an operator finds the container behind a sandbox id. A conflict means the
 // random suffix collided, which is cheap to retry and must not surface as a create
 // failure.
-func (b *Backend) createNamed(ctx context.Context, body map[string]any) (createdContainer, error) {
+func (b *Backend) createNamed(ctx context.Context, prefix string, body map[string]any) (createdContainer, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		var created createdContainer
 		err := b.call(ctx, http.MethodPost,
-			"/containers/create?name="+url.QueryEscape(newContainerName(sandboxNamePrefix)), body, &created)
+			"/containers/create?name="+url.QueryEscape(newContainerName(prefix)), body, &created)
 		if err == nil {
 			return created, nil
 		}
@@ -336,6 +336,23 @@ func (b *Backend) createNamed(ctx context.Context, body map[string]any) (created
 		}
 	}
 	return createdContainer{}, lastErr
+}
+
+// acquireCreateSlot takes one of the backend's create slots and returns its release.
+//
+// Create and the pool's refill share it: the gate exists to bound the daemon's queue,
+// and a refill that bypassed it would stampede that queue at the moment the pool is
+// supposed to be keeping the node quiet.
+func (b *Backend) acquireCreateSlot(ctx context.Context) (func(), error) {
+	if b.createSem == nil {
+		return func() {}, nil
+	}
+	select {
+	case b.createSem <- struct{}{}:
+		return func() { <-b.createSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
@@ -807,8 +824,10 @@ func demultiplex(raw []byte) string {
 // a restarted node needs to charge for it.
 //
 // The daemon is the source of truth: a service that trusted its own list would
-// leak every container it forgot across a restart. A warm pool entry is the one
-// exception, for the reason on refuseRunningPoolEntries.
+// leak every container it forgot across a restart. Unclaimed pool inventory comes back
+// marked as such, by name, so the node reclaims it without ever mistaking it for a
+// sandbox -- which is what a label could not express, because a label is immutable and
+// an entry keeps it after it has been claimed.
 func (b *Backend) Reconcile(ctx context.Context) ([]backend.Reconciled, error) {
 	listed, err := b.listOwned(ctx, labelSandbox+"=true", labelOwner+"="+b.cfg.OwnerID)
 	if err != nil {
@@ -818,33 +837,22 @@ func (b *Backend) Reconcile(ctx context.Context) ([]backend.Reconciled, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := refuseRunningPoolEntries(found); err != nil {
-		return nil, err
-	}
-	return found, nil
-}
-
-// refuseRunningPoolEntries refuses to reconcile while a warm pool entry is running.
-//
-// A pool entry's class label is written at create and a container's labels are
-// immutable, so a claimed entry still reads as pool inventory, and the claim
-// itself was recorded only in the memory of the process that is gone. A running
-// entry is therefore unattributable: charging it would be wrong, and destroying
-// it could destroy a caller's live sandbox. An entry that has exited holds
-// nothing and passes through, for the node to reclaim.
-func refuseRunningPoolEntries(found []backend.Reconciled) error {
-	running := 0
-	for _, rec := range found {
-		if rec.Class == warmPoolClass && rec.Running {
-			running++
+	// A sandbox outside the configured subtree is invisible to the sampler: its memory
+	// counts against the ancestor but not against any ceiling this node enforces. That
+	// is a configuration change with live sandboxes behind it, so it is refused rather
+	// than adopted.
+	if b.cfg.CgroupParent != "" {
+		for _, rec := range found {
+			if rec.Running && !rec.PoolInventory && rec.CgroupParent != b.cfg.CgroupParent {
+				return nil, fmt.Errorf(
+					"container %s is running outside the configured cgroup subtree %q (it is in %q): "+
+						"the sampler does not measure it, so its memory is invisible to this node's "+
+						"ceilings; release it before restarting on the new configuration",
+					rec.Handle.SandboxID, b.cfg.CgroupParent, rec.CgroupParent)
+			}
 		}
 	}
-	if running == 0 {
-		return nil
-	}
-	return fmt.Errorf(
-		"%d running warm pool containers cannot be attributed to a caller after a restart: "+
-			"drain the pool before restarting, or keep it disabled", running)
+	return found, nil
 }
 
 // FindByIdempotencyKey returns the sandbox a create with this key already made.
@@ -870,6 +878,31 @@ func (b *Backend) FindByIdempotencyKey(
 		return backend.Reconciled{}, false, err
 	}
 	return found, true, nil
+}
+
+// ForeignContainers counts running containers on this daemon that this service does not
+// own.
+//
+// They cannot be inside the sandbox subtree -- nothing but this service sets the parent
+// -- so they add to the ancestor's measured memory without appearing in any ceiling the
+// node enforces. That is worth a warning: the operator is sharing a daemon, and the
+// capacity it costs is invisible.
+func (b *Backend) ForeignContainers(ctx context.Context) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	var listed []struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	if err := b.call(ctx, http.MethodGet, "/containers/json", nil, &listed); err != nil {
+		return 0, err
+	}
+	foreign := 0
+	for _, container := range listed {
+		if container.Labels[labelSandbox] != "true" {
+			foreign++
+		}
+	}
+	return foreign, nil
 }
 
 // listOwned lists the container ids this service owns that match every label.
@@ -926,6 +959,7 @@ func (b *Backend) inspectOne(ctx context.Context, id string) (backend.Reconciled
 	defer cancel()
 	var inspected struct {
 		ID      string `json:"Id"`
+		Name    string `json:"Name"`
 		Created string `json:"Created"`
 		State   struct {
 			Running bool `json:"Running"`
@@ -935,9 +969,10 @@ func (b *Backend) inspectOne(ctx context.Context, id string) (backend.Reconciled
 			Env    []string          `json:"Env"`
 		} `json:"Config"`
 		HostConfig struct {
-			Memory    int64 `json:"Memory"`
-			CpuQuota  int64 `json:"CpuQuota"`
-			CpuPeriod int64 `json:"CpuPeriod"`
+			Memory       int64  `json:"Memory"`
+			CpuQuota     int64  `json:"CpuQuota"`
+			CpuPeriod    int64  `json:"CpuPeriod"`
+			CgroupParent string `json:"CgroupParent"`
 		} `json:"HostConfig"`
 	}
 	if err := b.call(ctx, http.MethodGet, "/containers/"+id+"/json", nil, &inspected); err != nil {
@@ -945,11 +980,14 @@ func (b *Backend) inspectOne(ctx context.Context, id string) (backend.Reconciled
 	}
 	labels := inspected.Config.Labels
 	rec := backend.Reconciled{
-		Handle:   backend.Handle{Backend: b.Name(), SandboxID: id, NodeID: labels[labelNode]},
-		Owner:    labels[backend.OwnerMetadataKey],
-		Class:    labels[labelClass],
-		ExecMode: labels[labelExecMode],
-		Running:  inspected.State.Running,
+		Name:          inspected.Name,
+		PoolInventory: isPoolInventoryName(inspected.Name),
+		CgroupParent:  inspected.HostConfig.CgroupParent,
+		Handle:        backend.Handle{Backend: b.Name(), SandboxID: id, NodeID: labels[labelNode]},
+		Owner:         labels[backend.OwnerMetadataKey],
+		Class:         labels[labelClass],
+		ExecMode:      labels[labelExecMode],
+		Running:       inspected.State.Running,
 		Resources: backend.Resources{
 			MemoryMB: inspected.HostConfig.Memory / (1024 * 1024),
 		},

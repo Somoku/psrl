@@ -409,7 +409,13 @@ func (l *Lifecycle) Sweep(ctx context.Context) SweepReport {
 			}
 		case allocResident:
 			switch {
-			case !l.ownerAlive(held.owner):
+			// A resident allocation with no owner is not evidence that its owner is
+			// gone. A warm-pool entry is claimed without being relabelled -- labels
+			// are immutable -- so a sandbox claimed from the pool reaches this node
+			// after a restart with no owner label. Reaping it on owner silence would
+			// destroy a live sandbox ninety seconds after every restart; the lifetime
+			// it does carry is the backstop that actually applies to it.
+			case held.owner != "" && !l.ownerAlive(held.owner):
 				decisions = append(decisions, decision{held.leaseID, reportID, ExitReclaimedOrphan})
 			case now.Sub(held.createdAt) >= held.lifetime:
 				decisions = append(decisions, decision{held.leaseID, reportID, ExitReapedLifetime})

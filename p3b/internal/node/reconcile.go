@@ -25,6 +25,9 @@ type ReconcileReport struct {
 	Adopted int
 	// Reclaimed are runtime objects that no longer hold memory and were removed.
 	Reclaimed int
+	// PoolReclaimed are unclaimed warm-pool entries that were destroyed. They held
+	// memory nothing had been promised, and the pool's own refill rebuilds them.
+	PoolReclaimed int
 	// Failures are removals the backend refused. They leave litter rather than a
 	// double charge, so they do not stop the node from serving.
 	Failures int
@@ -58,6 +61,21 @@ func (l *Lifecycle) Reconcile(ctx context.Context, backends []backend.Backend) (
 			return report, fmt.Errorf("enumerate %s: %w", b.Name(), err)
 		}
 		for _, rec := range found {
+			if rec.PoolInventory {
+				// An unclaimed entry belongs to no episode, so charging it would
+				// reserve the node's memory for nothing and adopting it would report a
+				// sandbox the caller never asked for. It is destroyed here and rebuilt
+				// by the pool once the node serves.
+				releaseCtx, cancel := context.WithTimeout(ctx, reconcileReleaseTimeout)
+				err := b.Release(releaseCtx, rec.Handle)
+				cancel()
+				if err != nil {
+					report.Failures++
+					continue
+				}
+				report.PoolReclaimed++
+				continue
+			}
 			if !rec.Running {
 				releaseCtx, cancel := context.WithTimeout(ctx, reconcileReleaseTimeout)
 				err := b.Release(releaseCtx, rec.Handle)

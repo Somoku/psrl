@@ -275,6 +275,39 @@ type Reconciled struct {
 	Lifetime   time.Duration
 	CreatedAt  time.Time
 	Running    bool
+	// Name is the runtime's name for the object, when it has one. It is what
+	// distinguishes unclaimed warm-pool inventory from a sandbox: a label written at
+	// create cannot be removed when an entry is claimed, but a name can be changed.
+	Name string
+	// PoolInventory reports that this object is an unclaimed warm-pool entry. A
+	// restarted node destroys these rather than charging them: nothing has been
+	// promised them, and they are rebuilt by the pool's own refill.
+	PoolInventory bool
+	// CgroupParent is where the object actually runs, so a restarted node can tell a
+	// sandbox it may adopt from one the sampler cannot see.
+	CgroupParent string
+}
+
+// PoolBudget is what a backend that prefetches containers has to ask before it
+// builds one.
+//
+// A warm pool is not a class: its entries exist before any episode does, so charging
+// them to a class would let prefetching starve the work it exists to accelerate. The
+// pool is instead held against the node's declared envelope, subtracted from every
+// class's headroom, and released the moment an entry is claimed or destroyed.
+type PoolBudget interface {
+	// AcquirePool reserves one entry's footprint, reporting whether it fits.
+	AcquirePool(Resources) bool
+	// ReleasePool returns a footprint reserved by AcquirePool.
+	ReleasePool(Resources)
+	// MemoryPressure reports the measured memory fraction and whether it is usable.
+	// An unusable reading must stop refill rather than let it run blind.
+	MemoryPressure() (float64, bool)
+}
+
+// PoolBudgeted is implemented by a backend whose pool needs a budget.
+type PoolBudgeted interface {
+	SetPoolBudget(PoolBudget)
 }
 
 // Reconciler is implemented by a backend that can read back what it already

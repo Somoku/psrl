@@ -25,6 +25,7 @@ import (
 	"psrl.dev/sandboxd/internal/backend/cubesandbox"
 	"psrl.dev/sandboxd/internal/backend/dockerbackend"
 	"psrl.dev/sandboxd/internal/backend/opensandbox"
+	"psrl.dev/sandboxd/internal/cgroup"
 	"psrl.dev/sandboxd/internal/monitor"
 	"psrl.dev/sandboxd/internal/node"
 	"psrl.dev/sandboxd/internal/placement"
@@ -100,6 +101,20 @@ type Config struct {
 		// UtilizationTarget is the measured memory fraction at which overcommit is
 		// fully withdrawn. Must be set and below LocalMemCeiling when Overcommit > 1.
 		UtilizationTarget float64 `json:"utilization_target"`
+		// CgroupParent is the subtree Docker creates sandboxes into and the sampler
+		// measures. Empty takes "psrl-sandboxes". The service creates it, bounds it,
+		// and moves itself out of it before any container is created.
+		//
+		// The ceilings above are fractions of *this* subtree, not of the host or of
+		// the pod this service runs in: measured on one of these nodes, a ceiling
+		// applied to the pod was mostly about a trainer's page cache.
+		CgroupParent string `json:"cgroup_parent"`
+		// SampleIntervalS is how often the domain is measured. Zero takes 5s. The
+		// interval is also the window a CPU rate is averaged over.
+		SampleIntervalS float64 `json:"sample_interval_s"`
+		// SandboxMemorySafety is the share of the ancestor's memory limit kept free for
+		// page cache growth and work that is not a sandbox. Zero takes 5%.
+		SandboxMemorySafety float64 `json:"sandbox_memory_safety"`
 	} `json:"node"`
 
 	Classes map[string]struct {
@@ -119,6 +134,31 @@ type Config struct {
 
 	DefaultBackend string `json:"default_backend"`
 	OwnerID        string `json:"owner_id"`
+}
+
+// WarmPoolDeclared is a deployment's warm-pool declaration.
+//
+// The template fields are what every entry is built from, so they must describe the
+// containers this deployment actually creates. They are compared exactly: an entry
+// whose env, workdir, class, exec mode or lifetime differ is not handed over, because a
+// label or a limit written at create cannot be changed afterwards.
+type WarmPoolDeclared struct {
+	Image           string            `json:"image"`
+	Size            int               `json:"size"`
+	MemoryMB        int64             `json:"memory_mb"`
+	CPUCount        float64           `json:"cpu_count"`
+	DiskMB          int64             `json:"disk_mb"`
+	Env             map[string]string `json:"env"`
+	Workdir         string            `json:"workdir"`
+	ResourceClass   string            `json:"resource_class"`
+	ExecMode        string            `json:"exec_mode"`
+	LifetimeS       float64           `json:"lifetime_s"`
+	EntryTTLS       float64           `json:"entry_ttl_s"`
+	RefillIntervalS float64           `json:"refill_interval_s"`
+	// PauseAbove stops refill at this measured memory fraction; ReclaimAbove also
+	// destroys idle entries. Zero takes 0.9 for both.
+	PauseAbove   float64 `json:"pause_above"`
+	ReclaimAbove float64 `json:"reclaim_above"`
 }
 
 // BackendConfig declares one backend. The fields a backend does not use are
@@ -175,14 +215,7 @@ type BackendConfig struct {
 	// For opensandbox the size is also a standing claim on the port range, because
 	// every entry holds a published host port: the backend refuses a pool above a
 	// quarter of port_max-port_min rather than letting it starve cold creates.
-	WarmPool struct {
-		Image           string  `json:"image"`
-		Size            int     `json:"size"`
-		MemoryMB        int64   `json:"memory_mb"`
-		CPUCount        float64 `json:"cpu_count"`
-		EntryTTLS       float64 `json:"entry_ttl_s"`
-		RefillIntervalS float64 `json:"refill_interval_s"`
-	} `json:"warm_pool"`
+	WarmPool WarmPoolDeclared `json:"warm_pool"`
 }
 
 func main() {
@@ -255,10 +288,38 @@ func preflight(configPath string, log *slog.Logger) error {
 		log.Info("no local runtime is declared, so this process would serve control only")
 		return nil
 	}
+	// The domain is resolved without creating anything: preflight runs against a
+	// deployment that may not have started yet, and a check with side effects would
+	// leave a subtree behind for a service that never served.
+	parent := cfg.Node.CgroupParent
+	if parent == "" {
+		parent = cgroup.SandboxParent
+	}
+	domain, err := cgroup.Resolve()
+	if err != nil {
+		return fmt.Errorf("sandbox domain: %w", err)
+	}
+	budget, err := domain.SetupReadOnly(parent, cgroup.Request{
+		MemoryMB:   cfg.Node.MemoryMB,
+		Overcommit: cfg.Node.Overcommit,
+		CPUMillis:  cfg.Node.CPUMillis,
+		Safety:     cfg.Node.SandboxMemorySafety,
+	})
+	if err != nil {
+		return fmt.Errorf("sandbox domain: %w", err)
+	}
+	log.Info("sandbox domain resolves",
+		"domain", domain.String(), "subtree", parent,
+		"limit_mib", budget.SubtreeLimitBytes/(1024*1024),
+		"declared_mib", budget.DeclaredMB, "requested_mib", budget.RequestedMB,
+		"ancestor_limit_mib", budget.AncestorLimitBytes/(1024*1024),
+		"unreclaimable_mib", budget.UnreclaimableBytes/(1024*1024))
+	if budget.Capped() {
+		log.Warn("the sandbox subtree would be smaller than the declared envelope",
+			"declared_mib", budget.RequestedMB, "envelope_mib", budget.DeclaredMB)
+	}
 	gate, err := node.NewAdmission(node.Config{
-		Envelope: node.Resources{
-			MemoryMB: cfg.Node.MemoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB,
-		},
+		Envelope:          nodeEnvelope(cfg, budget),
 		Classes:           nodeClasses(cfg),
 		GPUIndices:        cfg.Node.GPUIndices,
 		LocalCPUCeiling:   cfg.Node.LocalCPUCeiling,
@@ -322,8 +383,12 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	if len(local) == 0 {
 		return fmt.Errorf("role \"node\" requires at least one direct backend")
 	}
+	budget, pressureFn, err := nodeDomain(ctx, cfg, log)
+	if err != nil {
+		return err
+	}
 	gate, err := node.NewAdmission(node.Config{
-		Envelope:          node.Resources{MemoryMB: cfg.Node.MemoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB},
+		Envelope:          nodeEnvelope(cfg, budget),
 		Classes:           nodeClasses(cfg),
 		GPUIndices:        cfg.Node.GPUIndices,
 		LocalCPUCeiling:   cfg.Node.LocalCPUCeiling,
@@ -347,7 +412,7 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	life.SetOwnerLiveness(gate.OwnerAlive)
 	agent, err := server.NewNode(server.NodeConfig{
 		NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backends: local,
-		Pressure: nodePressure(log),
+		Pressure: pressureFn,
 	})
 	if err != nil {
 		return err
@@ -365,7 +430,7 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 		"reclaimed", reconciled.Reclaimed, "failures", reconciled.Failures)
 	life.Start(ctx)
 	defer life.Stop()
-	startBackends(ctx, local, log)
+	startBackends(ctx, local, gate, log)
 	defer stopBackends(local)
 
 	listener, err := listen(cfg.NodeListen)
@@ -477,12 +542,15 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		agent *server.Node
 		life  *node.Lifecycle
 		nodes server.NodeClient
+		gate  *node.Admission
 	)
 	if len(local) > 0 {
-		gate, err := node.NewAdmission(node.Config{
-			Envelope: node.Resources{
-				MemoryMB: cfg.Node.MemoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB,
-			},
+		budget, pressureFn, err := nodeDomain(ctx, cfg, log)
+		if err != nil {
+			return err
+		}
+		gate, err = node.NewAdmission(node.Config{
+			Envelope:          nodeEnvelope(cfg, budget),
 			Classes:           nodeClasses(cfg),
 			GPUIndices:        cfg.Node.GPUIndices,
 			LocalCPUCeiling:   cfg.Node.LocalCPUCeiling,
@@ -506,7 +574,7 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		life.SetOwnerLiveness(gate.OwnerAlive)
 		agent, err = server.NewNode(server.NodeConfig{
 			NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backends: local,
-			Pressure: nodePressure(log),
+			Pressure: pressureFn,
 		})
 		if err != nil {
 			return err
@@ -559,7 +627,7 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		// one that has any -- is started here and drained on the way out. It is
 		// reached through an interface rather than a type switch so a backend added
 		// later gets the same treatment without this file naming it.
-		startBackends(ctx, local, log)
+		startBackends(ctx, local, gate, log)
 		defer stopBackends(local)
 		go republish(ctx, agent, fleet, spans.LoadReportInterval())
 
@@ -698,13 +766,14 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 				Runtime:              declared.Runtime,
 				NetworkMode:          declared.NetworkMode,
 				MaxCreateConcurrency: declared.MaxCreateConcurrency,
+				CgroupParent:         cfg.Node.CgroupParent,
 				WarmPool: dockerbackend.WarmPoolConfig{
-					Image:          declared.WarmPool.Image,
+					Template:       warmPoolTemplate(declared.WarmPool),
 					Size:           declared.WarmPool.Size,
-					MemoryMB:       declared.WarmPool.MemoryMB,
-					CPUCount:       declared.WarmPool.CPUCount,
 					EntryTTL:       seconds(declared.WarmPool.EntryTTLS),
 					RefillInterval: seconds(declared.WarmPool.RefillIntervalS),
+					PauseAbove:     declared.WarmPool.PauseAbove,
+					ReclaimAbove:   declared.WarmPool.ReclaimAbove,
 				},
 			}, mode)
 		default:
@@ -870,8 +939,14 @@ func seconds(value float64) time.Duration {
 // Only a backend that has something to run implements this, so the assertion is
 // an interface check rather than a flag: a backend with no pool and no loop is
 // simply skipped.
-func startBackends(ctx context.Context, backends []backend.Backend, log *slog.Logger) {
+func startBackends(ctx context.Context, backends []backend.Backend, gate *node.Admission, log *slog.Logger) {
 	for _, b := range backends {
+		// A backend that prefetches containers borrows the node's budget for them, and
+		// the budget has to be installed before its loops start or the first refill
+		// would build memory the node never agreed to hold.
+		if budgeted, can := b.(backend.PoolBudgeted); can && gate != nil {
+			budgeted.SetPoolBudget(gate.AsPoolBudget())
+		}
 		starter, can := b.(interface{ Start(context.Context) })
 		if !can {
 			continue
@@ -879,6 +954,38 @@ func startBackends(ctx context.Context, backends []backend.Backend, log *slog.Lo
 		starter.Start(ctx)
 		log.Info("backend background work started", "backend", b.Name())
 	}
+	if count, err := foreignContainers(ctx, backends); err != nil {
+		log.Warn("could not count containers outside the sandbox subtree", "reason", err)
+	} else if count > 0 {
+		log.Warn("containers this service does not own are running beside its sandboxes",
+			"containers", count,
+			"reason", "they are outside the sandbox cgroup subtree, so the sampler does not measure them; "+
+				"their memory shows up as capacity this node can never admit")
+	}
+}
+
+// foreignContainers counts containers on the local daemons that this service does not own.
+//
+// They are outside the sandbox subtree by construction -- only containers this service
+// creates are placed there -- so they are charged to the ancestor cgroup and invisible to
+// every ceiling. One is a warning rather than a refusal: sharing a daemon is a deployment
+// choice, and the operator needs to know what it costs.
+func foreignContainers(ctx context.Context, backends []backend.Backend) (int, error) {
+	total := 0
+	for _, b := range backends {
+		counter, can := b.(interface {
+			ForeignContainers(context.Context) (int, error)
+		})
+		if !can {
+			continue
+		}
+		count, err := counter.ForeignContainers(ctx)
+		if err != nil {
+			return total, err
+		}
+		total += count
+	}
+	return total, nil
 }
 
 // stopBackends drains what startBackends began.
@@ -896,20 +1003,100 @@ func stopBackends(backends []backend.Backend) {
 	}
 }
 
-// nodePressure returns the Pressure function this node agent uses to read
-// actual machine utilization from the cgroup hierarchy.
+// nodeDomain prepares the sandbox cgroup subtree and the sampler that measures it.
 //
-// When cgroup v2 is not available — a development machine, a container with a
-// different hierarchy, or a host that did not configure it — the function falls
-// back to the zero reading so the service starts rather than refusing. The log
-// line is the only signal an operator has that the ceiling configuration is not
-// being enforced.
-func nodePressure(log *slog.Logger) func() node.Pressure {
-	reader, err := pressure.NewReader()
-	if err != nil {
-		log.Warn("cgroup v2 pressure reading unavailable; utilisation ceilings will not be enforced",
-			"reason", err)
-		return func() node.Pressure { return node.Pressure{} }
+// It is one function because the two have to agree: the subtree's limit is resolved
+// from the node's declared envelope and the ancestor's capacity, and the envelope
+// admission uses is the resolved value. Deriving them separately is what lets a kernel
+// bound and an admission bound drift apart, and the symptom of that drift is either a
+// ceiling nothing can reach or an OOM admission promised it had room for.
+//
+// A deployment that configured no measured ceiling, no overcommit and no subtree loses
+// nothing by running without a domain, so an unreadable cgroup warns instead of
+// refusing to start. Every deployment that did configure one is refused: admitting
+// against capacity it cannot see is the failure the domain exists to prevent.
+func nodeDomain(ctx context.Context, cfg Config, log *slog.Logger) (cgroup.Budget, func() node.Pressure, error) {
+	parent := cfg.Node.CgroupParent
+	if parent == "" {
+		parent = cgroup.SandboxParent
 	}
-	return reader.Read
+	request := cgroup.Request{
+		MemoryMB:   cfg.Node.MemoryMB,
+		Overcommit: cfg.Node.Overcommit,
+		CPUMillis:  cfg.Node.CPUMillis,
+		Safety:     cfg.Node.SandboxMemorySafety,
+	}
+	budget, pressureFn, err := prepareDomain(ctx, parent, request, seconds(cfg.Node.SampleIntervalS), log)
+	if err == nil {
+		return budget, pressureFn, nil
+	}
+	measured := cfg.Node.LocalCPUCeiling > 0 || cfg.Node.LocalMemCeiling > 0
+	if measured || cfg.Node.Overcommit > 1 || cfg.Node.CgroupParent != "" {
+		return cgroup.Budget{}, nil, fmt.Errorf("sandbox domain: %w", err)
+	}
+	log.Warn("no sandbox cgroup domain; measured ceilings and overcommit stay off", "reason", err)
+	return cgroup.Budget{DeclaredMB: cfg.Node.MemoryMB}, func() node.Pressure { return node.Pressure{} }, nil
+}
+
+// prepareDomain creates the subtree, moves this process out of it, and starts the
+// sampler that reads it.
+func prepareDomain(
+	ctx context.Context, parent string, request cgroup.Request, interval time.Duration, log *slog.Logger,
+) (cgroup.Budget, func() node.Pressure, error) {
+	domain, err := cgroup.Resolve()
+	if err != nil {
+		return cgroup.Budget{}, nil, err
+	}
+	budget, err := domain.Setup(parent, cgroup.HostLeaf, request)
+	if err != nil {
+		return cgroup.Budget{}, nil, err
+	}
+	reader, err := pressure.NewDomainReader(parent)
+	if err != nil {
+		return cgroup.Budget{}, nil, err
+	}
+	sampler, err := pressure.NewSampler(reader, interval)
+	if err != nil {
+		return cgroup.Budget{}, nil, err
+	}
+	sampler.Start(ctx)
+	log.Info("sandbox domain ready",
+		"domain", domain.String(), "subtree", parent,
+		"limit_mib", budget.SubtreeLimitBytes/(1024*1024),
+		"declared_mib", budget.DeclaredMB, "requested_mib", budget.RequestedMB,
+		"ancestor_limit_mib", budget.AncestorLimitBytes/(1024*1024),
+		"unreclaimable_mib", budget.UnreclaimableBytes/(1024*1024),
+		"cpu_millis", budget.CPUMillis, "sample_interval_s", sampler.Interval().Seconds())
+	if budget.Capped() {
+		log.Warn("the sandbox subtree is smaller than the declared envelope",
+			"declared_mib", budget.RequestedMB, "envelope_mib", budget.DeclaredMB,
+			"limit_mib", budget.SubtreeLimitBytes/(1024*1024),
+			"ancestor_limit_mib", budget.AncestorLimitBytes/(1024*1024),
+			"unreclaimable_mib", budget.UnreclaimableBytes/(1024*1024),
+			"reason", "the ancestor cgroup cannot hold the declared envelope plus what it already holds")
+	}
+	return budget, sampler.Pressure(), nil
+}
+
+// nodeEnvelope is the envelope admission uses: the resolved one when a domain exists.
+func nodeEnvelope(cfg Config, budget cgroup.Budget) node.Resources {
+	memoryMB := cfg.Node.MemoryMB
+	if budget.DeclaredMB > 0 {
+		memoryMB = budget.DeclaredMB
+	}
+	return node.Resources{MemoryMB: memoryMB, CPUMillis: cfg.Node.CPUMillis, DiskMB: cfg.Node.DiskMB}
+}
+
+// warmPoolTemplate turns a deployment's pool declaration into the spec entries are built
+// from.
+func warmPoolTemplate(cfg WarmPoolDeclared) backend.Spec {
+	return backend.Spec{
+		Source:        backend.Source{Kind: "image", Reference: cfg.Image},
+		Resources:     backend.Resources{MemoryMB: cfg.MemoryMB, CPUCount: cfg.CPUCount, DiskMB: cfg.DiskMB},
+		ResourceClass: cfg.ResourceClass,
+		Env:           cfg.Env,
+		Workdir:       cfg.Workdir,
+		ExecMode:      cfg.ExecMode,
+		Lifetime:      seconds(cfg.LifetimeS),
+	}
 }

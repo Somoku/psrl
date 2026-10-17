@@ -18,6 +18,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"psrl.dev/sandboxd/internal/backend"
 )
 
 // Resources is what one sandbox asks of a node.
@@ -314,6 +316,23 @@ func (a *Admission) ReleasePool(want Resources) {
 		a.pool = Resources{}
 	}
 }
+
+// AsPoolBudget adapts this gate to the interface a prefetching backend takes.
+//
+// The two packages speak different units for CPU -- the backend states fractional
+// cores and the node charges milliseconds -- so the conversion lives here rather than in
+// either of them.
+func (a *Admission) AsPoolBudget() backend.PoolBudget { return poolBudget{gate: a} }
+
+type poolBudget struct{ gate *Admission }
+
+func (p poolBudget) AcquirePool(want backend.Resources) bool {
+	return p.gate.AcquirePool(nodeResourcesFrom(want))
+}
+
+func (p poolBudget) ReleasePool(want backend.Resources) { p.gate.ReleasePool(nodeResourcesFrom(want)) }
+
+func (p poolBudget) MemoryPressure() (float64, bool) { return p.gate.MemoryPressure() }
 
 // Pooled reports what the warm pool currently holds.
 func (a *Admission) Pooled() Resources {

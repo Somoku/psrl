@@ -171,6 +171,12 @@ func resolveFrom(mountsPath, cgroupPath string) (Domain, error) {
 func (d Domain) String() string {
 	parts := make([]string, 0, len(d.Hierarchies))
 	for _, h := range d.Hierarchies {
+		// A named hierarchy ("name=systemd") carries no controller, so it is labelled
+		// by its mount point rather than by an empty list.
+		if len(h.Controllers) == 0 {
+			parts = append(parts, fmt.Sprintf("%s=%s", filepath.Base(h.Mount), h.Root))
+			continue
+		}
 		if h.Root == h.Mount {
 			parts = append(parts, fmt.Sprintf("%s=%s (mount root is the process cgroup)", strings.Join(h.Controllers, ","), h.Root))
 			continue

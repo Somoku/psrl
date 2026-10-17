@@ -3,6 +3,7 @@ package dockerbackend
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,32 +11,28 @@ import (
 	"psrl.dev/sandboxd/internal/backend"
 )
 
-// -- a fake runtime the pool can drive ----------------------------------------
+// -- fixtures -----------------------------------------------------------------
 
-// fakeRuntime stands in for the daemon. It records what the pool asked for, so a
-// test asserts on the pool's decisions rather than on a container.
+// fakeRuntime stands in for the daemon. It records what the pool asked for, so a test
+// asserts on the pool's decisions rather than on a container.
 type fakeRuntime struct {
 	mu        sync.Mutex
-	created   []string
+	created   []backend.Spec
 	destroyed []string
 	nextID    int
 	failNext  bool
-	createErr error
 }
 
-func (f *fakeRuntime) create(_ context.Context, _ backend.Spec) (string, error) {
+func (f *fakeRuntime) create(_ context.Context, spec backend.Spec) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failNext {
 		f.failNext = false
-		if f.createErr != nil {
-			return "", f.createErr
-		}
 		return "", fmt.Errorf("daemon refused")
 	}
 	f.nextID++
 	id := fmt.Sprintf("warm-%d", f.nextID)
-	f.created = append(f.created, id)
+	f.created = append(f.created, spec)
 	return id, nil
 }
 
@@ -58,32 +55,95 @@ func (f *fakeRuntime) destroyedCount() int {
 	return len(f.destroyed)
 }
 
+// fakeBudget stands in for the node's admission gate.
+type fakeBudget struct {
+	mu        sync.Mutex
+	reserved  int64
+	allow     int64
+	pressure  float64
+	valid     bool
+	acquired  int
+	released  int
+	refusedAt int
+}
+
+func newFakeBudget(allowMB int64) *fakeBudget {
+	return &fakeBudget{allow: allowMB, valid: true}
+}
+
+func (b *fakeBudget) AcquirePool(want backend.Resources) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.acquired++
+	if b.reserved+want.MemoryMB > b.allow {
+		b.refusedAt = b.acquired
+		return false
+	}
+	b.reserved += want.MemoryMB
+	return true
+}
+
+func (b *fakeBudget) ReleasePool(want backend.Resources) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.released++
+	b.reserved -= want.MemoryMB
+	if b.reserved < 0 {
+		b.reserved = 0
+	}
+}
+
+func (b *fakeBudget) MemoryPressure() (float64, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.pressure, b.valid
+}
+
+func (b *fakeBudget) reservedMB() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.reserved
+}
+
+// template is the spec every entry is built from in these tests.
+func template() backend.Spec {
+	return backend.Spec{
+		Source:        backend.Source{Kind: "image", Reference: "alpine:latest"},
+		Resources:     backend.Resources{MemoryMB: 512, CPUCount: 1},
+		ResourceClass: "rollout",
+		Env:           map[string]string{"A": "1"},
+		Workdir:       "/work",
+		ExecMode:      "one_shot",
+		Lifetime:      2 * time.Hour,
+	}
+}
+
 func poolConfig() WarmPoolConfig {
 	return WarmPoolConfig{
-		Image:          "alpine:latest",
+		Template:       template(),
 		Size:           3,
-		MemoryMB:       512,
-		CPUCount:       1,
 		EntryTTL:       10 * time.Minute,
 		RefillInterval: time.Minute,
 	}
 }
 
-func newTestPool(t *testing.T, cfg WarmPoolConfig) (*warmPool, *fakeRuntime) {
+func newTestPool(t *testing.T, cfg WarmPoolConfig, budget backend.PoolBudget) (*warmPool, *fakeRuntime) {
 	t.Helper()
 	runtime := &fakeRuntime{}
-	pool, err := newWarmPool(cfg, runtime.create, runtime.destroy)
+	pool, err := newWarmPool(cfg, runtime.create, runtime.destroy, budget)
 	if err != nil {
 		t.Fatalf("newWarmPool: %v", err)
 	}
 	return pool, runtime
 }
 
+// matchingSpec is the template as a caller would state it: the same container, with the
+// per-caller identity the template deliberately does not carry.
 func matchingSpec() backend.Spec {
-	return backend.Spec{
-		Source:    backend.Source{Kind: "image", Reference: "alpine:latest"},
-		Resources: backend.Resources{MemoryMB: 256, CPUCount: 0.5},
-	}
+	spec := template()
+	spec.Metadata = map[string]string{"owner_id": "caller-1"}
+	spec.IdempotencyKey = "task-1:rollout"
+	return spec
 }
 
 // -- configuration -------------------------------------------------------------
@@ -91,12 +151,10 @@ func matchingSpec() backend.Spec {
 func TestAZeroSizeDisablesThePool(t *testing.T) {
 	cfg := poolConfig()
 	cfg.Size = 0
-	pool, _ := newTestPool(t, cfg)
+	pool, _ := newTestPool(t, cfg, nil)
 	if pool != nil {
 		t.Fatal("a pool of size zero must be nil rather than an empty pool")
 	}
-	// A nil pool must still be safe to call: Create goes through claim on every
-	// request, and a nil check at each call site would be a second place to forget.
 	if _, ok := pool.claim(context.Background(), matchingSpec()); ok {
 		t.Error("a disabled pool must not report a claim")
 	}
@@ -110,18 +168,51 @@ func TestAZeroSizeDisablesThePool(t *testing.T) {
 
 func TestAPoolWithNoImageIsRefused(t *testing.T) {
 	cfg := poolConfig()
-	cfg.Image = ""
-	if _, err := newWarmPool(cfg, nil, nil); err == nil {
+	cfg.Template.Source.Reference = ""
+	if _, err := newWarmPool(cfg, nil, nil, nil); err == nil {
 		t.Fatal("a sized pool with no image must be refused: there is nothing to build")
 	}
 }
 
+func TestAPoolTemplateMustNameAClass(t *testing.T) {
+	// The class is a label on the entry. Without one, a claimed entry is unattributable
+	// after a restart, which is the state this whole design removes.
+	cfg := poolConfig()
+	cfg.Template.ResourceClass = ""
+	if _, err := newWarmPool(cfg, nil, nil, nil); err == nil {
+		t.Fatal("a template without a class must be refused")
+	}
+}
+
+func TestAPoolTemplateMustNotCarryPerCallerIdentity(t *testing.T) {
+	// Metadata and an idempotency key name one sandbox, and a shared entry belongs to
+	// none: baking either into the template would label every entry with one episode's
+	// identity, and labels cannot be changed after create.
+	withMetadata := poolConfig()
+	withMetadata.Template.Metadata = map[string]string{"owner_id": "caller-1"}
+	if _, err := newWarmPool(withMetadata, nil, nil, nil); err == nil {
+		t.Fatal("a template with metadata must be refused")
+	}
+
+	withKey := poolConfig()
+	withKey.Template.IdempotencyKey = "task-1:rollout"
+	if _, err := newWarmPool(withKey, nil, nil, nil); err == nil {
+		t.Fatal("a template with an idempotency key must be refused")
+	}
+}
+
+func TestAPoolTemplateMustNotRequestDevices(t *testing.T) {
+	cfg := poolConfig()
+	cfg.Template.Resources.GPUCount = 1
+	if _, err := newWarmPool(cfg, nil, nil, nil); err == nil {
+		t.Fatal("a template that asks for a device must be refused")
+	}
+}
+
 func TestARefillSlowerThanTheTTLIsRefused(t *testing.T) {
-	// An entry that expires before the pool can replace it means the pool is
-	// never warm, which is a configuration error rather than a slow pool.
 	cfg := poolConfig()
 	cfg.RefillInterval = cfg.EntryTTL
-	if _, err := newWarmPool(cfg, nil, nil); err == nil {
+	if _, err := newWarmPool(cfg, nil, nil, nil); err == nil {
 		t.Fatal("a refill interval at or above the entry TTL must be refused")
 	}
 }
@@ -129,385 +220,383 @@ func TestARefillSlowerThanTheTTLIsRefused(t *testing.T) {
 func TestAZeroTTLIsRefused(t *testing.T) {
 	cfg := poolConfig()
 	cfg.EntryTTL = 0
-	if _, err := newWarmPool(cfg, nil, nil); err == nil {
+	if _, err := newWarmPool(cfg, nil, nil, nil); err == nil {
 		t.Fatal("an entry TTL of zero must be refused")
 	}
 }
 
-// -- refill --------------------------------------------------------------------
-
-func TestRefillFillsToSize(t *testing.T) {
-	pool, runtime := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-	if got := runtime.createdCount(); got != 3 {
-		t.Errorf("created %d entries, want 3", got)
-	}
-	if report := pool.Snapshot(); report.Ready != 3 {
-		t.Errorf("ready %d, want 3", report.Ready)
-	}
-}
-
-func TestRefillIsIdempotentOnceFull(t *testing.T) {
-	pool, runtime := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-	pool.refill(context.Background())
-	if got := runtime.createdCount(); got != 3 {
-		t.Errorf("a second refill on a full pool created more: %d, want 3", got)
-	}
-}
-
-func TestOneFailedCreateStopsThatPass(t *testing.T) {
-	// A daemon that refused one create will refuse the next, so a pass that kept
-	// trying would spend the whole refill interval failing.
-	pool, runtime := newTestPool(t, poolConfig())
-	runtime.failNext = true
-	pool.refill(context.Background())
-	if got := runtime.createdCount(); got != 0 {
-		t.Errorf("created %d after the first create failed, want 0", got)
-	}
-	if report := pool.Snapshot(); report.Failures != 1 {
-		t.Errorf("failures %d, want 1", report.Failures)
-	}
-}
-
-func TestAFailedRefillRecoversOnTheNextPass(t *testing.T) {
-	pool, runtime := newTestPool(t, poolConfig())
-	runtime.failNext = true
-	pool.refill(context.Background())
-	pool.refill(context.Background())
-	if got := runtime.createdCount(); got != 3 {
-		t.Errorf("created %d on the recovery pass, want 3", got)
-	}
-}
-
-// -- claim ---------------------------------------------------------------------
-
-func TestAClaimTakesAReadyEntry(t *testing.T) {
-	pool, _ := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-
-	containerID, ok := pool.claim(context.Background(), matchingSpec())
-	if !ok {
-		t.Fatal("a matching spec must claim a ready entry")
-	}
-	if containerID == "" {
-		t.Error("a claim must return a container id")
-	}
-	if report := pool.Snapshot(); report.Ready != 2 {
-		t.Errorf("ready after one claim: %d, want 2", report.Ready)
-	}
-}
-
-func TestAnEmptyPoolReportsNoClaim(t *testing.T) {
-	pool, _ := newTestPool(t, poolConfig())
-	// Never refilled, so nothing is ready. The caller falls through to a cold
-	// create, which is correct rather than an error.
-	if _, ok := pool.claim(context.Background(), matchingSpec()); ok {
-		t.Fatal("an empty pool must report no claim")
-	}
-}
-
-func TestClaimsDrainThePoolExactlyOnce(t *testing.T) {
-	// The failure this prevents: two concurrent creates handed the same container.
-	pool, _ := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-
-	seen := map[string]bool{}
-	for i := 0; i < 3; i++ {
-		containerID, ok := pool.claim(context.Background(), matchingSpec())
-		if !ok {
-			t.Fatalf("claim %d failed on a pool of three", i)
-		}
-		if seen[containerID] {
-			t.Fatalf("container %s was claimed twice", containerID)
-		}
-		seen[containerID] = true
-	}
-	if _, ok := pool.claim(context.Background(), matchingSpec()); ok {
-		t.Error("a fourth claim on a pool of three must fail")
-	}
-}
-
-func TestConcurrentClaimsNeverRepeatAContainer(t *testing.T) {
+func TestATTLThatOutlivesTheLifetimeIsRefused(t *testing.T) {
+	// An entry's lifetime runs from when it was built, so a long TTL hands the caller a
+	// sandbox that is reclaimed sooner than its own budget expects.
 	cfg := poolConfig()
-	cfg.Size = 32
-	pool, _ := newTestPool(t, cfg)
-	pool.refill(context.Background())
-
-	var (
-		mu     sync.Mutex
-		claims []string
-		wg     sync.WaitGroup
-	)
-	for i := 0; i < 64; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if containerID, ok := pool.claim(context.Background(), matchingSpec()); ok {
-				mu.Lock()
-				claims = append(claims, containerID)
-				mu.Unlock()
-			}
-		}()
+	cfg.EntryTTL = cfg.Template.Lifetime / 2
+	cfg.RefillInterval = time.Minute
+	if _, err := newWarmPool(cfg, nil, nil, nil); err == nil {
+		t.Fatal("an entry TTL far inside the lifetime must be refused")
 	}
-	wg.Wait()
+}
 
-	if len(claims) != 32 {
-		t.Errorf("64 concurrent claims on a pool of 32 returned %d, want 32", len(claims))
-	}
-	seen := map[string]bool{}
-	for _, containerID := range claims {
-		if seen[containerID] {
-			t.Fatalf("container %s was handed to two callers", containerID)
-		}
-		seen[containerID] = true
+func TestReclaimBelowPauseIsRefused(t *testing.T) {
+	cfg := poolConfig()
+	cfg.PauseAbove = 0.8
+	cfg.ReclaimAbove = 0.5
+	if _, err := newWarmPool(cfg, nil, nil, nil); err == nil {
+		t.Fatal("reclaiming below the pause threshold must be refused")
 	}
 }
 
 // -- matching ------------------------------------------------------------------
 
-func TestADifferentImageDoesNotMatch(t *testing.T) {
-	pool, _ := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-	spec := matchingSpec()
-	spec.Source.Reference = "ubuntu:22.04"
-	if _, ok := pool.claim(context.Background(), spec); ok {
-		t.Fatal("a spec naming another image must not be served from the pool")
-	}
-}
+func TestOnlyAnExactSpecMatches(t *testing.T) {
+	// The entry's limits and labels were written at create, so a caller that differs in
+	// any of them would be served a container that is not what admission charged for.
+	pool, _ := newTestPool(t, poolConfig(), nil)
 
-func TestALargerFootprintDoesNotMatch(t *testing.T) {
-	// A container's cgroup limits are written at create. Handing a sandbox that
-	// asked for 1 GB an entry built with 512 MB would run it under a limit its
-	// admission never charged.
-	pool, _ := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-	spec := matchingSpec()
-	spec.Resources.MemoryMB = 1024
-	if _, ok := pool.claim(context.Background(), spec); ok {
-		t.Fatal("a spec asking for more memory than entries were built with must not match")
+	cases := []struct {
+		name   string
+		mutate func(*backend.Spec)
+	}{
+		{"image", func(s *backend.Spec) { s.Source.Reference = "other" }},
+		{"memory", func(s *backend.Spec) { s.Resources.MemoryMB = 1024 }},
+		{"cpu", func(s *backend.Spec) { s.Resources.CPUCount = 2 }},
+		{"disk", func(s *backend.Spec) { s.Resources.DiskMB = 100 }},
+		{"workdir", func(s *backend.Spec) { s.Workdir = "/elsewhere" }},
+		{"class", func(s *backend.Spec) { s.ResourceClass = "grader" }},
+		{"exec mode", func(s *backend.Spec) { s.ExecMode = "persistent" }},
+		{"lifetime", func(s *backend.Spec) { s.Lifetime = time.Hour }},
+		{"env value", func(s *backend.Spec) { s.Env = map[string]string{"A": "2"} }},
+		{"env key", func(s *backend.Spec) { s.Env = map[string]string{"B": "1"} }},
+		{"extra env", func(s *backend.Spec) { s.Env = map[string]string{"A": "1", "B": "2"} }},
+		{"devices", func(s *backend.Spec) { s.AssignedGPUs = []int32{0} }},
 	}
-}
-
-func TestASmallerFootprintMatches(t *testing.T) {
-	pool, _ := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-	spec := matchingSpec()
-	spec.Resources.MemoryMB = 128
-	if _, ok := pool.claim(context.Background(), spec); !ok {
-		t.Fatal("a spec asking for less than entries were built with must be served")
-	}
-}
-
-func TestAGPURequestDoesNotMatch(t *testing.T) {
-	// Entries are built with no device requests, so a GPU sandbox handed one
-	// would see no device while admission had charged it for one.
-	pool, _ := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-	spec := matchingSpec()
-	spec.Resources.GPUCount = 1
-	if _, ok := pool.claim(context.Background(), spec); ok {
-		t.Fatal("a GPU request must not be served from the pool")
-	}
-}
-
-func TestAnAssignedDeviceDoesNotMatch(t *testing.T) {
-	pool, _ := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-	spec := matchingSpec()
-	spec.AssignedGPUs = []int32{0}
-	if _, ok := pool.claim(context.Background(), spec); ok {
-		t.Fatal("a spec with a granted device must not be served from the pool")
-	}
-}
-
-func TestATemplateSourceDoesNotMatch(t *testing.T) {
-	pool, _ := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-	spec := matchingSpec()
-	spec.Source.Kind = "template"
-	if _, ok := pool.claim(context.Background(), spec); ok {
-		t.Fatal("a template source must not be served from an image pool")
-	}
-}
-
-// -- expiry --------------------------------------------------------------------
-
-func TestAnExpiredEntryIsNotClaimed(t *testing.T) {
-	// A container that has idled past its TTL may have had its image layers
-	// collected underneath it, so it is destroyed rather than handed out.
-	pool, runtime := newTestPool(t, poolConfig())
-	now := time.Now()
-	pool.now = func() time.Time { return now }
-	pool.refill(context.Background())
-
-	// Move past the TTL.
-	pool.now = func() time.Time { return now.Add(11 * time.Minute) }
-	if _, ok := pool.claim(context.Background(), matchingSpec()); ok {
-		t.Fatal("an expired entry must not be claimed")
-	}
-	if got := runtime.destroyedCount(); got != 3 {
-		t.Errorf("destroyed %d expired entries, want 3", got)
-	}
-	if report := pool.Snapshot(); report.Expired != 3 {
-		t.Errorf("expired count %d, want 3", report.Expired)
-	}
-}
-
-func TestASweepDestroysExpiredEntries(t *testing.T) {
-	pool, runtime := newTestPool(t, poolConfig())
-	now := time.Now()
-	pool.now = func() time.Time { return now }
-	pool.refill(context.Background())
-
-	pool.now = func() time.Time { return now.Add(11 * time.Minute) }
-	if swept := pool.sweep(context.Background()); swept != 3 {
-		t.Errorf("sweep reported %d, want 3", swept)
-	}
-	if got := runtime.destroyedCount(); got != 3 {
-		t.Errorf("destroyed %d, want 3", got)
-	}
-	if report := pool.Snapshot(); report.Ready != 0 {
-		t.Errorf("ready after sweep: %d, want 0", report.Ready)
-	}
-}
-
-func TestASweepKeepsFreshEntries(t *testing.T) {
-	pool, runtime := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-	if swept := pool.sweep(context.Background()); swept != 0 {
-		t.Errorf("a sweep over fresh entries reported %d, want 0", swept)
-	}
-	if got := runtime.destroyedCount(); got != 0 {
-		t.Errorf("destroyed %d fresh entries, want 0", got)
-	}
-}
-
-// -- shutdown ------------------------------------------------------------------
-
-func TestStopDrainsThePool(t *testing.T) {
-	// An entry left behind is a container with this service's owner label and no
-	// owner, which the next start would reclaim as an orphan.
-	pool, runtime := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-	pool.Stop(context.Background())
-	if got := runtime.destroyedCount(); got != 3 {
-		t.Errorf("destroyed %d on shutdown, want 3", got)
-	}
-	if report := pool.Snapshot(); report.Ready != 0 {
-		t.Errorf("ready after stop: %d, want 0", report.Ready)
-	}
-}
-
-func TestStartFillsThePool(t *testing.T) {
-	pool, runtime := newTestPool(t, poolConfig())
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	pool.Start(ctx)
-	defer pool.Stop(context.Background())
-
-	// Start fills once immediately so the first create can already be warm.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if runtime.createdCount() == 3 {
-			break
+	for _, testCase := range cases {
+		spec := matchingSpec()
+		testCase.mutate(&spec)
+		if pool.matches(spec) {
+			t.Errorf("a spec differing in %s must not match", testCase.name)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	if got := runtime.createdCount(); got != 3 {
-		t.Errorf("Start created %d entries, want 3", got)
-	}
-}
 
-// -- reporting -----------------------------------------------------------------
-
-func TestTheHitRatioReportsWhatThePoolServed(t *testing.T) {
-	// A pool whose hit ratio is low is a pool whose budget is wrong, and that is
-	// only visible as a number.
-	pool, _ := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
-
-	// Three hits, then two misses.
-	for i := 0; i < 3; i++ {
-		pool.claim(context.Background(), matchingSpec())
-	}
-	pool.claim(context.Background(), matchingSpec())
-	pool.claim(context.Background(), matchingSpec())
-
-	report := pool.Snapshot()
-	if report.Claims != 5 {
-		t.Errorf("claims %d, want 5", report.Claims)
-	}
-	if report.Hits != 3 {
-		t.Errorf("hits %d, want 3", report.Hits)
-	}
-	if ratio := report.HitRatio(); ratio < 0.59 || ratio > 0.61 {
-		t.Errorf("hit ratio %.3f, want ~0.6", ratio)
+	if !pool.matches(matchingSpec()) {
+		t.Error("the template as a caller states it must match")
 	}
 }
 
-func TestAPoolWithNoClaimsHasNoHitRatio(t *testing.T) {
-	// Zero claims is not zero hit rate: dividing would report a pool that is
-	// failing when nothing has asked it for anything.
-	pool, _ := newTestPool(t, poolConfig())
-	if ratio := pool.Snapshot().HitRatio(); ratio != 0 {
-		t.Errorf("hit ratio with no claims: %.3f, want 0", ratio)
-	}
-}
-
-// -- a non-matching claim does not consume an entry ----------------------------
-
-func TestANonMatchingClaimLeavesThePoolIntact(t *testing.T) {
-	pool, _ := newTestPool(t, poolConfig())
-	pool.refill(context.Background())
+func TestPerCallerIdentityDoesNotAffectMatching(t *testing.T) {
+	// Metadata and the idempotency key are exactly the fields a shared entry cannot
+	// carry, so they must not be part of the match.
+	pool, _ := newTestPool(t, poolConfig(), nil)
 
 	spec := matchingSpec()
-	spec.Source.Reference = "ubuntu:22.04"
-	pool.claim(context.Background(), spec)
+	spec.Metadata = map[string]string{"owner_id": "someone-else", "task": "9"}
+	spec.IdempotencyKey = "another-key"
 
-	if report := pool.Snapshot(); report.Ready != 3 {
-		t.Errorf("ready after a non-matching claim: %d, want 3", report.Ready)
-	}
-	// A spec the pool cannot serve is not a claim against it: counting it would
-	// make the hit ratio describe the workload rather than the pool.
-	if report := pool.Snapshot(); report.Claims != 0 {
-		t.Errorf("claims after a non-matching spec: %d, want 0", report.Claims)
+	if !pool.matches(spec) {
+		t.Error("per-caller identity must not stop an otherwise matching claim")
 	}
 }
 
-// -- a pool entry cannot be reconciled across a restart ------------------------
+// -- refill, expiry and drain ---------------------------------------------------
 
-func TestAReconcileRefusesWhileAPoolEntryIsRunning(t *testing.T) {
-	// A claimed entry keeps the pool's class label, because labels are immutable
-	// and the claim lived only in memory. After a restart a running pool entry
-	// cannot be told from a caller's sandbox, so the node must not guess: it
-	// refuses to start rather than charge one wrongly or destroy live work.
-	found := []backend.Reconciled{
-		{Handle: backend.Handle{SandboxID: "a"}, Class: "rollout", Running: true},
-		{Handle: backend.Handle{SandboxID: "b"}, Class: warmPoolClass, Running: true},
+func TestRefillBuildsToSize(t *testing.T) {
+	pool, runtime := newTestPool(t, poolConfig(), nil)
+
+	pool.refill(context.Background())
+
+	if got := runtime.createdCount(); got != 3 {
+		t.Fatalf("created: got %d, want 3", got)
 	}
-	if err := refuseRunningPoolEntries(found); err == nil {
-		t.Fatal("a running pool entry must stop the reconcile")
+	if got := pool.Snapshot().Ready; got != 3 {
+		t.Errorf("ready: got %d, want 3", got)
 	}
 }
 
-func TestAReconcilePassesAnExitedPoolEntryThroughForReclaim(t *testing.T) {
-	// An entry that has exited holds no memory, so there is nothing ambiguous
-	// about it: the node reclaims it like any other dead container.
-	found := []backend.Reconciled{
-		{Handle: backend.Handle{SandboxID: "a"}, Class: warmPoolClass, Running: false},
+func TestRefillStopsAtTheBudget(t *testing.T) {
+	// The pool is an optimization and the envelope is not: an entry that does not fit is
+	// not built.
+	budget := newFakeBudget(1024) // two entries of 512
+	pool, runtime := newTestPool(t, poolConfig(), budget)
+
+	pool.refill(context.Background())
+
+	if got := runtime.createdCount(); got != 2 {
+		t.Errorf("created: got %d, want 2 (the budget)", got)
 	}
-	if err := refuseRunningPoolEntries(found); err != nil {
-		t.Fatalf("an exited pool entry must not stop the reconcile: %v", err)
+	if got := budget.reservedMB(); got != 1024 {
+		t.Errorf("reserved: got %d, want 1024", got)
 	}
 }
 
-func TestAReconcileIgnoresOrdinarySandboxes(t *testing.T) {
-	found := []backend.Reconciled{
-		{Handle: backend.Handle{SandboxID: "a"}, Class: "rollout", Running: true},
-		{Handle: backend.Handle{SandboxID: "b"}, Class: "grader", Running: true},
+func TestAReleaseThatOutlivesTheBudgetIsRefused(t *testing.T) {
+	// A double release would let the node promise the same memory twice.
+	budget := newFakeBudget(1024)
+	pool, _ := newTestPool(t, poolConfig(), budget)
+	pool.refill(context.Background())
+
+	pool.Stop(context.Background())
+
+	if got := budget.reservedMB(); got != 0 {
+		t.Errorf("reserved after drain: got %d, want 0", got)
 	}
-	if err := refuseRunningPoolEntries(found); err != nil {
-		t.Fatalf("ordinary sandboxes must reconcile: %v", err)
+}
+
+func TestRefillStopsWhenMeasurementIsUnavailable(t *testing.T) {
+	// An unusable reading is not an idle node: building entries into a machine nobody can
+	// see is the one direction this must never fail in.
+	budget := newFakeBudget(1 << 20)
+	budget.valid = false
+	pool, runtime := newTestPool(t, poolConfig(), budget)
+
+	pool.refill(context.Background())
+
+	if got := runtime.createdCount(); got != 0 {
+		t.Errorf("created: got %d, want 0 while measurement is unavailable", got)
+	}
+}
+
+func TestRefillStopsAtThePauseThreshold(t *testing.T) {
+	budget := newFakeBudget(1 << 20)
+	budget.pressure = 0.85
+	pool, runtime := newTestPool(t, poolConfig(), budget)
+	pool.cfg.PauseAbove = 0.8
+	pool.cfg.ReclaimAbove = 0.95
+
+	pool.refill(context.Background())
+
+	if got := runtime.createdCount(); got != 0 {
+		t.Errorf("created: got %d, want 0 above the pause threshold", got)
+	}
+}
+
+func TestRefillReclaimsIdleEntriesAtTheReclaimThreshold(t *testing.T) {
+	budget := newFakeBudget(1 << 20)
+	pool, runtime := newTestPool(t, poolConfig(), budget)
+	pool.cfg.PauseAbove = 0.5
+	pool.cfg.ReclaimAbove = 0.8
+	pool.refill(context.Background())
+	if runtime.createdCount() != 3 {
+		t.Fatalf("the test needs a filled pool, got %d", runtime.createdCount())
+	}
+
+	budget.pressure = 0.9
+	pool.refill(context.Background())
+
+	if got := runtime.destroyedCount(); got != 3 {
+		t.Errorf("destroyed: got %d, want 3 (idle inventory)", got)
+	}
+	if got := budget.reservedMB(); got != 0 {
+		t.Errorf("reserved after reclaim: got %d, want 0", got)
+	}
+}
+
+func TestAnExpiredEntryIsDestroyedAndItsBudgetReturned(t *testing.T) {
+	budget := newFakeBudget(1 << 20)
+	pool, runtime := newTestPool(t, poolConfig(), budget)
+	pool.refill(context.Background())
+	pool.now = func() time.Time { return time.Now().Add(time.Hour) }
+
+	if got := pool.sweep(context.Background()); got != 3 {
+		t.Errorf("swept: got %d, want 3", got)
+	}
+	if got := runtime.destroyedCount(); got != 3 {
+		t.Errorf("destroyed: got %d, want 3", got)
+	}
+	if got := budget.reservedMB(); got != 0 {
+		t.Errorf("reserved: got %d, want 0", got)
+	}
+}
+
+func TestThePoolDrainsOnStop(t *testing.T) {
+	pool, runtime := newTestPool(t, poolConfig(), nil)
+	pool.refill(context.Background())
+
+	pool.Stop(context.Background())
+
+	if got := runtime.destroyedCount(); got != 3 {
+		t.Errorf("destroyed on stop: got %d, want 3", got)
+	}
+	if got := pool.Snapshot().Ready; got != 0 {
+		t.Errorf("ready after stop: got %d, want 0", got)
+	}
+}
+
+func TestAClaimTakesOneEntryAndTransfersItsBudget(t *testing.T) {
+	budget := newFakeBudget(1 << 20)
+	pool, _ := newTestPool(t, poolConfig(), budget)
+	pool.refill(context.Background())
+
+	entry, ok := pool.claim(context.Background(), matchingSpec())
+	if !ok {
+		t.Fatal("a matching spec must claim an entry")
+	}
+	if entry.containerID == "" {
+		t.Fatal("the claim must name a container")
+	}
+	pool.adopt(entry)
+
+	if got := budget.reservedMB(); got != 1024 {
+		t.Errorf("reserved after one claim: got %d, want 1024 (two entries left)", got)
+	}
+	if got := pool.Snapshot().Hits; got != 1 {
+		t.Errorf("hits: got %d, want 1", got)
+	}
+}
+
+func TestAnUnclaimReturnsTheEntryWithoutReleasingItsBudget(t *testing.T) {
+	// A daemon that did not answer an inspect is not evidence the entry is bad, so it goes
+	// back to the pool still reserved.
+	budget := newFakeBudget(1 << 20)
+	pool, _ := newTestPool(t, poolConfig(), budget)
+	pool.refill(context.Background())
+	entry, _ := pool.claim(context.Background(), matchingSpec())
+
+	pool.unclaim(entry)
+
+	if got := pool.Snapshot().Ready; got != 3 {
+		t.Errorf("ready: got %d, want 3", got)
+	}
+	if got := budget.reservedMB(); got != 1536 {
+		t.Errorf("reserved: got %d, want 1536 (the entry still exists)", got)
+	}
+	if got := budget.released; got != 0 {
+		t.Errorf("releases: got %d, want 0", got)
+	}
+}
+
+// -- verification and adoption ---------------------------------------------------
+
+func TestAClaimVerifiesTheEntryAndRenamesIt(t *testing.T) {
+	engine := &probeEngine{}
+	b := probeBackend(t, engine, "psrl-sandboxes")
+	tmpl := template()
+	b.pool, _ = newWarmPool(WarmPoolConfig{
+		Template: tmpl, Size: 1, EntryTTL: 10 * time.Minute, RefillInterval: time.Minute,
+	}, b.createPoolEntry, b.remove, nil)
+	entry := warmEntry{containerID: "c-1", createdAt: time.Now()}
+	engine.inspectBody = `{
+		"Name": "/psrl-warm-abc",
+		"State": {"Running": true},
+		"Config": {
+			"Image": "alpine:latest",
+			"Env": ["A=1", "PATH=/usr/bin"],
+			"WorkingDir": "/work",
+			"Labels": {"psrl.resource_class": "rollout", "psrl.owner": ""}
+		},
+		"HostConfig": {"Memory": 536870912, "CpuQuota": 100000, "CpuPeriod": 100000, "CgroupParent": "psrl-sandboxes"}
+	}`
+
+	created, adopted := b.adoptWarm(context.Background(), entry, tmpl, "node-a")
+
+	if !adopted {
+		t.Fatal("a verified entry must be adopted")
+	}
+	if !created.WarmStart {
+		t.Error("the reply must say the sandbox was warm")
+	}
+	renames := func() []string {
+		engine.mu.Lock()
+		defer engine.mu.Unlock()
+		return append([]string(nil), engine.renameCalls...)
+	}()
+	if len(renames) != 1 || !strings.HasPrefix(renames[0], sandboxNamePrefix) {
+		t.Errorf("renames: got %v, want one psrl-sbx-* rename", renames)
+	}
+}
+
+func TestAMismatchedEntryIsDestroyedRatherThanAdopted(t *testing.T) {
+	// The entry's limits were written at create and cannot be corrected, so a mismatch is
+	// destroyed and the caller gets a cold create instead.
+	engine := &probeEngine{}
+	b := probeBackend(t, engine, "psrl-sandboxes")
+	tmpl := template()
+	b.pool, _ = newWarmPool(WarmPoolConfig{
+		Template: tmpl, Size: 1, EntryTTL: 10 * time.Minute, RefillInterval: time.Minute,
+	}, b.createPoolEntry, b.remove, nil)
+	entry := warmEntry{containerID: "c-1", createdAt: time.Now()}
+	// Half the memory the spec asks for, which is the under-charge a `<=` match would let
+	// through.
+	engine.inspectBody = `{
+		"Name": "/psrl-warm-abc",
+		"State": {"Running": true},
+		"Config": {"Image": "alpine:latest", "Env": ["A=1"], "WorkingDir": "/work",
+			"Labels": {"psrl.resource_class": "rollout", "psrl.owner": ""}},
+		"HostConfig": {"Memory": 268435456, "CpuQuota": 100000, "CpuPeriod": 100000, "CgroupParent": "psrl-sandboxes"}
+	}`
+
+	_, adopted := b.adoptWarm(context.Background(), entry, tmpl, "node-a")
+
+	if adopted {
+		t.Fatal("an entry whose limits differ must not be adopted")
+	}
+	if got := b.pool.Snapshot().Mismatches; got != 1 {
+		t.Errorf("mismatches: got %d, want 1", got)
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if len(engine.renameCalls) != 0 {
+		t.Error("a mismatched entry must not be renamed into a sandbox")
+	}
+}
+
+func TestAnUnreadableEntryIsReturnedToThePool(t *testing.T) {
+	// A daemon that did not answer is not evidence the entry is bad.
+	engine := &probeEngine{}
+	b := probeBackend(t, engine, "")
+	tmpl := template()
+	b.pool, _ = newWarmPool(WarmPoolConfig{
+		Template: tmpl, Size: 1, EntryTTL: 10 * time.Minute, RefillInterval: time.Minute,
+	}, b.createPoolEntry, b.remove, nil)
+	b.pool.ready = nil
+	engine.inspectBody = `not-json`
+
+	_, adopted := b.adoptWarm(context.Background(), warmEntry{containerID: "c-1", createdAt: time.Now()}, tmpl, "node-a")
+
+	if adopted {
+		t.Fatal("an unreadable entry must not be adopted")
+	}
+	if got := b.pool.Snapshot().Ready; got != 1 {
+		t.Errorf("ready: got %d, want 1 (put back for the next claim)", got)
+	}
+}
+
+func TestAFailedRenameDestroysTheEntry(t *testing.T) {
+	// The handle must never be returned for a container still named as inventory: a
+	// restart would then destroy a live sandbox.
+	engine := &probeEngine{renameFails: true}
+	b := probeBackend(t, engine, "")
+	tmpl := template()
+	b.pool, _ = newWarmPool(WarmPoolConfig{
+		Template: tmpl, Size: 1, EntryTTL: 10 * time.Minute, RefillInterval: time.Minute,
+	}, b.createPoolEntry, b.remove, nil)
+	engine.inspectBody = `{
+		"Name": "/psrl-warm-abc",
+		"State": {"Running": true},
+		"Config": {"Image": "alpine:latest", "Env": ["A=1"], "WorkingDir": "/work",
+			"Labels": {"psrl.resource_class": "rollout", "psrl.owner": ""}},
+		"HostConfig": {"Memory": 536870912, "CpuQuota": 100000, "CpuPeriod": 100000}
+	}`
+
+	_, adopted := b.adoptWarm(context.Background(), warmEntry{containerID: "c-1", createdAt: time.Now()}, tmpl, "node-a")
+
+	if adopted {
+		t.Fatal("a container that could not be renamed must not be handed over")
+	}
+	if got := b.pool.Snapshot().Ready; got != 0 {
+		t.Errorf("ready: got %d, want 0 (the entry is gone)", got)
+	}
+}
+
+// -- reconcile classification ----------------------------------------------------
+
+func TestAPoolEntryNameMarksInventory(t *testing.T) {
+	for name, want := range map[string]bool{
+		"/psrl-warm-abc": true,
+		"psrl-warm-abc":  true,
+		"/psrl-sbx-abc":  false,
+		"/other":         false,
+	} {
+		if got := isPoolInventoryName(name); got != want {
+			t.Errorf("%q: got %v, want %v", name, got, want)
+		}
 	}
 }

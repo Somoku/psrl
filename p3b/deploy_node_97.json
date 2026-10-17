@@ -14,7 +14,10 @@
     "local_cpu_ceiling": 0.95,
     "local_mem_ceiling": 0.9,
     "overcommit": 1.5,
-    "utilization_target": 0.75
+    "utilization_target": 0.75,
+    "cgroup_parent": "psrl-sandboxes",
+    "sample_interval_s": 5,
+    "sandbox_memory_safety": 0.05
   },
   "classes": {
     "rollout": {

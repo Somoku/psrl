@@ -8,7 +8,7 @@
     "rpc_timeout_s": 60
   },
   "fleet": {
-    "memory_mb": 2880000,
+    "memory_mb": 3750000,
     "cpu_millis": 360000,
     "disk_mb": 8000000
   },

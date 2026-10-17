@@ -60,6 +60,10 @@ that the pool cannot serve:
 | 8 warm + 8 cold | 0.471 s | 0.894 s | 0.006 s |
 | 16 cold | 0.831 s | 1.337 s | 0.588 s |
 
+The lifetime rule end to end, against a template that states 7200 s: a request for
+3600 s was served from the pool in 0.005 s and took an entry with it, and a request for
+9000 s cold-created in 0.269 s because the entry could not outlive it.
+
 The batch improves by less than a single claim does, and that is the predicted shape: the
 pool covers `size/batch` of a burst, so a depth of 8 halves a batch of 16. The earlier
 create-contention work measured cold creates at 3.3 s with 8 in flight and 10.7 s with 64,

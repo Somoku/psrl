@@ -7,22 +7,12 @@ import os
 import time
 from abc import abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any
 
 from omegaconf import DictConfig
 
-from psrl.sandbox import (
-    SandboxCommandTimeout,
-    SandboxFeature,
-    SandboxLease,
-    SandboxProvisionError,
-    SandboxSession,
-    SandboxTransportError,
-    SnapshotKind,
-    SnapshotRef,
-    SyncSandboxManager,
-)
+from psrl.sandbox import SandboxFeature, SandboxLease, SandboxSession, SnapshotKind, SnapshotRef, SyncSandboxManager
 from psrl.utils.common.http_utils import SESSION_TURN_ACCOUNTING_KEY
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.harness import (
@@ -43,38 +33,6 @@ from psrl.workers.gen.utils import TokenOutput, rollout_token_budget
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
-
-# How many times provisioning is re-attempted when the node, rather than the task, is why it
-# failed. Provisioning is the one phase every episode of a step runs at the same time, so its
-# faults are contention: measured on an otherwise idle node, a create burst made an exec on an
-# unrelated container wait three times as long as it does alone, and a readiness probe that
-# overran its budget destroys its own sandbox. Failing the episode on that, and with it the
-# whole GRPO group, is out of proportion to the fault.
-_PROVISIONING_ATTEMPTS = 3
-_PROVISIONING_RETRY_BACKOFF_S = 5.0
-# A sandbox that overran a command, one that could not be provisioned, and one whose node did
-# not answer are all "ask again". A missing runtime tree or an unusable image is not: those
-# raise deterministically inside the harness and are reported as they are.
-_TRANSIENT_PROVISIONING_FAULTS = (SandboxCommandTimeout, SandboxProvisionError, SandboxTransportError)
-
-
-@dataclass(frozen=True)
-class _ProvisionedRun:
-    """The resources one successful provisioning attempt hands to the episode.
-
-    Handed back rather than torn down, because the episode owns them for its whole
-    lifetime: `run`'s `finally` aborts the harness, releases the lease, deletes the
-    session, drops the snapshot, and closes the task. An attempt that *fails* tears down
-    what it made before it re-raises, which is what lets a retry start from a clean slate.
-    """
-
-    task: HarnessTaskContext
-    session_id: str
-    lease: SandboxLease
-    harness: Harness
-    harness_runtime: HarnessRuntime
-    clean_snapshot: SnapshotRef | None
-    prepare_tasks: list[asyncio.Task[None]]
 
 
 def _raise_if_episode_is_over(lease: SandboxLease | None) -> None:
@@ -366,67 +324,32 @@ class HarnessAgentLoop(SessionAgentLoop):
             return None
         return self.max_turns
 
-    async def _provision_for_run(
+    async def run(
         self,
         request: dict,
-        timing: dict[str, float],
-        run_start: float,
-    ) -> _ProvisionedRun:
-        """Prepare a sandbox and a harness, re-attempting the faults that are contention.
-
-        Every episode of a step provisions at the same instant, so what fails here says
-        more about the node than about the task. A readiness probe that overran its budget
-        has destroyed the sandbox it ran in, and a node that could not answer a write is
-        not evidence about the harness, so both are retried on a fresh sandbox. Re-entering
-        creation rather than reusing the sandbox is deliberate: on a backend whose exec
-        cannot be signalled, an overrunning command is stopped exactly by destroying its
-        container, so the lease the failed attempt held is already gone.
-
-        A fault that is not in `_TRANSIENT_PROVISIONING_FAULTS` -- a missing runtime tree,
-        an unusable image, a rejected task specification -- is deterministic, so it is
-        raised immediately instead of being retried into the same failure.
-
-        Raises:
-            The last transient fault once every attempt is spent, so the caller can report
-            a rollout that never started rather than one that failed.
+    ) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
         """
-        for attempt in range(1, _PROVISIONING_ATTEMPTS + 1):
-            try:
-                return await self._provision_once(request, timing, run_start)
-            except _TRANSIENT_PROVISIONING_FAULTS as fault:
-                if attempt >= _PROVISIONING_ATTEMPTS:
-                    raise
-                psrl_logger.warning(
-                    "Provisioning attempt %d/%d for request %s failed with %s: %r. "
-                    "Retrying on a fresh sandbox in %.0fs.",
-                    attempt,
-                    _PROVISIONING_ATTEMPTS,
-                    request.get("uid"),
-                    type(fault).__name__,
-                    fault,
-                    _PROVISIONING_RETRY_BACKOFF_S,
-                )
-                await asyncio.sleep(_PROVISIONING_RETRY_BACKOFF_S)
-
-    async def _provision_once(
-        self,
-        request: dict,
-        timing: dict[str, float],
-        run_start: float,
-    ) -> _ProvisionedRun:
-        """Prepare one sandbox and harness for the episode, or tear down what it made.
-
-        The attempt owns its partial resources only until it returns: on any failure --
-        including cancellation -- it releases the lease, deletes the session, and closes the
-        task before re-raising, so nothing it created outlives it and the caller's retry
-        cannot inherit a half-built sandbox.
+        Execute the generic harness lifecycle for one training task.
         """
+        self.resolve_request_settings(request)
         task: HarnessTaskContext | None = None
         session_id: str | None = None
         lease: SandboxLease | None = None
         harness: Harness | None = None
         clean_snapshot: SnapshotRef | None = None
         prepare_tasks: list[asyncio.Task[None]] = []
+        run_start = time.perf_counter()
+        timing = {
+            "prep_s": 0.0,
+            "assistant_s": 0.0,
+            "env_s": 0.0,
+            "elapsed_s": 0.0,
+            "task_prepare_s": 0.0,
+            "sandbox_create_s": 0.0,
+            "snapshot_s": 0.0,
+            "sandbox_init_s": 0.0,
+            "harness_prepare_s": 0.0,
+        }
         try:
             task = await self.prepare_harness_task(request)
             task = self.attach_runtime_mount(task)
@@ -475,73 +398,6 @@ class HarnessAgentLoop(SessionAgentLoop):
             prepare_started = time.perf_counter()
             await harness.prepare(harness_runtime)
             timing["harness_prepare_s"] = time.perf_counter() - prepare_started
-        except BaseException:
-            for pending in prepare_tasks:
-                pending.cancel()
-            await asyncio.gather(*prepare_tasks, return_exceptions=True)
-            await self._cleanup_harness_run(task, session_id, lease, harness, clean_snapshot)
-            raise
-        return _ProvisionedRun(
-            task=task,
-            session_id=session_id,
-            lease=lease,
-            harness=harness,
-            harness_runtime=harness_runtime,
-            clean_snapshot=clean_snapshot,
-            prepare_tasks=prepare_tasks,
-        )
-
-    async def run(
-        self,
-        request: dict,
-    ) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
-        """
-        Execute the generic harness lifecycle for one training task.
-        """
-        self.resolve_request_settings(request)
-        task: HarnessTaskContext | None = None
-        session_id: str | None = None
-        lease: SandboxLease | None = None
-        harness: Harness | None = None
-        clean_snapshot: SnapshotRef | None = None
-        prepare_tasks: list[asyncio.Task[None]] = []
-        run_start = time.perf_counter()
-        timing = {
-            "prep_s": 0.0,
-            "assistant_s": 0.0,
-            "env_s": 0.0,
-            "elapsed_s": 0.0,
-            "task_prepare_s": 0.0,
-            "sandbox_create_s": 0.0,
-            "snapshot_s": 0.0,
-            "sandbox_init_s": 0.0,
-            "harness_prepare_s": 0.0,
-        }
-        try:
-            try:
-                provisioned = await self._provision_for_run(request, timing, run_start)
-            except _TRANSIENT_PROVISIONING_FAULTS as exhausted:
-                # The node could not deliver a usable sandbox within the attempts this
-                # episode is allowed, and no task code ever ran, so this is not evidence
-                # about the model or the harness. It is reported as a rollout that never
-                # started -- not as `DOWNSTREAM_TIMEOUT`, which means a call inside a
-                # running episode overran -- so the manager's breaker can name the cause.
-                self._record_error(exhausted)
-                psrl_logger.error(
-                    "Provisioning for request %s did not complete within %d attempts, so the "
-                    "episode ended before its harness ran. Last failure: %r.",
-                    request.get("uid"),
-                    _PROVISIONING_ATTEMPTS,
-                    exhausted,
-                )
-                return None, TerminateReason.ROLLOUT_DEADLINE_EXCEEDED
-            task = provisioned.task
-            session_id = provisioned.session_id
-            lease = provisioned.lease
-            harness = provisioned.harness
-            harness_runtime = provisioned.harness_runtime
-            clean_snapshot = provisioned.clean_snapshot
-            prepare_tasks = provisioned.prepare_tasks
             timing["prep_s"] = time.perf_counter() - run_start
 
             # Provisioning is complete: the sandbox lease is held, the environment is

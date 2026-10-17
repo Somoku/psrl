@@ -381,6 +381,23 @@ func TestSetupReadOnlyCreatesNothing(t *testing.T) {
 	}
 }
 
+func TestPreflightToleratesAFewMiBOfDrift(t *testing.T) {
+	// The limit is derived from measured memory, so two resolutions of one configuration
+	// differ slightly. Reporting that as a configuration change would make every preflight
+	// against a running node fail.
+	domain, dirs := newFakeV1(t)
+	subtree := filepath.Join(dirs.memory, SandboxParent)
+	if err := os.MkdirAll(subtree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Two MiB off the 1500MiB the request resolves to.
+	writeFile(t, subtree, "memory.limit_in_bytes", "1570766848\n")
+
+	if _, err := domain.SetupReadOnly(SandboxParent, request()); err != nil {
+		t.Fatalf("a two-MiB difference is measurement drift, not a configuration change: %v", err)
+	}
+}
+
 func TestPreflightRefusesAnExistingSubtreeWithAnotherLimit(t *testing.T) {
 	domain, dirs := newFakeV1(t)
 	subtree := filepath.Join(dirs.memory, SandboxParent)

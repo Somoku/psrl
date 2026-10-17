@@ -27,6 +27,7 @@ package cgroup
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -51,6 +52,11 @@ const (
 	// cpuPeriodMicros matches the period the container body requests, so a quota
 	// written here means the same thing to the subtree and to each container.
 	cpuPeriodMicros = int64(100000)
+
+	// setupLimitTolerance is how far an existing subtree's limit may differ from the
+	// resolved one before it is reported as a configuration change. The resolved value
+	// moves with measured memory, so an exact comparison reports drift as drift.
+	setupLimitTolerance = 0.05
 )
 
 // knownControllers is what a v1 mount's option list can name. The list only has to
@@ -294,10 +300,18 @@ func (d Domain) SetupReadOnly(parent string, req Request) (Budget, error) {
 	dir := filepath.Join(memory.Root, parent)
 	if _, statErr := os.Stat(dir); statErr == nil {
 		existing, readErr := memoryLimit(dir)
-		if readErr == nil && existing != budget.SubtreeLimitBytes {
-			return Budget{}, fmt.Errorf(
-				"cgroup: %s already exists with a %dMiB limit but this configuration resolves to %dMiB; "+
-					"a running node must be restarted to change it", dir, existing/MiB, budget.SubtreeLimitBytes/MiB)
+		// The limit is derived from measured memory that moves every second, so two
+		// resolutions of the same configuration legitimately differ by a few MiB. What this
+		// check is for is a *configuration* change behind a running node, which moves the
+		// limit by whole percent: a band separates the two without reporting drift.
+		if readErr == nil && existing > 0 {
+			drift := math.Abs(float64(existing-budget.SubtreeLimitBytes)) / float64(budget.SubtreeLimitBytes)
+			if drift > setupLimitTolerance {
+				return Budget{}, fmt.Errorf(
+					"cgroup: %s already exists with a %dMiB limit but this configuration resolves to %dMiB; "+
+						"a running node must be restarted to change it",
+					dir, existing/MiB, budget.SubtreeLimitBytes/MiB)
+			}
 		}
 	}
 	return budget, nil

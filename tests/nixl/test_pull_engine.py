@@ -83,28 +83,39 @@ def _locals(model: dict, tp: int, dtype: torch.dtype = torch.bfloat16) -> dict[s
 
 
 class Cluster:
-    def __init__(self, train_tp: int, gen_tp: int, instances: int, peer_diffusion: bool, train_dtype=torch.bfloat16):
+    model = MODEL
+
+    def __init__(
+        self,
+        train_tp: int,
+        gen_tp: int,
+        instances: int,
+        peer_diffusion: bool,
+        train_dtype=torch.bfloat16,
+        model: dict | None = None,
+    ):
         self.bus = NotifBus()
+        self.model = MODEL if model is None else model
         self.declared: dict[str, dict] = {}
         self.states: dict[str, dict] = {}
         kinds = {}
         for r in range(train_tp):
             name = f"NIXLTrainClient_{r}"
             kinds[name] = NIXLClientType.PUSH_SIDE
-            self.states[name] = _locals(MODEL, train_tp, train_dtype)
-            self.declared[name] = {k: _sharding(d, train_tp, r) for k, (s, d) in MODEL.items()}
+            self.states[name] = _locals(self.model, train_tp, train_dtype)
+            self.declared[name] = {k: _sharding(d, train_tp, r) for k, (s, d) in self.model.items()}
         for i in range(instances):
             for r in range(gen_tp):
                 name = f"NIXLGenClient_I{i}_R{r}"
                 kinds[name] = NIXLClientType.PULL_SIDE
-                self.states[name] = _locals(MODEL, gen_tp)
-                self.declared[name] = {k: _sharding(d, gen_tp, r) for k, (s, d) in MODEL.items()}
+                self.states[name] = _locals(self.model, gen_tp)
+                self.declared[name] = {k: _sharding(d, gen_tp, r) for k, (s, d) in self.model.items()}
         for name in self.states:
             if name.startswith("NIXLTrainClient"):
                 fill_by_layout(self.states[name], self.declared[name], version=7, wire_dtype=torch.bfloat16)
 
         unified = {name: copy.deepcopy(d) for name, d in self.declared.items()}
-        for key in MODEL:
+        for key in self.model:
             finest = NIXLSharding.find_finest_shard_mesh([unified[n][key].shard_mesh for n in unified])
             for name in unified:
                 unified[name][key].refactor_based_on_finer_shard_mesh(finest)
@@ -154,9 +165,9 @@ class Cluster:
 
     def judge(self, names, version: int) -> None:
         for name in names:
-            judged, failure = check_by_layout(self.states[name], self.declared[name], list(MODEL), version=version)
+            judged, failure = check_by_layout(self.states[name], self.declared[name], list(self.model), version=version)
             assert failure is None, f"{name}: {failure}"
-            assert judged == len(MODEL)
+            assert judged == len(self.model)
 
 
 @pytest.mark.parametrize("train_tp,gen_tp", [(2, 2), (4, 2), (2, 4), (1, 4), (4, 1)])
@@ -183,6 +194,109 @@ def test_fragmented_readers_stage_through_the_pool():
     report = cluster.pull(epoch=1)["NIXLGenClient_I0_R0"]
     cluster.judge(cluster.gen, version=7)
     assert report.staged_bytes > 0 and report.descriptors < 64
+
+
+LARGE_LATE_MODEL = {
+    "layers.0.a_proj.weight": ((HIDDEN, INTER), 1),
+    "layers.0.b_proj.weight": ((HIDDEN, INTER), 1),
+    "layers.0.c_proj.weight": ((HIDDEN, INTER), 1),
+    "layers.0.d_proj.weight": ((HIDDEN, INTER), 1),
+    # Last in wave order and four times a small key's bytes, so its staged cell neither
+    # fixes the pool size nor lands in the first wave.
+    "layers.0.z_big.weight": ((HIDDEN, INTER * 4), 1),
+}
+
+
+def test_the_staging_pool_is_sized_before_any_read_is_posted():
+    """A later wave needing a bigger staging item must not resize the pool mid-pull.
+
+    With peer diffusion the first staged wave runs while peer reads are in flight. The
+    engine now plans every source's specs up front and sizes the pool before posting, so
+    the phase cache is never invalidated under a running read. The old lazy allocation
+    freed in-flight handles here, which NIXL reports as `BAD_STATUS` (the strict
+    `MemcpyAgent` raises it too).
+    """
+    cluster = Cluster(train_tp=4, gen_tp=1, instances=2, peer_diffusion=True, model=LARGE_LATE_MODEL)
+    grew: list[tuple[str, int]] = []
+    grew_in_flight: list[str] = []
+    for name, engine in cluster.engines.items():
+        original = engine._ensure_pool
+
+        def ensure(need, _engine=engine, _name=name, _original=original):
+            in_flight = bool(_engine._in_flight)
+            before = _engine._pool.numel() if _engine._pool is not None else None
+            _original(need)
+            after = _engine._pool.numel() if _engine._pool is not None else None
+            if after != before:
+                grew.append((_name, need))
+                if in_flight:
+                    grew_in_flight.append(_name)
+
+        engine._ensure_pool = ensure
+
+    cluster.pull(epoch=1)
+    cluster.judge(cluster.gen, version=7)
+    assert grew, "the scenario never needed a staging pool"
+    assert not grew_in_flight, f"the pool was resized while reads were posted: {grew_in_flight}"
+
+
+def test_a_pool_resize_keeps_a_running_reads_handle():
+    """Handle ownership under a resize, independent of pull geometry.
+
+    A take-over phase can still need a bigger staging item after reads were posted. The
+    resize must not release a request NIXL is still polling: the handle is orphaned, the
+    old pool is retired, and both are reclaimed once the read completes.
+    """
+    cluster = Cluster(train_tp=4, gen_tp=1, instances=1, peer_diffusion=False)
+    engine = cluster.engines["NIXLGenClient_I0_R0"]
+    engine.pull(epoch=1)
+
+    phase = next(p for p in engine._phases.values() if p.direct)
+    assert phase.direct, "the scenario needs a direct handle to keep in flight"
+    handle = phase.direct[0]
+    engine._post([handle])
+    assert id(handle) in engine._in_flight
+
+    engine._ensure_pool(1 << 20)
+
+    assert not handle.handle.released, "a resize released a request that was still posted"
+    assert any(orphan is handle for orphan in engine._orphans)
+    assert engine._retired_pools, "the replaced pool was freed instead of retired"
+
+    engine._reap_orphans()
+    assert handle.handle.released, "the orphaned handle was never released after completion"
+    assert not engine._retired_pools
+
+
+def test_a_conn_info_only_peer_is_never_elected_as_designate():
+    """A peer without read addresses must not be planned as a source.
+
+    Peers receive conn-info-only metadata when the handshake plan does not make them
+    readers. A sync over a participant subset can elect a different designate from the
+    same group, and reading through an entry that never loaded addresses fails after
+    other waves have already moved. The reader must fall back to a readable peer or to
+    the trainer instead.
+    """
+    cluster = Cluster(train_tp=4, gen_tp=1, instances=2, peer_diffusion=True)
+    reader = "NIXLGenClient_I0_R0"
+    holder = "NIXLGenClient_I1_R0"
+    engine = cluster.engines[reader]
+    # Strip the addresses exactly as a conn-info-only NIXLClientInfo would have none.
+    other = cluster.clients[reader]._all_client_infos[holder]
+    for tensor in other.tensor_infos.values():
+        tensor.read_addrs = [None] * len(tensor.read_addrs) if tensor.read_addrs else []
+
+    upstream, peer, _followers = engine._assign(lambda client: True)
+    local = cluster.clients[reader].local_client_info.tensor_infos
+    for source, keys in peer.items():
+        assert source != holder
+        for key in keys:
+            shards = list(local[key].sharding.shard_indices)
+            assert engine._source_readable(source, key, shards)
+
+    report = engine.pull(epoch=1)
+    assert report.versions == {-1} or report.versions
+    cluster.judge([reader], version=7)
 
 
 @pytest.mark.parametrize("train_tp,gen_tp", [(4, 2), (2, 4)])

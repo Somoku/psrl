@@ -48,6 +48,7 @@ _NIXL_MEM = {"cuda": "VRAM", "cpu": "DRAM", "VRAM": "VRAM", "DRAM": "DRAM"}
 class _Staged:
     """One shard read into the staging pool, then copied into its local view."""
 
+    key: str
     nbytes: int
     remote: np.ndarray
     rel: np.ndarray
@@ -81,7 +82,11 @@ class _Handle:
     handle: object
     descriptors: int
     nbytes: int
+    #: Keys whose bytes this request covers, so a preemption can classify what completed.
+    keys: frozenset[str] = frozenset()
     posted_at: float = 0.0
+    #: A staged round reads into the staging pool, so the pool must outlive the request.
+    reads_pool: bool = False
 
 
 @dataclass
@@ -91,6 +96,10 @@ class _Phase:
     direct: list[_Handle] = field(default_factory=list)
     rounds: list[list[_Handle]] = field(default_factory=list)
     round_items: list[list[tuple[_Staged, int]]] = field(default_factory=list)
+    #: The staging pool the round handles read into. Growth retires it, not frees it, while a read may use it.
+    pool: torch.Tensor | None = None
+    #: Every key this phase reads, including the ones served by same-device copies.
+    keys: frozenset[str] = frozenset()
     versions: set[int] = field(default_factory=set)
     descriptors: int = 0
     nbytes: int = 0
@@ -127,8 +136,11 @@ class PullVerdict:
 
     landed: bool
     versions: frozenset[int]
-    #: Why this pull did not land: "torn", "invalidated", or "unavailable".
+    #: Why this pull did not land: "torn", "invalidated", "unavailable", or "preempted".
     reason: str | None = None
+    #: The pull was preempted by an optimizer write and completed by re-reading its
+    #: unfinished keys from certified same-node holders of the same version.
+    repaired: bool = False
 
     @property
     def torn(self) -> bool:
@@ -143,6 +155,46 @@ class TornPull(RuntimeError):
     the instance must not generate until a later pull completes. `nixl_pull_model_core`
     turns this into a `PullVerdict`, so the caller can re-pull instead of failing.
     """
+
+
+class PullPreempted(RuntimeError):
+    """The writer is about to overwrite the trainer bytes this pull was reading.
+
+    Carries what the reader needs to decide between repairing from certified holders of
+    the same version and giving up until the next version:
+
+    * ``completed_keys`` were read before the acknowledgement, which the writer waits for,
+      so they are safe;
+    * ``suspect_keys`` are every other key of the pull (in flight, not yet posted, or lost
+      to an abandoned source) and must be re-read or invalidated;
+    * ``holders`` are same-node instances the coordinator certified as holding ``version``.
+
+    ``repaired`` is set when the exception is raised *after* a successful repair attempt is
+    impossible; the caller must not serve the local bytes.
+    """
+
+    def __init__(
+        self,
+        epoch: int,
+        version: int,
+        completed_keys: frozenset[str],
+        suspect_keys: frozenset[str],
+        holders: tuple[str, ...],
+        repaired: bool = False,
+        reason: str | None = None,
+    ) -> None:
+        self.epoch = epoch
+        self.version = version
+        self.completed_keys = completed_keys
+        self.suspect_keys = suspect_keys
+        self.holders = holders
+        self.repaired = repaired
+        self.reason = reason
+        super().__init__(
+            f"pull preempted at epoch {epoch}: {len(suspect_keys)} suspect key(s), "
+            f"{len(holders)} holder(s), repaired={repaired}"
+            + (f", reason={reason}" if reason else "")
+        )
 
 
 class WeightRefreshFailed(RuntimeError):
@@ -176,6 +228,9 @@ class PullReport:
     failed_sources: set[str] = field(default_factory=set)
     # Bytes copied from a source that shares this device, rather than transferred (3.7.2.1).
     ipc_bytes: int = 0
+    #: The pull was preempted by an optimizer write and finished by re-reading its
+    #: unfinished keys from certified same-node holders of the same version.
+    repaired: bool = False
 
 
 class NIXLPullEngine:
@@ -213,10 +268,34 @@ class NIXLPullEngine:
         self._phases: dict[tuple, _Phase] = {}
         self._pool: torch.Tensor | None = None
         self._pool_reg = None
+        # Handles posted and not yet observed complete. The phase cache may be invalidated
+        # while one of these runs (a pool growth rebuilds it), so release must skip them.
+        self._in_flight: dict[int, _Handle] = {}
+        # Handles whose phase was invalidated while they were in flight. Released once complete.
+        self._orphans: list[_Handle] = []
+        # Pools a growth replaced. Kept alive until no orphaned handle can still read them.
+        self._retired_pools: list[tuple[torch.Tensor, object]] = []
         self._copy_stream: torch.cuda.Stream | None = None
         self._dlists: list[object] = []
         # (local allocation, remote allocation) to a small label, so coalescing never crosses one.
         self._region_labels: dict[tuple[int, int], int] = {}
+        # --- v2 write-gate state, reset at every pull ---
+        #: Writer epoch recorded by the coordinator when this pull was admitted.
+        self._pull_epoch: int | None = None
+        #: Called with the epoch the first time a preemption notice is observed.
+        self._on_preempt_ack = None
+        self._preempt_epoch: int | None = None
+        self._preempt_version: int = -1
+        self._preempt_holders: tuple[str, ...] = ()
+        self._completed_keys: set[str] = set()
+        self._pull_keys: set[str] = set()
+        self._key_outstanding: dict[str, int] = {}
+        self._next_control_poll = 0.0
+        #: True while re-reading suspect keys from holders; peer reads must not re-raise.
+        self._repairing = False
+        self._pull_started = 0.0
+        #: Preemption notices are polled at control-plane latency, not per 50 µs transfer poll.
+        self._control_poll_interval_s = 5e-4
 
     # ------------------------------------------------------------------ geometry
 
@@ -364,6 +443,7 @@ class NIXLPullEngine:
                 rel = np.arange(rr.count, dtype=np.int64) * rr.run_bytes
                 spec.staged.append(
                     _Staged(
+                        spec.key,
                         nbytes,
                         rr.starts,
                         rel,
@@ -376,6 +456,7 @@ class NIXLPullEngine:
             else:
                 spec.staged.append(
                     _Staged(
+                        spec.key,
                         span,
                         rr.starts[:1].copy(),
                         np.zeros(1, dtype=np.int64),
@@ -403,10 +484,15 @@ class NIXLPullEngine:
         size = -(-size // (2 * _ALIGN)) * (2 * _ALIGN)
         if self._pool is not None and self._pool.numel() >= size:
             return
-        # Prepared staging handles point into the old pool.
+        # Every cached prepared handle embeds addresses from this pull's geometry, and the
+        # staged ones point into the pool being replaced. Release them, but not the ones a
+        # running read still holds: a pull with peer reads can need a bigger item in a
+        # later wave, at which point the peer handles are already in flight. Freeing one
+        # would make the next status poll read a freed request (NIXL: "BAD_STATUS").
         self._release_handles()
-        if self._pool_reg is not None:
-            self.agent.deregister_memory(self._pool_reg)
+        if self._pool is not None:
+            # Not deregistered yet: an orphaned round may still be writing into it.
+            self._retired_pools.append((self._pool, self._pool_reg))
         self._pool = torch.empty(size, dtype=torch.uint8, device=self.client.device)
         self._pool_reg = self.agent.register_memory([self._pool])
 
@@ -418,6 +504,8 @@ class NIXLPullEngine:
         lengths: np.ndarray,
         remote_mem: str,
         remote_dev: int,
+        keys: frozenset[str] = frozenset(),
+        reads_pool: bool = False,
     ) -> _Handle:
         count = int(local.shape[0])
         dev = self.client.device.index or 0
@@ -432,14 +520,14 @@ class NIXLPullEngine:
         handle = self.agent.make_prepped_xfer(
             "READ", local_dlist, indices, remote_dlist, indices, f"pull:{self.client.client_name}".encode()
         )
-        return _Handle(source, handle, count, int(lengths.sum()))
+        return _Handle(source, handle, count, int(lengths.sum()), keys=keys, reads_pool=reads_pool)
 
     def _phase(self, specs: list[_Spec]) -> _Phase:
         signature = tuple(sorted((s.source, s.key) for s in specs))
         cached = self._phases.get(signature)
         if cached is not None:
             return cached
-        phase = _Phase()
+        phase = _Phase(keys=frozenset(spec.key for spec in specs))
         by_source: dict[str, list[_Spec]] = defaultdict(list)
         for spec in specs:
             by_source[spec.source].append(spec)
@@ -450,6 +538,15 @@ class NIXLPullEngine:
             if spec.ipc:
                 phase.ipc_bytes += spec.nbytes
         for source, group in sorted(by_source.items()):
+            staged.extend((source, item) for s in group for item in s.staged)
+
+        if staged:
+            # Before any handle exists: this may invalidate the phase cache, which holds
+            # handles other phases of this same pull already posted.
+            self._ensure_pool(max(_aligned(item.nbytes) for _, item in staged))
+            phase.pool = self._pool
+
+        for source, group in sorted(by_source.items()):
             info = self.client.all_client_infos[source].tensor_infos[group[0].key]
             local, remote, lengths, _ = _coalesce(
                 np.concatenate([s.direct_local for s in group]),
@@ -458,12 +555,21 @@ class NIXLPullEngine:
                 np.concatenate([s.direct_region for s in group]),
             )
             if local.shape[0]:
-                phase.direct.append(self._make_handle(source, local, remote, lengths, info.mem_type, info.device_id))
-            staged.extend((source, item) for s in group for item in s.staged)
+                phase.direct.append(
+                    self._make_handle(
+                        source,
+                        local,
+                        remote,
+                        lengths,
+                        info.mem_type,
+                        info.device_id,
+                        keys=frozenset(s.key for s in group),
+                    )
+                )
 
         if staged:
-            self._ensure_pool(max(_aligned(item.nbytes) for _, item in staged))
-            half = self._pool.numel() // 2
+            assert phase.pool is not None, "a staged phase has no staging pool"
+            half = phase.pool.numel() // 2
             rounds: list[list[tuple[str, _Staged, int]]] = [[]]
             used = 0
             for source, item in staged:
@@ -484,7 +590,18 @@ class NIXLPullEngine:
                     local = np.concatenate([slot_base + offset + item.rel for item, offset in items])
                     remote = np.concatenate([item.remote for item, _ in items])
                     lengths = np.concatenate([item.lengths for item, _ in items])
-                    handles.append(self._make_handle(source, local, remote, lengths, info.mem_type, info.device_id))
+                    handles.append(
+                        self._make_handle(
+                            source,
+                            local,
+                            remote,
+                            lengths,
+                            info.mem_type,
+                            info.device_id,
+                            keys=frozenset(item.key for item, _ in items),
+                            reads_pool=True,
+                        )
+                    )
                 phase.rounds.append(handles)
                 phase.round_items.append([(item, (index % 2) * half + offset) for _, item, offset in members])
                 phase.staged_bytes += sum(item.nbytes for _, item, _ in members)
@@ -496,6 +613,50 @@ class NIXLPullEngine:
         return phase
 
     # ------------------------------------------------------------------ execution
+
+    def _poll_pull_control(self) -> None:
+        """Observe a write-gate preemption and acknowledge it immediately.
+
+        Called from the transfer wait loops. The acknowledgement is what tells the writer
+        that reads completed from here on are past its boundary, so it is sent as soon as
+        the notice is seen -- it does not wait for any transfer to drain. Reads already
+        posted are classified as suspect by the caller and cancelled before repair.
+        """
+        if self._pull_epoch is None or self._preempt_epoch is not None:
+            return
+        now = time.time()
+        if now < self._next_control_poll:
+            return
+        self._next_control_poll = now + self._control_poll_interval_s
+        entry = self.client.drain_pull_preempt(self.client.client_name)
+        if entry is None:
+            return
+        epoch = int(entry.get("epoch", -1))
+        if epoch <= self._pull_epoch:
+            return
+        self._preempt_epoch = epoch
+        self._preempt_version = int(entry.get("version", -1))
+        self._preempt_holders = tuple(entry.get("holders", ()))
+        if self._on_preempt_ack is not None:
+            self._on_preempt_ack(epoch)
+
+    def _note_completed(self, handle: _Handle) -> None:
+        """Mark a handle's keys complete once every read that covers them finished."""
+        for key in handle.keys:
+            remaining = self._key_outstanding.get(key, 0) - 1
+            self._key_outstanding[key] = remaining
+            if remaining <= 0:
+                self._completed_keys.add(key)
+
+    def _check_preempted(self) -> None:
+        if self._preempt_epoch is not None and not self._repairing:
+            raise PullPreempted(
+                self._preempt_epoch,
+                self._preempt_version,
+                frozenset(self._completed_keys),
+                frozenset(self._pull_keys - self._completed_keys),
+                self._preempt_holders,
+            )
 
     def _post(self, handles: list[_Handle]) -> list[_Handle]:
         posted = []
@@ -512,6 +673,9 @@ class NIXLPullEngine:
                 psrl_logger.warning(f"{self.client.client_name}: posting a read from {h.source} failed.")
                 self.failed.add(h.source)
                 continue
+            self._in_flight[id(h)] = h
+            for key in h.keys:
+                self._key_outstanding[key] = self._key_outstanding.get(key, 0) + 1
             posted.append(h)
         return posted
 
@@ -528,15 +692,20 @@ class NIXLPullEngine:
         start = time.time()
         pending = list(handles)
         while pending:
+            self._poll_pull_control()
+            self._check_preempted()
             still = []
             for h in pending:
                 state = self.agent.check_xfer_state(h.handle)
                 if state == "DONE":
+                    self._in_flight.pop(id(h), None)
+                    self._note_completed(h)
                     done = time.time()
                     bytes_, first, last = self.source_trace.get(h.source, (0, done, done))
                     self.source_trace[h.source] = (bytes_ + h.nbytes, min(first, h.posted_at), done)
                     continue
                 if state == "ERR":
+                    self._in_flight.pop(id(h), None)
                     psrl_logger.warning(f"{self.client.client_name}: read of {h.nbytes} bytes from {h.source} failed.")
                     self.failed.add(h.source)
                     continue
@@ -550,10 +719,10 @@ class NIXLPullEngine:
                     return
                 time.sleep(5e-5)
 
-    def _scatter(self, items: list[tuple[_Staged, int]]) -> None:
+    def _scatter(self, items: list[tuple[_Staged, int]], pool: torch.Tensor) -> None:
         with torch.cuda.stream(self._copy_stream) if self._copy_stream is not None else nullcontext():
             for item, offset in items:
-                typed = self._pool.view(item.local_view.dtype)
+                typed = pool.view(item.local_view.dtype)
                 source = torch.as_strided(
                     typed, item.view_shape, item.view_strides, offset // item.local_view.element_size()
                 )
@@ -583,13 +752,23 @@ class NIXLPullEngine:
             ):
                 for destination, origin in phase.ipc:
                     destination.detach().copy_(origin.detach(), non_blocking=True)
+            # A key served only by same-device copies never touches the trainer, so a write
+            # cannot tear it; count it as complete for preemption classification.
+            transferred = {key for handle in phase.direct for key in handle.keys} | {
+                key for handles in phase.rounds for handle in handles for key in handle.keys
+            }
+            for key in phase.keys - transferred:
+                remaining = self._key_outstanding.get(key, 0)
+                if remaining <= 0:
+                    self._completed_keys.add(key)
         slot_free: list[torch.cuda.Event | None] = [None, None]
         in_flight: list[tuple[int, list[_Handle]]] = []
 
         def finish_oldest() -> None:
             index, handles = in_flight.pop(0)
             self._wait(handles)
-            self._scatter(phase.round_items[index])
+            assert phase.pool is not None, "a staged round has no staging pool"
+            self._scatter(phase.round_items[index], phase.pool)
             if self._copy_stream is not None:
                 event = torch.cuda.Event()
                 event.record(self._copy_stream)
@@ -659,23 +838,197 @@ class NIXLPullEngine:
                 moved += 1
         return out, moved, missing
 
+    def _prepare_pool(self, upstream: dict[str, dict[str, list]], peer: dict[str, list[str]]) -> None:
+        """Allocate the staging pool for the largest item this pull can plan.
+
+        Building every planned spec up front is cheap (they are cached by `(source, key)`)
+        and makes the pool geometry constant for the whole pull. A group that only appears
+        through mid-pull take-over can still ask for more; that path keeps the in-flight
+        handle protection in `_ensure_pool`.
+        """
+        tensors = self.client.local_client_info.tensor_infos
+        need = 0
+
+        def consider(source: str, key: str, shards: list) -> None:
+            nonlocal need
+            spec = self._spec(source, key, shards)
+            for item in spec.staged:
+                need = max(need, _aligned(item.nbytes))
+
+        for key, per_source in upstream.items():
+            for source, shards in per_source.items():
+                consider(source, key, shards)
+        for source, keys in peer.items():
+            for key in keys:
+                local = tensors.get(key)
+                if local is None:
+                    continue
+                consider(source, key, list(local.sharding.shard_indices))
+        if need:
+            self._ensure_pool(need)
+
+    def _pick_holder(self, key: str, holders: tuple[str, ...]) -> str | None:
+        """First same-node holder whose declared shards cover this client's for ``key``."""
+        local = self.client.local_client_info.tensor_infos.get(key)
+        if local is None:
+            return None
+        shards = list(local.sharding.shard_indices)
+        wanted = set(map(tuple, shards))
+        for name in holders:
+            if name == self.client.client_name or name in self.failed or name in self.unavailable:
+                continue
+            info = self.client.all_client_infos.get(name)
+            if info is None:
+                continue
+            tensor = info.tensor_infos.get(key)
+            if tensor is None:
+                continue
+            if wanted <= set(map(tuple, tensor.sharding.shard_indices)) and self._source_readable(
+                name, key, shards
+            ):
+                return name
+        return None
+
+    def _abandon_inflight(self) -> None:
+        """Cancel this pull's outstanding requests and drop the prepared-handle cache.
+
+        Called only on preemption. A cancelled read may have written part of its
+        destination, which is exactly why it is re-read from a holder: the repair
+        overwrites the whole key. Waiting for the transfers instead would let a large
+        upstream wave delay the writer, which is what the preemption exists to avoid.
+        """
+        self._release_handles()
+        for handle in self._orphans:
+            try:
+                self.agent.release_xfer_handle(handle.handle)
+            except Exception as exc:  # the transport may already have finished it
+                psrl_logger.warning(f"{self.client.client_name}: abandoning preempted read raised {exc!r}.")
+        self._orphans.clear()
+        self._in_flight.clear()
+
+    def _repair_after_preempt(self, preempted: PullPreempted) -> PullReport:
+        """Finish a preempted pull by re-reading its unfinished keys from certified holders.
+
+        The holders were chosen by the coordinator from the committed-version ledger and
+        are pinned for the write window, so their bytes are an immutable copy of the
+        version the reader is completing. If any suspect key has no such holder, the pull
+        cannot land one version and the caller must wait for the next one.
+        """
+        self._abandon_inflight()
+        suspect = set(preempted.suspect_keys)
+        if preempted.version < 0:
+            raise PullPreempted(
+                preempted.epoch,
+                preempted.version,
+                preempted.completed_keys,
+                frozenset(suspect),
+                preempted.holders,
+                repaired=False,
+                reason="preempt_notice_carried_no_version",
+            )
+        tensors = self.client.local_client_info.tensor_infos
+        specs: list[_Spec] = []
+        missing: list[str] = []
+        for key in sorted(suspect):
+            holder = self._pick_holder(key, preempted.holders)
+            if holder is None:
+                missing.append(key)
+                continue
+            local = tensors[key]
+            specs.append(self._spec(holder, key, list(local.sharding.shard_indices)))
+        if missing:
+            raise PullPreempted(
+                preempted.epoch,
+                preempted.version,
+                preempted.completed_keys,
+                frozenset(suspect),
+                preempted.holders,
+                repaired=False,
+                reason=f"no same-node holder for {len(missing)} key(s)",
+            )
+
+        peer_bytes = sum(spec.nbytes for spec in specs)
+        phase: _Phase | None = None
+        if specs:
+            self._repairing = True
+            try:
+                phase = self._phase(specs)
+                self._run(phase)
+            finally:
+                self._repairing = False
+        done = time.time()
+        psrl_logger.info(
+            f"{self.client.client_name}: pull repaired after preemption: "
+            f"{len(suspect)} key(s) re-read from {len({s.source for s in specs})} holder(s) "
+            f"({peer_bytes / 1e9:.2f} GB), version {preempted.version}."
+        )
+        return PullReport(
+            seconds=done - self._pull_started,
+            upstream_seconds=0.0,
+            peer_seconds=done - self._pull_started,
+            upstream_keys=0,
+            peer_keys=len(suspect),
+            fallback_keys=0,
+            upstream_bytes=0,
+            peer_bytes=peer_bytes,
+            descriptors=phase.descriptors if phase is not None else 0,
+            staged_bytes=phase.staged_bytes if phase is not None else 0,
+            followers=0,
+            versions={preempted.version},
+            sources=dict(self.source_trace),
+            takeover_keys=0,
+            failed_sources=set(self.failed),
+            repaired=True,
+        )
+
     def _assign(self, participates) -> tuple[dict[str, dict[str, list]], dict[str, list[str]], set[str]]:
-        """Split this client's keys into upstream reads and reads from a designate."""
+        """Split this client's keys into upstream reads and reads from a designate.
+
+        A peer is only eligible as the designate when this client holds its **full**
+        metadata. Peers are sent conn-info-only metadata when the handshake plan does not
+        make them readers (E4), and a sync over a participant subset can elect a different
+        designate from the same peer group. Electing one whose addresses this client never
+        loaded produces a read with no target and must fall back upstream instead.
+        """
         me = self.client.client_name
         plan = self.client.comm_plan
         assert plan is not None, f"{me} has no communication plan."
+        tensors = self.client.local_client_info.tensor_infos
         upstream: dict[str, dict[str, list]] = {}
         peer: dict[str, list[str]] = defaultdict(list)
         followers: set[str] = set()
         for key, per_source in plan.rollout_pull_from_ps_plan.get(me, {}).items():
+            local = tensors.get(key)
             live = [w for w in plan.get_peer_group(me, key) if w == me or participates(w)]
-            if len(live) >= 2:
-                if live[0] != me:
-                    peer[live[0]].append(key)
-                    continue
-                followers.update(live[1:])
+            if len(live) >= 2 and local is not None:
+                shards = list(local.sharding.shard_indices)
+                readable = [w for w in live if w == me or self._source_readable(w, key, shards)]
+                if readable:
+                    designate = readable[0]
+                    if designate != me:
+                        peer[designate].append(key)
+                        continue
+                    followers.update(w for w in live if w != me)
             upstream[key] = per_source
         return upstream, dict(peer), followers
+
+    def _source_readable(self, source: str, key: str, shards: list) -> bool:
+        """Whether ``source`` exposes an address for every one of ``shards`` of ``key``.
+
+        A conn-info-only or meta-only ``NIXLClientInfo`` has no read addresses; planning a
+        read against it would only fail later in `_spec`, after other waves had moved.
+        """
+        info = self.client.all_client_infos.get(source)
+        if info is None:
+            return False
+        tensor = info.tensor_infos.get(key)
+        if tensor is None or not tensor.read_addrs:
+            return False
+        positions = {shard: index for index, shard in enumerate(tensor.sharding.shard_indices)}
+        return all(
+            (index := positions.get(tuple(shard))) is not None and tensor.read_addrs[index] is not None
+            for shard in shards
+        )
 
     def _upstream_specs(self, keys: dict[str, dict[str, list]]) -> list[_Spec]:
         return [self._spec(src, key, shards) for key, per_source in keys.items() for src, shards in per_source.items()]
@@ -703,6 +1056,8 @@ class NIXLPullEngine:
         participants: set[str] | None = None,
         version_holders: frozenset[str] | None = None,
         target_version: int = -1,
+        pull_epoch: int | None = None,
+        on_preempt_ack=None,
     ) -> PullReport:
         """
         Read this client's weights for one sync.
@@ -721,11 +1076,55 @@ class NIXLPullEngine:
                 filtering (backward-compatible default for non-direct-supply modes).
             target_version (int): The model version this pull is acquiring. Used only for logging
                 when version_holders is set.  -1 means unknown / not applicable.
+            pull_epoch (int | None): Writer epoch recorded when the pull was admitted. When
+                provided, a preemption notice for a newer epoch interrupts the pull; None
+                disables the write-gate control path (non-direct modes).
+            on_preempt_ack: Called once with the epoch when a preemption is observed. It
+                must send the acknowledgement over the notification channel.
         """
+        # A pool growth releases every cached prepared handle, and on a fresh engine that
+        # first growth can happen after a peer wave has posted. Reap what an earlier pull
+        # left in that state before deciding what the cache may release.
+        self._reap_orphans()
+        try:
+            try:
+                return self._pull(
+                    epoch, participants, version_holders, target_version, pull_epoch, on_preempt_ack
+                )
+            except PullPreempted as preempted:
+                # The writer is inside its parameter update. Every byte read before the
+                # acknowledgement is safe; re-read the rest from certified holders of the
+                # same version, or fail so the caller waits for the next version.
+                return self._repair_after_preempt(preempted)
+        finally:
+            self._repairing = False
+            self._reap_orphans()
+
+    def _pull(
+        self,
+        epoch: int,
+        participants: set[str] | None,
+        version_holders: frozenset[str] | None,
+        target_version: int,
+        pull_epoch: int | None = None,
+        on_preempt_ack=None,
+    ) -> PullReport:
         start = time.time()
+        self._pull_started = start
         self.source_trace = {}
         self.failed = set()
+        self._pull_epoch = pull_epoch
+        self._on_preempt_ack = on_preempt_ack
+        self._preempt_epoch = None
+        self._preempt_version = -1
+        self._preempt_holders = ()
+        self._completed_keys = set()
+        self._pull_keys = set()
+        self._key_outstanding = {}
+        self._next_control_poll = 0.0
+        self._repairing = False
         upstream, peer, followers = self._assign(lambda c: participants is None or c in participants)
+        self._pull_keys = set(upstream) | {key for keys in peer.values() for key in keys}
         # D1 version-aware source selection: keep only trainer sources that have published
         # target_version.  An empty holder set (startup, or non-direct-supply mode) is treated
         # as "no filter" so the caller never has to check whether filtering is applicable.
@@ -756,6 +1155,10 @@ class NIXLPullEngine:
             {d: [k for k in keys if wave_of[k] == w] for d, keys in peer.items() if any(wave_of[k] == w for k in keys)}
             for w in range(self.waves)
         ]
+        # Size the staging pool before posting anything. The old lazy allocation could
+        # grow the pool in a later wave, which invalidated the prepared-handle cache while
+        # peer reads were in flight; pre-sizing makes that a take-over-only path.
+        self._prepare_pool(upstream, peer)
 
         versions: set[int] = set()
         stats = {
@@ -896,23 +1299,74 @@ class NIXLPullEngine:
         deadline = time.time() + self.peer_timeout_s
         while True:
             waiter.absorb()
+            self._poll_pull_control()
+            self._check_preempted()
             arrived = {s for s in sources if waiter.seen(epoch, chunk, s)}
             if arrived == sources or time.time() > deadline:
                 return arrived
             time.sleep(2e-4)
 
     def _release_handles(self) -> None:
+        """
+        Drop the prepared-handle cache, keeping handles a running read still holds.
+
+        Every cached handle embeds addresses from the geometry it was prepared for, so a
+        cache invalidation (registration change, pool growth) must replace all of them.
+        A pull can, however, have handles in flight when a later wave needs a bigger
+        staging item. Those are moved to `_orphans` and released once they complete:
+        releasing one now would free a request NIXL is still polling.
+        """
         for phase in self._phases.values():
             for h in phase.direct + [h for handles in phase.rounds for h in handles]:
-                self.agent.release_xfer_handle(h.handle)
+                if id(h) in self._in_flight:
+                    self._orphans.append(h)
+                else:
+                    self.agent.release_xfer_handle(h.handle)
         for dlist in self._dlists:
+            # Safe while a request is in flight: `make_prepped_xfer` copies the descriptor
+            # values into the request, so the dlist itself is no longer referenced.
             self.agent.release_dlist_handle(dlist)
         self._phases.clear()
         self._dlists.clear()
 
+    def _reap_orphans(self) -> None:
+        """Release orphaned handles that finished, and retire pools once none can read them."""
+        keep: list[_Handle] = []
+        for h in self._orphans:
+            if id(h) in self._in_flight:
+                try:
+                    state = self.agent.check_xfer_state(h.handle)
+                except Exception:
+                    state = "ERR"
+                if state in ("DONE", "ERR"):
+                    self._in_flight.pop(id(h), None)
+            if id(h) in self._in_flight:
+                keep.append(h)
+                continue
+            self.agent.release_xfer_handle(h.handle)
+        self._orphans = keep
+        if any(h.reads_pool for h in self._orphans):
+            # A still-running staged read may write into a retired pool after this pull
+            # returned. Keep the pools until it is reaped, then free them.
+            return
+        for _pool, reg in self._retired_pools:
+            if reg is not None:
+                self.agent.deregister_memory(reg)
+        self._retired_pools.clear()
+
     def release(self) -> None:
         """Drop every prepared handle and the staging pool. Required before memory is deregistered."""
         self._release_handles()
+        # The engine is going away: abort whatever is still running so its request does
+        # not outlive the descriptors and pool it reads.
+        for h in self._orphans:
+            self.agent.release_xfer_handle(h.handle)
+        self._orphans.clear()
+        self._in_flight.clear()
+        for _pool, reg in self._retired_pools:
+            if reg is not None:
+                self.agent.deregister_memory(reg)
+        self._retired_pools.clear()
         self._specs.clear()
         if self._pool_reg is not None:
             self.agent.deregister_memory(self._pool_reg)

@@ -55,6 +55,7 @@ class _Handle:
         self.remote = remote
         self.posts = 0
         self.owner: str | None = None
+        self.released = False
 
 
 class MemcpyAgent(nixl_agent):
@@ -118,10 +119,16 @@ class MemcpyAgent(nixl_agent):
         return "DONE"
 
     def check_xfer_state(self, handle):
+        if handle.released:
+            # NIXL deletes the request on release; polling it afterwards reads freed memory
+            # and its binding reports the garbage status as BAD_STATUS. Model the raise, not
+            # the read, so a cache invalidation that frees an in-flight handle fails here
+            # instead of corrupting a cluster run.
+            raise RuntimeError("BAD_STATUS")
         return "ERR" if handle.owner in self.dead_sources else "DONE"
 
     def release_xfer_handle(self, handle):
-        return None
+        handle.released = True
 
     def release_dlist_handle(self, handle):
         return None

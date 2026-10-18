@@ -32,7 +32,9 @@
       "shrink_above": 0.85,
       "shrink_after": 3,
       "shrink_step": 0.25,
-      "growth_horizon_s": 60
+      "growth_horizon_s": 60,
+      "start_limit_mb": 8192,
+      "limit_sample_interval_s": 0.2
     },
     "admission_reserve": 0.1
   },

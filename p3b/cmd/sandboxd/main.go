@@ -144,6 +144,25 @@ type Config struct {
 			// GrowthHorizonS is how far ahead admission reserves a class's observed growth.
 			GrowthHorizonS  float64 `json:"growth_horizon_s"`
 			SampleIntervalS float64 `json:"sample_interval_s"`
+			// StartLimitMB is the memory bound a sandbox is created under, and the level
+			// its bound is never lowered below while it lives. Zero creates it at the
+			// declared maximum, which is the shape this had before.
+			StartLimitMB int64 `json:"start_limit_mb"`
+			// CeilingLimitMB is the highest a sandbox's bound may be raised to. Zero uses
+			// what the sandbox declared.
+			CeilingLimitMB int64 `json:"ceiling_limit_mb"`
+			// GrowAbove is the fraction of its bound a sandbox reaches before the bound is
+			// raised, GrowFactor by how much, and EmergencyGrowFactor by how much on an
+			// OOM. ShrinkBelow is the fraction it must fall under, ShrinkDwellS for how
+			// long, and ShrinkFactor by how much it then comes down.
+			GrowAbove            float64 `json:"grow_above"`
+			GrowFactor           float64 `json:"grow_factor"`
+			EmergencyGrowFactor  float64 `json:"emergency_grow_factor"`
+			ShrinkBelow          float64 `json:"shrink_below"`
+			ShrinkDwellS         float64 `json:"shrink_dwell_s"`
+			ShrinkFactor         float64 `json:"shrink_factor"`
+			SafetyFraction       float64 `json:"safety_fraction"`
+			LimitSampleIntervalS float64 `json:"limit_sample_interval_s"`
 		} `json:"elastic"`
 	} `json:"node"`
 
@@ -491,6 +510,9 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	startBackends(ctx, local, gate, log)
 	defer stopBackends(local)
 	go elasticLoop(ctx, agent, seconds(cfg.Node.Elastic.SampleIntervalS), log)
+	// The bounds half runs on its own, much shorter cadence: it is the one a burst
+	// has to be visible to.
+	go limitLoop(ctx, agent, seconds(cfg.Node.Elastic.LimitSampleIntervalS), log)
 
 	listener, err := listen(cfg.NodeListen)
 	if err != nil {
@@ -699,6 +721,9 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		startBackends(ctx, local, gate, log)
 		defer stopBackends(local)
 		go elasticLoop(ctx, agent, seconds(cfg.Node.Elastic.SampleIntervalS), log)
+		// The bounds half runs on its own, much shorter cadence: it is the one a burst
+		// has to be visible to.
+		go limitLoop(ctx, agent, seconds(cfg.Node.Elastic.LimitSampleIntervalS), log)
 		go republish(ctx, agent, fleet, spans.LoadReportInterval())
 
 		// If node_listen is set in combined mode, also serve the node-plane
@@ -1015,11 +1040,6 @@ func seconds(value float64) time.Duration {
 	return time.Duration(value * float64(time.Second))
 }
 
-// startBackends begins any background work a backend owns.
-//
-// Only a backend that has something to run implements this, so the assertion is
-// an interface check rather than a flag: a backend with no pool and no loop is
-// simply skipped.
 // elasticConfig turns the deployment's declaration into the controller's configuration.
 func elasticConfig(cfg Config) server.ElasticConfig {
 	declared := cfg.Node.Elastic
@@ -1044,12 +1064,25 @@ func elasticConfig(cfg Config) server.ElasticConfig {
 		ReleaseMarginCPUMillis: declared.ReleaseMarginCPUMillis,
 		MinCPUMillis:           declared.MinCPUMillis,
 		GrowthHorizonS:         declared.GrowthHorizonS,
+		StartLimitMB:           declared.StartLimitMB,
+		CeilingLimitMB:         declared.CeilingLimitMB,
+		GrowAbove:              declared.GrowAbove,
+		GrowFactor:             declared.GrowFactor,
+		EmergencyGrowFactor:    declared.EmergencyGrowFactor,
+		ShrinkBelow:            declared.ShrinkBelow,
+		ShrinkDwellS:           declared.ShrinkDwellS,
+		ShrinkFactor:           declared.ShrinkFactor,
+		SafetyFraction:         declared.SafetyFraction,
+		LimitSampleIntervalS:   declared.LimitSampleIntervalS,
 	}
 }
 
-// elasticLoop runs the controller on its own cadence, which is the sampling cadence: a
-// faster loop would decide on a sample that has not changed, and a slower one would react
-// after the burst it is meant to absorb.
+// elasticLoop runs the pricing and reporting half of the controller.
+//
+// It keeps the slow cadence even though the limits half runs at 200ms, because what it
+// decides is a statistic over a class -- what a sandbox of this class costs, how fast the
+// class is climbing -- and a statistic taken five times a second is a different, noisier
+// number rather than a fresher one.
 func elasticLoop(ctx context.Context, agent *server.Node, interval time.Duration, log *slog.Logger) {
 	if interval <= 0 {
 		interval = seconds(0) // zero means the sampler's default
@@ -1070,8 +1103,7 @@ func elasticLoop(ctx context.Context, agent *server.Node, interval time.Duration
 			// more refusal, indistinguishable from a node that is simply full.
 			auditLedger(agent, log)
 			report := agent.ElasticTick(ctx)
-			changed := len(report.Shrunk) + len(report.Restored) +
-				len(report.Throttled) + len(report.Released)
+			changed := len(report.Throttled) + len(report.Released)
 			if changed == 0 && report.OOMKills == 0 {
 				continue
 			}
@@ -1080,9 +1112,37 @@ func elasticLoop(ctx context.Context, agent *server.Node, interval time.Duration
 				"reserved_mib", report.ReservedMB, "reserves_mib", report.ReservesMB,
 				"observed_cpu_millis", report.ObservedCPUMillis, "budget_cpu_millis", report.BudgetCPUMillis,
 				"reserved_cpu_millis", report.ReservedCPUMillis, "reserves_cpu_millis", report.ReservesCPUMillis,
-				"shrunk", len(report.Shrunk), "restored", len(report.Restored),
 				"throttled", len(report.Throttled), "released", len(report.Released),
 				"oom_kills", report.OOMKills)
+		}
+	}
+}
+
+// limitLoop runs the bounds half of the controller, at the cadence a burst is visible on.
+//
+// It logs only when something happened, and only the counts: at five ticks a second a line
+// per tick is not a log, it is the reason nobody reads the log.
+func limitLoop(ctx context.Context, agent *server.Node, interval time.Duration, log *slog.Logger) {
+	if interval <= 0 {
+		interval = server.DefaultLimitSampleInterval()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			report := agent.ElasticLimitsTick(ctx)
+			if len(report.Grown) == 0 && len(report.Shrunk) == 0 && len(report.Preempted) == 0 &&
+				len(report.OOMed) == 0 && len(report.Ended) == 0 {
+				continue
+			}
+			log.Warn("elastic admission moved a sandbox memory bound",
+				"grown", len(report.Grown), "shrunk", len(report.Shrunk),
+				"preempted", len(report.Preempted), "oomed", len(report.OOMed),
+				"ended", len(report.Ended),
+				"bounds_mib", report.LimitSumMB, "spare_mib", report.SpareMB)
 		}
 	}
 }
@@ -1112,6 +1172,11 @@ func auditLedger(agent *server.Node, log *slog.Logger) {
 		"granted_cpu_millis", granted.CPUMillis, "envelope_cpu_millis", envelope.CPUMillis)
 }
 
+// startBackends begins any background work a backend owns.
+//
+// Only a backend that has something to run implements this, so the assertion is
+// an interface check rather than a flag: a backend with no pool and no loop is
+// simply skipped.
 func startBackends(ctx context.Context, backends []backend.Backend, gate *node.Admission, log *slog.Logger) {
 	for _, b := range backends {
 		// A backend that prefetches containers borrows the node's budget for them, and

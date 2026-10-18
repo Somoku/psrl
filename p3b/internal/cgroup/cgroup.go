@@ -362,6 +362,28 @@ func (d Domain) memory() (Hierarchy, bool) {
 	return Hierarchy{}, false
 }
 
+// accounting returns the hierarchy that counts a cgroup's CPU time.
+//
+// v1 mounts cpuacct beside cpu, and on some hosts beside nothing else, so the controller
+// is named rather than the mount. A v2 host has one hierarchy and names "cpu" in it,
+// which is why the version decides the name here rather than at the call site.
+func (d Domain) accounting() (Hierarchy, bool) {
+	if d.Version == 2 {
+		for _, hierarchy := range d.Hierarchies {
+			if hierarchy.Has("cpu") {
+				return hierarchy, true
+			}
+		}
+		return Hierarchy{}, false
+	}
+	for _, hierarchy := range d.Hierarchies {
+		if hierarchy.Has("cpuacct") {
+			return hierarchy, true
+		}
+	}
+	return Hierarchy{}, false
+}
+
 // createLeaf makes this service's own cgroup in one hierarchy.
 func createLeaf(hierarchy Hierarchy, leaf string) error {
 	dir := filepath.Join(hierarchy.Root, leaf)

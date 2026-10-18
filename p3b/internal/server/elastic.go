@@ -33,6 +33,7 @@ import (
 	"context"
 	"log/slog"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -53,12 +54,14 @@ type ElasticConfig struct {
 	// may still need two cores for a compile, and one estimator over both would price
 	// each by the other's unit.
 	CPUFootprint node.FootprintConfig
-	// ShrinkAbove is the measured fraction of the sandbox budget above which idle sandboxes
-	// are asked to release reclaimable memory, and above which their CPU quota is lowered.
+	// ShrinkAbove is the measured fraction of the CPU budget above which idle sandboxes'
+	// quotas are lowered. It is a CPU threshold only: memory bounds are decided per
+	// sandbox, on their own cadence and against that sandbox's own usage, because an
+	// aggregate fraction says the node is busy and not which sandbox should pay.
 	ShrinkAbove float64
-	// RestoreBelow is the fraction below which their limits are raised again. The gap
-	// between the two is the hysteresis, so a node sitting at the threshold does not shrink
-	// and restore on alternate samples.
+	// RestoreBelow is the fraction below which their quotas are raised again. The gap
+	// between the two is the hysteresis, so a node sitting at the threshold does not
+	// throttle and release on alternate samples.
 	RestoreBelow float64
 	// ReleaseMarginMB is what is left above a sandbox's resident memory when its limit is
 	// lowered: enough to run a command without immediately reclaiming.
@@ -82,6 +85,56 @@ type ElasticConfig struct {
 	// without this a class can be priced at its idle rate while every sandbox in it is
 	// being throttled. Zero takes the default.
 	ThrottledAbove float64
+
+	// StartLimitMB is the kernel limit a sandbox is created under: its guarantee, and the
+	// level its limit is never lowered below while it lives.
+	//
+	// Creating a sandbox at its declared maximum and then lowering it is the worst of both
+	// worlds: the node pays the risk of every shrink and gets none of the density, because
+	// the reservation was already made at the maximum. A small start with room to grow
+	// costs nothing a sandbox does not ask for, and it is what keeps the sum of the
+	// kernel's hard bounds -- which the machine has to be able to back, whatever the
+	// ledger charged -- proportional to what is actually in use.
+	//
+	// Zero means "create at the declared maximum", which is the behaviour this had before.
+	StartLimitMB int64
+	// CeilingLimitMB is the highest a sandbox's limit may be raised to. Zero means the
+	// maximum the sandbox declared. Either way the ceiling is protection, not entitlement:
+	// growth stops there, and a sandbox that OOMs there has no tier left to raise.
+	CeilingLimitMB int64
+	// GrowAbove is the fraction of its current limit a sandbox's measured usage reaches
+	// before the limit is raised. It is deliberately well below one: by the time usage is
+	// at the limit the kernel is already refusing allocations, and on a host with no
+	// memory.high there is no soft band between "reclaiming" and "killing".
+	GrowAbove float64
+	// GrowFactor is how much the limit is multiplied by on ordinary pressure.
+	GrowFactor float64
+	// EmergencyGrowFactor is how much it is multiplied by on an OOM. An OOM means the
+	// controller was already too late, so the correction has to be larger than the one a
+	// threshold crossing gets.
+	EmergencyGrowFactor float64
+	// ShrinkBelow is the fraction of its limit a sandbox's usage must fall under before
+	// the limit may come down, and ShrinkDwellS is how long it must stay there.
+	//
+	// The gap between this and GrowAbove is the hysteresis, and it is wide on purpose.
+	// A wrong shrink is not a lost optimisation: it kills the sandbox and discards every
+	// turn of model interaction it accumulated. A wrong grow costs memory that was
+	// otherwise idle.
+	ShrinkBelow  float64
+	ShrinkDwellS float64
+	// ShrinkFactor is what the limit is multiplied by when it comes down. Halving rather
+	// than fitting to the measurement is what keeps a shrink from landing on the working
+	// set: the measurement is one sample, and the working set is not.
+	ShrinkFactor float64
+	// SafetyFraction is the share of the sandbox budget growth may not consume. It is the
+	// physical counterpart of the ledger's admission reserve: the ledger keeps capacity for
+	// admissions, this keeps it for sandboxes that have not asked yet.
+	SafetyFraction float64
+	// LimitSampleIntervalS is how often the limit controller reads the domain. It is much
+	// shorter than the pricing cadence because the two answer different questions: a price
+	// is a statistic over a class and is noise at this resolution, while a limit is a
+	// bound on one sandbox that a burst can outrun inside a single slow interval.
+	LimitSampleIntervalS float64
 }
 
 // ElasticConfigWithDefaults fills in what a deployment left unset.
@@ -113,6 +166,33 @@ func ElasticConfigWithDefaults(cfg ElasticConfig) ElasticConfig {
 	if cfg.GrowthHorizonS <= 0 {
 		cfg.GrowthHorizonS = DefaultGrowthHorizonS
 	}
+	// Sixty percent. Usage at the limit already means the kernel is refusing allocations;
+	// on a v1 host there is no memory.high to warn first, so the threshold has to leave
+	// room for the interval it takes to notice.
+	if cfg.GrowAbove <= 0 || cfg.GrowAbove >= 1 {
+		cfg.GrowAbove = 0.60
+	}
+	if cfg.GrowFactor <= 1 {
+		cfg.GrowFactor = 2.0
+	}
+	if cfg.EmergencyGrowFactor <= 1 {
+		cfg.EmergencyGrowFactor = 4.0
+	}
+	if cfg.ShrinkBelow <= 0 {
+		cfg.ShrinkBelow = 0.20
+	}
+	if cfg.ShrinkDwellS <= 0 {
+		cfg.ShrinkDwellS = DefaultShrinkDwellS
+	}
+	if cfg.ShrinkFactor <= 0 || cfg.ShrinkFactor >= 1 {
+		cfg.ShrinkFactor = 0.5
+	}
+	if cfg.SafetyFraction <= 0 || cfg.SafetyFraction >= 1 {
+		cfg.SafetyFraction = 0.05
+	}
+	if cfg.LimitSampleIntervalS <= 0 {
+		cfg.LimitSampleIntervalS = DefaultLimitSampleIntervalS
+	}
 	// A quarter of a core is what a sandbox holding a shell and an agent costs before the
 	// class has any history. It is deliberately not zero: the first batch after a restart
 	// is admitted against this, and zero would say a sandbox is free.
@@ -137,6 +217,29 @@ const DefaultThrottledAbove = 0.10
 // sandbox at its peak before it has any history.
 const DefaultGrowthHorizonS = 60.0
 
+// DefaultShrinkDwellS is how long a sandbox's measured usage must stay below ShrinkBelow
+// before its limit comes down.
+//
+// A minute, against ten seconds for the CPU quota: memory is the dimension where a wrong
+// move is unrecoverable. The dwell is not caution about the measurement, which is instant,
+// but about the workload -- an agent between tool calls looks idle for seconds at a time
+// and is about to allocate again.
+const DefaultShrinkDwellS = 60.0
+
+// DefaultLimitSampleIntervalS is how often the limit controller reads the sandbox domain.
+//
+// Two hundred milliseconds, because that is the interval at which a burst is visible at
+// all: one tool call can move a sandbox's demand by an order of magnitude inside a second,
+// and the pricing cadence of five seconds sees only the result. The cost of the read is
+// linear in the number of sandboxes and is measured in the benchmark, not assumed.
+const DefaultLimitSampleIntervalS = 0.2
+
+// DefaultLimitSampleInterval is DefaultLimitSampleIntervalS as a duration, for the
+// deployment's loop, which needs a ticker rather than a number.
+func DefaultLimitSampleInterval() time.Duration {
+	return time.Duration(DefaultLimitSampleIntervalS * float64(time.Second))
+}
+
 // ElasticReport is one tick's decisions, for the metric hook and for the log line that
 // explains a change in how much the node will admit.
 type ElasticReport struct {
@@ -158,10 +261,8 @@ type ElasticReport struct {
 	ReservesMB map[string]int64
 	// ReservesCPUMillis are the per-class per-sandbox CPU charges, in millicores.
 	ReservesCPUMillis map[string]int64
-	// Shrunk and Restored name the sandboxes whose kernel limit changed.
-	Shrunk   []string
-	Restored []string
-	// Throttled and Released name the sandboxes whose CPU quota changed.
+	// Throttled and Released name the sandboxes whose CPU quota changed. Memory bounds
+	// moved in a tick are reported by LimitReport, which runs on its own cadence.
 	Throttled []string
 	Released  []string
 	// OOMKills is the total the kernel reports across these sandboxes.
@@ -173,13 +274,394 @@ type ElasticReport struct {
 	ThrottledPct float64
 }
 
-// elastic is one node's controller state.
+// LimitReport is one limit tick's decisions.
 //
-// Its maps are read by the node's report, which a caller drives from the fleet poll, and
-// written by the controller's own tick on another goroutine, so the whole controller is
-// behind one lock. A report that raced a tick would not merely read a stale price -- an
-// unsynchronised map read against a map write is a fatal error in Go, which would take
-// the node down.
+// It is separate from ElasticReport because the two run at different cadences and answer
+// different questions: this one is about the kernel's hard bounds on individual sandboxes
+// over the next fraction of a second, the other about what a class costs over the next
+// minute.
+type LimitReport struct {
+	// Grown names the sandboxes whose limit was raised, and Shrunk the ones whose limit
+	// came down.
+	Grown  []string
+	Shrunk []string
+	// Preempted names the sandboxes that gave back a loan so another could grow.
+	Preempted []string
+	// OOMed names the sandboxes the kernel killed a process in since the last tick.
+	OOMed []string
+	// Ended names the sandboxes this tick ended because they were killed again with their
+	// limit already at the ceiling.
+	Ended []string
+	// LimitSumMB is the sum of the kernel's hard bounds across the domain, which is the
+	// number the machine has to be able to back regardless of what the ledger charged.
+	LimitSumMB int64
+	// SpareMB is what is left of the sandbox budget after those bounds and the safety
+	// share, which is what growth may spend.
+	SpareMB int64
+}
+
+// ElasticLimitsTick moves each sandbox's kernel memory bound one step.
+//
+// It runs far more often than ElasticTick, and that is the point: a bound is a promise
+// about the next allocation, and a tool call can outrun it inside one slow interval. The
+// pricing half of the controller is a statistic over a class and would be noise at this
+// resolution, so the two are deliberately separate loops rather than one loop at a
+// compromise cadence.
+//
+// The rules are asymmetric on purpose. Growing is cheap -- memory that is not asked for is
+// not spent -- so it happens on a single sample, and on an OOM it happens by a larger
+// factor still, because an OOM means this tick was already too late. Shrinking is
+// expensive: a bound below a sandbox's working set does not slow it down, it kills it and
+// discards every turn of model interaction it had accumulated. So a shrink needs a fraction
+// of the limit that no sane workload sits at by accident, and it needs that to hold for a
+// dwell, because an agent between tool calls looks idle for seconds and then allocates.
+func (n *Node) ElasticLimitsTick(ctx context.Context) LimitReport {
+	report := LimitReport{}
+	if n.elastic == nil || !n.elastic.cfg.Enabled || len(n.elasticDomain.Hierarchies) == 0 {
+		return report
+	}
+	n.elastic.mu.Lock()
+	defer n.elastic.mu.Unlock()
+	cfg := n.elastic.cfg
+	children, err := n.elasticDomain.Children(n.elasticParent)
+	if err != nil {
+		// A domain that cannot be read is not a domain that is idle. No bound moves.
+		return report
+	}
+
+	// Everything below is in bytes, which is what the kernel speaks; the budget is
+	// published in MiB, and mixing the two here would make "spare" a number from another
+	// unit system rather than a wrong number -- the kind that fails only at fleet scale.
+	budget := n.elasticBudgetMB() * mib
+	// The domain is read once. Every decision in this tick works from this slice, including
+	// preemption, which needs to know what every *other* sandbox's bound is: re-reading the
+	// domain per sandbox is one directory listing and a handful of files per sandbox per
+	// sandbox, which is a tick that costs seconds at two hundred sandboxes rather than
+	// milliseconds. The entries are mutable so a write made here is seen by the decisions
+	// that follow it in the same tick.
+	tracked := make([]boundState, 0, len(children))
+	var limitSum int64
+	for _, child := range children {
+		if _, known := n.elastic.classBySandbox[child.ID]; !known {
+			continue
+		}
+		if child.Limit <= 0 {
+			continue
+		}
+		oomDelta, oomKnown := n.oomDeltaLocked(child)
+		failDelta, failKnown := n.failDeltaLocked(child)
+		tracked = append(tracked, boundState{
+			id: child.ID, usage: child.Usage, resident: child.Resident, limit: child.Limit,
+			start: n.elastic.startMBBySandbox[child.ID] * mib, ceiling: n.ceilingLocked(child.ID),
+			oomDelta: oomDelta, oomKnown: oomKnown, failDelta: failDelta, failKnown: failKnown,
+		})
+		limitSum += child.Limit
+	}
+	// Growth spends from what the machine can actually back, not from what the ledger
+	// charged. The two are different numbers by design -- the ledger sells the average --
+	// and the kernel's bounds are the ones that have to hold when several sandboxes are
+	// at their ceiling at once.
+	spare := budget - int64(float64(budget)*cfg.SafetyFraction) - limitSum
+	initialSpare := spare
+
+	// The preemptible loans, ranked largest first and computed once. Reclaiming one big
+	// loan is one write and one reclaim; several small ones are several of each.
+	loans := make([]*boundState, 0, len(tracked))
+	for i := range tracked {
+		e := &tracked[i]
+		if e.limit > e.start && e.usage < e.start {
+			loans = append(loans, e)
+		}
+	}
+	sort.Slice(loans, func(i, j int) bool { return loans[i].limit-loans[i].start > loans[j].limit-loans[j].start })
+
+	now := time.Now()
+	var ended []string
+	next := 0
+	for i := range tracked {
+		e := &tracked[i]
+		switch {
+		case e.oomKnown && e.oomDelta > 0:
+			// The kernel killed something in this sandbox. It is the emergency signal: the
+			// threshold was crossed and then some, so the correction is larger than the one
+			// a threshold crossing gets.
+			report.OOMed = append(report.OOMed, e.id)
+			if atCeiling(e.limit, e.ceiling) {
+				if n.elastic.exhausted[e.id] {
+					// Killed again with nowhere left to grow. This trajectory is already
+					// corrupted by starvation; ending it and saying so lets the trainer
+					// resample the task instead of learning from it.
+					ended = append(ended, e.id)
+					continue
+				}
+				// The first one is not enough to condemn it: the kill may have been of a
+				// runaway child, and growth may still be possible once a loan is taken back.
+				n.elastic.exhausted[e.id] = true
+				slog.Error("a sandbox was killed for memory with its limit already at the ceiling",
+					"sandbox", e.id, "class", n.elastic.classBySandbox[e.id],
+					"limit_mb", e.limit/mib, "usage_mb", e.usage/mib, "rss_mb", e.resident/mib)
+				break
+			}
+			if grew := n.raise(e, e.limit*int64(cfg.EmergencyGrowFactor), &spare, loans, &next); grew {
+				report.Grown = append(report.Grown, e.id)
+			}
+		case float64(e.usage) >= float64(e.limit)*cfg.GrowAbove || (e.failKnown && e.failDelta > 0):
+			// Usage approaching the bound, or the kernel reporting that the bound was
+			// already in the way. failcnt is the early signal and OOM is the late one: on
+			// a host with no memory.high there is no soft band between them, so the
+			// threshold has to be crossed well before the ceiling.
+			if e.limit < e.ceiling {
+				if grew := n.raise(e, e.limit*int64(cfg.GrowFactor), &spare, loans, &next); grew {
+					report.Grown = append(report.Grown, e.id)
+				}
+			}
+		case float64(e.usage) < float64(e.limit)*cfg.ShrinkBelow:
+			if started, running := n.elastic.lowSince[e.id]; !running {
+				n.elastic.lowSince[e.id] = now
+			} else if now.Sub(started) >= time.Duration(cfg.ShrinkDwellS*float64(time.Second)) {
+				if target := n.shrinkTarget(e, cfg); target > 0 && target < e.limit {
+					if err := n.elasticDomain.SetChildLimit(n.elasticParent, e.id, target); err == nil {
+						report.Shrunk = append(report.Shrunk, e.id)
+						spare += e.limit - target
+						e.limit = target
+						delete(n.elastic.lowSince, e.id)
+					}
+				}
+			}
+		default:
+			// Inside the hysteresis band: one sample neither grows nor shrinks, which is
+			// what stops the limit oscillating around the threshold.
+			delete(n.elastic.lowSince, e.id)
+		}
+	}
+
+	// Ended outside the loop and outside this lock's other work, so the lifecycle is never
+	// re-entered from under the controller's own mutex.
+	for _, id := range ended {
+		if err := n.lifecycle.Release(ctx, id, node.ExitOOM); err == nil {
+			report.Ended = append(report.Ended, id)
+			slog.Error("ended a sandbox that was killed for memory with no tier left to raise",
+				"sandbox", id, "class", n.elastic.classBySandbox[id])
+			delete(n.elastic.exhausted, id)
+			delete(n.elastic.startMBBySandbox, id)
+			delete(n.elastic.maxMemoryMBBySandbox, id)
+		}
+	}
+	// The bounds the machine now has to back are the ones it had at the start plus
+	// everything this tick handed out, and "spare" already carries that difference
+	// exactly: growth subtracts from it and reclamation adds to it. Deriving the sum from
+	// it is cheaper and cannot disagree with it.
+	report.LimitSumMB = (limitSum + (initialSpare - spare)) / mib
+	report.SpareMB = spare / mib
+	return report
+}
+
+// boundState is one sandbox's bounds, as this tick sees them.
+//
+// It is a working copy rather than the reading itself because a tick makes writes, and a
+// decision taken after a write has to see it: two sandboxes may draw from the same spare
+// budget in one tick, and a preemption has to know that the loan it is about to take back
+// was not already given to someone else in the tick before.
+type boundState struct {
+	id        string
+	usage     int64
+	resident  int64
+	limit     int64
+	start     int64
+	ceiling   int64
+	oomDelta  int64
+	oomKnown  bool
+	failDelta int64
+	failKnown bool
+}
+
+// mib is the unit the configuration speaks and the kernel does not.
+const mib = 1024 * 1024
+
+// atCeiling reports whether a limit has nowhere left to grow. A limit within a MiB of the
+// ceiling is at it: the difference is rounding in the kernel's own accounting, and treating
+// it as headroom would raise the bound by a MiB and call that help.
+func atCeiling(limit, ceiling int64) bool {
+	return ceiling <= 0 || limit+mib > ceiling
+}
+
+// oomDeltaLocked and failDeltaLocked report how many times the kernel killed a process, or
+// refused an allocation, since the previous reading.
+//
+// Both counters are cumulative and both survive the container that owned them, so the
+// first sighting is recorded without being acted on: a cgroup that already says four
+// kills belongs to a sandbox that no longer exists, and reading that as fresh evidence
+// would end an episode for something it never did.
+func (n *Node) oomDeltaLocked(child cgroup.Child) (int64, bool) {
+	previous, known := n.elastic.oomCountBySandbox[child.ID]
+	n.elastic.oomCountBySandbox[child.ID] = child.OOMKills
+	if !known {
+		return 0, false
+	}
+	return child.OOMKills - previous, true
+}
+
+func (n *Node) failDeltaLocked(child cgroup.Child) (int64, bool) {
+	previous, known := n.elastic.failCountBySandbox[child.ID]
+	n.elastic.failCountBySandbox[child.ID] = child.MemoryFailCount
+	if !known {
+		return 0, false
+	}
+	return child.MemoryFailCount - previous, true
+}
+
+// ceilingLocked is the highest this sandbox's limit may be raised to: what it declared,
+// capped by what the node will allow any one sandbox to hold.
+func (n *Node) ceilingLocked(sandboxID string) int64 {
+	ceiling := n.elastic.maxMemoryMBBySandbox[sandboxID] * mib
+	if cap := n.elastic.cfg.CeilingLimitMB * mib; cap > 0 && (ceiling <= 0 || ceiling > cap) {
+		ceiling = cap
+	}
+	if start := n.elastic.startMBBySandbox[sandboxID] * mib; start > ceiling {
+		ceiling = start
+	}
+	return ceiling
+}
+
+// raise moves one sandbox's bound up towards target, spending from what the machine has
+// spare and taking back unused loans when it does not have enough.
+//
+// Callers hold the controller's lock. loans is this tick's ranked list of preemptible
+// loans and next is how far into it the tick has already got, so one loan is taken back at
+// most once even though every sandbox in a burst asks in the same tick.
+func (n *Node) raise(e *boundState, target int64, spare *int64, loans []*boundState, next *int) bool {
+	if target > e.ceiling {
+		target = e.ceiling
+	}
+	need := target - e.limit
+	if need <= 0 {
+		return false
+	}
+	for need > *spare && *next < len(loans) {
+		l := loans[*next]
+		*next++
+		if l == e || l.limit <= l.start {
+			continue
+		}
+		// Still not using its guarantee? The reading is from this tick's single pass and
+		// nothing has changed it since, so the answer is still the one it was.
+		if l.usage >= l.start {
+			continue
+		}
+		if err := n.elasticDomain.SetChildLimit(n.elasticParent, l.id, l.start); err != nil {
+			continue
+		}
+		*spare += l.limit - l.start
+		l.limit = l.start
+	}
+	if need > *spare {
+		// Take what there is rather than nothing. A partial growth still buys time, and the
+		// next tick is one interval away.
+		need = *spare
+		if need <= 0 {
+			return false
+		}
+		target = e.limit + need
+	}
+	if err := n.elasticDomain.SetChildLimit(n.elasticParent, e.id, target); err != nil {
+		slog.Warn("elastic admission could not raise a sandbox limit",
+			"sandbox", e.id, "target_mb", target/mib, "error", err)
+		return false
+	}
+	*spare -= need
+	e.limit = target
+	// A sandbox that just grew is not idle, whatever the sample said before it grew.
+	delete(n.elastic.lowSince, e.id)
+	return true
+}
+
+// shrinkTarget is where one sandbox's bound may come down to, or zero when it may not come
+// down at all.
+//
+// The floors, in order of what they protect: half the current bound, because fitting the
+// bound to one sample is how it lands on a working set; the guarantee, because that was
+// promised and only preemption of a loan may take it back; and what the sandbox has
+// charged plus a margin, because a bound below the pages is not a slowdown.
+func (n *Node) shrinkTarget(e *boundState, cfg ElasticConfig) int64 {
+	target := int64(float64(e.limit) * cfg.ShrinkFactor)
+	floor := e.start
+	if min := cfg.MinLimitMB * mib; floor < min {
+		floor = min
+	}
+	// Usage, not resident: the bound charges page cache too, so a floor taken from
+	// anonymous pages alone would sit below what the sandbox already has charged and force
+	// a reclaim of the very files the next command is about to read.
+	if used := e.usage + cfg.ReleaseMarginMB*mib; floor < used {
+		floor = used
+	}
+	if target < floor {
+		target = floor
+	}
+	if target >= e.limit {
+		return 0
+	}
+	return target
+}
+
+// applyStartLimit returns the spec a sandbox is created under: its memory bound is the
+// guarantee rather than the declared maximum.
+//
+// The ceiling is remembered separately and is what growth may reach, so lowering the
+// creation bound does not lower what the sandbox may become -- only what it must be given
+// before it has asked for anything.
+func (n *Node) applyStartLimit(spec backend.Spec) backend.Spec {
+	if n.elastic == nil || !n.elastic.cfg.Enabled {
+		return spec
+	}
+	n.elastic.mu.Lock()
+	start := n.startLimitLocked(spec)
+	n.elastic.mu.Unlock()
+	if start <= 0 || start >= spec.Resources.MemoryMB {
+		return spec
+	}
+	out := spec
+	out.Resources.MemoryMB = start
+	return out
+}
+
+// startLimitLocked is the memory bound a new sandbox is created under, in MiB.
+//
+// Unset, it is the declared maximum and nothing moves -- which is the shape this had
+// before, and which a deployment that has not measured its workloads should keep. Set, it
+// is the guarantee: the level the sandbox's bound is never lowered below, and the level
+// growth starts from. It is never more than what was declared, because a caller asking for
+// a smaller sandbox is asking for a smaller sandbox.
+func (n *Node) startLimitLocked(spec backend.Spec) int64 {
+	cfg := n.elastic.cfg
+	declared := spec.Resources.MemoryMB
+	if declared <= 0 || cfg.StartLimitMB <= 0 {
+		return declared
+	}
+	start := cfg.StartLimitMB
+	if min := cfg.MinLimitMB; start < min {
+		start = min
+	}
+	if start > declared {
+		start = declared
+	}
+	return start
+}
+
+// elasticRemember records what a sandbox declared, which is the ceiling its kernel limit
+// may be raised to, and the guarantee it was created under, which is the floor it may not
+// be lowered below.
+func (n *Node) elasticRemember(sandboxID string, spec backend.Spec) {
+	if n.elastic == nil {
+		return
+	}
+	n.elastic.mu.Lock()
+	defer n.elastic.mu.Unlock()
+	n.elastic.maxMemoryMBBySandbox[sandboxID] = spec.Resources.MemoryMB
+	n.elastic.maxCPUMillisBySandbox[sandboxID] = int64(spec.Resources.CPUCount * 1000)
+	n.elastic.classBySandbox[sandboxID] = spec.ResourceClass
+	n.elastic.startMBBySandbox[sandboxID] = n.startLimitLocked(spec)
+}
+
 type elastic struct {
 	mu  sync.Mutex
 	cfg ElasticConfig
@@ -194,10 +676,24 @@ type elastic struct {
 	// maxCPUMillisBySandbox is the CPU each running sandbox declared, which is what its
 	// quota is restored to.
 	maxCPUMillisBySandbox map[string]int64
+	// startMBBySandbox is the guarantee each sandbox was created under. A bound is never
+	// lowered below it by the slow shrink -- that would be taking back what was promised
+	// -- but the portion above it is a loan, and a loan is preemptible.
+	startMBBySandbox map[string]int64
+	// lowSince is when each sandbox's usage first fell under ShrinkBelow, which is what
+	// the dwell is measured from. Absent means the clock is not running.
+	lowSince map[string]time.Time
+	// failCount and oomCount are the previous readings of each sandbox's memory.failcnt
+	// and oom_kill counters. Both are cumulative, so the counter is not the signal -- the
+	// delta is. An OOM that happened before the sandbox was admitted is not the
+	// controller's business and must not be read as one.
+	failCountBySandbox map[string]int64
+	oomCountBySandbox  map[string]int64
+	// exhausted names the sandboxes that OOMed with their bound already at the ceiling,
+	// so a second one is an ending rather than another growth attempt.
+	exhausted map[string]bool
 	// classBySandbox is what the sandbox was admitted as.
 	classBySandbox map[string]string
-	// shrunk records which sandboxes are currently below their declared maximum.
-	shrunk map[string]bool
 	// throttled records which sandboxes are currently below their declared CPU quota.
 	throttled map[string]bool
 	// cpuUsage is the last cumulative CPU reading per sandbox. A rate needs the previous
@@ -334,10 +830,11 @@ func (n *Node) ElasticTick(ctx context.Context) ElasticReport {
 	report.ReservedMB = granted.MemoryMB
 	report.ReservedCPUMillis = granted.CPUMillis
 
-	memFraction := 0.0
-	if report.BudgetMB > 0 {
-		memFraction = float64(report.ObservedMB) / float64(report.BudgetMB)
-	}
+	// Memory bounds are not decided here. They are per-sandbox decisions on a 200ms
+	// cadence -- see ElasticLimitsTick -- because a bound is a promise about the next
+	// allocation, and an aggregate fraction over the whole domain is not: it says the node
+	// is busy, which is neither a reason to take memory from a particular sandbox nor a
+	// signal that arrives soon enough to matter.
 	cpuFraction := 0.0
 	if report.BudgetCPUMillis > 0 {
 		cpuFraction = float64(report.ObservedCPUMillis) / float64(report.BudgetCPUMillis)
@@ -345,12 +842,6 @@ func (n *Node) ElasticTick(ctx context.Context) ElasticReport {
 	for _, child := range children {
 		if _, known := n.elastic.classBySandbox[child.ID]; !known {
 			continue
-		}
-		switch {
-		case memFraction >= cfg.ShrinkAbove:
-			report.Shrunk = n.releaseMemory(child, cfg, report.Shrunk)
-		case memFraction <= cfg.RestoreBelow:
-			report.Restored = n.restoreMemory(child, report.Restored)
 		}
 		switch {
 		case cpuFraction >= cfg.ShrinkAbove:
@@ -485,48 +976,6 @@ func growthOver(now, before int64, elapsed time.Duration, horizonS float64) int6
 	return int64(ratePerSecond * horizonS)
 }
 
-// releaseMemory lowers one idle sandbox's limit to what it cannot give back.
-func (n *Node) releaseMemory(child cgroup.Child, cfg ElasticConfig, shrunk []string) []string {
-	if n.elastic.shrunk[child.ID] || n.sandboxBusy(child) {
-		// A command is running, so its page cache is the code it is executing: shrinking
-		// here would reclaim the working set of a live step.
-		return shrunk
-	}
-	targetMB := child.Resident/(1024*1024) + cfg.ReleaseMarginMB
-	if targetMB < cfg.MinLimitMB {
-		targetMB = cfg.MinLimitMB
-	}
-	if child.Limit <= targetMB*(1024*1024) {
-		return shrunk
-	}
-	if err := n.elasticDomain.SetChildLimit(n.elasticParent, child.ID, targetMB*(1024*1024)); err != nil {
-		slog.Warn("elastic admission could not lower a sandbox limit",
-			"sandbox", child.ID, "target_mb", targetMB, "error", err)
-		return shrunk
-	}
-	n.elastic.shrunk[child.ID] = true
-	return append(shrunk, child.ID)
-}
-
-// restoreMemory raises a sandbox back to its declared maximum.
-func (n *Node) restoreMemory(child cgroup.Child, restored []string) []string {
-	if !n.elastic.shrunk[child.ID] {
-		return restored
-	}
-	maxMB := n.elastic.maxMemoryMBBySandbox[child.ID]
-	if maxMB <= 0 {
-		delete(n.elastic.shrunk, child.ID)
-		return restored
-	}
-	if err := n.elasticDomain.SetChildLimit(n.elasticParent, child.ID, maxMB*(1024*1024)); err != nil {
-		slog.Warn("elastic admission could not restore a sandbox limit",
-			"sandbox", child.ID, "target_mb", maxMB, "error", err)
-		return restored
-	}
-	delete(n.elastic.shrunk, child.ID)
-	return append(restored, child.ID)
-}
-
 // throttleCPU lowers one idle sandbox's quota to what it measured using, plus a margin.
 //
 // CPU is the compressible dimension, so unlike a memory shrink this cannot kill the
@@ -639,19 +1088,6 @@ func (n *Node) elasticCharge(spec backend.Spec) node.Resources {
 	return charge
 }
 
-// elasticRemember records what a sandbox declared, which is what its kernel limits are
-// restored to after the controller has taken them down.
-func (n *Node) elasticRemember(sandboxID string, spec backend.Spec) {
-	if n.elastic == nil {
-		return
-	}
-	n.elastic.mu.Lock()
-	defer n.elastic.mu.Unlock()
-	n.elastic.maxMemoryMBBySandbox[sandboxID] = spec.Resources.MemoryMB
-	n.elastic.maxCPUMillisBySandbox[sandboxID] = int64(spec.Resources.CPUCount * 1000)
-	n.elastic.classBySandbox[sandboxID] = spec.ResourceClass
-}
-
 // footprintFor returns a class's memory estimate, creating it on first use.
 func (n *Node) memoryFootprintFor(class string) *node.Footprint {
 	n.elastic.mu.Lock()
@@ -733,6 +1169,12 @@ func (n *Node) elasticBudgetCPUMillis() int64 {
 }
 
 // elasticAudit drops controller state for sandboxes this node no longer holds.
+//
+// Every map the controller keeps is indexed by sandbox id, so a sandbox that goes without
+// this leaves its start, its dwell clock and its OOM counters behind. The counters are the
+// dangerous ones: they are cumulative, so a later sandbox that inherits nothing else still
+// inherits a reading that says "this one has already been killed", which is how a fresh
+// episode gets ended for an OOM that was never its own.
 func (n *Node) elasticAudit() {
 	for sandboxID := range n.elastic.maxMemoryMBBySandbox {
 		if n.lifecycle.Running(sandboxID) {
@@ -741,9 +1183,15 @@ func (n *Node) elasticAudit() {
 		delete(n.elastic.maxMemoryMBBySandbox, sandboxID)
 		delete(n.elastic.maxCPUMillisBySandbox, sandboxID)
 		delete(n.elastic.classBySandbox, sandboxID)
-		delete(n.elastic.shrunk, sandboxID)
+		delete(n.elastic.startMBBySandbox, sandboxID)
+		delete(n.elastic.lowSince, sandboxID)
+		delete(n.elastic.failCountBySandbox, sandboxID)
+		delete(n.elastic.oomCountBySandbox, sandboxID)
+		delete(n.elastic.exhausted, sandboxID)
 		delete(n.elastic.throttled, sandboxID)
 		delete(n.elastic.cpuUsageNanos, sandboxID)
 		delete(n.elastic.cpuRateMillis, sandboxID)
+		delete(n.elastic.cpuThrottledNanos, sandboxID)
+		delete(n.elastic.cpuThrottle, sandboxID)
 	}
 }

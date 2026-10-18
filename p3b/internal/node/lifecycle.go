@@ -40,6 +40,13 @@ const (
 	ExitReleased        ExitReason = "released"
 	ExitReapedLifetime  ExitReason = "reaped_lifetime"
 	ExitReclaimedOrphan ExitReason = "reclaimed_orphan"
+	// ExitOOM is a sandbox the kernel kept killing for memory until the node ended it.
+	//
+	// It is its own reason rather than a failure or a release because what the caller does
+	// with it is different: a trajectory whose tool calls were killed for memory is not a
+	// trajectory that produced a wrong answer, it is one that never ran, and training on
+	// it teaches the policy something about a task it never saw. The caller resamples.
+	ExitOOM ExitReason = "oom"
 )
 
 // exitRecord attributes a sandbox that is no longer held.

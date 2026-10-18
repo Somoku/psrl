@@ -108,8 +108,12 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 			cpuFootprints:         map[string]*node.Footprint{},
 			maxMemoryMBBySandbox:  map[string]int64{},
 			maxCPUMillisBySandbox: map[string]int64{},
+			startMBBySandbox:      map[string]int64{},
+			lowSince:              map[string]time.Time{},
+			failCountBySandbox:    map[string]int64{},
+			oomCountBySandbox:     map[string]int64{},
+			exhausted:             map[string]bool{},
 			classBySandbox:        map[string]string{},
-			shrunk:                map[string]bool{},
 			throttled:             map[string]bool{},
 			cpuUsageNanos:         map[string]int64{},
 			cpuRateMillis:         map[string]int64{},
@@ -211,6 +215,13 @@ func (n *Node) CreateOn(ctx context.Context, req *v1.CreateOnRequest) (*v1.Creat
 		spec.Metadata = map[string]string{}
 	}
 	spec.Metadata[backend.OwnerMetadataKey] = owner
+
+	// The container is born under its guarantee, not under its declared maximum. Doing it
+	// here rather than by lowering the limit afterwards means there is no window in which
+	// the sandbox is bounded by a number the node has not agreed to back, and it is the
+	// only point at which the *creation* limit and the *ceiling* can be different numbers
+	// without a second write racing the sandbox's own first allocations.
+	spec = n.applyStartLimit(spec)
 
 	if handled, found, err := n.adoptByIdempotencyKey(ctx, hosted, leaseID, spec.IdempotencyKey); found {
 		return handled, err

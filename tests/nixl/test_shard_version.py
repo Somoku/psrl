@@ -269,7 +269,7 @@ class TestTheStampIsWrittenWhereReadersCanSeeIt:
             Path(__file__).resolve().parents[2] / "psrl/trainer/ppo/ray_trainer.py"
         ).read_text()
 
-        read_at = source.index("bootstrap_version = (")
+        read_at = source.index("bootstrap_version = ray.get(")
         server_dispatch_at = source.index("self.ps_manager_handle.nixl_protocol.remote()")
         worker_dispatch_at = source.index(
             '"nixl_protocol", actor_protocol_mode, bootstrap_version'
@@ -277,17 +277,19 @@ class TestTheStampIsWrittenWhereReadersCanSeeIt:
 
         assert read_at < server_dispatch_at < worker_dispatch_at
 
-    def test_only_direct_supply_stamps(self):
-        """With a PS the weights come from it, so a train-rank stamp would claim
-        authorship of bytes this rank did not publish."""
+    def test_every_mode_reads_the_version(self):
+        """PS workers stamp their shards with the published version, so the read is not
+        direct-supply-only. A rollout that pulls from an unstamped PS reports version -1
+        and the commit gate rejects its pull with `stale pull: announced v0 but shards
+        [-1]`."""
         from pathlib import Path
 
         source = (
             Path(__file__).resolve().parents[2] / "psrl/trainer/ppo/ray_trainer.py"
         ).read_text()
-        at = source.index("bootstrap_version = (")
+        at = source.index("bootstrap_version = ray.get(")
 
-        assert "has_ps_data_plane" in source[at : at + 300]
+        assert "has_ps_data_plane" not in source[at : at + 300]
 
     def test_both_overrides_take_the_argument(self):
         """A base class that does not accept it turns the extra argument into a TypeError

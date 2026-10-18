@@ -1989,24 +1989,49 @@ class NIXLStorageClient:
             self.agent.send_notif(dst_agent_name, payload)
 
     def _should_register_rdma(self) -> bool:
-        """Whether this client must register its tensors with NIXL for RDMA access.
+        """Whether this client must register its tensors with NIXL.
 
         When every reader in the comm plan is on the same node as this client, no remote
         NIC will ever issue a GET against these pages — the IPC copy path handles them
         instead (design §3.7.2.1). Registering anyway costs one `nixlRegDList` call plus
         `get_xfer_descs`/`get_serialized_descs` per region, which at MoE scale is the
-        same O(#shards) cost that drove §3.5.5. Skipping it entirely removes that cost
-        from every colocate wakeup.
+        same O(#shards) cost that drove §3.5.5.
+
+        **A pull-side client always registers.** Its tensors are also the *destination* of
+        its own pulls, and NIXL requires the local side of a transfer to be registered.
+        The plan's "who reads me" only answers whether *others* need remote access; with
+        no remote readers a sleeping validate instance skipped registration entirely and
+        then failed its upstream pull with `NIXL_ERR_NOT_FOUND` on
+        `prep_xfer_dlist(NIXL_INIT_AGENT, ...)`. Readers whose every source is a
+        same-device IPC copy could still skip, but proving that per deployment is not
+        worth the registration it saves.
 
         Falls back to True when the plan or the client infos are not yet populated:
         without them we cannot prove the deployment is pure colocate, so the safe answer
         is to register.
         """
+        if self.client_type is NIXLClientType.PULL_SIDE:
+            return True
         if self._comm_plan is None or not self._all_client_infos:
             return True
+        # A client that moves bytes through NIXL needs its own descriptors serialized and
+        # its memory registered even when no one reads it remotely: its local side is the
+        # source of a push or the destination of a pull. The train client is exactly that
+        # case in PS mode -- its shards may be read only by a same-node PS worker, but it
+        # still writes them to the PS every step and pulls them back after a wake.
+        # Skipping registration left `desc_bytes_list` unset and made the first trainer
+        # pull fall into the temp-buffer path with no mapping (KeyError on embed_tokens).
+        plan = self._comm_plan
+        for mapping in (
+            plan.push_to_ps_plan,
+            plan.train_pull_from_ps_plan,
+            plan.rollout_pull_from_ps_plan,
+        ):
+            if mapping.get(self.client_name):
+                return True
         from psrl.utils.nixl.registration_policy import needs_rdma_registration  # noqa: PLC0415
 
-        return needs_rdma_registration(self._comm_plan, self._all_client_infos, self.client_name)
+        return needs_rdma_registration(plan, self._all_client_infos, self.client_name)
 
     def _is_reader_of(self, source: str) -> bool:
         """Whether this client reads from ``source`` according to the comm plan.

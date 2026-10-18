@@ -164,7 +164,7 @@ class PSStorageWorker:
         self.nixl_multi_storage_clients.wait_for_server_temp_mappings()
         psrl_logger.info("nixl client protocol done.")
 
-    def nixl_protocol(self):
+    def nixl_protocol(self, bootstrap_version: int | None = None):
         psrl_logger.info("nixl protocol start with two phases.")
         unified_multi_meta_state_dicts, unified_multi_sharding_dicts = self._nixl_protocol_phase1()
         # Torch allocation is not thread-safe, so registration stays on the main thread.
@@ -187,6 +187,15 @@ class PSStorageWorker:
                 unified_multi_meta_state_dicts[self.client_for_pull_name],
                 unified_multi_sharding_dicts[self.client_for_pull_name],
             )
+        # Stamp before the local info goes out in phase 2. The checkpoint is loaded into
+        # these buffers *after* the handshake, but the version those bytes represent is
+        # already known (the manager's bootstrap version), and readers cache this metadata
+        # at the handshake. Stamping later would leave every reader seeing -1 until the
+        # next update broadcast, and the first-pull version assertion would reject a
+        # correct pull.
+        if bootstrap_version is not None:
+            client_for_push.publish_version(bootstrap_version)
+            client_for_pull.publish_version(bootstrap_version)
         self._nixl_protocol_phase2()
 
     def nixl_wait_for_update_infos(self, info_num: int):

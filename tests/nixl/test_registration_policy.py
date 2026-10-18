@@ -272,7 +272,6 @@ class TestClientShouldRegisterRdma:
 
     def test_no_plan_means_register(self):
         """Before wait_for_server_info the plan is None; must not skip registration."""
-        from psrl.utils.nixl.registration_policy import needs_rdma_registration
 
         class _FakePlan:
             push_to_ps_plan = {}
@@ -282,10 +281,10 @@ class TestClientShouldRegisterRdma:
         # needs_rdma_registration with an empty plan returns False (no readers),
         # but _should_register_rdma returns True when _comm_plan is None.
         # We test the wrapper logic directly:
-        from unittest.mock import patch
 
         # Simulate a client with no plan set
         class _Stub:
+            client_type = NIXLClientType.PUSH_SIDE
             _comm_plan = None
             _all_client_infos = {}
             client_name = "train0"
@@ -322,3 +321,51 @@ class TestClientShouldRegisterRdma:
 
         from psrl.utils.nixl.registration_policy import needs_rdma_registration
         assert needs_rdma_registration(plan, clients, "train0") is False
+
+    def test_a_pull_side_client_always_registers_for_its_own_destination(self):
+        """No remote reader does not mean no registration: the client pulls *into* the
+        memory, and NIXL requires the local side of a transfer to be registered. A woken
+        validate instance skipped it and then failed upstream reads with NOT_FOUND."""
+        from psrl.utils.nixl.client import NIXLStorageClient
+
+        class _Stub:
+            client_type = NIXLClientType.PULL_SIDE
+            _comm_plan = object()
+            _all_client_infos = {"x": object()}
+            client_name = "gen0"
+
+            def _should_register_rdma(self_):
+                return NIXLStorageClient._should_register_rdma(self_)
+
+        assert _Stub()._should_register_rdma() is True
+
+    def test_a_client_that_pushes_or_pulls_through_nixl_always_registers(self):
+        """A local transfer source/destination needs registration even with no remote reader.
+
+        The train client in PS mode pushes its shards to the PS every step and pulls them
+        back after a wake. If its only readers are same-node PS workers the old policy
+        skipped registration entirely, leaving its descriptors unset; the first trainer
+        pull then fell into the temp-buffer path with no mapping.
+        """
+        from psrl.utils.nixl.client import NIXLStorageClient
+
+        node = TRAIN_NODE
+        clients = {
+            "train0": _client("train0", NIXLClientType.PUSH_SIDE, node),
+            "ps0": _client("ps0", NIXLClientType.PS_FOR_PUSH, node),
+            "ps1": _client("ps1", NIXLClientType.PS_FOR_PULL, node),
+            "gen0": _client("gen0", NIXLClientType.PULL_SIDE, node),
+        }
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+        assert plan.push_to_ps_plan.get("train0"), "the train client has no push plan in this fixture"
+
+        class _Stub:
+            client_type = NIXLClientType.PUSH_SIDE
+            _comm_plan = plan
+            _all_client_infos = clients
+            client_name = "train0"
+
+            def _should_register_rdma(self_):
+                return NIXLStorageClient._should_register_rdma(self_)
+
+        assert _Stub()._should_register_rdma() is True

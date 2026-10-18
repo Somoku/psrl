@@ -739,7 +739,11 @@ class NIXLMetaServer:
                 "info": self.client_infos[client_name].serialize(),
                 "temp_mapping": self._client_temp_mappings[client_name],
             }
-        payload = pickle.dumps(payload_dict)
+        # Tagged, as every other handshake notification the server sends is. A bare
+        # pickle decodes to `None` on the client, which files it as foreign and then
+        # waits for an update info that never arrives -- both switch directions hang
+        # until the handshake budget expires, with nothing logged on either side.
+        payload = encode(NotifKind.UPDATE_INFO, payload_dict)
 
         for agent_name in dst_agent_names:
             # Send notification with updated client infos

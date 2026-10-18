@@ -52,7 +52,7 @@ from verl.single_controller.ray.base import (
 )
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.core_algos import AdvantageEstimator
 from verl.trainer.ppo.metric_utils import (
     RolloutMoELoadBalanceMetricsAccumulator,
     compute_data_metrics,
@@ -100,11 +100,11 @@ from psrl.trainer.ppo.batch_schedule import (
     get_batch_schedule_strategy,
     resolve_sample_keys,
 )
-from psrl.trainer.ppo.session_loss import agg_session_loss, compute_session_loss_weights
 from psrl.trainer.ppo.resource_pool import (
     PSRL_RayWorkerGroup,
     PSRL_SubRayResourcePool,
 )
+from psrl.trainer.ppo.session_loss import agg_session_loss, compute_session_loss_weights
 from psrl.trainer.ppo.utils import (
     PSRL_Role,
     ResourcePoolManager,
@@ -112,8 +112,7 @@ from psrl.trainer.ppo.utils import (
     compute_advantage_for_multi_trajectories,
 )
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
-from psrl.utils.ps_mode import has_ps_data_plane, requires_ps_workers, uses_nixl
-from psrl.utils.common.worker_naming import WorkerKey, ps_agent_name, train_client_name
+from psrl.utils.common.worker_naming import WorkerKey, gen_client_name, ps_agent_name, train_client_name
 from psrl.utils.config import resolve_train_model_dtype
 from psrl.utils.dataset import DataProcessor
 from psrl.utils.elastic_rm.cluster_topology import ClusterTopology
@@ -127,6 +126,7 @@ from psrl.utils.post_processor import (
     load_buffer_post_processor,
     load_group_post_processor,
 )
+from psrl.utils.ps_mode import has_ps_data_plane, requires_ps_workers, uses_nixl
 from psrl.utils.server.command import Command, CommandType
 from psrl.utils.transferqueue_utils import PayloadState, clear_payload
 from psrl.workers.agent_loop.manager import PSRL_AgentLoopManager
@@ -2259,11 +2259,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # but the handshake cannot finish, because the train ranks are waiting on
             # this very `ray.get` before they start their half of it. Measured: zero
             # clients connected in 27 minutes, with every vLLM replica up and healthy.
-            bootstrap_version = (
-                None
-                if has_ps_data_plane(self.config.psrl.ps_mode)
-                else ray.get(self.ps_manager_handle.get_ps_model_version.remote())
-            )
+            #
+            # Read for every mode, not just direct supply: the PS workers stamp their
+            # registered shards with it before publishing local info, so a rollout's
+            # first pull reports the version the manager announced instead of -1.
+            bootstrap_version = ray.get(self.ps_manager_handle.get_ps_model_version.remote())
 
             with log_dual_events("Executing NIXL protocol", psrl_logger, event_type=EventType.INIT):
                 futures = []
@@ -2271,7 +2271,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 # comm plan are metadata, and direct supply still needs both.
                 futures.append(self.ps_manager_handle.nixl_protocol.remote())
                 if has_ps_data_plane(self.config.psrl.ps_mode):
-                    futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
+                    futures.extend(self.ps_wg.execute_all_async("nixl_protocol", bootstrap_version))
                 # `bootstrap_version` was read above, before the meta server began
                 # serialising on its own handshake.
                 futures.extend(
@@ -2605,7 +2605,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # supply, where the trainer is their only copy (`stage_offload.stage_policy`).
             Step.TRAINER_OFFLOAD: lambda: ray.get(self.actor_wg.execute_all_async("nixl_sleep", "full")),
             Step.VALIDATE_WAKE_ALL: lambda: ray.get([h.nixl_wake_up.remote() for h in validate_handles]),
-            Step.VALIDATE_WAKE_WEIGHTS: lambda: ray.get([h.nixl_wake_up.remote(["weights"]) for h in validate_handles]),
+            Step.VALIDATE_WAKE_WEIGHTS: lambda: ray.get(
+                [h.nixl_wake_up.remote(["weights"]) for h in validate_handles]
+            ),
             Step.VALIDATE_WAKE_KV: lambda: ray.get([h.wake_up.remote(["kv_cache"]) for h in validate_handles]),
             Step.VALIDATE_PUBLISH: self._publish_validate_client_infos,
             # Blocking: under direct supply the next step deregisters the source, so the
@@ -2624,28 +2626,62 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.is_rollout_mode_in_actor = True
 
     def _validate_instance_ids(self) -> list:
-        validate_dp_size = self.config.train_actor_rollout_ref.rollout.data_parallel_size
+        """Validate instances, named by the base worker ids they registered with."""
+        ranks_per_instance = self._ranks_per_instance("validate")
         return [
-            (base_worker_id, i)
-            for base_worker_id in self.tag_to_base_worker_ids.get("validate", [])
-            for i in range(validate_dp_size)
+            (base_worker_id, rank)
+            for base_worker_id, ranks in zip(
+                self.tag_to_base_worker_ids.get("validate", []), ranks_per_instance
+            )
+            for rank in range(ranks)
+        ]
+
+    def _ranks_per_instance(self, role: str) -> list[int]:
+        """Ranks in each rollout or validate instance, read from the worker groups.
+
+        Deliberately not read from `worker_to_ps_idx`. That map is filled in only where
+        PS storage workers exist, so under direct supply it is empty and every instance
+        reports zero ranks: the rebroadcast then names no destination for them while
+        they still wait for the one client info it would have sent, and both sides sit
+        until the handshake budget expires. The count belongs to the worker group, not
+        to where a parameter server was placed.
+        """
+        groups = self.rollout_wg_list if role == "rollout" else self.validate_wg_list
+        return [wg.world_size for wg in groups]
+
+    def _gen_client_names(self, role: str) -> list[str]:
+        """NIXL client names of a role's instances, in worker-group order.
+
+        The client name embeds the server's **gateway replica id**, which is not a
+        role-local index when rollout and validate instances interleave. Deriving it from
+        `WorkerKey(role, i, ...)` with a validate offset renames the wrong clients: a
+        validation wake then publishes one role's info under the other role's names, and
+        the clients that actually woke never receive their addresses. The base worker ids
+        are the ids the servers registered with, so using them is the only mapping that
+        cannot drift from the live cluster.
+        """
+        ranks_per_instance = self._ranks_per_instance(role)
+        base_ids = self.tag_to_base_worker_ids.get(role, [])
+        assert len(base_ids) == len(ranks_per_instance), (
+            f"{role}: {len(base_ids)} registered base worker ids for "
+            f"{len(ranks_per_instance)} worker groups."
+        )
+        return [
+            gen_client_name(base_worker_id, rank)
+            for base_worker_id, ranks in zip(base_ids, ranks_per_instance)
+            for rank in range(ranks)
         ]
 
     def _publish_validate_client_infos(self) -> None:
         """Send the woken validate instances' new addresses through the meta server."""
-        updated_client_names = []
+        ranks_per_instance = self._ranks_per_instance("validate")
+        updated_client_names = self._gen_client_names("validate")
         futures = []
-        tp_size = 0
-        for i in range(self.n_validate_instances):
-            tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "validate" and k.instance_id == i)
-            for rank in range(tp_size):
-                updated_client_names.append(
-                    WorkerKey("validate", i, rank).to_nixl_client_name(self.n_rollout_instances)
-                )
+        for i in range(len(ranks_per_instance)):
             futures.append(
                 self.tag_to_server_handles["validate"][i].nixl_send_local_info_to.remote(NIXL_META_SERVER_NAME)
             )
-        futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.n_validate_instances * tp_size))
+        futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(sum(ranks_per_instance)))
         ray.get(futures)
         self._broadcast_updated_client_infos_from_ps_manager(updated_client_names)
 
@@ -2784,15 +2820,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             for i in range(self.ps_wg.world_size):
                 dst_agent_names.append(ps_agent_name(i))
         # 2. rollout workers
-        for i in range(self.n_rollout_instances):
-            tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "rollout" and k.instance_id == i)
-            for rank in range(tp_size):
-                dst_agent_names.append(WorkerKey("rollout", i, rank).to_nixl_client_name())
+        dst_agent_names.extend(self._gen_client_names("rollout"))
         # 3. validate workers
-        for i in range(self.n_validate_instances):
-            tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "validate" and k.instance_id == i)
-            for rank in range(tp_size):
-                dst_agent_names.append(WorkerKey("validate", i, rank).to_nixl_client_name(self.n_rollout_instances))
+        dst_agent_names.extend(self._gen_client_names("validate"))
         # 4. actor workers
         for i in range(self.actor_wg.world_size):
             dst_agent_names.append(train_client_name(i))

@@ -476,11 +476,12 @@ PSRL 对 scale 做同一件事，且比 amax 更简单——§3 已证明 scale 
 | FSDP2 | fp8-native | — | — | **拒绝**：FSDP2 无 TE `fp8_param` 等价物（上游缺失） |
 | 任意 | 任意 | **per-tensor**，且该维 train/rollout 分片不一致 | — | **拒绝**：scale 不可重分片（§3 例外 2） |
 | 任意 | 任意 | blockwise + `weight_scale_refine`（MoE） | — | 支持：trainer 按 rollout 声明的细网格复制 scale（§3 例外 1） |
+| 任意 | 任意 | 任意 | — | **拒绝**：validate 与 rollout 的 `quantization` 不一致。两者消费同一份发布字节，validate 引擎由 `train_actor_rollout_ref.rollout` 构建；只给 `gen_actor_rollout_ref.rollout` 开 FP8 时，validate 实例以 bf16 注册，第一次拉取新版本即触发 dtype 断言 |
 
 拒绝必须发生在**握手期的配置校验**，而不是传输期。理由与 §3 同一条：
 FP8 的错误不会在数值上暴露。校验要检查的恰好是 §3 与 §4 推导所依赖的前提：
 scale grid 可组合、scale dtype 在 `_DTYPE_MAP` 里、每个 fp8 weight 都有配对 scale
-且两者同组、wire 变体与硬件相容。
+且两者同组、wire 变体与硬件相容、validate 与 rollout 的量化声明一致。
 
 ---
 

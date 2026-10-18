@@ -436,3 +436,170 @@ python tests/nixl/bench_fp8_logprob_gap.py --model <ckpt> --mode fp8 --out /tmp/
 
 另一个发现：同一次真实栈运行里，**第二次拉取在 peer 读处抛 `NIXL_ERR_NOT_FOUND`**，
 4 个 rollout 被摘除。关掉 DCP 且不保存的对照同样失败，所以与保存无关，见实现文档。
+
+## 10. 写入原子性（v2）：提交校验与 peer 修复
+
+机制见主文档 §3.4.2.2，落地状态见实现文档 E5。本节记录可复现的实测。
+
+**稳态写门闩是 O(1)。** 没有在飞读者时，写者不枚举 holder、不发通知。
+`python tests/nixl/bench_write_gate.py`（CPU，纯状态机 + 假 client info）：
+
+| 实例数 | 在飞读者 | holder 查找 | 通知数 | 单条 payload | fanout |
+|---|---|---|---|---|---|
+| 1000 | 0 | 0 | 0 | 0 B | 2.1 µs |
+| 1000 | 100 | 1000 | 100 | 213 B | 609 µs |
+| 10000 | 0 | 0 | 0 | 0 B | **0.6 µs** |
+| 10000 | 100 | 10000 | 100 | 213 B | 5.9 ms |
+| 10000 | 1000 | 10000 | 1000 | 116 B | 6.8 ms |
+
+- 查找次数恒为 `holders + readers`，与读者数无关；通知数恒为 readers。
+- payload 只含一个节点的 holder（≤ 8 条），不随集群规模增长。
+- 有读者时的一次写约 6 ms（10k 实例），相对训练步（约 50 s）是 0.01%；稳态为 0.6 µs。
+- 写者对读者传输的等待是 **0**：只等一次控制面 ack 往返，上限 100 ms。
+
+**正确性判据（CPU）。**
+`tests/unit/test_write_state.py` 是一个穷举真值表：对 `(pull 起点, ack, repaired)`
+的全部组合，只有「读取 epoch 未变」或「本 epoch ack 且全部 suspect key 从 certified
+holder 修复」两种拉取能被提交；其余被拒绝。`tests/nixl/test_pull_preempt.py` 用真实
+client/planner/engine 验证有 holder 时修复落地同一版本、无 holder 时
+`PullPreempted(repaired=False)` 且不提交；`tests/nixl/test_pull_engine.py` 则在
+`MemcpyAgent` 上建模了 NIXL 的释放语义（轮询已释放句柄抛 `BAD_STATUS`），钉住句柄
+所有权。
+
+**两节点生产 e2e。** 配置：Qwen3-8B，Megatron TP4，8 rollout + 8 validate，
+`ps_mode=nixl_direct`，`await_write_gate=True`，10 个训练步
+（`RAY_ADDRESS=<head>:6399 LOCAL_IP=<head> bash examples/grpo_trainer/qwen3_8b_megatron_direct.sh`）：
+
+| 量 | 值 |
+|---|---|
+| 完成的训练步 / 验证轮 | **10/10**，step 5 与最终验证均完成 |
+| 写门闩次数 | 10（每步一次） |
+| 写者等待 | **0.03–0.09 ms**（稳态无在飞读者，O(1)） |
+| 权重 pull 次数 | 26，0.91–1.70 s（中位 1.05 s） |
+| PREEMPT / 修复 / ack | 0 / 0 / 0（pull 都在 optimizer 写之前完成） |
+| 提交拒绝 / NIXL / 运行错误 | 0 / 0 / 0 |
+
+- 稳态没有 pull 与 optimizer 写重叠，所以门闩路径只走了「零读者」分支；这本来就是
+  设计目标（写者不等待）。抢占 / ack / holder 修复由 CPU 测试确定性覆盖
+  （`test_pull_preempt.py`、`test_write_state.py` 真值表）。
+- 最终 reward 为 0 是基座模型在数学题上的预期结果，不是传输或门闩的问题；传输链路的
+  正确性判据是步进与验证全部完成、pull 无错误、无提交拒绝。
+
+**e2e 过程中暴露并修复的两处非 v2 缺陷（都是生产路径才可达）：**
+
+1. **重注册广播的 client 名映射错误。** `_publish_validate_client_infos` 与广播的
+   目的地用 `WorkerKey(role, i, rank).to_nixl_client_name(...)` 计算名字，而实际
+   NIXL client 名编码的是 **gateway replica id**；rollout/validate 交替编号时二者
+   不同。validation wake 因此把一方的 info 发到另一方的名下，真正醒来的 validate
+   客户端收不到新地址，pull 读到 `read_addrs=None`。修复为按
+   `tag_to_base_worker_ids` + 每实例 rank 生成 client 名。
+2. **选源未过滤没有可读地址的 peer。** peer 在握手时可能只拿到 conn-info-only
+   元数据；participant 子集变化会重新选 designate，可能选中一个从未加载地址的
+   peer。pull engine 现在在 `_assign`/`_pick_holder` 里过滤这类源，回退到可读
+   peer 或 upstream。
+
+3. **注册策略漏掉了「自己也是读目的地」。** W13 的 `_should_register_rdma` 只回答
+   「有没有远程读者读我」，据此在纯同节点场景跳过注册；但 pull 侧的本地张量同时是
+   自己 pull 的目的地，NIXL 的本地 dlist 必须已注册。sleep/wake 后的 validate 实例
+   因此在上游读时以 `NIXL_INIT_AGENT` 报 `NIXL_ERR_NOT_FOUND`。修复：PULL_SIDE
+   始终注册；真正的「所有读都是同设备 IPC」再作为后续细化。
+
+## 11. 精度对照：direct vs PS（同一坐标判据）与 reward 全 0 的根因
+
+**坐标判据两臂对照**（`tests/nixl/test_nixl_e2e.py --config-name nixl_e2e_1node`，
+4 train + 4 gen，Megatron TP2 / gen TP2，两轮换版本）：
+
+| 臂 | round 1 | round 2（新版本） | trainer egress |
+|---|---|---|---|
+| direct（`direct_supply=true`） | 4 clients × **399/399** | 4 clients × **399/399** | 32.76 GB |
+| PS（`direct_supply=false`） | 4 clients × **399/399** | **FAIL**：`lm_head.weight` 311,159,884/311,164,928 个元素不一致 | 32.76 GB |
+
+- **round 1 两臂逐元素一致**：direct 与 PS 搬运的是同一份字节，direct 的传输精度与
+  PS 路径在该版本上等价。
+- **round 2 只有 direct 通过**；PS 臂在 `lm_head` 上失败（几乎全部元素不同），说明该
+  PS 配置的第二版本发布/拉取本身有缺陷，不能作为 round 2 的参考。direct 直接对
+  ground-truth 坐标函数验证通过，因此**不依赖 PS 臂也成立**。
+
+**reward 全 0 的根因（GSM8K 对照实验）**
+
+初版结论（「8192 截断导致无答案」）只解释了离线 DAPO 探针为何判无答案，不是训练日志
+全 0 的原因。换成 GSM8K 后 training/validation reward 仍然全 0，而同一段生成文本在
+离线用 `gsm8k.compute_score` 打分是 1.0，说明 reward 函数根本没有被调用：
+
+- 数据集行里没有 `reward_model_dicts`。agent loop 从 batch 取该字段时默认 `[]`，
+  `_resolve_reward_manager([])` 返回空的 manager 列表，reward 等于对空列表求和 =
+  **0.0**，且不报错（`grading_failed=0`），与「答案错误」不可区分。
+- 修复：`PSRLRLHFDataset.__getitem__` 把数据集配置（`data.reward_model_dicts`，多数据
+  集模式取各条目）附到每一行；行内已有该字段时以行内为准。
+  `tests/unit/test_dataset_reward_spec.py` 覆盖三种情形。
+- DAPO 在 8192 上限下确实还会因生成没有收敛到答案行而拿 0（离线探针），两个问题叠加。
+  因此精度对照改用 GSM8K（非零方差）。
+
+**PS vs direct 10 步对照（Qwen3-8B / GSM8K / 2 节点 × 8 GPU，除 `ps_mode` 外同配置）：**
+
+| 指标 | PS baseline | direct | direct − PS（Welch 95% CI） |
+|---|---|---|---|
+| 完成步数 | 10/10 | 10/10 | — |
+| 训练/NIXL 错误 | 0 | 0 | — |
+| 训练 reward 均值 | 0.4047 | 0.4070 | +0.0023 [−0.149, +0.153] |
+| entropy | 0.2134 | 0.2389 | +0.025 [−0.026, +0.077] |
+| grad norm | 0.3363 | 0.2909 | −0.045 [−0.153, +0.062] |
+| response length | 1606.5 | 1762.6 | +156 [−543, +855] |
+| step 时间 | 72.4 s | 74.2 s | +1.8 [−53.7, +57.4] |
+| 初始验证 reward | 0.3442 | 0.1698 | — |
+| 最终验证 reward | 0.6611 | 0.6520 | 差 0.009（1319 样本，噪声 ≈0.019） |
+
+- step 0 的验证值两臂不同（0.34 vs 0.17），但使用同一份初始权重的 step 1 rollout
+  reward（0.727 vs 0.625，n=128）和最终验证都在噪声范围内；fp8 臂的 step 0 验证
+  （0.196）也贴近 direct 臂，因此 PS 的 step-0 点更像一次性异常，对照以逐步指标和
+  最终验证为准。
+- direct 写门闩 10 次，最大等待 0.05 ms；PREEMPT / 修复 / 提交拒绝均为 0。
+- 数据集修复后，DAPO 的 reward-0 问题也随之中断：任何需要 rule reward 的示例都必须
+  携带 `reward_model_dicts`，否则 reward 静默为 0。
+
+## 12. FP8 rollout + BF16 training（direct）
+
+场景：trainer 保持 BF16，在发布点把权重按 128×128 block 量化为 FP8 副本（scale 随
+字节一起传输），rollout 与 validate 引擎均以 `quantization=fp8` 运行。配置与
+`qwen3_8b_megatron_direct.sh` 对齐，只多这一项。
+
+**逐位精度（`tests/nixl/test_nixl_e2e.py +model.gen_quantization=fp8`）：**
+
+- 4 个 gen client × 399 个 key × 2 轮：FP8 权重**逐位**、`_scale_inv` **逐值**与坐标
+  判据一致（`check_fp8_exact`），0 失败。
+- 单次 pull trainer egress **18.88 GB**（bf16 同场景 32.76 GB，−42%）。
+- scale 池化改造后重跑同样通过。
+
+**生产 10 步（Qwen3-8B / GSM8K，train 1×8 GPU TP4，rollout 1×8 GPU TP1）：**
+
+| 指标 | bf16 direct | fp8 direct |
+|---|---|---|
+| 完成步数 / 错误 | 10/10 / 0 | 10/10 / 0 |
+| 初始验证 reward | 0.1698 | 0.1964 |
+| 最终验证 reward | 0.6520 | 0.6475 |
+| 训练 reward 均值 | 0.4070 | 0.4516（差 +0.045，CI [−0.088, +0.177]） |
+| 每步 pull（p50） | 1.017 s，16.38 GB | **0.693 s，9.44 GB** |
+| 每步 publish | 0.01–0.04 s | 0.03–0.17 s |
+| validation→trainer 切换 | 1.14–1.28 s | 9.86–10.85 s → **1.80 s**（修复后） |
+| trainer→validation 切换 | 21.3–23.1 s | 26.4–27.7 s |
+| step 时间 | 74.2 s | 100.4 s（CI 重叠） |
+
+**过程中修复的两处问题：**
+
+1. **validate 引擎与 rollouts 的量化配置必须一致。** validate 实例由
+   `train_actor_rollout_ref.rollout` 构建，而发布格式由
+   `gen_actor_rollout_ref.rollout.quantization` 决定。只给后者开 fp8 时，validate
+   引擎以 bf16 注册，第一次拉取新版本即报
+   `... is torch.float8_e4m3fn ... but torch.bfloat16 locally`，rollout 协调器把
+   8 个 validate 实例标记为不可用。修复：示例脚本同时设置两处；`_resolve_publish_cast`
+   在启动时断言两者一致（`tests/unit/test_publish_format_config.py`）。
+2. **FP8 scale 张量的注册粒度。** `_derive_block_scales` 原先每个权重分配一个 scale
+   tensor，每个 tensor 都是独立的 NIXL region：Qwen3-8B 每 rank 257 个 region，
+   每次 trainer wake 注册耗时 **8.5–9.2 s**，主导了 validation→trainer 切换。
+   改为按设备分配一块 float32 池、各 scale 作为连续 view 后，注册降为 **6 个 region /
+   0.12–0.17 s**，切换时间回到 1.80 s（bf16 为 1.14–1.28 s）。
+
+**剩余差异**：trainer→validation 切换仍多约 5 s。原因在 validate 侧：FP8 vLLM 的权重
+和 scale 是各自独立的分配，每实例 439 个 region，唤醒时注册约 14.5 s；bf16 同路径也
+需要数百个 region，因此净差约 5 s。这部分属于 vLLM 分配布局，不影响每步同步热路径。
+

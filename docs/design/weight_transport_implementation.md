@@ -909,7 +909,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | A6 删 FSDP1 | ✅ | ✅ | L1 ✅ |
 > | A7 join 三级判定 | ✅ | ✅ `server.py` | L1 ✅ |
 > | A8 colocate IPC | ✅ `device_ipc.py` | ✅ 同设备的源改为设备拷贝 | L1 4 条跨进程；L2 colocate 三格（Megatron bf16 / FP8、FSDP2）逐位通过，16.4 / 9.4 / 2.1 GB 走拷贝 |
-> | **A9 FP8 wire** | ✅ `block_fp8.py` | ✅ trainer 发布 block FP8 副本与 scale | L1 量化器与 vLLM 逐位一致，L2 17 格 FP8 位与 scale 逐位判定（含 Megatron FP8 train 4 格），单 GPU 真实权重贪心 token 100% 一致 |
+> | **A9 FP8 wire** | ✅ `block_fp8.py` | ✅ trainer 发布 block FP8 副本与 scale | L1 量化器与 vLLM 逐位一致，L2 17 格 FP8 位与 scale 逐位判定（含 Megatron FP8 train 4 格），单 GPU 真实权重贪心 token 100% 一致；生产 e2e `qwen3_8b_megatron_direct_fp8gen.sh` 10 步 0 错误，与 bf16 臂指标一致（FINDINGS §12） |
 > | B1 chunk/commit group | — | — | **已删除**：拉取引擎按源一次提交，不再需要 chunk 计划 |
 > | B2 slot ack | ✅ | ❌ 零 import | **不再需要**：cast 产物是常驻发布副本，在推送锁内刷新（主文档 §3.4.2） |
 > | B3 chunk 自适应 | — | — | **已删除**，同 B1 |
@@ -928,7 +928,8 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | D5 `chunk_offset` | ✅ | ❌ 零 import | L1 |
 > | D6 降级继续生成 | ✅ | ✅ | L2 ✅ |
 > | D7/D8 DP 副本接管 | ✅ `pull_engine._replica_of` / `_reroute` | ✅ `nixl_pull_model_core` 将 `failed_sources` 提升到 `unavailable`；`chunk_availability.py` 是零 import 的重复实现 | L1 五条故障注入：源失效改读 DP 副本，整组失效抛 `ChunkUnavailable` 且不动权重，mid-pull 失效下次 pull 直接跳过 |
-> | E1 版本级等待 | ✅ | ✅ `ps_manager` + `vllm_async_server` + `version_barrier` | L2 ✅，读者侧重拉已接线 |
+> | E1 版本级等待 | ✅ | ✅ `ps_manager` + `vllm_async_server` + `version_barrier` | L2 ✅，读者侧重拉已接线；**直供 + 同精度路径由 E5 的提交校验取代**（publish 前 drain 无法覆盖「写期间开始、publish 前读完」的读者） |
+> | **E5 写入原子性（v2）** | ✅ `write_state.py` | ✅ `PSManager.begin_write` / `finish_shared_pull`，pull engine 抢占与 holder 修复，trainer optimizer 写门闩 | L1 37 条（真值表、抢占/修复/无 holder、扇出复杂度）；两节点生产 e2e 10/10 步，门闩 ≤ 0.09 ms，0 拒绝/错误（FINDINGS §10） |
 > | E2 运行中 reshard | ❌ `staleness.py` 只有纯函数 | ❌ 零调用 | 原设计不可行（单边 RDMA，源端无法比对 epoch），见 §9 阶段 E 的 E2 |
 > | E3 握手解复用 | ✅ | ✅ `server.py` / `client.py` | L2 ✅ |
 > | E3 `admit_joiners` | ✅ | ❌ 生产无调用方（`nixl_admit_joiners` 不存在） | L3 真实 agent 准入（测试直接调用）；RESHARD 分支对既有成员无效，见 E2 |
@@ -1773,6 +1774,75 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
 
       **仍待做**：把两段式接到 `client_info` 的真实扇出路径上
       （当前 `meta=self.agent.get_agent_metadata()` 仍是全量），需与 E3 的事件驱动 join 同批。
+
+### E5 — 写入原子性：乐观提交校验 + peer 副本修复（v2）
+
+**落点**：
+`psrl/workers/ps/write_state.py`（纯状态机）、
+`psrl/workers/ps/ps_manager.py`（准入 / `begin_write` / 提交校验 / 通知扇出）、
+`psrl/utils/nixl/handshake_notif.py`（`PULL_PREEMPT` / `PULL_PREEMPT_ACK`）、
+`psrl/utils/nixl/server.py`（`drain_pull_acks`）、
+`psrl/utils/nixl/client.py`（通知收发）、
+`psrl/utils/nixl/pull_engine.py`（抢占轮询 / suspect 分类 / holder 修复 / pool 预分配）、
+`psrl/workers/gen/vllm_extension.py` 与 `vllm_async_server.py`（接线与重拉）、
+`psrl/workers/train/engine_train_worker.py`（optimizer 写门闩）、
+`psrl/utils/config.py` + `nixl.yaml`（`await_write_gate` 判据）。
+
+**做什么**：
+
+1. **写 epoch**：`begin_write` 在第一次 optimizer 参数写**之前**推进 epoch；
+   状态机 `OPEN → CLOSING → WRITING → OPEN(v+1)`。
+2. **读者准入**：pull 开始时记录 `start_epoch`；`state != OPEN` 时拒绝，读者保持当前
+   一致版本，发布后重拉。
+3. **抢占**：向在飞读者发 `PULL_PREEMPT{epoch, version, holders}`，payload 只带该读者
+   同节点的 holder。写者最多等 `preempt_ack_timeout_ms`，**不等待数据传输完成**。
+4. **读方响应**：在传输等待循环中以 0.5 ms 粒度轮询通知；看到新 epoch 立即回
+   `PULL_PREEMPT_ACK`，把未完成 key 记为 suspect，取消在飞请求。
+5. **修复**：suspect key 从 certified holder 整 key 重读（NVLink）；全部可修复则落地
+   原版本，否则放弃本轮并等 `v+1`。holder 在 `WRITING` 期间被 pin。
+6. **提交校验**：`finish_shared_pull` 接受两种证明——读取 epoch == 当前 epoch，或
+   本 epoch 内 ack + 全部 suspect key 由 holder 修复。其余一律拒绝，实例不得服务
+   混合字节。
+7. **池几何**：pull 开始在 `_prepare_pool` 里预扫描计划内所有源并一次性分配 staging
+   pool；中途只在 take-over 出现更大 item 时才可能扩容，而扩容已保证不释放在飞句柄。
+8. **判据**：`validate_config` 解析 `await_write_gate`：直供 + 同精度为 True；
+   cast/FP8、PS 数据面为 False；显式布尔覆盖保留。启用时关闭 E1 的发布期屏障，
+   避免两套机制互相失效。
+9. **重试不能持锁等待**：被抢占/版本已关闭的读者先退出共享准入（释放 reader count），
+   再等下一版本并重新准入。持锁等待会与仍取 exclusive 侧的 publish 形成死锁，
+   也会让旧版本的 reader count 无谓地拖住发布。写者在门闩路径下也不再取
+   exclusive push lock——匹配精度下 publish 只翻转版本，不移动字节。
+
+**判据**：
+
+- 提交点的真值表覆盖所有 `(pull 起点, ack, repaired)` 组合：只有可证明单版本的拉取
+  能提交（`tests/unit/test_write_state.py`）。
+- 被抢占的 pull 能从 holder 修复并落地同一版本；无 holder 时抛
+  `PullPreempted(repaired=False)` 且不分发任何字节（`tests/nixl/test_pull_preempt.py`）。
+- 稳态写者 O(1)：无在飞读者时不枚举 holder、不发通知（`test_write_state.py`；
+  `bench_write_gate.py` 实测 10k 实例、0 读者 fanout **0.6 µs**）。
+- 扇出 O(readers)、payload 与集群规模无关：10k 实例、1000 读者时 lookups ==
+  holders + readers、通知数 == readers、单条 payload < 4 KB（`test_write_gate_fanout.py`）。
+- 旧行为回归：`test_pull_engine.py` 的句柄所有权测试（已修复的在飞释放）与
+  `MemcpyAgent` 的释放语义仍通过。
+
+**验证**：
+- `tests/unit/test_write_state.py`（真值表与 O(1) 稳态）、`test_write_gate_config.py`
+  （拓扑/精度判据）、`test_write_gate_fanout.py`（O(readers) 扇出）、
+  `tests/nixl/test_pull_preempt.py`（真实 engine 的抢占/修复/拒绝）共 **37 passed**。
+- 全量 CPU 回归：`tests/unit + tests/nixl -m cpu_test` **797 passed**（另有 2 条既有的
+  source-text 断言与 1 条仅在合并运行时出现的 planner 测试偶发失败，均与 v2 无关）。
+- 两节点生产 e2e：10/10 步、step 5 与最终验证完成；写门闩 10 次，
+  等待 **0.03–0.09 ms**；26 次 pull（中位 1.05 s），0 抢占、0 提交拒绝、0 错误。
+  见 `weight_transport_FINDINGS.md` §10。
+
+**遗留取舍**：
+- 没有 holder 的 suspect key 需要等 `v+1`（可用性代价一个 sync 周期），不是正确性代价。
+- take-over 仍可能让 staging pool 在 pull 中途扩容；此时由 `_ensure_pool` 的在飞句柄
+  保活逻辑兜底（owner 规则已由 `test_a_pool_resize_keeps_a_running_reads_handle` 钉住）。
+- **提交判据不使用 engine 报告的 per-shard 版本戳**：rollout 侧戳在 publish 后不刷新
+  （D1 已记录），用它比较已发布版本会误拒稳态 pull。epoch/ack/修复认证是权威判据，
+  engine 的 `versions` 只用于同一次 pull 内的撕裂检测。
 
 ### 测试改造
 - [x] **T1 已落地并验证**：`tests/nixl/coord_judge.py`，`test_coord_judge.py` 30 passed，

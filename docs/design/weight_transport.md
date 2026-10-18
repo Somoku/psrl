@@ -872,6 +872,13 @@ colocate 下 rollout 已暂停，不存在「读的字节是否被改写」这�
 它与 rollout 侧 KV cache 争的不是同一块显存（副本在 trainer 上），
 真正受约束的是 trainer 的激活显存，可以按需用 `publish_copy_budget_mb` 封顶。
 
+**副本及其派生张量必须按设备合并分配。** 副本在 colocate 切换的 sleep 阶段被释放
+（把显存让给验证实例的 KV cache），唤醒时重新分配并注册；NIXL 的注册开销按 region
+数计，而不是按 shard 数。因此 block FP8 的 scale 不能每权重一个 tensor：Qwen3-8B
+每 rank 会从个位数 region 涨到 257 个，唤醒多花约 9 秒。所有 scale 合并进一块按设备
+分配的 float32 池，各 shard 作为连续 view，注册回到 6 个 region、0.1 秒级。
+
+
 **副本还顺带消除了源端 strided。** 同精度下若读方切得比 trainer 细（gen TP 大于 train TP 的
 row-parallel 权重、EP 一侧与 TP 一侧的 expert），trainer 的 shard 对读方是逐行 strided 的，
 descriptor 数随行数或 expert 数线性增长。发布副本是连续的，读方任意切法都只需一个 descriptor。
@@ -943,6 +950,12 @@ bf16 配置则同样落在这一格且**必需**（§3.8.0a）。
 「把 pause 窗口从整个 transfer 收窄到 commit group 切换瞬间」，
 收益需用 §7 验证项 4 的等待时长分布衡量。
 
+> **定位更正（v2，§3.4.2.2）**：publish 前的 drain 无法保证读取原子性。
+> 一个在 optimizer 写期间开始、并在 publish 之前读完的读者，既不在 drain 的计数里，
+> 也不会看到 INVALID，却读到了两个版本的混合字节。直供 + 同精度路径改用
+> **write epoch 提交校验 + peer 副本修复**；本节描述的发布期屏障保留给
+> cast 发布副本刷新与 PS 数据面。
+
 同精度直读下，冲突窗口由两个已核实的事实决定，比直觉窄得多：
 
 1. **Megatron `DistributedOptimizer`（默认开启）的 optimizer step 写的是 fp32 master
@@ -968,6 +981,98 @@ trainer 在执行 param 回写之前：
 读者开始读时 +1、结束时 -1，由 index 维护但 trainer 可本地缓存。
 **这比原方案的「版本 × chunk 租约表」简单一个量级**，
 因为同精度路径下不需要回答「谁预约了哪个版本」,只需要回答「这段现在有人在读吗」。
+
+#### 3.4.2.2 v2：乐观提交校验 + peer 副本修复
+
+**适用范围：直供（rollout 读 train rank 的活参数）+ 同精度。** cast / FP8 rollout
+读独立的发布副本，PS 数据面的读者读 PS 内存，两者都由发布锁保护，不需要本节机制。
+
+##### 为什么「publish 前 drain」不够
+
+冲突窗口不是 publish 事件，而是 **optimizer 写参数**的那一段。一个读者可能在写开始后
+开始、在 publish 之前读完：
+
+- 它结束时计数已归零，barrier 看不到它；
+- publish 尚未发生，它读到的旧版本戳没有被标记 INVALID；
+- 它提交的字节混合了 `v` 与 `v+1`，而任何版本戳校验都不会报错。
+
+因此正确性不能依赖「写者等到没人读」，而应依赖 **读者能否证明自己读的是单一版本**。
+
+##### 协议
+
+状态由 coordinator（`PSManager`）维护：
+
+```
+version, write_epoch, state ∈ {OPEN, CLOSING, WRITING}
+holders[v] = 已提交 v 的实例集合
+inflight   = {instance: (admission_epoch, acked, preempt_epoch)}
+```
+
+1. **准入**：读者开始 pull 时以 `(instance, version)` 请求共享准入，记录
+   `start_epoch`。`state != OPEN`（写者已宣布）时拒绝：读者继续用当前版本生成，
+   发布后重新拉取 `v+1`。
+2. **写者宣布**：在第一次 optimizer 参数写之前，rank 0 调用 `begin_write()`：
+   `write_epoch += 1`、`state = CLOSING`，向所有在飞读者发一条控制面通知
+   `PULL_PREEMPT{epoch, version, holders}`。`holders` 只包含该读者**同节点**的
+   已提交实例。
+3. **读者 ack**：读者在传输等待循环里轮询通知（0.5 ms 粒度）。一旦看到更新的 epoch：
+   立即回 `PULL_PREEMPT_ACK{epoch}`——这是**控制面往返，不是数据 drain**；
+   把已完成的 key 记为安全，把在飞/未开始的 key 记为 suspect，取消在飞请求。
+4. **写者写**：写者最多等 `preempt_ack_timeout_ms`（默认 100 ms），无论 ack 是否齐全
+   都开始写。**写者从不等待数据传输完成**：单边 READ 不会破坏写者内存，未 ack 的读者
+   会在提交点被拒绝。
+5. **读者修复**：suspect key 从通知里列出的同节点 holder 整 key 重读（走既有 peer
+   路径，NVLink）。全部 key 都有 holder → 落地同一版本并提交；任一 key 无 holder →
+   放弃本轮，保持暂停直到 `v+1` 发布后整轮重拉。
+6. **提交**：`finish_shared_pull` 校验以下之一：
+   - 读者实际读取的 epoch == 当前 `write_epoch`（写发生在读取之后）；
+   - 读者在本 epoch 内 ack，且所有 suspect key 来自 certified holder。
+   否则拒绝，实例不得服务其本地字节。
+   记录到 staleness 账本的版本号取 **coordinator 的已发布版本**，不取 reader 缓存的
+   per-shard 版本戳：rollout 侧戳只在重注册时刷新，publish 不会更新它，天生滞后于
+   coordinator，用它做提交判据会误拒每一次稳态 pull。
+
+##### 正确性论证
+
+- **提交 accepted ⇒ 读到的字节全属一个版本。**
+  - epoch 未变：读者在提交前完成所有传输；写者的 epoch 推进在 coordinator 的总序中
+    晚于这次提交，而实际写入又在推进之后，所以全部读发生在写之前。
+  - 修复路径：ack 前的完成读由写者等待 ack 保证在写之前；其余 key 从 holder 重读，
+    holder 在写窗口内被 pin 住，字节是不可变的同版本副本。
+- **写者写入期间存在并发读者 ⇒ 该读者无法提交旧版本。** epoch 已推进，且它无法同时
+  满足 ack 与 holder 认证。
+- **单边读不改变写者数据**：所以写者不需要等待任何传输完成。
+
+##### 与 peer 扩散的关系
+
+peer 机制同时是**修复基质**：已提交 `v` 的实例天然持有一份不可变副本，suspect key
+可以整 key 从同节点 holder 读回，走 NVLink 而不是让 trainer 重新出口。没有 holder 的
+key 只能等 `v+1`，这是可用性代价（一个 sync 周期），不是正确性代价。
+holder 在 `WRITING` 期间被 pin，不能开始自己的下一次 pull，否则修复读到的字节会变。
+
+##### 拓扑判据
+
+是否需要本机制，判据是「rollout 是否读 trainer 的活参数」：
+
+| 配置 | 需要 | 原因 |
+|---|---|---|
+| 直供 + 同精度 + rollout 跨节点 | 是 | 读活 bf16 参数 |
+| 直供 + cast/FP8 | 否 | 读发布副本，刷新在发布锁内 |
+| PS 数据面 | 否 | 读 PS 内存，发布锁保护 |
+| `colocate_validate_and_train=True` 但 rollout 在别的节点 | **是** | 只有 validation 共卡，rollout 仍是异步读者 |
+
+最后一行是 E1 原判据的错误来源：`colocate_validate_and_train` 描述的是 validation 的
+放置，不是 rollout 是否暂停。v2 的判据在 `validate_config` 里解析为
+`psrl.nixl.await_write_gate`。
+
+##### 规模与延迟
+
+- **稳态零成本**：没有在飞读者时 `begin_write` 不枚举 holder、不发通知，O(1)。
+- **有读者时**：每读者一条通知 + 一条 ack；payload 只带同节点 holder
+  （与集群规模无关）；holder 分组 O(holders + readers)。
+- **写者延迟**：一次控制面 ack 往返，上限 `preempt_ack_timeout_ms`；与 pull 大小、
+  慢读者、模型规模无关。
+- **生成不暂停**：只有权重刷新路径被短暂关闭；长尾 rollout 继续用当前版本生成。
 
 #### 3.4.3 取舍原则：等待的上限由算法目标决定，不由 infra 方便决定
 

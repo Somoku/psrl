@@ -163,6 +163,10 @@ type Config struct {
 			ShrinkFactor         float64 `json:"shrink_factor"`
 			SafetyFraction       float64 `json:"safety_fraction"`
 			LimitSampleIntervalS float64 `json:"limit_sample_interval_s"`
+			// ReapForeign removes cgroups in the sandbox subtree that nothing owns;
+			// ReapUsageMB is the most one may be holding before it is left alone.
+			ReapForeign bool  `json:"reap_foreign"`
+			ReapUsageMB int64 `json:"reap_usage_mb"`
 		} `json:"elastic"`
 	} `json:"node"`
 
@@ -1079,6 +1083,8 @@ func elasticConfig(cfg Config) server.ElasticConfig {
 		ShrinkFactor:           declared.ShrinkFactor,
 		SafetyFraction:         declared.SafetyFraction,
 		LimitSampleIntervalS:   declared.LimitSampleIntervalS,
+		ReapForeign:            declared.ReapForeign,
+		ReapUsageMB:            declared.ReapUsageMB,
 	}
 }
 

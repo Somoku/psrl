@@ -473,3 +473,119 @@ func TestTheSumOfTheBoundsStaysInsideTheSubtree(t *testing.T) {
 		t.Errorf("spare: got %d MiB, want the safety share to have been kept", report.SpareMB)
 	}
 }
+
+// A cgroup this node does not own contributes its memory to what the machine carries and
+// nothing to what the node reports about its own sandboxes.
+//
+// The counters are cumulative and a cgroup outlives its container, so a domain-wide OOM
+// total counts kills that belong to sandboxes that no longer exist. That number never goes
+// down, points at nothing, and reads as an ongoing fault -- which is exactly how 71 kills
+// sat in a log line for two hours without an owner.
+func TestAForeignCgroupCountsItsMemoryAndNotItsFaults(t *testing.T) {
+	const parent = "psrl-test-sandboxes"
+	domain, memoryDir, cpuDir := fakeDomain(t, parent)
+	agent := limitsNode(t, domain, parent, 100000, 100000, ElasticConfig{
+		Enabled: true, StartLimitMB: 1024,
+	})
+
+	spec := backendSpec(t, "rollout", 2)
+	spec.Resources.MemoryMB = 32768
+	agent.elasticRemember("mine", spec)
+	// The lifecycle has to hold it, or the audit drops it as a sandbox that is not running
+	// and it becomes foreign too.
+	agent.lifecycle.Reserve(node.Grant{LeaseID: "lease-1", Class: "rollout"}, "owner", "one_shot", time.Hour)
+	if _, claimed := agent.lifecycle.Claim("lease-1"); !claimed {
+		t.Fatal("the test needs the reserved grant")
+	}
+	if !agent.lifecycle.AdoptCreated("lease-1", backend.Handle{Backend: "stub", SandboxID: "mine"}, providerStub{}) {
+		t.Fatal("the test needs the lifecycle to hold this sandbox")
+	}
+	sandbox(t, memoryDir, cpuDir, parent, "mine", 512*mib, 1024*mib)
+	setKillCount(t, memoryDir, parent, "mine", 3)
+
+	// An orphan: in the domain, owned by nobody, carrying the kill count of a sandbox that
+	// is long gone.
+	sandbox(t, memoryDir, cpuDir, parent, "orphan", 2048*mib, 8192*mib)
+	setKillCount(t, memoryDir, parent, "orphan", 68)
+
+	agent.ElasticTick(context.Background())
+	report := agent.ElasticTick(context.Background())
+
+	if report.Foreign != 1 {
+		t.Errorf("foreign count: got %d, want 1", report.Foreign)
+	}
+	if report.ForeignMB < 2048 {
+		t.Errorf("foreign memory: got %d MiB, want at least the 2048 MiB it holds", report.ForeignMB)
+	}
+	// The kills are not this run's and must not be reported as though they were.
+	if report.OOMKills != 3 {
+		t.Errorf("oom kills: got %d, want 3 -- the orphan's 68 belong to nobody", report.OOMKills)
+	}
+	// But the memory is real wherever it sits, so it stays inside the observed total that
+	// protects admission.
+	if report.ObservedMB < 2048+512 {
+		t.Errorf("observed: got %d MiB, want the orphan's memory to count against the node", report.ObservedMB)
+	}
+}
+
+// The guards around reaping, which are the part that must never be wrong: a live sandbox's
+// cgroup and an orphan holding real memory both survive.
+//
+// Whether the removal itself works is a question about the kernel, so it is left to the
+// integration test, where there is a real cgroup filesystem to remove one from.
+func TestReapingSparesLiveSandboxesAndOrphansHoldingMemory(t *testing.T) {
+	const parent = "psrl-test-sandboxes"
+	domain, memoryDir, cpuDir := fakeDomain(t, parent)
+	agent := limitsNode(t, domain, parent, 100000, 100000, ElasticConfig{
+		Enabled: true, StartLimitMB: 1024, ReapForeign: true, ReapUsageMB: 64,
+	})
+
+	spec := backendSpec(t, "rollout", 2)
+	spec.Resources.MemoryMB = 32768
+	agent.elasticRemember("mine", spec)
+	// Held by the lifecycle, or the audit drops it and it stops being this node's sandbox.
+	agent.lifecycle.Reserve(node.Grant{LeaseID: "lease-1", Class: "rollout"}, "owner", "one_shot", time.Hour)
+	if _, claimed := agent.lifecycle.Claim("lease-1"); !claimed {
+		t.Fatal("the test needs the reserved grant")
+	}
+	if !agent.lifecycle.AdoptCreated("lease-1", backend.Handle{Backend: "stub", SandboxID: "mine"}, providerStub{}) {
+		t.Fatal("the test needs the lifecycle to hold this sandbox")
+	}
+	sandbox(t, memoryDir, cpuDir, parent, "mine", 512*mib, 1024*mib)
+	// Empty and owned by nothing: this one is reaped, and the reap is what proves the
+	// guards were evaluated rather than the whole domain being skipped.
+	sandbox(t, memoryDir, cpuDir, parent, "empty-orphan", 0, 1024*mib)
+	// Nobody owns it, but it holds real memory. Removing the directory would not free
+	// that memory -- it would only stop anyone from being able to say whose it is.
+	sandbox(t, memoryDir, cpuDir, parent, "heavy-orphan", 4096*mib, 8192*mib)
+
+	agent.ElasticTick(context.Background())
+	report := agent.ElasticTick(context.Background())
+
+	if _, err := os.Stat(filepath.Join(memoryDir, parent, "heavy-orphan")); err != nil {
+		t.Errorf("an orphan holding 4 GiB was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(memoryDir, parent, "mine")); err != nil {
+		t.Errorf("a live sandbox's cgroup was removed: %v", err)
+	}
+	if report.Foreign != 2 {
+		t.Errorf("foreign count: got %d, want 2 -- the heavy orphan is still counted", report.Foreign)
+	}
+}
+
+// Reaping is off unless a deployment turns it on: removing directories from a host's
+// cgroup tree is not a thing a node should start doing because a flag defaulted to yes.
+func TestOrphansAreLeftAloneUnlessReapingIsEnabled(t *testing.T) {
+	const parent = "psrl-test-sandboxes"
+	domain, memoryDir, cpuDir := fakeDomain(t, parent)
+	agent := limitsNode(t, domain, parent, 100000, 100000, ElasticConfig{
+		Enabled: true, StartLimitMB: 1024,
+	})
+	sandbox(t, memoryDir, cpuDir, parent, "empty-orphan", 0, 1024*mib)
+
+	agent.ElasticTick(context.Background())
+
+	if _, err := os.Stat(filepath.Join(memoryDir, parent, "empty-orphan")); err != nil {
+		t.Errorf("an orphan was removed with reaping off: %v", err)
+	}
+}

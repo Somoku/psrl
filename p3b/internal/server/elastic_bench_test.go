@@ -274,6 +274,7 @@ func benchNode(t benchTB, domain cgroup.Domain, parent string) *Node {
 		Elastic: ElasticConfig{
 			Enabled: true, StartLimitMB: 1024, GrowAbove: 0.60, GrowFactor: 2.0,
 			ShrinkBelow: 0.20, ShrinkDwellS: 60, ShrinkFactor: 0.5, SafetyFraction: 0.05,
+			ReapForeign: true, ReapUsageMB: 64,
 		},
 		Domain: domain, SandboxParent: parent, SandboxBudgetMB: 200000,
 	})

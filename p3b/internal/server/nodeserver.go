@@ -113,6 +113,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 			failCountBySandbox:    map[string]int64{},
 			oomCountBySandbox:     map[string]int64{},
 			exhausted:             map[string]bool{},
+			reapFailed:            map[string]bool{},
 			classBySandbox:        map[string]string{},
 			throttled:             map[string]bool{},
 			cpuUsageNanos:         map[string]int64{},

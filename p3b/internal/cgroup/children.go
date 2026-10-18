@@ -207,6 +207,42 @@ func oomKills(dir string) int64 {
 	return 0
 }
 
+// RemoveChild deletes one sandbox's cgroup from every hierarchy that carries one.
+//
+// Nothing here decides *whether* a cgroup may go -- that is the caller's, and the guards
+// belong there because only the caller knows what the cgroup is for. This only carries the
+// removal out and reports which hierarchies let it happen, because a cgroup removed from
+// the memory hierarchy but not the accounting one is a worse state than one left alone:
+// it is invisible to half the controller and still charged by the other half.
+//
+// The kernel is the last guard and it is the only one that cannot be wrong: rmdir on a
+// cgroup that still holds a task fails, whatever the caller believed about it.
+func (d Domain) RemoveChild(parent, id string) error {
+	if parent == "" || id == "" {
+		return fmt.Errorf("cgroup: removing a child needs a parent and an id")
+	}
+	var removed []string
+	var failed []string
+	for _, hierarchy := range d.Hierarchies {
+		dir := filepath.Join(hierarchy.Root, parent, id)
+		if _, err := os.Stat(dir); err != nil {
+			continue
+		}
+		if err := os.Remove(dir); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", hierarchy.Controllers, err))
+			continue
+		}
+		removed = append(removed, strings.Join(hierarchy.Controllers, ","))
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("cgroup: %s could not be removed from %s", id, strings.Join(failed, "; "))
+	}
+	if len(removed) == 0 {
+		return fmt.Errorf("cgroup: %s is in no hierarchy under %s", id, parent)
+	}
+	return nil
+}
+
 // SetChildLimit rewrites one sandbox's memory bound.
 //
 // Lowering it is the only way a v1 host can make a sandbox give memory back: v1 has no

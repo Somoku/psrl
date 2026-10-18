@@ -130,6 +130,19 @@ type ElasticConfig struct {
 	// physical counterpart of the ledger's admission reserve: the ledger keeps capacity for
 	// admissions, this keeps it for sandboxes that have not asked yet.
 	SafetyFraction float64
+	// ReapForeign removes cgroups in the sandbox subtree that belong to nothing: no
+	// allocation, no tasks, and holding under ReapUsageMB.
+	//
+	// A destroyed container leaves its cgroup behind when the kernel still holds a
+	// reference to it, and the directory then outlives the container for as long as the
+	// node runs. What that costs is the accounting rather than the memory -- they are
+	// counted in the observed total, and their cumulative OOM counters are counted with
+	// everybody else's, so a node that has run for a week reports faults nobody owns.
+	ReapForeign bool
+	// ReapUsageMB is the most an orphan may be holding before it is left alone. A cgroup
+	// with real pages in them is real memory, and removing the directory would not free
+	// them -- it would only stop anyone from being able to say whose they are.
+	ReapUsageMB int64
 	// LimitSampleIntervalS is how often the limit controller reads the domain. It is much
 	// shorter than the pricing cadence because the two answer different questions: a price
 	// is a statistic over a class and is noise at this resolution, while a limit is a
@@ -193,6 +206,9 @@ func ElasticConfigWithDefaults(cfg ElasticConfig) ElasticConfig {
 	if cfg.LimitSampleIntervalS <= 0 {
 		cfg.LimitSampleIntervalS = DefaultLimitSampleIntervalS
 	}
+	if cfg.ReapUsageMB <= 0 {
+		cfg.ReapUsageMB = DefaultReapUsageMB
+	}
 	// A quarter of a core is what a sandbox holding a shell and an agent costs before the
 	// class has any history. It is deliberately not zero: the first batch after a restart
 	// is admitted against this, and zero would say a sandbox is free.
@@ -234,6 +250,15 @@ const DefaultShrinkDwellS = 60.0
 // linear in the number of sandboxes and is measured in the benchmark, not assumed.
 const DefaultLimitSampleIntervalS = 0.2
 
+// DefaultReapUsageMB is the most an orphaned cgroup may be holding before the node leaves
+// it alone.
+//
+// A few tens of MiB: enough to cover the residue the kernel keeps for a container that has
+// gone, and far below anything a sandbox that is doing anything would be charged. The
+// point is not to free the memory -- rmdir does not -- but to be able to say, before
+// removing a directory, that no work is in it.
+const DefaultReapUsageMB = 64
+
 // DefaultLimitSampleInterval is DefaultLimitSampleIntervalS as a duration, for the
 // deployment's loop, which needs a ticker rather than a number.
 func DefaultLimitSampleInterval() time.Duration {
@@ -265,8 +290,23 @@ type ElasticReport struct {
 	// moved in a tick are reported by LimitReport, which runs on its own cadence.
 	Throttled []string
 	Released  []string
-	// OOMKills is the total the kernel reports across these sandboxes.
+	// OOMKills is the total the kernel reports across the sandboxes this node owns.
+	//
+	// Deliberately not the total across the domain. The counter is cumulative and a
+	// cgroup outlives the container that made it, so a domain total counts kills that
+	// belong to sandboxes that no longer exist -- which is a number that never goes down,
+	// points at nothing, and reads as an ongoing fault. A node that restarted shows zero
+	// not because anything was fixed but because the memory of it was.
 	OOMKills int64
+	// Reaped names the cgroups this tick removed because nothing owned them.
+	Reaped []string
+	// Foreign is how many cgroups in the domain are not sandboxes this node owns, and
+	// ForeignMB what they are charged. They are counted apart because they are real
+	// memory and real directories -- the machine carries them -- but they are not
+	// anybody's episode, so nothing in the controller may act on them and no alarm may
+	// be raised in their name.
+	Foreign   int
+	ForeignMB int64
 	// ThrottledPct is the share of the interval the sandboxes spent stopped for exceeding
 	// their CPU quota, averaged over the ones being measured. It is the number that says
 	// the node admitted more CPU demand than it can serve, and it is invisible in usage:
@@ -662,6 +702,63 @@ func (n *Node) elasticRemember(sandboxID string, spec backend.Spec) {
 	n.elastic.startMBBySandbox[sandboxID] = n.startLimitLocked(spec)
 }
 
+// reapForeign removes the cgroups in this node's subtree that belong to nothing.
+//
+// A container that is destroyed leaves its cgroup behind when the kernel still holds a
+// reference to it -- a charged page, a zombie -- and the directory then outlives the
+// container for as long as the node runs. They accumulate one wave at a time, and what
+// they cost is not the memory, which is usually nil, but the accounting: they are counted
+// in the domain's observed usage, their cumulative OOM and failcnt counters are counted
+// with everybody else's, and their bounds are counted in the sum the machine has to back.
+// A node that has run for a week reports faults nobody can act on.
+//
+// The guards, in order of how much they protect:
+//
+//   - The node must not own it. A cgroup the controller has registered, or one with a live
+//     allocation, is somebody's sandbox.
+//   - It must be holding almost nothing. A cgroup with real pages in it is real memory on
+//     the machine, and removing the directory does not free them -- it only stops anyone
+//     from being able to say whose they are.
+//   - The kernel must agree. rmdir on a cgroup that still holds a task fails, and that is
+//     the only test for "is anything in there" that cannot be wrong.
+//
+// A directory that cannot be removed is left alone and reported once, not retried every
+// five seconds for the rest of the run.
+func (n *Node) reapForeign(children []cgroup.Child) []string {
+	if !n.elastic.cfg.ReapForeign || len(n.elasticDomain.Hierarchies) == 0 {
+		return nil
+	}
+	limit := n.elastic.cfg.ReapUsageMB * mib
+	if limit <= 0 {
+		limit = DefaultReapUsageMB * mib
+	}
+	var reaped []string
+	for _, child := range children {
+		if _, known := n.elastic.classBySandbox[child.ID]; known {
+			continue
+		}
+		if n.lifecycle.Running(child.ID) {
+			continue
+		}
+		if child.Usage > limit {
+			continue
+		}
+		if err := n.elasticDomain.RemoveChild(n.elasticParent, child.ID); err != nil {
+			if !n.elastic.reapFailed[child.ID] {
+				n.elastic.reapFailed[child.ID] = true
+				slog.Info("elastic admission could not remove an orphaned cgroup",
+					"sandbox", child.ID, "error", err)
+			}
+			continue
+		}
+		delete(n.elastic.reapFailed, child.ID)
+		reaped = append(reaped, child.ID)
+		slog.Info("elastic admission removed an orphaned cgroup",
+			"sandbox", child.ID, "usage_mb", child.Usage/mib)
+	}
+	return reaped
+}
+
 type elastic struct {
 	mu  sync.Mutex
 	cfg ElasticConfig
@@ -692,6 +789,9 @@ type elastic struct {
 	// exhausted names the sandboxes that OOMed with their bound already at the ceiling,
 	// so a second one is an ending rather than another growth attempt.
 	exhausted map[string]bool
+	// reapFailed names the orphaned cgroups the kernel would not let go, so the node says
+	// so once instead of every five seconds for the rest of the run.
+	reapFailed map[string]bool
 	// classBySandbox is what the sandbox was admitted as.
 	classBySandbox map[string]string
 	// throttled records which sandboxes are currently below their declared CPU quota.
@@ -765,13 +865,22 @@ func (n *Node) ElasticTick(ctx context.Context) ElasticReport {
 	for class := range n.elastic.classCount {
 		n.elastic.classCount[class] = 0
 	}
+	var foreignBytes int64
+	foreign := 0
 	for _, child := range children {
 		observedBytes += child.Usage
-		oomKills += child.OOMKills
 		class, known := n.elastic.classBySandbox[child.ID]
 		if !known {
+			// In the domain but not this node's sandbox: an orphaned cgroup, a container
+			// belonging to another runtime, or one created by a previous process. Its
+			// memory is real and the machine carries it, so it stays in the observed total
+			// that protects admission -- but its kills and its failures are not this run's
+			// and must not be reported as though they were.
+			foreign++
+			foreignBytes += child.Usage
 			continue
 		}
+		oomKills += child.OOMKills
 		n.elastic.classCount[class]++
 		memoryByClass[class] = append(memoryByClass[class], child.Resident/(1024*1024))
 		if rate, ok := n.cpuDemand(child, elapsed); ok {
@@ -784,6 +893,11 @@ func (n *Node) ElasticTick(ctx context.Context) ElasticReport {
 	report.ObservedMB = observedBytes / (1024 * 1024)
 	report.ObservedCPUMillis = observedCPU
 	report.OOMKills = oomKills
+	report.Foreign = foreign
+	report.ForeignMB = foreignBytes / (1024 * 1024)
+	if reap := n.reapForeign(children); len(reap) > 0 {
+		report.Reaped = reap
+	}
 	if measured > 0 {
 		report.ThrottledPct = throttledTotal / float64(measured)
 	}

@@ -11,7 +11,11 @@ install -m 0755 "$STAGED" /usr/local/bin/sandboxd
 echo "installed: $(sha256sum /usr/local/bin/sandboxd | cut -c1-16)"
 
 for config in "$@"; do
-    pkill -f "sandbox[d] -config $config" || true
+    # Match on the config's basename, not on the path as given: the daemon is started
+    # with an absolute path, so a pattern built from a relative one matches nothing and
+    # the old process keeps the port. The new one then exits with "address already in
+    # use" and the restart looks like it worked.
+    pkill -f "sandbox[d] -config .*$(basename "$config")" || true
 done
 sleep 2
 

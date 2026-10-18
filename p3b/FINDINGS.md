@@ -115,6 +115,233 @@ batch the node was willing to hold. The first measurement of the change -- node 
 control unchanged -- admitted exactly as many sandboxes as before, and raising the fleet total
 did not move it either, which is how placement's accounting was identified.
 
+### 3.1 CPU is the dimension a burst is bounded by, and pricing it moves the fleet 4x
+
+The memory reserve above changed nothing end to end on the mini_swe step (§3.2). The reason
+is the other dimension: every sandbox declares `cpu_count=2` because one tool call may want
+two cores, and between calls it uses a fraction of one.
+
+Measured with a burst of creates of one 30 GiB / 2-core spec, same binary both times:
+
+| Charge | Admitted | Time |
+| --- | --- | --- |
+| declared cores (elastic off) | **180 of 200** | 60.1 s (the rest timed out queued) |
+| published CPU reserve (elastic on) | **700 of 700** | 23.3 s |
+
+180 is exactly `fleet.cpu_millis / 2000`: the fleet sells 360 cores and hands out two per
+sandbox. At the measured reserve of 250 millicores a sandbox costs an eighth of a core, and
+the ledger stops being the thing that decides how large a burst runs.
+
+Both nodes publish the CPU reserve on their report (`class_reserve_cpu_millis`), and the
+control states what it charges:
+
+```
+level=INFO msg="pricing a sandbox class from the nodes' published reserve"
+    class=rollout dimension=cpu_millis requested=2000 charged=250
+```
+
+### 3.2 One step of the real rollout, elastic off against elastic on
+
+Same recipe, same tasks, one training step, both nodes restarted between arms:
+
+| Metric | off | on |
+| --- | --- | --- |
+| `timing_s/step` | 1185.9 s | 1059.7 s |
+| `timing_s/wait_for_gen` | 339.8 s | 263.2 s |
+| `sandbox/admission/waits_total` | 279 | 279 |
+| `admission/wait_s_mean_worst_worker` | 57.1 s | 59.4 s |
+| `sandbox/usage/peak_sessions_total` | 168 | 168 |
+| OOM kills (both nodes) | 0 | 0 |
+
+The fleet admits 700 sandboxes where it admitted 180, and the step's concurrency does not
+move. **The fourth ledger is on the PSRL side.** `SandboxCapacityCoordinator`
+(`psrl/sandbox/capacity.py`) keeps its own mirror of the node envelope and charges each
+request its declared vector against it, so it admits `1,802,240 MiB / 30,720 MiB = 58`
+sandboxes per node -- which is the 58 `peak_active_sessions` a worker reports and, across
+two nodes plus graders, exactly the 168 every arm reports. It never sees the published
+reserve.
+
+`wait_for_gen` moved by 77 s, and the same metric has ranged over 100 s between runs of the
+same arm, so that is not a result. What is a result is that the number every arm agrees on
+is 168, and it is a PSRL-side number.
+
+### 3.3 Routing the rollout through the service, end to end
+
+The step's sandboxes were being created by the **in-process docker backend**, not by the
+service: the harness loop names its backend from `sandbox_config.backend`, which fell
+through to the manager's `default_backend` of `docker`. That put a fourth ledger in the
+path -- `SandboxCapacityCoordinator` in `psrl/sandbox/capacity.py`, which mirrors the node
+envelope locally and charges each sandbox its declared 30 GiB, so it admits
+`1,802,240 MiB / 30,720 MiB = 58` per node. That 58 is the `peak_active_sessions` a worker
+reports, and two nodes plus graders is the 168 every arm agreed on.
+
+Routing the rollout to the service needed host mounts, which the service advertised without
+implementing: the docker backend listed `host_mount` and had no mount plumbing at all. It
+now binds them, behind an allowlist (`backends[].mount_allowlist`), and advertises the
+feature only when the allowlist is non-empty.
+
+Same recipe, one training step, one binary, both nodes restarted between arms:
+
+| Admission | `waits_total` | `wait_s_mean_worst_worker` | `peak_sessions` | OOM |
+| --- | --- | --- | --- | --- |
+| docker backend, elastic off | 279 | 57.1 s | 168 | 0 |
+| docker backend, elastic on (service not in path) | 279 | 59.4 s | 168 | 0 |
+| rollout on the service, elastic on | **139** | **9.0 s** | **110** | 0 |
+
+Six times less queueing per sandbox. `timing_s/step` did not move (1186 / 1060 / 1151 s
+across the three), because the step's critical path is twenty turns of model latency rather
+than sandbox admission: the queue was costing latency per sandbox, not throughput.
+
+That arm was still half on the old path: **node 97 carries its own, stale checkout of
+`/home/psrl`** (HEAD from 10-07, with its own local modifications), so the worker placed on
+97 ran the old PSRL -- no `HOST_MOUNT` on its p3b client, no `backend: p3b` in its harness
+config -- and created its sandboxes in the in-process docker backend. Syncing the changed
+files to 97 and configuring p3b alone gives the full result:
+
+| Arm | `waits_total` | `wait_s_mean_worst_worker` | sandboxes live at peak |
+| --- | --- | --- | --- |
+| docker backend in path | 279 | 57.1 s | ~7-15 per node |
+| rollout on the service, one stale node | 139 | 9.0 s | ~15 fleet-wide |
+| rollout on the service, both nodes current | **0** | **0 s** | **128 per node (256 fleet-wide)** |
+
+`timing_s/step` still did not move (1181 s). The concurrency that was available all along
+is now used -- 256 sandboxes where the ledger used to admit 58 per node -- and the step is
+still bounded by twenty turns of model latency, not by admission.
+
+The CPU reserve is doing what it was built to do: the grader class, measured while its
+containers were running, now prices at 1386 and 890 millicores on the two nodes (up from the
+250 floor), while rollout sits at 250-266 -- its sandboxes are idle between turns. The
+grader costs what it uses and the rollout no longer pays for cores it never touches.
+
+### 3.4 The gaps that only appear once density is real
+
+The 256-sandbox step exposed three defects that the 58-per-node ceiling had been hiding.
+All three are now fixed; all three were found by reading what the machine said rather than
+what the ledger assumed.
+
+**a. A class guarantee at the node was never exercised.** `Node.Admit` returned a refusal
+without calling `Admission.Enqueue`, so `queued[class]` stayed zero and
+`reservedForOthersLocked` never held a share back. The first wave took the whole envelope
+and the second wave -- grading -- could not get in. It surfaced in a production log as:
+
+```
+Grader sandbox was never admitted for task '...mypy-5617'; keeping the trajectory as ungraded.
+```
+
+which is §1.3's failure mode exactly: an infrastructure fault becoming training signal,
+because an ungraded trajectory is either dropped or scored as if it had been measured.
+Admission now records refused demand (`Enqueue` on refusal, `Dequeue` when a class is
+served) with a TTL (`DemandTTL`, default 2 min) so a caller that went away does not hold a
+share idle. `TestARefusedRequestHoldsItsClassGuarantee` asserts it, and
+`TestWithoutRefusedDemandTheFirstWaveTakesEverything` is the counterfactual that keeps the
+assertion about the mechanism rather than about the envelope.
+
+**b. CPU demand was invisible past the quota.** `cpuacct` usage is censored from above: a
+sandbox that wants more than it was given only ever reaches its quota, so its measured rate
+saturates and stops describing demand. The throttling counters are the only place the kernel
+says a sandbox asked and was refused. Live, on this host:
+
+| Reading | Value |
+| --- | --- |
+| one sandbox's `cpu.stat` | `nr_periods 2544`, `nr_throttled 2092` (**82%** of periods), `throttled_time` 21.4 s |
+| live test, 2 threads in a 0.5-core quota | throttled 5.86 s against usage 2.11 s -- usage capped at the quota, throttling kept climbing |
+| 127 sandboxes during a step | throttled fraction **0.019**, none above 80% |
+
+So the mechanism is in place and correctly dormant at this load: a throttled sandbox's
+demand is at least its quota, and that lower bound replaces the truncated measurement
+(`ThrottledAbove`, default 10% of the interval). It also counts as busy, so a sandbox being
+throttled is never shrunk on the grounds that no command is in flight.
+
+**c. The metrics plane shared a concurrency budget with the data plane.**
+`sandbox_metrics_snapshot` is a synchronous actor method that had to take a slot from
+`max_concurrency_per_worker`; at 256 concurrent sandboxes every slot was held by trajectory
+work and the per-step read timed out:
+
+```
+Could not read sandbox worker snapshots for metrics.   (GetTimeoutError)
+```
+
+The read now runs in its own Ray concurrency group. Verified against the live cluster: with
+the single rollout slot held busy for 8 s, the snapshot returns in 0.00 s.
+
+One step, before and after (both step 1, same recipe):
+
+| | before | after |
+| --- | --- | --- |
+| `Grader sandbox was never admitted` | 1 | **0** |
+| `Could not read sandbox worker snapshots` | 1 | **0** |
+| `timing_s/step` | 1387 s | 1149 s |
+| `timing_s/wait_for_gen` | 877 s | 349 s |
+
+The two errors occurred once each in the before run (~0.4% of its samples), so zero in one
+run is consistent rather than conclusive; what is conclusive is the mechanism, which the
+unit tests pin. The timings are single samples of a metric that varied by more than 300 s
+between identical arms earlier in this document.
+
+### 3.5 Why 256 was not a result: pricing the future, not the present
+
+The 256-sandbox step in §3.3 was measured with a clipped workload (`max_turns=20`,
+`trajectory_timeout=300`). Run at the production budget (`max_turns=80`,
+`trajectory_timeout=1800`) the same configuration failed:
+
+```
+Grader sandbox was never admitted for task '...'                    x37
+Sandbox capacity was never granted for request [17920]              x32
+notify_group_failed -> 16 requests of one parent retried             x2
+```
+
+The mechanism is not a bug in the measurements, it is what the measurements said:
+
+| | at the floor | after measuring |
+|---|---|---|
+| rollout price | 512 MiB / 250 millicores | **15,723 MiB / 2,981 millicores** (peaked 33,276 / 3,265) |
+| fleet admits (CPU, 360,000 millis) | 1440 | **120** |
+| physical demand of 256 sandboxes | — | 768 cores against 360; 3.8 TB against 3.3 TB of subtree limit |
+
+So 256 was **over-admission made possible by a price that had not seen the workload yet**, and the failures were the system discovering it. Three things were missing, all of which the design document had already named:
+
+1. **Admission charged the present, not the future.** A sandbox's cost is what it will have used by the time anyone notices, and noticing is a sample away. Fixed: each class's observed growth rate is reserved over a horizon (`GrowthHorizonS`, default 60 s), both for the sandboxes already running (`pending_growth`) and for the one being admitted (`candidate_headroom`) -- §6.2's formula and VenusRL's `G_active + G_candidate`.
+2. **The price could jump without a bound, and the fleet never caught up.** The nodes reprice their reservations as they measure; the fleet charged each grant what its class cost at admission and forgot it, so it kept granting capacity no node would honour. Fixed twice: one sample may now raise a class's estimate by at most `MaxGrowthFactor` (default 2x, still converging within a few samples), and the fleet reprices its outstanding grants on the report cadence (`Ledger.Reprice`, driven between reports rather than on the admission path).
+3. **Nothing was kept for a wave that had not arrived.** Fixed: `AdmissionReserve` (default 10%) is a share of the envelope no running sandbox may spend, which is WeEnv's admission reservation.
+
+Measured at the production budget after the three fixes (one step, run to completion):
+
+| | the failing run | after the fixes |
+| --- | --- | --- |
+| `Grader sandbox was never admitted` | 37 | **0** |
+| `Sandbox capacity was never granted` (rollout) | 32 | **0** |
+| `Could not read sandbox worker snapshots` | 1 | **0** |
+| tracebacks | 1 | **0** |
+| concurrent sandboxes (peak, sampled) | 256, over-subscribed | **127** (64 + 63; the recipe asks for 8 prompts x 16 responses) |
+| throttled fraction while loaded | — | 0.168, none above 80% |
+| `timing_s/wait_for_gen` | 877 s | 6219 s |
+| `timing_s/step` | 1387 s | 8249 s |
+| `termination/finished/fraction` | 0.649 (step 1 of that run) | 0.473 |
+| `max_turns_exceeded/fraction` | 0.352 | 0.527 |
+| OOM kills | 0 | **3** of ~270 sandboxes (1.1%) |
+
+Two of those numbers need their caveats stated rather than smoothed over:
+
+- **The step got six times slower, and the two runs are not comparable.** The failing run
+  was faster because it was dropping work: 32 rollout requests never got a sandbox and 37
+  graders never got one, and a dropped trajectory does not take time. A controlled A/B at
+  the production budget -- elastic off against elastic on with the fixes, same seed, same
+  data -- is what would say whether the fixes cost throughput or only made the cost
+  visible. It is not done here.
+- **Three sandboxes were OOM-killed, and the controller did not cause it.** The log line
+  at each event reads `shrunk=0 restored=0 throttled=0 released=0 oom_kills=1`: nothing
+  was lowered, the counter is the kernel's. Those sandboxes exceeded the 30 GB the recipe
+  declares, which is also the kernel hard limit they were created with. Either the
+  declaration is too small for the hardest ~1% of tasks, or the harness needs to be told
+  to use less. It is a workload-sizing signal the previous runs could not surface, because
+  their episodes were too short to reach a large footprint.
+
+What is solid: no request is refused for capacity any more, no group is lost, and the
+concurrency the system reports is the concurrency the machine can hold -- 127 at ~3 cores
+and ~15 GB each against 360 cores and 3.3 TB of subtree limit. The honest number for this
+workload is the number the workload asks for, admitted without refusal, not the largest
+number a price that has not measured anything will let through.
+
 ## 4. Limits of these results
 
 - **The pool serves one image, and this workload uses one image per task.** The mini_swe
@@ -143,6 +370,11 @@ did not move it either, which is how placement's accounting was identified.
 - **The release path is verified at test scale, not at workload scale.** Filling a 1.65 TB
   subtree needs a workload this deployment does not run, so the shrink is proven by the
   integration test above rather than by a training run.
+- **The published reserve is charged by p3b, not yet by the caller.** Three ledgers inside
+  p3b charge the reserve (fleet quota, placement, node admission); the trainer's own
+  `SandboxCapacityCoordinator` still charges the declared vector, and on this workload it
+  is the one that decides concurrency (§3.2). Until it charges the reserve too, an elastic
+  arm is measured as a fleet that admits more sandboxes than its caller asks for.
 - **The growth model assumes sandboxes grow independently, and a GRPO group's do not.** The
   reservation follows a class's observed resident memory, so a batch that grows *after* it was
   admitted is only bounded by each sandbox's own hard limit and by the node's measured ceiling

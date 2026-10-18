@@ -344,19 +344,20 @@ func (n *NodeListener) report(_ context.Context) (any, error) {
 // nodeViewWire is the over-the-wire shape of a NodeView. It uses slices for the
 // set fields because map[string]struct{} does not serialize as JSON.
 type nodeViewWire struct {
-	NodeID          string                  `json:"node_id"`
-	Backends        []backendCapWire        `json:"backends"`
-	Envelope        headroomWire            `json:"envelope"`
-	ClassHeadroom   map[string]headroomWire `json:"class_headroom"`
-	LiveSandboxes   int                     `json:"live_sandboxes"`
-	CPUUsedPct      float64                 `json:"cpu_used_pct"`
-	MemUsedPct      float64                 `json:"mem_used_pct"`
-	GPUFree         int32                   `json:"gpu_free"`
-	Draining        bool                    `json:"draining"`
-	ClassReserve    map[string]int64        `json:"class_reserve_mb"`
-	ImageDigests    []string                `json:"image_digests"`
-	ImageReferences []string                `json:"image_references"`
-	Labels          []string                `json:"labels"`
+	NodeID                string                  `json:"node_id"`
+	Backends              []backendCapWire        `json:"backends"`
+	Envelope              headroomWire            `json:"envelope"`
+	ClassHeadroom         map[string]headroomWire `json:"class_headroom"`
+	LiveSandboxes         int                     `json:"live_sandboxes"`
+	CPUUsedPct            float64                 `json:"cpu_used_pct"`
+	MemUsedPct            float64                 `json:"mem_used_pct"`
+	GPUFree               int32                   `json:"gpu_free"`
+	Draining              bool                    `json:"draining"`
+	ClassReserveMB        map[string]int64        `json:"class_reserve_mb"`
+	ClassReserveCPUMillis map[string]int64        `json:"class_reserve_cpu_millis"`
+	ImageDigests          []string                `json:"image_digests"`
+	ImageReferences       []string                `json:"image_references"`
+	Labels                []string                `json:"labels"`
 }
 
 type backendCapWire struct {
@@ -385,8 +386,9 @@ func nodeViewToWire(view placement.NodeView) nodeViewWire {
 			MemoryMB: view.Envelope.MemoryMB, CPUMillis: view.Envelope.CPUMillis,
 			GPUCount: view.Envelope.GPUCount, DiskMB: view.Envelope.DiskMB,
 		},
-		ClassHeadroom: make(map[string]headroomWire, len(view.ClassHeadroom)),
-		ClassReserve:  view.ClassReserve,
+		ClassHeadroom:         make(map[string]headroomWire, len(view.ClassHeadroom)),
+		ClassReserveMB:        view.ClassReserveMB,
+		ClassReserveCPUMillis: view.ClassReserveCPUMillis,
 	}
 	for class, h := range view.ClassHeadroom {
 		w.ClassHeadroom[class] = headroomWire{
@@ -414,18 +416,19 @@ func nodeViewToWire(view placement.NodeView) nodeViewWire {
 
 func nodeViewFromWire(w nodeViewWire) placement.NodeView {
 	view := placement.NodeView{
-		NodeID:          w.NodeID,
-		SeenAt:          time.Now(),
-		LiveSandboxes:   w.LiveSandboxes,
-		CPUUsedPct:      w.CPUUsedPct,
-		MemUsedPct:      w.MemUsedPct,
-		GPUFree:         w.GPUFree,
-		Draining:        w.Draining,
-		ClassHeadroom:   make(map[string]placement.Headroom, len(w.ClassHeadroom)),
-		ClassReserve:    w.ClassReserve,
-		ImageDigests:    make(map[string]struct{}, len(w.ImageDigests)),
-		ImageReferences: make(map[string]struct{}, len(w.ImageReferences)),
-		Labels:          make(map[string]struct{}, len(w.Labels)),
+		NodeID:                w.NodeID,
+		SeenAt:                time.Now(),
+		LiveSandboxes:         w.LiveSandboxes,
+		CPUUsedPct:            w.CPUUsedPct,
+		MemUsedPct:            w.MemUsedPct,
+		GPUFree:               w.GPUFree,
+		Draining:              w.Draining,
+		ClassHeadroom:         make(map[string]placement.Headroom, len(w.ClassHeadroom)),
+		ClassReserveMB:        w.ClassReserveMB,
+		ClassReserveCPUMillis: w.ClassReserveCPUMillis,
+		ImageDigests:          make(map[string]struct{}, len(w.ImageDigests)),
+		ImageReferences:       make(map[string]struct{}, len(w.ImageReferences)),
+		Labels:                make(map[string]struct{}, len(w.Labels)),
 		Envelope: placement.Headroom{
 			MemoryMB: w.Envelope.MemoryMB, CPUMillis: w.Envelope.CPUMillis,
 			GPUCount: w.Envelope.GPUCount, DiskMB: w.Envelope.DiskMB,

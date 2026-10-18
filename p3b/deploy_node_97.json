@@ -20,17 +20,22 @@
     "sandbox_memory_safety": 0.05,
     "elastic": {
       "enabled": true,
+      "growth_margin": 0.25,
+      "min_cpu_millis": 100,
+      "min_limit_mb": 256,
+      "min_reserve_cpu_millis": 250,
       "min_reserve_mb": 512,
       "percentile": 95,
-      "growth_margin": 0.25,
+      "release_margin_cpu_millis": 250,
+      "release_margin_mb": 256,
+      "restore_below": 0.6,
+      "sample_interval_s": 5,
+      "shrink_above": 0.85,
       "shrink_after": 3,
       "shrink_step": 0.25,
-      "shrink_above": 0.85,
-      "restore_below": 0.6,
-      "release_margin_mb": 256,
-      "min_limit_mb": 256,
-      "sample_interval_s": 5
-    }
+      "growth_horizon_s": 60
+    },
+    "admission_reserve": 0.1
   },
   "classes": {
     "rollout": {
@@ -46,7 +51,10 @@
       "mode": "direct",
       "socket": "/var/run/docker.sock",
       "api_version": "v1.40",
-      "max_create_concurrency": 64
+      "max_create_concurrency": 64,
+      "mount_allowlist": [
+        "/shared/psrl/harness-runtimes"
+      ]
     }
   ],
   "default_backend": "docker",

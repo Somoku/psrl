@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -75,6 +76,10 @@ type Control struct {
 	// provisions is what a create with an idempotency key is doing, so a caller
 	// that has no response yet can tell "still working" from "lost the request".
 	provisions map[string]*provisionRecord
+	// pricing is the reserve this control last charged a class, so a class whose
+	// price moves is stated once instead of once per request.
+	pricing map[string]int64
+	log     *slog.Logger
 }
 
 // provisionRecord is what a create with an idempotency key is doing.
@@ -99,6 +104,12 @@ type sandboxRecord struct {
 	grantID       string
 	reservationID string
 	class         string
+	// charged is what this sandbox cost the fleet when it was admitted, and declared is
+	// the maximum its caller asked for. Both are kept so the grant can be repriced: the
+	// class's price is a measurement that moves, and a fleet still charging the
+	// admission-time number promises capacity no node will honour.
+	charged  quota.Amount
+	declared quota.Amount
 }
 
 // ControlConfig is what the control plane needs to run.
@@ -115,6 +126,8 @@ type ControlConfig struct {
 	// ReservationRenewInterval overrides how often a create renews its placement
 	// reservation while provisioning. Zero takes the default.
 	ReservationRenewInterval time.Duration
+	// Logger states pricing changes to an operator. Zero takes slog's default.
+	Logger *slog.Logger
 }
 
 // NewControl returns the cluster-level server.
@@ -131,6 +144,9 @@ func NewControl(cfg ControlConfig) (*Control, error) {
 	if cfg.ReservationRenewInterval <= 0 {
 		cfg.ReservationRenewInterval = 20 * time.Second
 	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
 	return &Control{
 		registry:                 cfg.Registry,
 		ledger:                   cfg.Ledger,
@@ -142,6 +158,8 @@ func NewControl(cfg ControlConfig) (*Control, error) {
 		reservationRenewInterval: cfg.ReservationRenewInterval,
 		sandbox:                  map[string]sandboxRecord{},
 		provisions:               map[string]*provisionRecord{},
+		pricing:                  map[string]int64{},
+		log:                      cfg.Logger,
 	}, nil
 }
 
@@ -195,6 +213,10 @@ func (c *Control) create(ctx context.Context, req *v1.CreateRequest) (*v1.Create
 	c.remember(created.handle.SandboxID, sandboxRecord{
 		handle: created.handle, backend: selected,
 		grantID: grantID, reservationID: created.reservationID, class: spec.ResourceClass,
+		// What it costs now, and what its caller declared: the first is what the fleet
+		// charges until the class's price moves, and the second is the ceiling a reprice
+		// may never exceed.
+		charged: amount, declared: quotaAmount(spec),
 	})
 	return createdToProto(created.created), nil
 }
@@ -204,22 +226,49 @@ func (c *Control) create(ctx context.Context, req *v1.CreateRequest) (*v1.Create
 // A node publishes what one sandbox of a class actually costs it, measured from its own
 // sandboxes. Charging that instead of the request's declared maximum is what lets the
 // fleet and placement admit a burst the node has room for: the maximum is a protection
-// bound for one sandbox, and summing it across a batch reserves memory nobody is using.
+// bound for one sandbox, and summing it across a batch reserves capacity nobody is using.
 //
-// Only memory is repriced. CPU, disk and devices are stated requirements rather than
-// measured costs, and a node that has not enabled the pricing publishes nothing, which
-// leaves the request as it was.
+// Memory and CPU are repriced; disk and devices are not. Disk is stated rather than
+// measured because it is consumed rather than held, and a device is a whole object: a
+// sandbox either has a GPU or it does not. A node that has not enabled the pricing
+// publishes nothing, which leaves the request as it was.
 func (c *Control) charged(spec backend.Spec) backend.Spec {
-	if c.monitor == nil || spec.Resources.MemoryMB <= 0 {
-		return spec
-	}
-	reserve, published := c.monitor.ClassReserveMB(spec.ResourceClass)
-	if !published || reserve <= 0 || reserve >= spec.Resources.MemoryMB {
+	if c.monitor == nil {
 		return spec
 	}
 	charged := spec
-	charged.Resources.MemoryMB = reserve
+	if reserve, published := c.monitor.ClassReserveMB(spec.ResourceClass); published &&
+		spec.Resources.MemoryMB > 0 && reserve > 0 && reserve < spec.Resources.MemoryMB {
+		charged.Resources.MemoryMB = reserve
+		c.notePricing(spec.ResourceClass, "memory_mb", spec.Resources.MemoryMB, reserve)
+	}
+	requestedCPU := int64(spec.Resources.CPUCount * 1000)
+	if reserve, published := c.monitor.ClassReserveCPUMillis(spec.ResourceClass); published &&
+		requestedCPU > 0 && reserve > 0 && reserve < requestedCPU {
+		charged.Resources.CPUCount = float64(reserve) / 1000
+		c.notePricing(spec.ResourceClass, "cpu_millis", requestedCPU, reserve)
+	}
 	return charged
+}
+
+// notePricing states what a class costs the fleet, once per value.
+//
+// Elastic pricing is the difference between admitting a batch and queueing it, and it
+// happens between two processes that each look correct alone: the node publishes a
+// reserve, the control charges it. When one of them stops, nothing fails -- the fleet
+// simply goes back to charging every request's maximum -- so the charge is stated
+// where an operator can see it rather than inferred from throughput later.
+func (c *Control) notePricing(class, dimension string, requested, reserve int64) {
+	key := class + "/" + dimension
+	c.mu.Lock()
+	if c.pricing[key] == reserve {
+		c.mu.Unlock()
+		return
+	}
+	c.pricing[key] = reserve
+	c.mu.Unlock()
+	c.log.Info("pricing a sandbox class from the nodes' published reserve",
+		"class", class, "dimension", dimension, "requested", requested, "charged", reserve)
 }
 
 // admit charges one request against its class, waiting for room when the class
@@ -336,11 +385,26 @@ func (c *Control) place(
 	}
 
 	var lastRefusal string
-	for attempt := 0; attempt < c.placementAttempts; attempt++ {
+	// refused carries the nodes that already said no into the next attempt. Placement
+	// ranks on a reported headroom that can be seconds old, while a refusal is that
+	// node's own ledger speaking about now; re-asking the same node the same question is
+	// what turns a single full machine into a fleet-wide exhaustion error.
+	refused := make([]string, 0, c.placementAttempts)
+	// Do not try more times than there are nodes to try. The attempt after the last node
+	// has refused has an empty candidate set, and the error it produces no longer says
+	// whether the fleet was full or unable to serve the request -- which is the one thing
+	// the caller needs in order to know whether to wait or give up.
+	attempts := c.placementAttempts
+	if live := c.placement.LiveCount(); live > 0 && live < attempts {
+		attempts = live
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
 		// Charge what the node says a sandbox costs, not what the caller asked for as a
 		// maximum: placement's promises are cleared by the node's own report, so a promise
 		// of the maximum would refuse a batch the node is willing to hold.
-		decision, err := c.placement.Choose(placementRequest(charged, selected.Name(), owner))
+		request := placementRequest(charged, selected.Name(), owner)
+		request.ExcludeNodes = refused
+		decision, err := c.placement.Choose(request)
 		if err != nil {
 			if errors.Is(err, placement.ErrExhausted) {
 				return placed{}, status.Error(codes.ResourceExhausted, err.Error())
@@ -357,6 +421,7 @@ func (c *Control) place(
 			// a sandbox it just declined.
 			c.placement.Cancel(decision.ReservationID)
 			lastRefusal = refusal
+			refused = append(refused, decision.NodeID)
 			continue
 		}
 		withDevices := spec
@@ -607,6 +672,70 @@ func (c *Control) remember(id string, record sandboxRecord) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sandbox[id] = record
+}
+
+// RepriceGrants brings the fleet's ledger back in line with what the nodes measure.
+// It is the exported face of repriceGrants, so the loop that drives it lives with the
+// rest of the process's background work.
+//
+// The nodes reprice their own reservations as they sample; the fleet charges each grant
+// what its class cost at admission and otherwise forgets it. Left alone that gap is the
+// whole failure: the fleet keeps admitting against a price that has moved on, every one
+// of those admissions is refused by the node that owns the pages, and the caller sees
+// capacity exhaustion until the under-charged sandboxes happen to finish.
+//
+// It is cheap on purpose -- a read of the published reserve per class and a walk of the
+// live grants -- so it can run between reports rather than on the admission path.
+func (c *Control) RepriceGrants() {
+	if c.monitor == nil {
+		return
+	}
+	c.mu.Lock()
+	type pending struct {
+		grantID string
+		amount  quota.Amount
+		class   string
+	}
+	updates := make([]pending, 0, len(c.sandbox))
+	for _, record := range c.sandbox {
+		if record.grantID == "" {
+			continue
+		}
+		want := c.chargedAmount(record.declared, record.class)
+		if want == record.charged {
+			continue
+		}
+		updates = append(updates, pending{grantID: record.grantID, amount: want, class: record.class})
+	}
+	c.mu.Unlock()
+
+	for _, update := range updates {
+		c.ledger.Reprice(update.grantID, update.amount)
+
+		c.mu.Lock()
+		for id, record := range c.sandbox {
+			if record.grantID != update.grantID {
+				continue
+			}
+			record.charged = update.amount
+			c.sandbox[id] = record
+			break
+		}
+		c.mu.Unlock()
+	}
+}
+
+// chargedAmount is what a class's published price makes this request cost the fleet,
+// never more than the caller declared.
+func (c *Control) chargedAmount(declared quota.Amount, class string) quota.Amount {
+	want := declared
+	if reserve, published := c.monitor.ClassReserveMB(class); published && reserve > 0 && reserve < want.MemoryMB {
+		want.MemoryMB = reserve
+	}
+	if reserve, published := c.monitor.ClassReserveCPUMillis(class); published && reserve > 0 && reserve < want.CPUMillis {
+		want.CPUMillis = reserve
+	}
+	return want
 }
 
 func (c *Control) lookup(id string) (sandboxRecord, bool) {

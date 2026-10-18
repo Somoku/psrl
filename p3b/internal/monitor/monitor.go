@@ -70,14 +70,28 @@ func (m *Monitor) Report(view placement.NodeView) {
 	m.rebuildLocked()
 }
 
-// ClassReserveMB is the per-sandbox charge the live nodes published for a class, and
-// whether any of them published one.
+// ClassReserveMB is the per-sandbox memory charge the live nodes published for a class,
+// and whether any of them published one.
 //
 // The largest of them, not the smallest: each node states what a sandbox costs *it*, and
 // charging the least optimistic is the direction that cannot over-admit a fleet whose
 // nodes priced themselves differently. No node publishing means the deployment has not
 // enabled elastic pricing, and the caller keeps charging the request's maximum.
 func (m *Monitor) ClassReserveMB(class string) (int64, bool) {
+	return m.largestPublished(class, func(view placement.NodeView) map[string]int64 {
+		return view.ClassReserveMB
+	})
+}
+
+// ClassReserveCPUMillis is the same question about CPU, in millicores.
+func (m *Monitor) ClassReserveCPUMillis(class string) (int64, bool) {
+	return m.largestPublished(class, func(view placement.NodeView) map[string]int64 {
+		return view.ClassReserveCPUMillis
+	})
+}
+
+// largestPublished takes the largest reserve any live node published for a class.
+func (m *Monitor) largestPublished(class string, published func(placement.NodeView) map[string]int64) (int64, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	now := m.now()
@@ -87,8 +101,8 @@ func (m *Monitor) ClassReserveMB(class string) (int64, bool) {
 		if m.nodeTTL > 0 && now.Sub(view.SeenAt) > m.nodeTTL {
 			continue
 		}
-		reserve, published := view.ClassReserve[class]
-		if !published || reserve <= 0 {
+		reserve, stated := published(view)[class]
+		if !stated || reserve <= 0 {
 			continue
 		}
 		if !known || reserve > largest {

@@ -103,18 +103,28 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 	if cfg.Elastic.Enabled {
 		agent.elastic = &elastic{
-			cfg:            ElasticConfigWithDefaults(cfg.Elastic),
-			footprints:     map[string]*node.Footprint{},
-			maxBySandbox:   map[string]int64{},
-			classBySandbox: map[string]string{},
-			shrunk:         map[string]bool{},
+			cfg:                   ElasticConfigWithDefaults(cfg.Elastic),
+			memoryFootprints:      map[string]*node.Footprint{},
+			cpuFootprints:         map[string]*node.Footprint{},
+			maxMemoryMBBySandbox:  map[string]int64{},
+			maxCPUMillisBySandbox: map[string]int64{},
+			classBySandbox:        map[string]string{},
+			shrunk:                map[string]bool{},
+			throttled:             map[string]bool{},
+			cpuUsageNanos:         map[string]int64{},
+			cpuRateMillis:         map[string]int64{},
+			cpuThrottledNanos:     map[string]int64{},
+			cpuThrottle:           map[string]float64{},
+			previousPrice:         map[string]node.Resources{},
+			classCount:            map[string]int{},
 		}
 		// Seed one estimate per declared class, so the node's first report already
 		// publishes a price. Without it the batch admitted before the first report -- which
 		// is every batch after a restart -- is charged the request's maximum, the
 		// reservation this exists to remove.
 		for class := range cfg.Admission.Snapshot().ClassHeadroom {
-			agent.footprintFor(class)
+			agent.memoryFootprintFor(class)
+			agent.cpuFootprintFor(class)
 		}
 	}
 	return agent, nil
@@ -128,20 +138,38 @@ func (n *Node) Admit(ctx context.Context, req *v1.AdmitRequest) (*v1.AdmitRespon
 	spec := specFromProto(req.GetSpec())
 	n.admission.SetPressure(n.pressure())
 	owner := ownerOf(spec)
-	charge := nodeResources(spec)
-	if n.elastic != nil {
-		// Charge what a sandbox of this class actually costs rather than its declared
-		// maximum. The maximum stays as the kernel's hard bound for this sandbox; the
-		// ledger's job is to know what the node has promised, and nothing has promised the
-		// maximum.
-		if reserve := n.footprintFor(spec.ResourceClass).ReserveMB(); reserve < charge.MemoryMB {
-			charge.MemoryMB = reserve
+	// Charge what a sandbox of this class actually costs rather than its declared maximum.
+	// The maximum stays as the kernel's hard bound for this sandbox; the ledger's job is to
+	// know what the node has promised, and nothing has promised the maximum.
+	//
+	// CPU is charged the same way, and it is the dimension that decides how large a burst
+	// the fleet admits: every sandbox declares the cores one tool call may want, and nearly
+	// all of them are idle between calls.
+	// Charge the class's measured price plus the growth it is committed to, because the
+	// question admission answers is not "does this fit now" but "will it still fit when
+	// it has grown, and will the ones before it".
+	charge := n.elasticCharge(spec)
+	if growth := n.admission.GrowthPerSandbox(spec.ResourceClass); growth.MemoryMB > 0 || growth.CPUMillis > 0 {
+		if charge.MemoryMB > 0 {
+			charge.MemoryMB += growth.MemoryMB
+		}
+		if charge.CPUMillis > 0 {
+			charge.CPUMillis += growth.CPUMillis
 		}
 	}
 	grant, refusal, ok := n.admission.Reserve(spec.ResourceClass, owner, charge)
 	if !ok {
+		// The refusal is what makes this class's guarantee real. Without it the node has
+		// no record of a class waiting, so nothing is held back from the classes that are
+		// running, and the first one to arrive can take the whole envelope -- which is how
+		// grading sandboxes ended up un-admittable behind a full rollout wave.
+		n.admission.Enqueue(spec.ResourceClass)
+		n.admission.ExpireDemand()
 		return &v1.AdmitResponse{Admitted: false, Refusal: string(refusal)}, nil
 	}
+	// One waiter of this class is served, so its claim on the guarantee is released. The
+	// demand that is still waiting keeps the share held.
+	n.admission.Dequeue(spec.ResourceClass)
 	// The record is created from the grant, so a grant that never becomes a
 	// container is still swept rather than held until the next restart.
 	n.lifecycle.Reserve(grant, owner, spec.ExecMode, lifetimeOf(spec))
@@ -194,12 +222,10 @@ func (n *Node) CreateOn(ctx context.Context, req *v1.CreateOnRequest) (*v1.Creat
 		n.lifecycle.FailCreate(leaseID)
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	if n.elastic != nil {
-		// The kernel limit is the declared maximum even though the ledger charges the
-		// class's estimate, so the controller needs both numbers.
-		n.elastic.maxBySandbox[created.Handle.SandboxID] = spec.Resources.MemoryMB
-		n.elastic.classBySandbox[created.Handle.SandboxID] = spec.ResourceClass
-	}
+	// The kernel limit is the declared maximum even though the ledger charges the class's
+	// estimate, so the controller needs both numbers -- for CPU too, because a throttled
+	// quota is restored to what the sandbox declared.
+	n.elasticRemember(created.Handle.SandboxID, spec)
 	if !n.lifecycle.AdoptCreated(leaseID, created.Handle, hosted) {
 		// The record was reclaimed while the create was in flight, so this
 		// container has no owner to charge it to. Destroy it on a budget of its
@@ -356,18 +382,19 @@ func (n *Node) view() *v1.NodeView {
 func (n *Node) View() placement.NodeView {
 	proto := n.view()
 	view := placement.NodeView{
-		NodeID:          proto.GetNodeId(),
-		SeenAt:          time.Now(),
-		ClassHeadroom:   map[string]placement.Headroom{},
-		LiveSandboxes:   int(proto.GetLiveSandboxes()),
-		CPUUsedPct:      proto.GetCpuUsedPct(),
-		MemUsedPct:      proto.GetMemUsedPct(),
-		GPUFree:         proto.GetGpuFree(),
-		Draining:        proto.GetDraining(),
-		ImageDigests:    map[string]struct{}{},
-		ImageReferences: map[string]struct{}{},
-		Labels:          map[string]struct{}{},
-		ClassReserve:    n.classReserves(),
+		NodeID:                proto.GetNodeId(),
+		SeenAt:                time.Now(),
+		ClassHeadroom:         map[string]placement.Headroom{},
+		LiveSandboxes:         int(proto.GetLiveSandboxes()),
+		CPUUsedPct:            proto.GetCpuUsedPct(),
+		MemUsedPct:            proto.GetMemUsedPct(),
+		GPUFree:               proto.GetGpuFree(),
+		Draining:              proto.GetDraining(),
+		ImageDigests:          map[string]struct{}{},
+		ImageReferences:       map[string]struct{}{},
+		Labels:                map[string]struct{}{},
+		ClassReserveMB:        n.classMemoryReservesMB(),
+		ClassReserveCPUMillis: n.classCPUReservesMillis(),
 	}
 	if envelope := proto.GetEnvelope(); envelope != nil {
 		view.Envelope = placement.Headroom{

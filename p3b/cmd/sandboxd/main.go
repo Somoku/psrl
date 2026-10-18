@@ -109,6 +109,11 @@ type Config struct {
 		// the pod this service runs in: measured on one of these nodes, a ceiling
 		// applied to the pod was mostly about a trainer's page cache.
 		CgroupParent string `json:"cgroup_parent"`
+		// AdmissionReserve is the share of the envelope no running sandbox may spend, kept
+		// so a wave that has not arrived yet has somewhere to land. Without it the first
+		// wave takes the machine and grading -- or the next batch -- cannot be admitted
+		// until an episode finishes. Zero disables it; unset takes 10%.
+		AdmissionReserve float64 `json:"admission_reserve"`
 		// SampleIntervalS is how often the domain is measured. Zero takes 5s. The
 		// interval is also the window a CPU rate is averaged over.
 		SampleIntervalS float64 `json:"sample_interval_s"`
@@ -119,16 +124,25 @@ type Config struct {
 		// for their reclaimable memory when the node is near its budget. Disabled charges each
 		// sandbox its declared maximum, which is the shape every deployment had before.
 		Elastic struct {
-			Enabled         bool    `json:"enabled"`
-			MinReserveMB    int64   `json:"min_reserve_mb"`
-			Percentile      float64 `json:"percentile"`
-			GrowthMargin    float64 `json:"growth_margin"`
-			ShrinkAfter     int     `json:"shrink_after"`
-			ShrinkStep      float64 `json:"shrink_step"`
-			ShrinkAbove     float64 `json:"shrink_above"`
-			RestoreBelow    float64 `json:"restore_below"`
-			ReleaseMarginMB int64   `json:"release_margin_mb"`
-			MinLimitMB      int64   `json:"min_limit_mb"`
+			Enabled bool `json:"enabled"`
+			// MinReserveMB is what a sandbox is charged for memory before its class has
+			// any history; MinReserveCPUMillis is the same for CPU, in millicores.
+			MinReserveMB        int64   `json:"min_reserve_mb"`
+			MinReserveCPUMillis int64   `json:"min_reserve_cpu_millis"`
+			Percentile          float64 `json:"percentile"`
+			GrowthMargin        float64 `json:"growth_margin"`
+			ShrinkAfter         int     `json:"shrink_after"`
+			ShrinkStep          float64 `json:"shrink_step"`
+			ShrinkAbove         float64 `json:"shrink_above"`
+			RestoreBelow        float64 `json:"restore_below"`
+			ReleaseMarginMB     int64   `json:"release_margin_mb"`
+			MinLimitMB          int64   `json:"min_limit_mb"`
+			// ReleaseMarginCPUMillis is what an idle sandbox's quota is left above what it
+			// measured using, and MinCPUMillis is the lowest it may be throttled to.
+			ReleaseMarginCPUMillis int64 `json:"release_margin_cpu_millis"`
+			MinCPUMillis           int64 `json:"min_cpu_millis"`
+			// GrowthHorizonS is how far ahead admission reserves a class's observed growth.
+			GrowthHorizonS  float64 `json:"growth_horizon_s"`
 			SampleIntervalS float64 `json:"sample_interval_s"`
 		} `json:"elastic"`
 	} `json:"node"`
@@ -203,6 +217,12 @@ type BackendConfig struct {
 	// value the OpenSandbox deployment documents. Applies to every backend that
 	// drives a daemon: docker, opensandbox, and cubesandbox.
 	MaxCreateConcurrency int `json:"max_create_concurrency"`
+	// MountAllowlist is the host trees this node will share with a sandbox. Empty
+	// means it shares none, and a spec that asks for a mount is refused rather than
+	// created without it. A host mount is the one request in the contract that is
+	// about the machine, so the node states what it is willing to give instead of
+	// honouring any path a caller names.
+	MountAllowlist []string `json:"mount_allowlist"`
 
 	// OpenSandbox in direct mode. The agent image carries execd, bootstrap.sh,
 	// and bubblewrap; it is staged once at startup into stage_dir and then
@@ -344,7 +364,10 @@ func preflight(configPath string, log *slog.Logger) error {
 		LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 		Overcommit:        cfg.Node.Overcommit,
 		UtilizationTarget: cfg.Node.UtilizationTarget,
-		LeaseTTL:          timing.OwnerLease,
+		// A share of the envelope no sandbox may spend, so a later wave always has
+		// somewhere to land.
+		AdmissionReserve: cfg.Node.AdmissionReserve,
+		LeaseTTL:         timing.OwnerLease,
 	})
 	if err != nil {
 		return err
@@ -538,13 +561,17 @@ func runControl(ctx context.Context, cfg Config, spans timing.Contract, log *slo
 	}
 	control, err := server.NewControl(server.ControlConfig{
 		Registry: registry, Ledger: ledger, Placement: place, Monitor: fleet,
-		Nodes: fleetClient,
+		Nodes: fleetClient, Logger: log,
 	})
 	if err != nil {
 		return err
 	}
 
 	go sweepReservations(ctx, place, timing.SweepInterval)
+	// The fleet's grants are repriced between reports, because that is when the nodes'
+	// published prices move. Doing it on the admission path would put a walk of every
+	// live grant in front of the request that is waiting for it.
+	go repriceGrants(ctx, control, spans.LoadReportInterval())
 
 	listener, err := listen(cfg.Listen)
 	if err != nil {
@@ -656,7 +683,7 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 	}
 	control, err := server.NewControl(server.ControlConfig{
 		Registry: registry, Ledger: ledger, Placement: place, Monitor: fleet,
-		Nodes: nodes,
+		Nodes: nodes, Logger: log,
 	})
 	if err != nil {
 		return err
@@ -687,6 +714,10 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		}
 	}
 	go sweepReservations(ctx, place, timing.SweepInterval)
+	// The fleet's grants are repriced between reports, because that is when the nodes'
+	// published prices move. Doing it on the admission path would put a walk of every
+	// live grant in front of the request that is waiting for it.
+	go repriceGrants(ctx, control, spans.LoadReportInterval())
 
 	listener, err := listen(cfg.Listen)
 	if err != nil {
@@ -815,6 +846,7 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 				Runtime:              declared.Runtime,
 				NetworkMode:          declared.NetworkMode,
 				MaxCreateConcurrency: declared.MaxCreateConcurrency,
+				MountAllowlist:       declared.MountAllowlist,
 				CgroupParent:         cfg.Node.CgroupParent,
 				WarmPool: dockerbackend.WarmPoolConfig{
 					Template:       warmPoolTemplate(declared.WarmPool),
@@ -991,19 +1023,27 @@ func seconds(value float64) time.Duration {
 // elasticConfig turns the deployment's declaration into the controller's configuration.
 func elasticConfig(cfg Config) server.ElasticConfig {
 	declared := cfg.Node.Elastic
+	estimator := node.FootprintConfig{
+		Percentile:   declared.Percentile,
+		GrowthMargin: declared.GrowthMargin,
+		ShrinkAfter:  declared.ShrinkAfter,
+		ShrinkStep:   declared.ShrinkStep,
+	}
+	memory := estimator
+	memory.MinReserve = declared.MinReserveMB
+	cpu := estimator
+	cpu.MinReserve = declared.MinReserveCPUMillis
 	return server.ElasticConfig{
-		Enabled: declared.Enabled,
-		Footprint: node.FootprintConfig{
-			MinReserveMB: declared.MinReserveMB,
-			Percentile:   declared.Percentile,
-			GrowthMargin: declared.GrowthMargin,
-			ShrinkAfter:  declared.ShrinkAfter,
-			ShrinkStep:   declared.ShrinkStep,
-		},
-		ShrinkAbove:     declared.ShrinkAbove,
-		RestoreBelow:    declared.RestoreBelow,
-		ReleaseMarginMB: declared.ReleaseMarginMB,
-		MinLimitMB:      declared.MinLimitMB,
+		Enabled:                declared.Enabled,
+		Footprint:              memory,
+		CPUFootprint:           cpu,
+		ShrinkAbove:            declared.ShrinkAbove,
+		RestoreBelow:           declared.RestoreBelow,
+		ReleaseMarginMB:        declared.ReleaseMarginMB,
+		MinLimitMB:             declared.MinLimitMB,
+		ReleaseMarginCPUMillis: declared.ReleaseMarginCPUMillis,
+		MinCPUMillis:           declared.MinCPUMillis,
+		GrowthHorizonS:         declared.GrowthHorizonS,
 	}
 }
 
@@ -1025,13 +1065,18 @@ func elasticLoop(ctx context.Context, agent *server.Node, interval time.Duration
 			return
 		case <-ticker.C:
 			report := agent.ElasticTick(ctx)
-			if len(report.Shrunk) == 0 && len(report.Restored) == 0 && report.OOMKills == 0 {
+			changed := len(report.Shrunk) + len(report.Restored) +
+				len(report.Throttled) + len(report.Released)
+			if changed == 0 && report.OOMKills == 0 {
 				continue
 			}
 			log.Warn("elastic admission changed sandbox limits",
 				"observed_mib", report.ObservedMB, "budget_mib", report.BudgetMB,
-				"reserved_mib", report.ReservedMB, "reserves_mib", report.Reserves,
+				"reserved_mib", report.ReservedMB, "reserves_mib", report.ReservesMB,
+				"observed_cpu_millis", report.ObservedCPUMillis, "budget_cpu_millis", report.BudgetCPUMillis,
+				"reserved_cpu_millis", report.ReservedCPUMillis, "reserves_cpu_millis", report.ReservesCPUMillis,
 				"shrunk", len(report.Shrunk), "restored", len(report.Restored),
+				"throttled", len(report.Throttled), "released", len(report.Released),
 				"oom_kills", report.OOMKills)
 		}
 	}
@@ -1209,5 +1254,29 @@ func warmPoolTemplate(cfg WarmPoolDeclared) backend.Spec {
 		Workdir:       cfg.Workdir,
 		ExecMode:      cfg.ExecMode,
 		Lifetime:      seconds(cfg.LifetimeS),
+	}
+}
+
+// repriceGrants keeps the fleet's ledger honest about what the nodes measure.
+//
+// It runs on the report cadence for the same reason placement does: the fleet cannot know
+// a class's price until a node publishes it, and a price it has not seen yet is not a
+// reason to move anything.
+func repriceGrants(ctx context.Context, control *server.Control, interval time.Duration) {
+	if control == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			control.RepriceGrants()
+		}
 	}
 }

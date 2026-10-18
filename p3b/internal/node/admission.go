@@ -124,6 +124,12 @@ type Config struct {
 	// envelope accounts for what was promised, and this admits against what is
 	// actually being used. One means off, which is the default.
 	Overcommit float64
+	// ObservedMaxAge is how long a measured reading may serve as a floor on the charge
+	// without a fresh sample. Zero takes DefaultObservedMaxAge. It exists because a
+	// measurement is knowledge about a moment, and a domain that stopped being readable
+	// leaves that moment behind: the pages are still there, so the reading stays as the
+	// best estimate, but it is no longer a fact about now.
+	ObservedMaxAge time.Duration
 	// UtilizationTarget is the measured fraction at which the overcommit is fully
 	// withdrawn. Below it the node expands proportionally; at it the node grants
 	// exactly its declared envelope and nothing more.
@@ -132,6 +138,20 @@ type Config struct {
 	// to the point where the node starts refusing would mean the overcommit is
 	// handing out capacity the next request is rejected for.
 	UtilizationTarget float64
+	// AdmissionReserve is a share of the envelope that no running sandbox may consume, so
+	// there is always somewhere for a later request to go.
+	//
+	// Without it the first wave takes everything and the second wave -- grading, or the
+	// next batch -- has nowhere to land until a whole episode finishes. It is headroom
+	// reserved for admissions rather than for a class: a guarantee protects one class, and
+	// this protects the act of admitting at all.
+	AdmissionReserve float64
+	// DemandTTL bounds how long a refused request holds its class's guarantee. The
+	// guarantee exists so a class that is waiting is not starved by the classes that
+	// arrived first; a caller that has gone away is not waiting, and holding its share
+	// for longer than this keeps that share out of every other class's reach for nothing.
+	// Zero takes DefaultDemandTTL.
+	DemandTTL time.Duration
 	// LeaseTTL bounds a grant whose owner stops renewing.
 	LeaseTTL time.Duration
 }
@@ -221,16 +241,42 @@ type Admission struct {
 	// queued counts demand per class, so a class's guarantee is reserved only
 	// while it is actually waiting. Reserving against an idle class leaves the
 	// node idle and full at once.
-	queued   map[string]int
-	owners   map[string]time.Time
-	freeGPUs []int32
-	pressure Pressure
+	queued map[string]int
+	// queuedAt is when each class last had demand refused, which is what bounds the
+	// claim: a guarantee held for a caller that has gone quiet is capacity kept idle.
+	queuedAt map[string]time.Time
+	// growth is what each class is expected to grow by before the next sample can correct
+	// it: growthPerSandbox for the request being admitted, growthTotal for the ones
+	// already running.
+	//
+	// A sandbox's cost is not what it uses now, it is what it will have used by the time
+	// anyone notices -- and the noticing is a sample away. Charging only the present is
+	// how a fleet admits a burst at a price that stops being true before the burst has
+	// finished starting.
+	growthPerSandbox map[string]Resources
+	growthTotal      map[string]Resources
+	owners           map[string]time.Time
+	freeGPUs         []int32
+	pressure         Pressure
 	// observed is what the measured domain is actually using, and observedValid says
 	// whether that reading can be trusted. The ledger charges reservations, which are an
 	// estimate; when the estimate is low the measurement is the truth, so headroom is
 	// computed against whichever is larger.
+	//
+	// observedAt is when the reading was taken, and it is what makes "trusted" a
+	// statement about now rather than about a moment in the past. A domain that stopped
+	// being readable leaves the last measurement behind, and that measurement is still
+	// the best estimate of the pages -- memory does not come back on its own -- but it
+	// is not a fact about now, so it stops being a floor once it is old enough that the
+	// domain could have changed and we would not know.
 	observed      Resources
 	observedValid bool
+	observedAt    time.Time
+	// observedMaxAge is how long a measurement may be used as a floor without a fresh
+	// reading. Three missed samples is the same bound the pressure sampler uses to call
+	// a reading unusable, so the two dimensions stop agreeing at the same moment rather
+	// than one trusting a number the other has already discarded.
+	observedMaxAge time.Duration
 	// pool is the memory held by warm-pool entries that no caller has claimed yet.
 	// It is not a class: an entry exists before any episode does, so charging it to
 	// a class would let prefetching starve the work it exists to accelerate. It is
@@ -258,15 +304,146 @@ func NewAdmission(cfg Config) (*Admission, error) {
 	// Devices are declared as indices, so the envelope's device count follows from
 	// them rather than being configured twice and able to disagree.
 	cfg.Envelope.GPUCount = int32(len(cfg.GPUIndices))
+	if cfg.ObservedMaxAge <= 0 {
+		cfg.ObservedMaxAge = DefaultObservedMaxAge
+	}
+	if cfg.DemandTTL <= 0 {
+		cfg.DemandTTL = DefaultDemandTTL
+	}
+	if cfg.AdmissionReserve < 0 || cfg.AdmissionReserve >= 1 {
+		cfg.AdmissionReserve = DefaultAdmissionReserve
+	}
 	return &Admission{
-		cfg:      cfg,
-		used:     map[string]Resources{},
-		queued:   map[string]int{},
-		owners:   map[string]time.Time{},
-		freeGPUs: free,
-		refusals: map[Refusal]int64{},
-		now:      time.Now,
+		cfg:              cfg,
+		used:             map[string]Resources{},
+		queued:           map[string]int{},
+		queuedAt:         map[string]time.Time{},
+		growthPerSandbox: map[string]Resources{},
+		growthTotal:      map[string]Resources{},
+		owners:           map[string]time.Time{},
+		freeGPUs:         free,
+		refusals:         map[Refusal]int64{},
+		now:              time.Now,
+		observedMaxAge:   cfg.ObservedMaxAge,
 	}, nil
+}
+
+// DefaultObservedMaxAge is how long a measurement may serve as a floor without a fresh
+// reading. It is three sampling intervals at the cadence this deployment runs, so a
+// controller that has lost its domain for three samples stops being trusted rather than
+// keep charging against a number nobody has confirmed.
+const DefaultObservedMaxAge = 15 * time.Second
+
+// DefaultDemandTTL is how long a refused request keeps its class's guarantee reserved.
+// It is longer than a placement retry, so a request that bounces between nodes keeps its
+// claim, and far shorter than an episode, so a caller that gave up does not hold capacity
+// idle for the whole rollout.
+const DefaultDemandTTL = 2 * time.Minute
+
+// DefaultAdmissionReserve is the share of the envelope kept for admissions. Ten percent
+// costs a tenth of the density and buys the guarantee that a later wave -- grading, or the
+// next batch -- is never locked out until an episode finishes.
+const DefaultAdmissionReserve = 0.10
+
+// SetObservedMaxAge overrides the floor's freshness bound, for a test that drives the
+// clock or for a deployment whose sampling cadence is not the default five seconds.
+func (a *Admission) SetObservedMaxAge(age time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.observedMaxAge = age
+}
+
+// demandTTL is how long a refused request may hold its class's guarantee.
+func (a *Admission) demandTTL() time.Duration {
+	if a.cfg.DemandTTL > 0 {
+		return a.cfg.DemandTTL
+	}
+	return DefaultDemandTTL
+}
+
+// SetDemandTTL overrides how long a refused request holds its class's guarantee, for a
+// test that drives the clock.
+func (a *Admission) SetDemandTTL(ttl time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cfg.DemandTTL = ttl
+}
+
+// SetGrowth records what a class is expected to grow by before the next sample.
+//
+// perSandbox is added to the request being admitted, and total to the classes already
+// running. They are separate because they answer different questions -- "will this one
+// fit once it has grown" and "has the fleet already promised more than the machine can
+// hold once they all have" -- and adding one to the other would either double-charge the
+// candidate or let the running set grow for free.
+func (a *Admission) SetGrowth(class string, perSandbox, total Resources) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.growthPerSandbox == nil {
+		a.growthPerSandbox = map[string]Resources{}
+		a.growthTotal = map[string]Resources{}
+	}
+	a.growthPerSandbox[class] = perSandbox
+	a.growthTotal[class] = total
+}
+
+// totalGrowthLocked is the growth every class is expected to add before the next sample.
+func (a *Admission) totalGrowthLocked() Resources {
+	var total Resources
+	for _, growth := range a.growthTotal {
+		total = total.Add(growth)
+	}
+	return total
+}
+
+// admissionReserve is the share of the envelope kept for admissions.
+//
+// Zero is a configured choice -- "keep nothing back" -- and not an unset field, so it is
+// respected rather than replaced by the default. Only a value outside the range, which a
+// node could not honour, falls back.
+func (a *Admission) admissionReserve() float64 {
+	if a.cfg.AdmissionReserve >= 0 && a.cfg.AdmissionReserve < 1 {
+		return a.cfg.AdmissionReserve
+	}
+	return DefaultAdmissionReserve
+}
+
+// GrowthPerSandbox is what one more sandbox of this class is expected to grow by, which
+// admission charges on top of the class's price.
+func (a *Admission) GrowthPerSandbox(class string) Resources {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.growthPerSandbox[class]
+}
+
+// ExpireDemand drops claims whose caller has gone quiet, so a node is not left holding
+// a share for a request that will never arrive.
+func (a *Admission) ExpireDemand() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for name, seen := range a.queuedAt {
+		if a.now().Sub(seen) > a.demandTTL() {
+			delete(a.queued, name)
+			delete(a.queuedAt, name)
+		}
+	}
+}
+
+// observedUsableLocked reports whether the measurement may still be believed.
+//
+// A node that has never been given a reading is not a node with a stale one: the elastic
+// controller may be off, or it may not have ticked yet, and in that case overcommit has
+// always been pressure-driven. Requiring a measurement there would withdraw overcommit
+// from every deployment that never enabled the controller, which is a regression dressed
+// as a safety check. So the gate only applies once something has reported.
+func (a *Admission) observedUsableLocked() bool {
+	if a.observedAt.IsZero() {
+		return true
+	}
+	if !a.observedValid {
+		return false
+	}
+	return a.now().Sub(a.observedAt) <= a.observedMaxAge
 }
 
 // SetClock replaces the gate's clock, for a test that drives time directly.
@@ -287,6 +464,9 @@ func (a *Admission) SetObserved(used Resources, valid bool) {
 	defer a.mu.Unlock()
 	a.observed = used
 	a.observedValid = valid
+	if valid {
+		a.observedAt = a.now()
+	}
 }
 
 // Adjust changes a class's charge by a delta.
@@ -393,10 +573,23 @@ func (a *Admission) Draining() bool {
 
 // Enqueue records demand that could not be admitted, so this class's guarantee
 // is held back while it waits.
+//
+// It is the only thing that makes a guarantee real at this node. A guarantee says a
+// class can always have its share, but the share is only worth something if it is held
+// back from everyone else *while the class is waiting*, and the node is the only place
+// that can see a class waiting: the control plane sees refusals from whichever node it
+// happened to ask, and it does not own the pages. A node that never records refused
+// demand has guarantees that are never exercised, and the first class to arrive takes
+// the whole envelope -- which at this deployment showed up as grading sandboxes that
+// could never be admitted because rollout had already taken the machine.
+//
+// The demand is stamped, because a refusal is not a reservation forever: a caller that
+// went away must not hold a share idle, so the claim lapses (see Config.DemandTTL).
 func (a *Admission) Enqueue(class string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.queued[class]++
+	a.queuedAt[class] = a.now()
 }
 
 // Dequeue withdraws queued demand whose caller gave up or was admitted.
@@ -407,6 +600,7 @@ func (a *Admission) Dequeue(class string) {
 		a.queued[class]--
 		if a.queued[class] == 0 {
 			delete(a.queued, class)
+			delete(a.queuedAt, class)
 		}
 	}
 }
@@ -506,7 +700,14 @@ func (a *Admission) effectiveEnvelopeLocked() Resources {
 	}
 	// An unusable sample withdraws the expansion rather than reading as idle: the
 	// node then admits exactly its declared envelope, which is the behaviour it had
-	// before overcommit existed. A *valid* zero is different and is not special-cased
+	// before overcommit existed. Unusable now covers the measurement as well as the
+	// pressure: overcommit is the claim that reservations overstate use, and a node
+	// that has not read its sandbox domain for a while cannot make that claim. Both
+	// signals therefore have to be fresh for the envelope to expand.
+	if !a.observedUsableLocked() {
+		return envelope
+	}
+	// A *valid* zero is different and is not special-cased
 	// -- it means the measured domain is empty, which is the case the feature is for.
 	if !a.pressure.Valid {
 		return envelope
@@ -555,10 +756,28 @@ func (a *Admission) headroomLocked(class string) Resources {
 	// The charge is the larger of what was promised and what is measured: reservations
 	// that the measurement has outgrown are no longer what bounds the node.
 	bound := a.totalUsedLocked()
+	// A stale measurement is still a floor, and the reason is the direction of the
+	// unknown. Sandboxes released since the last reading would make the true usage
+	// lower, but sandboxes that kept growing would make it higher, and of the two only
+	// the second can cost an episode. So the last reading stays as the floor -- the node
+	// never assumes usage went down because it cannot confirm it -- and what a stale
+	// reading costs is the expansion: see effectiveEnvelopeLocked, which withdraws
+	// overcommit until the domain is readable again.
 	if a.observedValid && a.observed.MemoryMB > bound.MemoryMB {
 		bound.MemoryMB = a.observed.MemoryMB
 	}
-	free := effective.Sub(bound).Sub(a.pool).Sub(a.reservedForOthersLocked(class))
+	if a.observedValid && a.observed.CPUMillis > bound.CPUMillis {
+		bound.CPUMillis = a.observed.CPUMillis
+	}
+	// Growth comes next, and it is charged against every class rather than the one
+	// asking: the sandboxes that are already running are the ones about to grow, and
+	// their growth consumes the same pages and the same cores as a new sandbox would.
+	bound = bound.Add(a.totalGrowthLocked())
+	// What is left is then reduced by the admission reserve, which no class may spend.
+	// This is the capacity a later wave lands in; a node that let the first wave take
+	// all of it has to wait for an episode to end before it can admit anything at all.
+	free := effective.Sub(bound).Sub(a.pool).Sub(a.reservedForOthersLocked(class)).
+		Sub(a.cfg.Envelope.Scale(a.admissionReserve()))
 	share, declared := a.cfg.Classes[class]
 	if !declared || share.Max == 0 {
 		return free
@@ -605,6 +824,11 @@ func (a *Admission) reservedForOthersLocked(class string) Resources {
 	var reserved Resources
 	for name, share := range a.cfg.Classes {
 		if name == class || a.queued[name] == 0 {
+			continue
+		}
+		if seen, ok := a.queuedAt[name]; ok && a.now().Sub(seen) > a.demandTTL() {
+			// The demand lapsed. The share goes back to the pool rather than sitting idle
+			// for a caller that is no longer asking.
 			continue
 		}
 		reserved = reserved.Add(a.cfg.Envelope.Scale(share.Guaranteed).Sub(a.used[name]))
@@ -745,6 +969,11 @@ type Report struct {
 	// is bounded by when it exceeds the reservations.
 	Observed      Resources
 	ObservedValid bool
+	// ObservedFresh says the reading is recent enough to still be used as a floor. Valid
+	// but stale means the domain stopped being readable and admission has gone back to
+	// charging reservations alone, which is the state an operator has to be able to see:
+	// without it an unreadable domain looks exactly like an idle one.
+	ObservedFresh bool
 	// Pooled is the memory held by warm-pool entries that no caller has claimed.
 	// It is inside Granted's envelope but outside every class's charge, which is
 	// why a report that omitted it would show headroom the node does not have.
@@ -780,6 +1009,7 @@ func (a *Admission) Snapshot() Report {
 		Granted:           a.totalUsedLocked(),
 		Observed:          a.observed,
 		ObservedValid:     a.observedValid,
+		ObservedFresh:     a.observedUsableLocked(),
 		Pooled:            a.pool,
 		FreeGPUs:          len(a.freeGPUs),
 		Draining:          a.draining,

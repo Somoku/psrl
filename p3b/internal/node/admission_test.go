@@ -17,6 +17,11 @@ func envelope() Config {
 		LocalCPUCeiling: 0.95,
 		LocalMemCeiling: 0.90,
 		LeaseTTL:        time.Minute,
+		// Off here on purpose. These tests isolate the guarantee, the ceiling and the
+		// pressure rules against a whole envelope; the admission reserve takes a share of
+		// every one of them, so leaving it on would move every number in the file. It has
+		// its own test.
+		AdmissionReserve: 0,
 	}
 }
 
@@ -535,5 +540,45 @@ func TestAShrinkBelowZeroIsCorrectedRatherThanCarried(t *testing.T) {
 
 	if got := gate.Snapshot().Granted.MemoryMB; got != 0 {
 		t.Errorf("granted: got %d, want 0", got)
+	}
+}
+
+func TestTheAdmissionReserveIsHeldForAWaveThatHasNotArrived(t *testing.T) {
+	// A share of the envelope no running sandbox may spend. Without it the first wave
+	// takes the machine and the second wave -- grading, or the next batch -- has nowhere
+	// to land until an episode finishes, which is what turned into trajectories kept but
+	// ungraded.
+	cfg := envelope()
+	cfg.AdmissionReserve = 0.10
+	gate := mustGate(t, cfg)
+
+	if got := gate.Headroom("rollout").MemoryMB; got != 900 {
+		t.Fatalf("headroom with a 10%% reserve: got %dMB, want 900MB", got)
+	}
+	// The reserve is not a class guarantee: it is taken after every other deduction, so
+	// it costs density and nothing else, and it is there for whoever arrives next.
+	if got := gate.Headroom("grader").MemoryMB; got != 900 {
+		t.Errorf("the reserve is not class-specific: got %dMB for grader", got)
+	}
+}
+
+func TestExpectedGrowthIsChargedBeforeItHappens(t *testing.T) {
+	// The cost of a sandbox is not what it uses now, it is what it will have used by the
+	// time anyone notices. Charging only the present is how a fleet admits a burst at a
+	// price that stops being true before the burst has finished starting.
+	gate := mustGate(t, envelope())
+	gate.Reserve("rollout", "w", Resources{MemoryMB: 100, CPUMillis: 500})
+
+	if got := gate.Headroom("rollout").MemoryMB; got != 900 {
+		t.Fatalf("headroom before growth is known: got %dMB, want 900MB", got)
+	}
+
+	// Ten sandboxes are running and each is growing by 5MB before the next sample.
+	gate.SetGrowth("rollout", Resources{MemoryMB: 5}, Resources{MemoryMB: 50})
+	if got := gate.Headroom("rollout").MemoryMB; got != 850 {
+		t.Errorf("headroom with growth reserved: got %dMB, want 850MB", got)
+	}
+	if got := gate.GrowthPerSandbox("rollout").MemoryMB; got != 5 {
+		t.Errorf("the candidate's own growth: got %dMB, want 5MB", got)
 	}
 }

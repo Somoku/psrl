@@ -218,24 +218,28 @@ func (n *Node) CreateOn(ctx context.Context, req *v1.CreateOnRequest) (*v1.Creat
 
 	// The container is born under its guarantee, not under its declared maximum. Doing it
 	// here rather than by lowering the limit afterwards means there is no window in which
-	// the sandbox is bounded by a number the node has not agreed to back, and it is the
-	// only point at which the *creation* limit and the *ceiling* can be different numbers
-	// without a second write racing the sandbox's own first allocations.
-	spec = n.applyStartLimit(spec)
+	// the sandbox is bounded by a number the node has not agreed to back.
+	//
+	// The lowered bound goes into a copy. The spec itself keeps what the caller declared,
+	// because that is the ceiling growth may reach: remembering the ceiling from the copy
+	// would record the guarantee as the maximum, and a sandbox with nowhere to grow is
+	// exactly the one this exists to help.
+	createSpec := n.applyStartLimit(spec)
 
 	if handled, found, err := n.adoptByIdempotencyKey(ctx, hosted, leaseID, spec.IdempotencyKey); found {
 		return handled, err
 	}
 
-	created, err := hosted.Create(ctx, n.nodeID, spec, req.GetCallbackTarget())
+	created, err := hosted.Create(ctx, n.nodeID, createSpec, req.GetCallbackTarget())
 	if err != nil {
 		// The sandbox does not exist, so its admission must not stay charged.
 		n.lifecycle.FailCreate(leaseID)
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	// The kernel limit is the declared maximum even though the ledger charges the class's
-	// estimate, so the controller needs both numbers -- for CPU too, because a throttled
-	// quota is restored to what the sandbox declared.
+	// The ceiling is the declared maximum even though the container was created under the
+	// guarantee and the ledger charges the class's estimate, so the controller needs all
+	// three numbers -- for CPU too, because a throttled quota is restored to what the
+	// sandbox declared.
 	n.elasticRemember(created.Handle.SandboxID, spec)
 	if !n.lifecycle.AdoptCreated(leaseID, created.Handle, hosted) {
 		// The record was reclaimed while the create was in flight, so this

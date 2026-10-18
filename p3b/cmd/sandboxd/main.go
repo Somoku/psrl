@@ -481,7 +481,12 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 			"min_reserve_mb", cfg.Node.Elastic.MinReserveMB,
 			"growth_margin", cfg.Node.Elastic.GrowthMargin,
 			"shrink_above", cfg.Node.Elastic.ShrinkAbove,
-			"restore_below", cfg.Node.Elastic.RestoreBelow)
+			"restore_below", cfg.Node.Elastic.RestoreBelow,
+			// The two numbers the bounds controller turns on: a sandbox that is created
+			// at its declared maximum has nowhere to grow, and a cadence that is not
+			// sub-second cannot see the burst that kills it.
+			"start_limit_mb", cfg.Node.Elastic.StartLimitMB,
+			"limit_sample_interval_s", cfg.Node.Elastic.LimitSampleIntervalS)
 	}
 	agent, err := server.NewNode(server.NodeConfig{
 		NodeID: cfg.NodeID, Admission: gate, Lifecycle: life, Backends: local,

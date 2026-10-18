@@ -120,12 +120,20 @@ func TestASandboxIsCreatedUnderItsGuaranteeNotItsMaximum(t *testing.T) {
 
 	spec := backendSpec(t, "rollout", 2)
 	spec.Resources.MemoryMB = 30720
-	created := agent.applyStartLimit(spec)
 
+	// The sequence CreateOn actually runs: lower a copy for the creation call, and
+	// remember what the caller declared.
+	//
+	// Lowering the spec itself and then remembering it records the guarantee as the
+	// ceiling. A sandbox whose ceiling is its guarantee has nowhere to grow, so every
+	// growth rule silently does nothing and the sandbox is killed at its start bound --
+	// the failure this whole mechanism exists to prevent, produced by the mechanism.
+	created := agent.applyStartLimit(spec)
 	if created.Resources.MemoryMB != 8192 {
 		t.Errorf("creation limit: got %d MiB, want the 8192 MiB guarantee", created.Resources.MemoryMB)
 	}
 	agent.elasticRemember("sb-1", spec)
+
 	if got := agent.elastic.startMBBySandbox["sb-1"]; got != 8192 {
 		t.Errorf("remembered start: got %d, want 8192", got)
 	}
@@ -133,6 +141,9 @@ func TestASandboxIsCreatedUnderItsGuaranteeNotItsMaximum(t *testing.T) {
 	// what the sandbox may become -- only what it must be given before it has asked.
 	if got := agent.elastic.maxMemoryMBBySandbox["sb-1"]; got != 30720 {
 		t.Errorf("remembered ceiling: got %d, want the 30720 MiB declared", got)
+	}
+	if ceiling := agent.ceilingLocked("sb-1") / mib; ceiling != 30720 {
+		t.Errorf("ceiling: got %d MiB, want 30720 -- growth would have nowhere to go", ceiling)
 	}
 }
 

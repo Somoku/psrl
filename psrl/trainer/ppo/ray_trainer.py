@@ -1112,7 +1112,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def _val_metrics_update(
         self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns
     ) -> dict[str, float]:
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        # `reward_extra_info` is one dict per sample, kept for the generation dump. It is
+        # not a metric series and averaging a dict raises inside verl's metric utils, so
+        # it is held back here. Passing it through crashed every validation that reached
+        # this point, whatever the transport.
+        metric_infos = {k: v for k, v in reward_extra_infos_dict.items() if k != "reward_extra_info"}
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, metric_infos)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
@@ -1326,7 +1331,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         return self._val_metrics_update(data_sources, sample_parent_ids, reward_extra_infos_dict, sample_turns)
 
-    @staticmethod
     def _write_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
         """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)

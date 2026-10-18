@@ -1,6 +1,12 @@
 - name: mini_swe_claude_code
   _target_: psrl.workers.agent_loop.loops.mini_swe_harness_agent_loop.MiniSWEHarnessAgentLoop
   sandbox_config: &sandbox_config
+    # p3b, not the in-process docker backend: the service is what prices a sandbox from
+    # what it measures, and its ledger is the one that can admit a burst. Left unset, this
+    # falls through to the manager's default backend, which here is the in-process docker
+    # one -- and that one charges each sandbox its declared 30 GiB against a local mirror
+    # of the node envelope, which caps a step at 58 sandboxes per node.
+    backend: p3b
     sandbox_cpu_count: 2
     collect_resource_metrics: ${oc.decode:${oc.env:PSRL_SANDBOX_COLLECT_RESOURCE_METRICS,false}}
     snapshot_verifier: true
@@ -11,7 +17,7 @@
     rollout_environment:
       # Must cover whatever the agent runs inside the sandbox (pytest, type checkers). An
       # undersized limit gets the whole container OOM-killed and the episode loses its work.
-      memory: "16g"
+      memory: "30g"
       # Node capacity class. Each class holds a guaranteed slice of the node envelope, so the
       # rollout and grader sandboxes below cannot starve each other. Both names must be
       # declared under rollout.agent.sandbox.capacity.classes.

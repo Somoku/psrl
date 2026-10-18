@@ -36,7 +36,7 @@
       "growth_horizon_s": 60,
       "start_limit_mb": 8192,
       "limit_sample_interval_s": 0.2,
-      "reap_foreign": true
+      "reap_foreign": false
     },
     "admission_reserve": 0.1
   },

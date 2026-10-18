@@ -143,6 +143,15 @@ type ElasticConfig struct {
 	// with real pages in them is real memory, and removing the directory would not free
 	// them -- it would only stop anyone from being able to say whose they are.
 	ReapUsageMB int64
+	// ReapDwellS is how long a cgroup must have been foreign before it is a candidate.
+	//
+	// This is the guard that makes the difference between an orphan and a container that
+	// has not been registered yet. Docker creates a container's cgroups in every
+	// hierarchy at create time and does not write its process into them until start; in
+	// between, the directory has no tasks and no usage and is indistinguishable from
+	// garbage. Removing it makes the start fail with ENODEV on a cgroup that no longer
+	// exists. A runtime owns its container in milliseconds, and this waits far longer.
+	ReapDwellS float64
 	// LimitSampleIntervalS is how often the limit controller reads the domain. It is much
 	// shorter than the pricing cadence because the two answer different questions: a price
 	// is a statistic over a class and is noise at this resolution, while a limit is a
@@ -209,6 +218,9 @@ func ElasticConfigWithDefaults(cfg ElasticConfig) ElasticConfig {
 	if cfg.ReapUsageMB <= 0 {
 		cfg.ReapUsageMB = DefaultReapUsageMB
 	}
+	if cfg.ReapDwellS <= 0 {
+		cfg.ReapDwellS = DefaultReapDwellS
+	}
 	// A quarter of a core is what a sandbox holding a shell and an agent costs before the
 	// class has any history. It is deliberately not zero: the first batch after a restart
 	// is admitted against this, and zero would say a sandbox is free.
@@ -258,6 +270,20 @@ const DefaultLimitSampleIntervalS = 0.2
 // point is not to free the memory -- rmdir does not -- but to be able to say, before
 // removing a directory, that no work is in it.
 const DefaultReapUsageMB = 64
+
+// DefaultReapDwellS is how long a cgroup must have been foreign before the node will
+// consider removing it.
+//
+// A minute, for the same reason the shrink dwell is a minute: the observation that makes a
+// cgroup look disposable is also true of a container at the wrong moment of its own life,
+// and the cost of being wrong is an episode rather than an optimisation.
+const DefaultReapDwellS = 60.0
+
+// daemonOwnedTTL is how long the runtime's own inventory is reused.
+//
+// Enumerating a daemon with hundreds of containers is not a thing to do on every tick, and
+// the answer only ever loses entries -- a container that exists now existed a second ago.
+const daemonOwnedTTL = 30 * time.Second
 
 // DefaultLimitSampleInterval is DefaultLimitSampleIntervalS as a duration, for the
 // deployment's loop, which needs a ticker rather than a number.
@@ -707,32 +733,40 @@ func (n *Node) elasticRemember(sandboxID string, spec backend.Spec) {
 // A container that is destroyed leaves its cgroup behind when the kernel still holds a
 // reference to it -- a charged page, a zombie -- and the directory then outlives the
 // container for as long as the node runs. They accumulate one wave at a time, and what
-// they cost is not the memory, which is usually nil, but the accounting: they are counted
-// in the domain's observed usage, their cumulative OOM and failcnt counters are counted
-// with everybody else's, and their bounds are counted in the sum the machine has to back.
-// A node that has run for a week reports faults nobody can act on.
+// they cost is the accounting rather than the memory: they are counted in the domain's
+// observed usage, and before this change their cumulative OOM counters were counted with
+// everybody else's, so a node that had run for a while reported faults nobody owned.
 //
 // The guards, in order of how much they protect:
 //
-//   - The node must not own it. A cgroup the controller has registered, or one with a live
-//     allocation, is somebody's sandbox.
-//   - It must be holding almost nothing. A cgroup with real pages in it is real memory on
-//     the machine, and removing the directory does not free them -- it only stops anyone
-//     from being able to say whose they are.
+//   - The node must not own it, and neither may the runtime. A cgroup the controller has
+//     registered, one with a live allocation, or one the daemon says is a container of
+//     its own is somebody's sandbox -- including a warm-pool entry, which has no lease
+//     and no tasks and looks exactly like garbage.
+//   - It must have been foreign for ReapDwellS. This is the one that separates an orphan
+//     from a container that has simply not been registered yet: Docker creates the
+//     cgroups in every hierarchy at create time and writes the process into them at
+//     start, and in between the directory is empty and indistinguishable. Removing it
+//     makes the start fail with ENODEV against a cgroup that no longer exists.
+//   - It must be holding almost nothing. A cgroup with real pages in it is real memory,
+//     and removing the directory does not free them -- it only stops anyone from being
+//     able to say whose they are.
 //   - The kernel must agree. rmdir on a cgroup that still holds a task fails, and that is
 //     the only test for "is anything in there" that cannot be wrong.
-//
-// A directory that cannot be removed is left alone and reported once, not retried every
-// five seconds for the rest of the run.
-func (n *Node) reapForeign(children []cgroup.Child) []string {
+func (n *Node) reapForeign(children []cgroup.Child, now time.Time) []string {
 	if !n.elastic.cfg.ReapForeign || len(n.elasticDomain.Hierarchies) == 0 {
 		return nil
 	}
+	dwell := time.Duration(n.elastic.cfg.ReapDwellS * float64(time.Second))
 	limit := n.elastic.cfg.ReapUsageMB * mib
 	if limit <= 0 {
 		limit = DefaultReapUsageMB * mib
 	}
-	var reaped []string
+
+	// First-seen times, refreshed against this tick's reading. A cgroup that has gone is
+	// forgotten, so a later one that reuses the name is not treated as old.
+	present := make(map[string]struct{}, len(children))
+	var candidates []cgroup.Child
 	for _, child := range children {
 		if _, known := n.elastic.classBySandbox[child.ID]; known {
 			continue
@@ -740,7 +774,34 @@ func (n *Node) reapForeign(children []cgroup.Child) []string {
 		if n.lifecycle.Running(child.ID) {
 			continue
 		}
+		present[child.ID] = struct{}{}
+		if _, seen := n.elastic.foreignSince[child.ID]; !seen {
+			n.elastic.foreignSince[child.ID] = now
+			continue
+		}
+		if now.Sub(n.elastic.foreignSince[child.ID]) < dwell {
+			continue
+		}
 		if child.Usage > limit {
+			continue
+		}
+		candidates = append(candidates, child)
+	}
+	for id := range n.elastic.foreignSince {
+		if _, here := present[id]; !here {
+			delete(n.elastic.foreignSince, id)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	owned := n.daemonOwned(now)
+	var reaped []string
+	for _, child := range candidates {
+		if _, theirs := owned[child.ID]; theirs {
+			// The runtime says this is a container of its own. It may be stopped, or idle
+			// in a pool, or mid-create: none of those are states a node may delete.
 			continue
 		}
 		if err := n.elasticDomain.RemoveChild(n.elasticParent, child.ID); err != nil {
@@ -752,11 +813,49 @@ func (n *Node) reapForeign(children []cgroup.Child) []string {
 			continue
 		}
 		delete(n.elastic.reapFailed, child.ID)
+		delete(n.elastic.foreignSince, child.ID)
 		reaped = append(reaped, child.ID)
 		slog.Info("elastic admission removed an orphaned cgroup",
-			"sandbox", child.ID, "usage_mb", child.Usage/mib)
+			"sandbox", child.ID, "usage_mb", child.Usage/mib,
+			"foreign_for", now.Sub(n.elastic.foreignSince[child.ID]).String())
 	}
 	return reaped
+}
+
+// daemonOwned asks the runtimes this node hosts which sandboxes they actually have.
+//
+// The node's own records are not enough to decide that a cgroup belongs to nothing: a
+// warm-pool entry has no lease and no tasks, and a container between create and start has
+// neither a registration nor a process. Only the runtime knows. The answer is cached
+// because enumerating a daemon is not a thing to do on every tick, and because it only
+// ever loses entries -- a container that exists now existed a moment ago.
+func (n *Node) daemonOwned(now time.Time) map[string]struct{} {
+	if !n.elastic.ownedAt.IsZero() && now.Sub(n.elastic.ownedAt) < daemonOwnedTTL {
+		return n.elastic.owned
+	}
+	out := make(map[string]struct{})
+	for _, name := range n.order {
+		reconciler, can := n.backends[name].(backend.Reconciler)
+		if !can {
+			// A runtime whose objects live on an external platform has nothing on this
+			// machine to protect.
+			continue
+		}
+		found, err := reconciler.Reconcile(context.Background())
+		if err != nil {
+			slog.Warn("elastic admission could not enumerate a runtime before reaping",
+				"backend", name, "error", err)
+			// Not knowing is not permission. Leave everything alone until the runtime
+			// will answer.
+			return n.elastic.owned
+		}
+		for _, rec := range found {
+			out[rec.Handle.SandboxID] = struct{}{}
+		}
+	}
+	n.elastic.owned = out
+	n.elastic.ownedAt = now
+	return out
 }
 
 type elastic struct {
@@ -792,6 +891,13 @@ type elastic struct {
 	// reapFailed names the orphaned cgroups the kernel would not let go, so the node says
 	// so once instead of every five seconds for the rest of the run.
 	reapFailed map[string]bool
+	// foreignSince is when each cgroup in the domain was first seen as belonging to
+	// nobody. Nothing is removed on the strength of one observation.
+	foreignSince map[string]time.Time
+	// owned is what the runtimes last said they have, and ownedAt when. A cgroup the
+	// runtime owns is not an orphan whatever it looks like.
+	owned   map[string]struct{}
+	ownedAt time.Time
 	// classBySandbox is what the sandbox was admitted as.
 	classBySandbox map[string]string
 	// throttled records which sandboxes are currently below their declared CPU quota.
@@ -895,7 +1001,7 @@ func (n *Node) ElasticTick(ctx context.Context) ElasticReport {
 	report.OOMKills = oomKills
 	report.Foreign = foreign
 	report.ForeignMB = foreignBytes / (1024 * 1024)
-	if reap := n.reapForeign(children); len(reap) > 0 {
+	if reap := n.reapForeign(children, time.Now()); len(reap) > 0 {
 		report.Reaped = reap
 	}
 	if measured > 0 {

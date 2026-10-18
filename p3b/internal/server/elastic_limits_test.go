@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -588,4 +589,164 @@ func TestOrphansAreLeftAloneUnlessReapingIsEnabled(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(memoryDir, parent, "empty-orphan")); err != nil {
 		t.Errorf("an orphan was removed with reaping off: %v", err)
 	}
+}
+
+// A container between create and start is not an orphan.
+//
+// Docker creates a container's cgroups in every hierarchy at create time and writes the
+// process into them at start. In between, the directory has no tasks and holds nothing and
+// is indistinguishable from the residue of a destroyed container -- which is how a node
+// removed one out from under a start and the start failed with ENODEV against a cgroup
+// that no longer existed.
+//
+// Nothing is removed on the strength of one observation, so the window has to close before
+// the node will act, and a runtime that claims the container is never contradicted.
+func TestAContainerBeingCreatedIsNotReaped(t *testing.T) {
+	const parent = "psrl-test-sandboxes"
+	domain, memoryDir, cpuDir := fakeDomain(t, parent)
+	agent := limitsNode(t, domain, parent, 100000, 100000, ElasticConfig{
+		Enabled: true, StartLimitMB: 1024, ReapForeign: true, ReapUsageMB: 64, ReapDwellS: 60,
+	})
+	sandbox(t, memoryDir, cpuDir, parent, "starting", 0, 1024*mib)
+
+	now := time.Now()
+	// The observable for "this is now a candidate" is that the node went and asked the
+	// runtime what it owns. It only does that when something has waited out the dwell --
+	// the removal itself is a question for the kernel and is covered by the integration
+	// test, because a tmpfs directory full of files cannot be rmdir'd.
+	agent.reapForeign(mustChildren(t, domain, parent), now)
+	if !agent.elastic.ownedAt.IsZero() {
+		t.Fatal("the node asked the runtime about a cgroup it had only just seen")
+	}
+	agent.reapForeign(mustChildren(t, domain, parent), now.Add(30*time.Second))
+	if !agent.elastic.ownedAt.IsZero() {
+		t.Fatal("the node asked the runtime before the dwell had passed")
+	}
+	agent.reapForeign(mustChildren(t, domain, parent), now.Add(61*time.Second))
+	if agent.elastic.ownedAt.IsZero() {
+		t.Fatal("the node never treated the orphan as a candidate")
+	}
+	// And the cgroup is still there: the guards decided, nothing was destroyed.
+	if _, err := os.Stat(filepath.Join(memoryDir, parent, "starting")); err != nil {
+		t.Errorf("the cgroup was removed: %v", err)
+	}
+}
+
+// A runtime that says the container is its own is believed, whatever the cgroup looks like.
+//
+// A warm-pool entry has no lease and no tasks; a stopped container has no process. Both
+// look exactly like garbage from the cgroup, and deleting either is destroying a sandbox.
+func TestACgroupTheRuntimeOwnsIsNeverReaped(t *testing.T) {
+	const parent = "psrl-test-sandboxes"
+	domain, memoryDir, cpuDir := fakeDomain(t, parent)
+	agent := ownedNode(t, domain, parent, "theirs")
+	sandbox(t, memoryDir, cpuDir, parent, "theirs", 0, 1024*mib)
+	sandbox(t, memoryDir, cpuDir, parent, "nobody", 0, 1024*mib)
+
+	now := time.Now()
+	agent.reapForeign(mustChildren(t, domain, parent), now)
+	reaped := agent.reapForeign(mustChildren(t, domain, parent), now.Add(120*time.Second))
+
+	for _, id := range reaped {
+		if id == "theirs" {
+			t.Errorf("the runtime's own container was reaped")
+		}
+	}
+	if _, err := os.Stat(filepath.Join(memoryDir, parent, "theirs")); err != nil {
+		t.Errorf("the runtime's container lost its cgroup: %v", err)
+	}
+}
+
+// Not knowing what the runtime owns is not permission to delete.
+func TestARuntimeThatWillNotAnswerStopsAllReaping(t *testing.T) {
+	const parent = "psrl-test-sandboxes"
+	domain, memoryDir, cpuDir := fakeDomain(t, parent)
+	agent := brokenNode(t, domain, parent)
+	sandbox(t, memoryDir, cpuDir, parent, "nobody", 0, 1024*mib)
+
+	now := time.Now()
+	agent.reapForeign(mustChildren(t, domain, parent), now)
+	if got := agent.reapForeign(mustChildren(t, domain, parent), now.Add(120*time.Second)); len(got) != 0 {
+		t.Errorf("reaped while the runtime would not answer: %v", got)
+	}
+	if _, err := os.Stat(filepath.Join(memoryDir, parent, "nobody")); err != nil {
+		t.Errorf("removed a cgroup without knowing who owned it: %v", err)
+	}
+}
+
+func mustChildren(t *testing.T, domain cgroup.Domain, parent string) []cgroup.Child {
+	t.Helper()
+	children, err := domain.Children(parent)
+	if err != nil {
+		t.Fatalf("read the domain: %v", err)
+	}
+	return children
+}
+
+// ownedBackend is a runtime that says which containers are its own, and brokenBackend one
+// that will not answer. Both stand in for the property that decides reaping: only the
+// runtime knows whether a cgroup belongs to something.
+type ownedBackend struct {
+	providerStub
+	owned []string
+	err   error
+}
+
+func (b ownedBackend) Reconcile(context.Context) ([]backend.Reconciled, error) {
+	if b.err != nil {
+		return nil, b.err
+	}
+	out := make([]backend.Reconciled, 0, len(b.owned))
+	for _, id := range b.owned {
+		out = append(out, backend.Reconciled{
+			Handle: backend.Handle{Backend: "stub", SandboxID: id},
+		})
+	}
+	return out, nil
+}
+
+func (b ownedBackend) FindByIdempotencyKey(context.Context, string) (backend.Reconciled, bool, error) {
+	return backend.Reconciled{}, false, nil
+}
+
+// nodeWithBackend builds a reaping node over a runtime that reports the given containers.
+func nodeWithBackend(t *testing.T, domain cgroup.Domain, parent string, be backend.Backend) *Node {
+	t.Helper()
+	gate, err := node.NewAdmission(node.Config{
+		Envelope: node.Resources{MemoryMB: 100000, CPUMillis: 100000},
+		Classes:  map[string]node.ClassShare{"rollout": {Guaranteed: 0.9}, "grader": {Guaranteed: 0.1}},
+		LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("gate: %v", err)
+	}
+	gate.SetPressure(node.Pressure{SampledAt: time.Now(), Valid: true})
+	life, err := node.NewLifecycle("n1", gate, time.Second)
+	if err != nil {
+		t.Fatalf("lifecycle: %v", err)
+	}
+	agent, err := NewNode(NodeConfig{
+		NodeID: "n1", Admission: gate, Lifecycle: life,
+		Backends: []backend.Backend{be},
+		Pressure: func() node.Pressure { return node.Pressure{SampledAt: time.Now(), Valid: true} },
+		Elastic: ElasticConfig{
+			Enabled: true, StartLimitMB: 1024,
+			ReapForeign: true, ReapUsageMB: 64, ReapDwellS: 60,
+		},
+		Domain: domain, SandboxParent: parent, SandboxBudgetMB: 100000,
+	})
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	return agent
+}
+
+func ownedNode(t *testing.T, domain cgroup.Domain, parent string, owned ...string) *Node {
+	t.Helper()
+	return nodeWithBackend(t, domain, parent, ownedBackend{owned: owned})
+}
+
+func brokenNode(t *testing.T, domain cgroup.Domain, parent string) *Node {
+	t.Helper()
+	return nodeWithBackend(t, domain, parent, ownedBackend{err: errors.New("daemon unreachable")})
 }

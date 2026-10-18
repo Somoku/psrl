@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"psrl.dev/sandboxd/internal/cgroup"
 )
@@ -69,7 +70,11 @@ func TestAnOrphanedCgroupIsRemovedFromEveryHierarchy(t *testing.T) {
 		t.Fatalf("the orphan is not in the domain: %v", children)
 	}
 
-	reaped := agent.reapForeign(children)
+	// Twice, with the dwell elapsed in between: nothing is removed on the strength of one
+	// observation, because one observation is also what a container mid-create looks like.
+	now := time.Now()
+	agent.reapForeign(children, now)
+	reaped := agent.reapForeign(children, now.Add(2*time.Minute))
 	if len(reaped) != 1 || reaped[0] != id {
 		t.Fatalf("reaped: got %v, want the orphan", reaped)
 	}

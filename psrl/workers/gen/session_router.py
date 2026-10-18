@@ -222,7 +222,7 @@ class SessionRouter:
         is_subagent = self.is_subagent_request(request)
         async with state.lock:
             if state.turn_budget_exhausted:
-                psrl_logger.info(
+                psrl_logger.debug(
                     f"Session {state.headers.get(SESSION_ID_HEADER, '?')!r} spent its turn budget "
                     f"(main_turns={state.main_turns}, subagent_turns={state.subagent_turns}); refusing this turn."
                 )

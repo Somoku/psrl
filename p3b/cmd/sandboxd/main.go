@@ -1064,6 +1064,11 @@ func elasticLoop(ctx context.Context, agent *server.Node, interval time.Duration
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// The ledger is audited on this cadence because this is the node's only
+			// place that looks at itself rather than at a request. A charge above the
+			// envelope is not something a caller can report: from outside it is one
+			// more refusal, indistinguishable from a node that is simply full.
+			auditLedger(agent, log)
 			report := agent.ElasticTick(ctx)
 			changed := len(report.Shrunk) + len(report.Restored) +
 				len(report.Throttled) + len(report.Released)
@@ -1080,6 +1085,31 @@ func elasticLoop(ctx context.Context, agent *server.Node, interval time.Duration
 				"oom_kills", report.OOMKills)
 		}
 	}
+}
+
+// auditLedger states whether this node is charging capacity it does not have.
+//
+// It is logged once per transition rather than per tick, so a node that stays broken is
+// one line an operator can find rather than a line every five seconds that buries
+// everything else.
+var ledgerUnaccounted bool
+
+func auditLedger(agent *server.Node, log *slog.Logger) {
+	granted, envelope, accounted := agent.LedgerAudit()
+	if accounted {
+		if ledgerUnaccounted {
+			ledgerUnaccounted = false
+			log.Warn("the node's charge is inside its envelope again", "granted_memory_mb", granted.MemoryMB)
+		}
+		return
+	}
+	if ledgerUnaccounted {
+		return
+	}
+	ledgerUnaccounted = true
+	log.Error("the node is charging more than it has: every request will be refused until it is restarted",
+		"granted_memory_mb", granted.MemoryMB, "envelope_memory_mb", envelope.MemoryMB,
+		"granted_cpu_millis", granted.CPUMillis, "envelope_cpu_millis", envelope.CPUMillis)
 }
 
 func startBackends(ctx context.Context, backends []backend.Backend, gate *node.Admission, log *slog.Logger) {

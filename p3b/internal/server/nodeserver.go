@@ -328,6 +328,20 @@ func (n *Node) ReleaseOn(ctx context.Context, handle *v1.SandboxHandle) (*v1.Emp
 	return &v1.Empty{}, nil
 }
 
+// LedgerAudit reports whether the node's charge can still be accounted for by its
+// envelope.
+//
+// Granted above Envelope is not a full node. Every admission is checked against the
+// headroom that is left, so the charge can only pass the envelope if something changed
+// it without going through an admission -- which means the ledger is charging capacity
+// to leases it no longer holds, and every request from then on is refused against
+// capacity nobody is using. It is reported rather than corrected: guessing at which
+// lease is wrong would trade a visible fault for an invisible one.
+func (n *Node) LedgerAudit() (granted node.Resources, envelope node.Resources, accounted bool) {
+	report := n.admission.Snapshot()
+	return report.Granted, report.Envelope, report.Granted.FitsIn(report.Envelope)
+}
+
 // Report is this node's view of itself, which the monitor collects.
 //
 // Headroom is reported per class because that is the granularity admission

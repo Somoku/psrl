@@ -422,6 +422,11 @@ func (c *Control) place(
 			c.placement.Cancel(decision.ReservationID)
 			lastRefusal = refusal
 			refused = append(refused, decision.NodeID)
+			if c.log != nil {
+				c.log.Warn("a node refused this sandbox",
+					"node", decision.NodeID, "class", charged.ResourceClass, "reason", refusal,
+					"asked_memory_mb", charged.Resources.MemoryMB, "asked_cpu_millis", chargedResourcesMillis(charged))
+			}
 			continue
 		}
 		withDevices := spec
@@ -438,9 +443,24 @@ func (c *Control) place(
 		}
 		return placed{created: created, handle: created.Handle, reservationID: decision.ReservationID}, nil
 	}
+	if c.log != nil {
+		// A refusal is the one thing the caller cannot see through: it arrives as a
+		// class of error that means "wait", and whether waiting helps depends on why
+		// the nodes said no. Logged here because the fleet is the only place that
+		// knows every node answered.
+		c.log.Warn("no node would take this sandbox",
+			"class", charged.ResourceClass, "nodes_asked", len(refused), "last_reason", lastRefusal,
+			"asked_memory_mb", charged.Resources.MemoryMB, "asked_cpu_millis", chargedResourcesMillis(charged))
+	}
 	return placed{}, status.Errorf(codes.ResourceExhausted,
 		"every node placement tried refused this request (last reason: %q); this clears as sandboxes are released",
 		lastRefusal)
+}
+
+// chargedResourcesMillis is the CPU the fleet is asking a node for, in the units the
+// node's ledger reports.
+func chargedResourcesMillis(spec backend.Spec) int64 {
+	return int64(spec.Resources.CPUCount * 1000)
 }
 
 // groupCleanupTimeout bounds releasing the members of a group that failed part

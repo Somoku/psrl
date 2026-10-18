@@ -173,6 +173,20 @@ func (n *NodeListener) admit(ctx context.Context, raw json.RawMessage) (any, err
 	if err != nil {
 		return nil, err
 	}
+	if !resp.GetAdmitted() {
+		// A refusal is the node's ledger answering for itself, and it is the only
+		// record of why a class could not get in. Without it the reason a grading wave
+		// never landed has to be reconstructed from a caller's timeout, and "the node
+		// was full" and "the node believes it is full" look identical from there.
+		//
+		// The headroom is logged with the refusal because it is what distinguishes
+		// them: a node refusing with headroom it cannot use is a ledger that has
+		// charged capacity to nothing, which no amount of waiting will clear.
+		headroom := n.node.admission.Headroom(payload.Spec.ResourceClass)
+		n.log.Warn("this node refused a sandbox",
+			"class", payload.Spec.ResourceClass, "reason", resp.GetRefusal(),
+			"headroom_memory_mb", headroom.MemoryMB, "headroom_cpu_millis", headroom.CPUMillis)
+	}
 	return map[string]any{
 		"admitted":    resp.GetAdmitted(),
 		"lease_id":    resp.GetLeaseId(),

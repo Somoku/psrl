@@ -77,6 +77,22 @@ class BoundedIdSet:
         return len(self._ids)
 
 
+def _root_cause(failure_summary: str | None, terminate_reason) -> str:
+    """Turn a worker-captured diagnosis into something worth printing.
+
+    It never returns blank. A summary that is only whitespace -- which is what a
+    whitespace-only traceback produces -- prints as empty lines, and empty lines read as
+    "the logger is broken" rather than "this failure had no cause recorded". When there is
+    nothing to say it says so, and names the terminate reason, so the line still tells a
+    sandbox fault from a harness fault.
+    """
+    body = (failure_summary or "").strip()
+    if body:
+        return body
+    reason = terminate_reason.value if terminate_reason is not None else "<unset>"
+    return f"<the worker captured no underlying exception; terminate_reason={reason}>"
+
+
 class PSRL_AgentLoopManager:
     def __init__(
         self,
@@ -974,13 +990,6 @@ class PSRL_AgentLoopManager:
                 Recorded on the train path so the refill breaker can name the cause.
             failure_summary (str | None): Worker-captured root cause text for the log.
         """
-        if failure_summary:
-            psrl_logger.error(
-                "notify_group_failed: root cause for parent_id=%s failed_uid=%s:\n%s",
-                parent_id,
-                failed_uid,
-                failure_summary,
-            )
         async with AsyncBusyPollingRayLock(self.ps_manager_handle):
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
             failed_group_ids = self._failed_val_group_ids if is_validate else self._failed_train_group_ids
@@ -994,6 +1003,22 @@ class PSRL_AgentLoopManager:
             # A failed group's samples are discarded, so a grading fault recorded against it
             # must not be charged to the replacement group that reuses this parent id.
             self._grading_capacity_faults.discard(parent_id)
+
+            # The root cause is logged here rather than before the duplicate guard, and
+            # therefore once per group rather than once per child.
+            #
+            # A group failure aborts every sibling, and each aborted sibling reports its
+            # own failure with the same diagnosis. In a cascade that is thousands of
+            # identical lines carrying no new information -- which is how the one line an
+            # operator needs ends up buried. The first child to fail carries the cause;
+            # the rest are already known to be the same group.
+            psrl_logger.error(
+                "notify_group_failed: root cause for parent_id=%s failed_uid=%s (terminate_reason=%s):\n%s",
+                parent_id,
+                failed_uid,
+                terminate_reason.value if terminate_reason is not None else "<unset>",
+                _root_cause(failure_summary, terminate_reason),
+            )
 
             all_child_uids = [parent_id * rollout_n + i for i in range(rollout_n)]
             sibling_uids = [uid for uid in all_child_uids if uid != failed_uid]

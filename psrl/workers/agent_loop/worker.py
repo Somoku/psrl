@@ -367,10 +367,23 @@ class PSRL_AgentLoopWorker:
         return task_done_callback
 
     @staticmethod
-    def _failure_diagnostics(agent_loop) -> str:
-        """Extract the original loop failure retained across retry handling."""
-        details = getattr(agent_loop, "last_error_traceback", "")
-        return details or "<no underlying exception was captured>"
+    def _failure_diagnostics(agent_loop, terminate_reason=None) -> str:
+        """Extract the original loop failure retained across retry handling.
+
+        The result is stripped, because a summary that is only whitespace prints as blank
+        lines and a diagnostic that prints as nothing is worse than one that says it has
+        nothing: from the log an operator cannot tell "no cause was recorded" from "the
+        cause was empty", and both look like the logger is broken.
+
+        When nothing was captured the fallback names the terminate reason, because that
+        is the one thing known about the failure and it is enough to tell a sandbox fault
+        from a harness fault.
+        """
+        details = (getattr(agent_loop, "last_error_traceback", "") or "").strip()
+        if details:
+            return details
+        reason = terminate_reason.value if terminate_reason is not None else "<unset>"
+        return f"<no underlying exception was captured; terminate_reason={reason}>"
 
     async def generate_trajectory(self, batch: TensorDict):
         """Generate trajectories using the specified agent type based on configuration.
@@ -518,7 +531,7 @@ class PSRL_AgentLoopWorker:
                                 request_ids,
                                 retry_attempt,
                                 retry_limit,
-                                self._failure_diagnostics(agent_loop),
+                                self._failure_diagnostics(agent_loop, terminate_reason),
                             )
                         psrl_logger.warning(
                             f"Retrying agent loop: request_ids={request_ids!r}, "
@@ -533,7 +546,7 @@ class PSRL_AgentLoopWorker:
                             "Agent loop requests %s exhausted with terminate_reason=%s. Root cause:\n%s",
                             request_ids,
                             terminate_reason.value,
-                            self._failure_diagnostics(agent_loop),
+                            self._failure_diagnostics(agent_loop, terminate_reason),
                         )
                     psrl_logger.warning(
                         f"Agent loop exhausted retries: request_ids={request_ids!r}, "
@@ -562,7 +575,7 @@ class PSRL_AgentLoopWorker:
                             failed_uid=failed_uid,
                             is_validate=validate,
                             terminate_reason=terminate_reason,
-                            failure_summary=self._failure_diagnostics(agent_loop),
+                            failure_summary=self._failure_diagnostics(agent_loop, terminate_reason),
                         )
                     else:
                         raise RuntimeError(

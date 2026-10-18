@@ -187,9 +187,13 @@ class TestEverySpecFieldIsAccountedFor:
 class TestWhatTheServiceCannotCarryIsRefused:
     """A dropped field runs and produces a wrong result; a refusal costs a fix."""
 
-    def test_a_host_mount_is_refused(self):
-        with pytest.raises(ValueError, match="bind mount"):
-            convert(spec(mounts=(MountSpec(source="/data", target="/data"),)))
+    def test_a_host_mount_is_carried_to_the_service(self):
+        # The service answers a mount per node against its own allowlist, so the backend
+        # forwards it rather than refusing it here: a refusal here would deny mounts on
+        # every node because one node allows none.
+        out = convert(spec(mounts=(MountSpec(source="/data", target="/data"),)))
+
+        assert [(m.source, m.target) for m in out.mounts] == [("/data", "/data")]
 
     def test_an_egress_policy_is_refused(self):
         with pytest.raises(ValueError, match="egress policy"):
@@ -212,8 +216,10 @@ class TestCapabilitiesAreTheFleetsUnion:
         assert declared.supports(SandboxFeature.RESUME_ANYWHERE)
         assert declared.resume_level is ResumeLevel.FULL_STATE
 
-    def test_a_host_mount_is_not_claimed(self):
-        assert not make_backend().capabilities.supports(SandboxFeature.HOST_MOUNT)
+    def test_a_host_mount_is_claimed(self):
+        # Claimed because the service can answer it, and the caller is then refused by
+        # the node whose operator allowed nothing rather than by the client library.
+        assert make_backend().capabilities.supports(SandboxFeature.HOST_MOUNT)
 
 
 class TestAReattachIsRefusedRatherThanFaked:

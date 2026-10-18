@@ -508,38 +508,135 @@ func TestAnUnusableObservationLeavesTheLedgerOnItsReservations(t *testing.T) {
 	}
 }
 
-func TestAdjustingAClassChargeMovesItsHeadroom(t *testing.T) {
-	// This is how a reservation follows what its sandboxes use: up when one turns out to
-	// need more, down when a quiet batch gives some back.
+// TestTheChargeIsWhatTheLeasesHold drives the invariant the whole gate rests on: the
+// node's charge is the sum of the leases it has issued and not had back, and nothing
+// else.
+//
+// It is phrased as a workload rather than as a unit, because the failure it guards was
+// not a wrong number in one function -- it was a second copy of the truth that drifted
+// from the first. Any number of admissions, repricings and returns must leave the charge
+// equal to what the leases say, and once every lease is back it must be zero. A charge
+// that survives its own leases is capacity the node will never offer again.
+func TestTheChargeIsWhatTheLeasesHold(t *testing.T) {
 	gate := mustGate(t, envelope())
-	if _, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 200}); !ok {
-		t.Fatal("the test needs a reservation")
-	}
-	before := gate.Headroom("rollout").MemoryMB
+	const price = 100
 
-	gate.Adjust("rollout", Resources{MemoryMB: 300})
-	if got := gate.Headroom("rollout").MemoryMB; got != before-300 {
-		t.Errorf("after growing, headroom is %d, want %d", got, before-300)
+	// A wave arrives while the class is cheap, which is how a step starts.
+	var leases []string
+	for i := 0; i < 8; i++ {
+		grant, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: price})
+		if !ok {
+			t.Fatalf("admit %d of 8", i)
+		}
+		leases = append(leases, grant.LeaseID)
+	}
+	if got := gate.Snapshot().Granted.MemoryMB; got != 8*price {
+		t.Fatalf("granted while held: got %d, want %d", got, 8*price)
 	}
 
-	gate.Adjust("rollout", Resources{MemoryMB: -300})
-	if got := gate.Headroom("rollout").MemoryMB; got != before {
-		t.Errorf("after shrinking back, headroom is %d, want %d", got, before)
+	// The class is repriced -- the measurement moved -- and the wave drains. The return
+	// knows only what it was handed, so every lease has to come back in full.
+	for i, lease := range leases {
+		if i == 4 {
+			// Reprice mid-drain, which is what a real tick does: some sandboxes are
+			// already gone and some are still running.
+			gate.SetGrowth("rollout", Resources{MemoryMB: 500}, Resources{MemoryMB: 500})
+		}
+		gate.Return(Grant{LeaseID: lease, Class: "rollout", Resources: Resources{MemoryMB: price}})
+	}
+
+	if got := gate.Snapshot().Granted.MemoryMB; got != 0 {
+		t.Errorf("granted after every lease came back: got %d, want 0", got)
+	}
+	if held := gate.Held(); len(held) != 0 {
+		t.Errorf("leases still open: %d", len(held))
+	}
+	// Growth is a separate term and is recomputed from scratch on every tick, so it is
+	// the only thing still standing between the gate and a whole envelope.
+	if got := gate.Headroom("rollout").MemoryMB; got != 500 {
+		t.Errorf("headroom after the drain: got %d, want the envelope less the growth", got)
+	}
+	gate.SetGrowth("rollout", Resources{}, Resources{})
+	if got := gate.Headroom("rollout").MemoryMB; got != 1000 {
+		t.Errorf("headroom once the next tick clears growth: got %d, want the whole envelope", got)
 	}
 }
 
-func TestAShrinkBelowZeroIsCorrectedRatherThanCarried(t *testing.T) {
-	// A release without a matching charge would let the node promise the same memory
-	// twice, so the class's charge is floored at zero.
+// TestReturningALeaseTwiceGivesNothingBackTwice is the same invariant from the other
+// side: a return is a statement about a lease, not a subtraction, so a duplicated one
+// cannot make the node believe it is holding less than it is.
+func TestReturningALeaseTwiceGivesNothingBackTwice(t *testing.T) {
 	gate := mustGate(t, envelope())
-	if _, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 100}); !ok {
+	grant, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 400})
+	if !ok {
 		t.Fatal("the test needs a reservation")
 	}
 
-	gate.Adjust("rollout", Resources{MemoryMB: -500})
+	gate.Return(grant)
+	gate.Return(grant)
 
 	if got := gate.Snapshot().Granted.MemoryMB; got != 0 {
-		t.Errorf("granted: got %d, want 0", got)
+		t.Errorf("granted: got %d, want 0, not a negative charge carried as zero", got)
+	}
+}
+
+// TestTheNodeNeverChargesMoreThanItHas is the bound the production failure crossed.
+//
+// A gate that has granted more than its envelope has no headroom left in any class, so
+// it refuses every request -- rollout and grading alike -- while its sandboxes are all
+// gone. The number was visible in a log line for ten minutes and read as a measurement
+// rather than as an alarm, because nothing stated that it was impossible.
+func TestTheNodeNeverChargesMoreThanItHas(t *testing.T) {
+	gate := mustGate(t, envelope())
+	admitted := 0
+	for {
+		_, refusal, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 250, CPUMillis: 2500})
+		if !ok {
+			if refusal != RefusedClassFull {
+				t.Fatalf("refused with %q, want the envelope to be what stops it", refusal)
+			}
+			break
+		}
+		admitted++
+		if admitted > 100 {
+			t.Fatal("the envelope never filled")
+		}
+	}
+	granted := gate.Snapshot().Granted
+	if !granted.FitsIn(gate.Snapshot().Envelope) {
+		t.Errorf("granted %+v exceeds the envelope %+v", granted, gate.Snapshot().Envelope)
+	}
+}
+
+// TestDevicesComeBackWithTheirLease covers the second copy of the truth this gate used
+// to keep: a free list beside the leases. A device handed back twice, or not at all,
+// fails the same way a charge does and is harder to see, because the symptom is a
+// request refused for devices on a node with every device idle.
+func TestDevicesComeBackWithTheirLease(t *testing.T) {
+	gate := mustGate(t, envelope())
+	grants := make([]Grant, 0, 4)
+	for i := 0; i < 4; i++ {
+		grant, _, ok := gate.Reserve("rollout", "w", Resources{MemoryMB: 10, GPUCount: 1})
+		if !ok {
+			t.Fatalf("admit %d of 4", i)
+		}
+		grants = append(grants, grant)
+	}
+	if got := gate.Snapshot().FreeGPUs; got != 0 {
+		t.Fatalf("free devices with four leases held: got %d, want 0", got)
+	}
+
+	gate.Return(grants[0])
+	gate.Return(grants[0]) // the same lease twice, which is not two leases
+	if got := gate.Snapshot().FreeGPUs; got != 1 {
+		t.Errorf("free devices: got %d, want 1", got)
+	}
+
+	for _, grant := range grants[1:] {
+		gate.Return(grant)
+	}
+	if got := gate.Snapshot().FreeGPUs; got != 4 {
+		t.Errorf("free devices after every lease came back: got %d, want 4", got)
 	}
 }
 

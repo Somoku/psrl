@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,8 +26,17 @@ func (providerStub) Name() string                       { return "stub" }
 func (providerStub) Mode() backend.SchedulingMode       { return backend.SchedulingProvider }
 func (providerStub) Capabilities() backend.Capabilities { return backend.Capabilities{} }
 
+// stubSandboxIDs gives every created sandbox its own id. A stub that hands out one id to
+// every caller is not a stub of anything: the lifecycle indexes by sandbox id, so the
+// second sandbox silently becomes the first one's record and a release leaves the rest
+// charged. A test of more than one sandbox needs them to be distinguishable.
+var stubSandboxIDs atomic.Uint64
+
 func (providerStub) Create(context.Context, string, backend.Spec, string) (backend.Created, error) {
-	return backend.Created{Handle: backend.Handle{Backend: "stub", SandboxID: "sb-1"}}, nil
+	id := stubSandboxIDs.Add(1)
+	return backend.Created{
+		Handle: backend.Handle{Backend: "stub", SandboxID: fmt.Sprintf("sb-%d", id)},
+	}, nil
 }
 func (providerStub) Release(context.Context, backend.Handle) error          { return nil }
 func (providerStub) Status(context.Context, backend.Handle) (string, error) { return "running", nil }

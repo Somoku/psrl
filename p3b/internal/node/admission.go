@@ -235,9 +235,19 @@ type Grant struct {
 // copies of one fact drift, and that drift is what let a grant be returned while
 // its container still held memory.
 type Admission struct {
-	mu   sync.Mutex
-	cfg  Config
-	used map[string]Resources
+	mu  sync.Mutex
+	cfg Config
+	// grants is the set of leases this gate has issued and not yet had back, keyed by
+	// lease id. It is the only record of what the node has promised.
+	//
+	// Every charge below is derived from it rather than accumulated beside it. A
+	// per-class total stored next to the leases it describes can drift from them, and
+	// the drift has no upper bound: one that is raised while a class is busy and
+	// lowered while it is quiet keeps the difference forever, and a class that empties
+	// is never repriced at all. The node then charges more than the machine has and
+	// refuses everything until it is restarted. Deriving the totals makes that
+	// unrepresentable -- there is no second copy to disagree.
+	grants map[string]Grant
 	// queued counts demand per class, so a class's guarantee is reserved only
 	// while it is actually waiting. Reserving against an idle class leaves the
 	// node idle and full at once.
@@ -256,7 +266,6 @@ type Admission struct {
 	growthPerSandbox map[string]Resources
 	growthTotal      map[string]Resources
 	owners           map[string]time.Time
-	freeGPUs         []int32
 	pressure         Pressure
 	// observed is what the measured domain is actually using, and observedValid says
 	// whether that reading can be trusted. The ledger charges reservations, which are an
@@ -299,8 +308,6 @@ func NewAdmission(cfg Config) (*Admission, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	free := make([]int32, len(cfg.GPUIndices))
-	copy(free, cfg.GPUIndices)
 	// Devices are declared as indices, so the envelope's device count follows from
 	// them rather than being configured twice and able to disagree.
 	cfg.Envelope.GPUCount = int32(len(cfg.GPUIndices))
@@ -315,13 +322,12 @@ func NewAdmission(cfg Config) (*Admission, error) {
 	}
 	return &Admission{
 		cfg:              cfg,
-		used:             map[string]Resources{},
+		grants:           map[string]Grant{},
 		queued:           map[string]int{},
 		queuedAt:         map[string]time.Time{},
 		growthPerSandbox: map[string]Resources{},
 		growthTotal:      map[string]Resources{},
 		owners:           map[string]time.Time{},
-		freeGPUs:         free,
 		refusals:         map[Refusal]int64{},
 		now:              time.Now,
 		observedMaxAge:   cfg.ObservedMaxAge,
@@ -469,19 +475,31 @@ func (a *Admission) SetObserved(used Resources, valid bool) {
 	}
 }
 
-// Adjust changes a class's charge by a delta.
+// chargesLocked is what each class is holding, summed from the leases that are still
+// open. Callers hold the lock.
 //
-// It is how a reservation follows reality: a sandbox that turns out to need more raises
-// its class's charge, and one that goes quiet lowers it. The class is the unit because
-// the ledger holds aggregates and no per-grant table, which is what keeps one fact in one
-// place.
-func (a *Admission) Adjust(class string, delta Resources) {
+// It is a sum over the grant set rather than a stored total. The cost is one pass over
+// at most a few hundred leases, on a path that runs once per admission.
+func (a *Admission) chargesLocked() map[string]Resources {
+	charges := make(map[string]Resources, len(a.cfg.Classes))
+	for _, grant := range a.grants {
+		charges[grant.Class] = charges[grant.Class].Add(grant.Resources)
+	}
+	return charges
+}
+
+// Held returns the leases this gate has issued and not had back.
+//
+// It is what lets an operator, or a test, compare the node's charge against the
+// sandboxes that are actually supposed to account for it.
+func (a *Admission) Held() []Grant {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.used[class] = a.used[class].Add(delta)
-	if a.used[class].MemoryMB < 0 || a.used[class].CPUMillis < 0 || a.used[class].DiskMB < 0 {
-		a.used[class] = Resources{}
+	out := make([]Grant, 0, len(a.grants))
+	for _, grant := range a.grants {
+		out = append(out, grant)
 	}
+	return out
 }
 
 // SetPressure records what the node measures about itself.
@@ -511,7 +529,7 @@ func (a *Admission) MemoryPressure() (float64, bool) {
 func (a *Admission) AcquirePool(want Resources) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	free := a.cfg.Envelope.Sub(a.totalUsedLocked()).Sub(a.pool)
+	free := a.cfg.Envelope.Sub(totalOf(a.chargesLocked())).Sub(a.pool)
 	if !want.FitsIn(free) {
 		return false
 	}
@@ -637,8 +655,9 @@ func (a *Admission) Reserve(class, owner string, want Resources) (Grant, Refusal
 		a.refuse(RefusedPressure)
 		return Grant{}, RefusedPressure, false
 	}
+	charges := a.chargesLocked()
 	if share, declared := a.cfg.Classes[class]; declared && share.Max > 0 {
-		if !want.FitsIn(a.cfg.Envelope.Scale(share.Max).Sub(a.used[class])) {
+		if !want.FitsIn(a.cfg.Envelope.Scale(share.Max).Sub(charges[class])) {
 			a.refuse(RefusedClassCeiling)
 			return Grant{}, RefusedClassCeiling, false
 		}
@@ -646,22 +665,23 @@ func (a *Admission) Reserve(class, owner string, want Resources) (Grant, Refusal
 	// Devices before the class share: an exhausted device pool is a more specific
 	// answer than a full class, and reporting it as "class full" would suggest the
 	// request will fit once other work drains, which it will not.
-	if int(want.GPUCount) > len(a.freeGPUs) {
+	if int(want.GPUCount) > len(a.freeGPUsLocked()) {
 		a.refuse(RefusedDevices)
 		return Grant{}, RefusedDevices, false
 	}
-	if !want.FitsIn(a.headroomLocked(class)) {
+	if !want.FitsIn(a.headroomForLocked(class, charges)) {
 		a.refuse(RefusedClassFull)
 		return Grant{}, RefusedClassFull, false
 	}
 
-	devices := a.takeGPUsLocked(want.GPUCount)
+	free := a.freeGPUsLocked()
+	devices := append([]int32(nil), free[:want.GPUCount]...)
 	a.nextID++
 	grant := Grant{
 		LeaseID: fmt.Sprintf("lease-%d", a.nextID), Class: class,
 		Resources: want, GPUIndices: devices,
 	}
-	a.used[class] = a.used[class].Add(want)
+	a.grants[grant.LeaseID] = grant
 	a.owners[owner] = a.now()
 	a.admitted++
 	return grant, "", true
@@ -748,14 +768,17 @@ func (a *Admission) Overcommitted() float64 {
 func (a *Admission) Headroom(class string) Resources {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.headroomLocked(class)
+	return a.headroomForLocked(class, a.chargesLocked())
 }
 
-func (a *Admission) headroomLocked(class string) Resources {
+// headroomForLocked answers one class's question against charges the caller has already
+// summed, so a report that walks every class sums the leases once rather than once per
+// class.
+func (a *Admission) headroomForLocked(class string, charges map[string]Resources) Resources {
 	effective := a.effectiveEnvelopeLocked()
 	// The charge is the larger of what was promised and what is measured: reservations
 	// that the measurement has outgrown are no longer what bounds the node.
-	bound := a.totalUsedLocked()
+	bound := totalOf(charges)
 	// A stale measurement is still a floor, and the reason is the direction of the
 	// unknown. Sandboxes released since the last reading would make the true usage
 	// lower, but sandboxes that kept growing would make it higher, and of the two only
@@ -776,7 +799,7 @@ func (a *Admission) headroomLocked(class string) Resources {
 	// What is left is then reduced by the admission reserve, which no class may spend.
 	// This is the capacity a later wave lands in; a node that let the first wave take
 	// all of it has to wait for an episode to end before it can admit anything at all.
-	free := effective.Sub(bound).Sub(a.pool).Sub(a.reservedForOthersLocked(class)).
+	free := effective.Sub(bound).Sub(a.pool).Sub(a.reservedForOthersLocked(class, charges)).
 		Sub(a.cfg.Envelope.Scale(a.admissionReserve()))
 	share, declared := a.cfg.Classes[class]
 	if !declared || share.Max == 0 {
@@ -786,7 +809,7 @@ func (a *Admission) headroomLocked(class string) Resources {
 	// effective one: a ceiling of 0.5 means "half the machine", which is a
 	// configuration the operator stated about the machine, not about the current
 	// overcommit factor.
-	underCeiling := a.cfg.Envelope.Scale(share.Max).Sub(a.used[class])
+	underCeiling := a.cfg.Envelope.Scale(share.Max).Sub(charges[class])
 	return Resources{
 		MemoryMB:  minI64(free.MemoryMB, underCeiling.MemoryMB),
 		CPUMillis: minI64(free.CPUMillis, underCeiling.CPUMillis),
@@ -813,14 +836,15 @@ func (a *Admission) ClassHeadroom() map[string]Resources {
 		names = append(names, "default")
 	}
 	sort.Strings(names)
+	charges := a.chargesLocked()
 	out := make(map[string]Resources, len(names))
 	for _, name := range names {
-		out[name] = a.headroomLocked(name)
+		out[name] = a.headroomForLocked(name, charges)
 	}
 	return out
 }
 
-func (a *Admission) reservedForOthersLocked(class string) Resources {
+func (a *Admission) reservedForOthersLocked(class string, charges map[string]Resources) Resources {
 	var reserved Resources
 	for name, share := range a.cfg.Classes {
 		if name == class || a.queued[name] == 0 {
@@ -831,43 +855,57 @@ func (a *Admission) reservedForOthersLocked(class string) Resources {
 			// for a caller that is no longer asking.
 			continue
 		}
-		reserved = reserved.Add(a.cfg.Envelope.Scale(share.Guaranteed).Sub(a.used[name]))
+		reserved = reserved.Add(a.cfg.Envelope.Scale(share.Guaranteed).Sub(charges[name]))
 	}
 	return reserved
 }
 
-func (a *Admission) totalUsedLocked() Resources {
+// totalOf sums every class's charge. The whole node's obligation is the sum of its
+// leases, so this is Granted.
+func totalOf(charges map[string]Resources) Resources {
 	var total Resources
-	for _, amount := range a.used {
+	for _, amount := range charges {
 		total = total.Add(amount)
 	}
 	return total
 }
 
-func (a *Admission) takeGPUsLocked(count int32) []int32 {
-	if count <= 0 {
+// freeGPUsLocked is the devices no open lease holds. Derived from the grant set for the
+// same reason the charges are: a free list kept beside the leases can be handed back
+// twice, or not at all.
+func (a *Admission) freeGPUsLocked() []int32 {
+	if len(a.cfg.GPUIndices) == 0 {
 		return nil
 	}
-	taken := make([]int32, count)
-	copy(taken, a.freeGPUs[:count])
-	a.freeGPUs = a.freeGPUs[count:]
-	return taken
+	held := make(map[int32]struct{}, len(a.cfg.GPUIndices))
+	for _, grant := range a.grants {
+		for _, index := range grant.GPUIndices {
+			held[index] = struct{}{}
+		}
+	}
+	free := make([]int32, 0, len(a.cfg.GPUIndices))
+	for _, index := range a.cfg.GPUIndices {
+		if _, taken := held[index]; !taken {
+			free = append(free, index)
+		}
+	}
+	return free
 }
 
 // Return gives one grant's budget back, once its runtime object is gone.
 //
-// It is keyed on the grant rather than on an id because this gate keeps no
-// per-grant table: the lifecycle owns the record, and this is arithmetic over
-// the envelope.
+// It is keyed on the lease rather than on the amount the caller happens to be holding.
+// A caller's copy is a snapshot of what the grant cost when it was handed out; the gate's
+// record is what the node is actually charging. Returning the snapshot is how a charge
+// that moved afterwards leaves a residue that never comes back.
+//
+// A lease the gate does not hold is returned as a no-op rather than as a subtraction:
+// it was already given back, or never issued here, and subtracting again would leave the
+// node believing it holds less than it does.
 func (a *Admission) Return(grant Grant) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.used[grant.Class] = a.used[grant.Class].Sub(grant.Resources)
-	if (a.used[grant.Class] == Resources{}) {
-		delete(a.used, grant.Class)
-	}
-	a.freeGPUs = append(a.freeGPUs, grant.GPUIndices...)
-	sort.Slice(a.freeGPUs, func(i, j int) bool { return a.freeGPUs[i] < a.freeGPUs[j] })
+	delete(a.grants, grant.LeaseID)
 }
 
 // Recharge charges a grant this process did not reserve, which is what a node
@@ -879,10 +917,10 @@ func (a *Admission) Return(grant Grant) {
 func (a *Admission) Recharge(grant Grant, owner string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if missing := a.takeIndicesLocked(grant.GPUIndices); len(missing) > 0 {
+	if missing := a.claimedIndicesLocked(grant.GPUIndices); len(missing) > 0 {
 		return fmt.Errorf("device indices %v are already granted", missing)
 	}
-	a.used[grant.Class] = a.used[grant.Class].Add(grant.Resources)
+	a.grants[grant.LeaseID] = grant
 	a.owners[owner] = a.now()
 	a.admitted++
 	return nil
@@ -900,23 +938,26 @@ func (a *Admission) RetainOwners(live map[string]struct{}) {
 	}
 }
 
-// takeIndicesLocked removes named devices from the free list and reports the ones
-// that were not free.
-func (a *Admission) takeIndicesLocked(indices []int32) []int32 {
+// claimedIndicesLocked reports which of these devices an open lease already holds.
+//
+// It takes the whole set rather than claiming them one at a time because a partial claim
+// is worse than a refused one: two leases that each hold an index the other believes it
+// owns is a fault no later check can detect.
+func (a *Admission) claimedIndicesLocked(indices []int32) []int32 {
+	if len(indices) == 0 {
+		return nil
+	}
+	held := make(map[int32]struct{}, len(a.cfg.GPUIndices))
+	for _, grant := range a.grants {
+		for _, index := range grant.GPUIndices {
+			held[index] = struct{}{}
+		}
+	}
 	var missing []int32
 	for _, index := range indices {
-		found := -1
-		for i, free := range a.freeGPUs {
-			if free == index {
-				found = i
-				break
-			}
-		}
-		if found < 0 {
+		if _, taken := held[index]; taken {
 			missing = append(missing, index)
-			continue
 		}
-		a.freeGPUs = append(a.freeGPUs[:found], a.freeGPUs[found+1:]...)
 	}
 	return missing
 }
@@ -992,9 +1033,10 @@ func (a *Admission) Snapshot() Report {
 	for name := range a.cfg.Classes {
 		names = append(names, name)
 	}
+	charges := a.chargesLocked()
 	headroom := make(map[string]Resources, len(names))
 	for _, name := range names {
-		headroom[name] = a.headroomLocked(name)
+		headroom[name] = a.headroomForLocked(name, charges)
 	}
 	effective := a.effectiveEnvelopeLocked()
 	overcommit := 1.0
@@ -1006,12 +1048,12 @@ func (a *Admission) Snapshot() Report {
 		EffectiveEnvelope: effective,
 		Overcommit:        overcommit,
 		ClassHeadroom:     headroom,
-		Granted:           a.totalUsedLocked(),
+		Granted:           totalOf(charges),
 		Observed:          a.observed,
 		ObservedValid:     a.observedValid,
 		ObservedFresh:     a.observedUsableLocked(),
 		Pooled:            a.pool,
-		FreeGPUs:          len(a.freeGPUs),
+		FreeGPUs:          len(a.freeGPUsLocked()),
 		Draining:          a.draining,
 		Admitted:          a.admitted,
 		Refusals:          refusals,

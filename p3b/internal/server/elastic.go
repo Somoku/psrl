@@ -304,24 +304,24 @@ func (n *Node) ElasticTick(ctx context.Context) ElasticReport {
 	// charges that climb over the next horizon rather than the present alone.
 	n.reserveGrowth(elapsed)
 
-	// Reprice each class. A class with no running sandbox keeps its last estimate, which is
-	// what seeds the next batch: an empty class would otherwise fall back to the minimum
-	// between two steps and under-reserve the batch that follows.
+	// Reprice each class from what its sandboxes measured. The price is what the *next*
+	// sandbox of that class is charged at admission, and a class with no running sandbox
+	// keeps its last estimate, which is what seeds the following batch: an empty class
+	// would otherwise fall back to the minimum between two steps and under-reserve the
+	// batch that follows.
+	//
+	// The price is deliberately not pushed back into the ledger's charge for the sandboxes
+	// that are already running. The ledger holds what the node promised, and a promise is
+	// made once, at admission; moving it afterwards cannot be undone, because the return
+	// only knows the amount it was handed. What tracks a sandbox that outgrew its promise
+	// is the measurement above, which headroom already treats as a floor, and the growth
+	// reservation, which is recomputed from scratch on every tick. Both are self-healing;
+	// an adjusted charge is not, and it ratchets until the node refuses everything.
 	for class, residents := range memoryByClass {
-		footprint := n.memoryFootprintForLocked(class)
-		before := footprint.Reserve()
-		footprint.Observe(residents)
-		if after := footprint.Reserve(); after != before {
-			n.admission.Adjust(class, node.Resources{MemoryMB: int64(len(residents)) * (after - before)})
-		}
+		n.memoryFootprintForLocked(class).Observe(residents)
 	}
 	for class, rates := range cpuMillisByClass {
-		footprint := n.cpuFootprintForLocked(class)
-		before := footprint.Reserve()
-		footprint.Observe(rates)
-		if after := footprint.Reserve(); after != before {
-			n.admission.Adjust(class, node.Resources{CPUMillis: int64(len(rates)) * (after - before)})
-		}
+		n.cpuFootprintForLocked(class).Observe(rates)
 	}
 	for class := range n.elastic.memoryFootprints {
 		report.ReservesMB[class] = n.elastic.memoryFootprints[class].Reserve()

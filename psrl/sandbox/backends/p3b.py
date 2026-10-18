@@ -42,6 +42,9 @@ from sandboxd import (
     Feature as ServiceFeature,
 )
 from sandboxd import (
+    Mount as ServiceMount,
+)
+from sandboxd import (
     Resources as ServiceResources,
 )
 from sandboxd import (
@@ -387,6 +390,10 @@ class P3bBackend(SandboxBackend):
                     SandboxFeature.RESUME_ANYWHERE,
                     SandboxFeature.WARM_POOL,
                     SandboxFeature.IMAGE_ON_DEMAND,
+                    # The service answers a mount per node: it shares the host trees its
+                    # operator listed and refuses the rest, so a deployment that allows
+                    # none advertises none and the caller is refused before it asks.
+                    SandboxFeature.HOST_MOUNT,
                 }
             ),
             resume_level=ResumeLevel.FULL_STATE,
@@ -602,13 +609,6 @@ def _to_service_spec(
     backend silently served one-shot commands and unchecked features for a
     workload that had declared it needed otherwise.
     """
-    if spec.mounts:
-        raise ValueError(
-            "A p3b sandbox is placed by the service, which may land on a node "
-            "other than this worker's. A host bind mount cannot be honoured. "
-            "Use a provider volume that the service can attach, or use the "
-            "docker backend to run the sandbox on this worker's own node."
-        )
     if spec.volumes:
         raise ValueError(
             "P3bBackend does not forward provider volumes to the service. "
@@ -673,6 +673,15 @@ def _to_service_spec(
         # How long this sandbox is meant to work, which the caller knows and the node
         # cannot infer.
         lifetime_s=int(spec.lifetime_timeout_s) if spec.lifetime_timeout_s else None,
+        # Host paths this sandbox needs, forwarded so the node decides: it shares the
+        # trees its operator listed and refuses everything else. A path only exists on
+        # the machine that holds it, so this is the one request that depends on where
+        # the sandbox lands -- which is exactly why the node answers it rather than
+        # this client guessing. A fleet whose nodes share no storage refuses here, and
+        # that refusal names the path, which is the answer a caller can act on.
+        mounts=tuple(
+            ServiceMount(source=mount.source, target=mount.target, read_only=mount.read_only) for mount in spec.mounts
+        ),
     )
 
 

@@ -296,6 +296,14 @@ type jsonSpec struct {
 	ForbiddenNodeLabels []string                     `json:"forbidden_node_labels"`
 	LifetimeS           int64                        `json:"lifetime_s"`
 	BackendOptions      map[string]map[string]string `json:"backend_options"`
+	Mounts              []jsonMount                  `json:"mounts"`
+}
+
+// jsonMount is one host path a sandbox must see, on the node-plane wire.
+type jsonMount struct {
+	Source   string `json:"source"`
+	Target   string `json:"target"`
+	ReadOnly bool   `json:"read_only"`
 }
 
 func (s jsonSpec) toProto() *v1.SandboxSpec {
@@ -322,6 +330,11 @@ func (s jsonSpec) toProto() *v1.SandboxSpec {
 	}
 	for _, feature := range s.RequiredFeatures {
 		out.RequiredFeatures = append(out.RequiredFeatures, featureValue(feature))
+	}
+	for _, mount := range s.Mounts {
+		out.Mounts = append(out.Mounts, &v1.Mount{
+			Source: mount.Source, Target: mount.Target, ReadOnly: mount.ReadOnly,
+		})
 	}
 	if len(s.BackendOptions) > 0 {
 		out.BackendOptions = map[string]*v1.BackendOptions{}

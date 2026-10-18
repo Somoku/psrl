@@ -735,6 +735,13 @@ def _spec_payload(spec: SandboxSpec) -> dict[str, Any]:
         payload["lifetime_s"] = spec.lifetime_s
     if spec.backend_options:
         payload["backend_options"] = {name: dict(values) for name, values in spec.backend_options.items()}
+    # A mount is part of the environment the sandbox is for, so it travels with the
+    # request rather than being left for the caller to arrange afterwards: the service
+    # decides which host paths this node will share, and refuses the rest.
+    if spec.mounts:
+        payload["mounts"] = [
+            {"source": mount.source, "target": mount.target, "read_only": mount.read_only} for mount in spec.mounts
+        ]
     return payload
 
 

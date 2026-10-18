@@ -226,6 +226,12 @@ func (p *warmPool) matches(spec backend.Spec) bool {
 	if spec.Resources.GPUCount > 0 || len(spec.AssignedGPUs) > 0 {
 		return false
 	}
+	// A mount cannot be added to a container that already exists, so a spec that asks
+	// for one is never served from the pool: matching here would hand back a sandbox
+	// without the host path its work depends on.
+	if len(spec.Mounts) > 0 {
+		return false
+	}
 	if spec.Workdir != template.Workdir {
 		return false
 	}
@@ -592,7 +598,7 @@ func (b *Backend) createPoolEntry(ctx context.Context, spec backend.Spec) (strin
 	}
 	defer release()
 
-	created, err := b.createNamed(ctx, warmNamePrefix, b.createBody(spec, b.cfg.NodeID))
+	created, err := b.createNamed(ctx, warmNamePrefix, b.createBody(spec, b.cfg.NodeID, nil))
 	if err != nil {
 		return "", fmt.Errorf("warm pool create: %w", err)
 	}

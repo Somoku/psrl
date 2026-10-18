@@ -144,6 +144,26 @@ class Resources:
 
 
 @dataclass(frozen=True)
+class Mount:
+    """One host path a sandbox must see.
+
+    A mount is a request about the node rather than about the sandbox: it hands the
+    sandbox a view of a path the machine owns. The service decides which trees a node
+    will share and refuses the rest, so a caller states what it needs and gets either
+    the mount or a refusal -- never a sandbox silently missing the path its work
+    depends on.
+    """
+
+    source: str
+    target: str
+    read_only: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.source or not self.target:
+            raise ValueError("A mount names both a host source and a path inside the sandbox.")
+
+
+@dataclass(frozen=True)
 class SandboxSpec:
     """The portable creation request.
 
@@ -156,6 +176,8 @@ class SandboxSpec:
 
     source: Source
     resources: Resources = field(default_factory=Resources)
+    # Host paths this sandbox must see. Empty is the common case.
+    mounts: tuple[Mount, ...] = ()
 
     resource_class: str = "default"
     workflow_id: str | None = None

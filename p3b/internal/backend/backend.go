@@ -75,9 +75,29 @@ type Resources struct {
 }
 
 // Spec is the portable creation request.
+// Mount is one host directory a sandbox needs to see.
+//
+// A mount is a request about the machine, not about the sandbox: it hands a sandbox a
+// view of a path the node owns. That is why a backend is allowed to refuse one -- see the
+// allowlist in the docker backend -- and why it travels as part of the spec's identity
+// rather than as a backend option: two environments that see different host paths are not
+// the same environment, and an idempotent create that silently dropped the mount would
+// hand back a sandbox that cannot do its work.
+type Mount struct {
+	// Source is the path on the node, which must exist and must be allowed.
+	Source string
+	// Target is where the sandbox sees it.
+	Target string
+	// ReadOnly keeps the sandbox from writing to a path the node shares with others.
+	ReadOnly bool
+}
+
 type Spec struct {
 	Source    Source
 	Resources Resources
+	// Mounts are the host paths this sandbox must see. Empty is the common case, and a
+	// backend that cannot mount refuses a spec that asks rather than degrading silently.
+	Mounts []Mount
 
 	ResourceClass  string
 	WorkflowID     string

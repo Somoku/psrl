@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -99,6 +100,16 @@ type Config struct {
 	// that matches the pool's spec claims one instantly rather than paying the
 	// container-build cost. Zero-value Size disables the pool.
 	WarmPool WarmPoolConfig
+	// MountAllowlist is the set of host path prefixes a sandbox may be given. Empty
+	// means none, and a spec that asks for a mount is then refused rather than
+	// created without it.
+	//
+	// A host mount is the one request in the contract that is about the machine rather
+	// than the sandbox: it hands a sandbox a view of a path the node owns, and a node
+	// that honoured any path would let any caller read or overwrite anything that user
+	// can reach -- including the daemon's own socket. So the node states which trees it
+	// is willing to share, and everything else is refused at create.
+	MountAllowlist []string
 }
 
 // Backend is the Docker runtime for one node.
@@ -202,7 +213,12 @@ func (b *Backend) Mode() backend.SchedulingMode { return b.mode }
 // isolation boundary needs a configured runtime, and claiming one the node lacks
 // would admit a spec and then run it with less isolation than it asked for.
 func (b *Backend) Capabilities() backend.Capabilities {
-	features := []string{"freeze", "host_mount", "filesystem_snapshot", "restore", "credential_injection"}
+	// host_mount is earned: a node with no allowlist shares nothing, and claiming the
+	// feature there would let a caller ask for a mount it can only be refused.
+	features := []string{"freeze", "filesystem_snapshot", "restore", "credential_injection"}
+	if len(b.cfg.MountAllowlist) > 0 {
+		features = append(features, "host_mount")
+	}
 	if b.cfg.Runtime != "" {
 		features = append(features, "isolation_runtime")
 	}
@@ -251,6 +267,13 @@ func (b *Backend) Create(ctx context.Context, nodeID string, spec backend.Spec, 
 			return created, nil
 		}
 	}
+	// Mounts are resolved before anything is created: a mount this node will not make is
+	// a refusal, and refusing after the image pull would waste the pull and leave the
+	// caller with a slower failure and the same answer.
+	binds, err := b.binds(spec)
+	if err != nil {
+		return backend.Created{}, err
+	}
 	if err := b.ensureImage(ctx, spec.Source.Reference); err != nil {
 		return backend.Created{}, err
 	}
@@ -260,7 +283,7 @@ func (b *Backend) Create(ctx context.Context, nodeID string, spec backend.Spec, 
 	}
 	defer release()
 
-	body := b.createBody(spec, nodeID)
+	body := b.createBody(spec, nodeID, binds)
 	created, err := b.createNamed(ctx, sandboxNamePrefix, body)
 	if err != nil {
 		return backend.Created{}, fmt.Errorf("docker create: %w", err)
@@ -355,7 +378,7 @@ func (b *Backend) acquireCreateSlot(ctx context.Context) (func(), error) {
 	}
 }
 
-func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
+func (b *Backend) createBody(spec backend.Spec, nodeID string, binds []string) map[string]any {
 	env := make([]string, 0, len(spec.Env))
 	for key, value := range spec.Env {
 		env = append(env, key+"="+value)
@@ -409,6 +432,9 @@ func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
 	if b.cfg.CgroupParent != "" {
 		hostConfig["CgroupParent"] = b.cfg.CgroupParent
 	}
+	if len(binds) > 0 {
+		hostConfig["Binds"] = binds
+	}
 	if len(spec.AssignedGPUs) > 0 {
 		hostConfig["DeviceRequests"] = []map[string]any{{
 			"Driver":       "nvidia",
@@ -436,6 +462,73 @@ func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
 		body["WorkingDir"] = spec.Workdir
 	}
 	return body
+}
+
+// binds turns a spec's mounts into the daemon's bind strings, refusing what this node
+// will not share.
+//
+// Two things make this more than a string join. A path is resolved before it is compared,
+// because a symlink inside an allowed tree is a way out of it: a caller who can create a
+// link under /shared can otherwise mount /etc. And a path that does not exist is refused
+// rather than passed through, because the daemon creates a missing bind source as a
+// directory on the host -- a caller would get an empty mount and no error, which reads as
+// success for a request that was never honoured.
+func (b *Backend) binds(spec backend.Spec) ([]string, error) {
+	if len(spec.Mounts) == 0 {
+		return nil, nil
+	}
+	if len(b.cfg.MountAllowlist) == 0 {
+		return nil, fmt.Errorf(
+			"docker: this sandbox asks for %d host mount(s) but this node allows none; "+
+				"set backends[].mount_allowlist to the host trees this node may share", len(spec.Mounts))
+	}
+	var allowed []string
+	for _, root := range b.cfg.MountAllowlist {
+		resolved, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			return nil, fmt.Errorf("docker: mount allowlist entry %q is not a path on this node: %w", root, err)
+		}
+		allowed = append(allowed, resolved)
+	}
+	binds := make([]string, 0, len(spec.Mounts))
+	for _, mount := range spec.Mounts {
+		if mount.Target == "" {
+			return nil, fmt.Errorf("docker: mount source %q names no path inside the sandbox", mount.Source)
+		}
+		source, err := filepath.EvalSymlinks(mount.Source)
+		if err != nil {
+			return nil, fmt.Errorf("docker: mount source %q is not a path on this node: %w", mount.Source, err)
+		}
+		permitted := false
+		for _, root := range allowed {
+			if withinPath(root, source) {
+				permitted = true
+				break
+			}
+		}
+		if !permitted {
+			return nil, fmt.Errorf(
+				"docker: mount source %q is outside this node's mount allowlist (%s)",
+				source, strings.Join(b.cfg.MountAllowlist, ", "))
+		}
+		mode := "rw"
+		if mount.ReadOnly {
+			mode = "ro"
+		}
+		binds = append(binds, fmt.Sprintf("%s:%s:%s", source, mount.Target, mode))
+	}
+	return binds, nil
+}
+
+// withinPath reports whether path is root itself or lives under it.
+//
+// The separator is part of the comparison: a prefix check alone would let
+// /shared/psrl-secrets through an allowlist of /shared/psrl.
+func withinPath(root, path string) bool {
+	if path == root {
+		return true
+	}
+	return strings.HasPrefix(path, root+string(filepath.Separator))
 }
 
 func deviceIDs(indices []int32) []string {

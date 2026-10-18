@@ -179,6 +179,13 @@ func specToProto(spec backend.Spec) *v1.SandboxSpec {
 	for _, feature := range spec.RequiredFeatures {
 		out.RequiredFeatures = append(out.RequiredFeatures, featureValue(feature))
 	}
+	// Mounts travel the same way: a spec that asked for a host path and reached a node
+	// without it would be a different environment, not the same one with less.
+	for _, mount := range spec.Mounts {
+		out.Mounts = append(out.Mounts, &v1.Mount{
+			Source: mount.Source, Target: mount.Target, ReadOnly: mount.ReadOnly,
+		})
+	}
 	if len(spec.BackendOptions) > 0 {
 		out.BackendOptions = map[string]*v1.BackendOptions{}
 		for name, values := range spec.BackendOptions {

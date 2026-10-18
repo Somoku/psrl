@@ -49,6 +49,11 @@ func specFromProto(in *v1.SandboxSpec) backend.Spec {
 			GPUCount: resources.GetGpuCount(),
 		}
 	}
+	for _, mount := range in.GetMounts() {
+		spec.Mounts = append(spec.Mounts, backend.Mount{
+			Source: mount.GetSource(), Target: mount.GetTarget(), ReadOnly: mount.GetReadOnly(),
+		})
+	}
 	for _, feature := range in.GetRequiredFeatures() {
 		spec.RequiredFeatures = append(spec.RequiredFeatures, featureName(feature))
 	}

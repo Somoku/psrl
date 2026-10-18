@@ -502,6 +502,19 @@ func specToWire(spec backend.Spec) map[string]any {
 	if len(spec.BackendOptions) > 0 {
 		s["backend_options"] = spec.BackendOptions
 	}
+	if len(spec.Mounts) > 0 {
+		// A mount is part of the environment the sandbox is for, so it crosses to the node
+		// like every other field of the spec: the node decides whether it will share the
+		// path, and a hop that dropped it would hand back a sandbox whose work cannot run
+		// while looking exactly like one that can.
+		mounts := make([]map[string]any, 0, len(spec.Mounts))
+		for _, mount := range spec.Mounts {
+			mounts = append(mounts, map[string]any{
+				"source": mount.Source, "target": mount.Target, "read_only": mount.ReadOnly,
+			})
+		}
+		s["mounts"] = mounts
+	}
 	return s
 }
 

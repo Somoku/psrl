@@ -1929,6 +1929,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 PSRL_AgentLoopWorker.options(
                     name=f"agent_loop_worker_{i}",
                     max_concurrency=max_concurrency_per_worker,
+                    # The metrics group the snapshot read runs in is declared on the actor
+                    # class, because Ray takes concurrency_groups from the decorator and not
+                    # from .options(); see PSRL_AgentLoopWorker.
                     scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=not hard_affinity),
                 ).remote(
                     self.config,

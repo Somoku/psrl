@@ -98,9 +98,15 @@ def loss_mask_is_zero(terminate_reason: TerminateReason, *, overlong_filtering: 
     return terminate_reason.is_ungraded or (overlong_filtering and terminate_reason.is_budget_truncated)
 
 
-@ray.remote
+@ray.remote(concurrency_groups={"metrics": 1})
 class PSRL_AgentLoopWorker:
-    """Agent loop worker takes a batch of messages and run each message in an agent loop."""
+    """Agent loop worker takes a batch of messages and run each message in an agent loop.
+
+    The ``metrics`` group is a single slot the per-step snapshot read runs in, kept apart
+    from the pool trajectory work uses. Sharing that pool made observability the first
+    thing to fail as density rose: with every slot held by the data plane, the read that
+    reports how full the node is was the one call that could not run on a full node.
+    """
 
     def __init__(
         self,
@@ -319,12 +325,17 @@ class PSRL_AgentLoopWorker:
         )
         await self.sandbox_manager.shutdown()
 
+    @ray.method(concurrency_group="metrics")
     def sandbox_metrics_snapshot(self) -> dict[str, float]:
         """Return this worker's sandbox plane metrics for the trainer's per-step hook.
 
         The planes report and never log, and the trainer is the only reader, so the
         sandbox metric group lands on the same step axis as reward and timing
         without a second pipeline.
+
+        It runs in its own concurrency group because it is a read of the control
+        plane, not part of the data plane: a snapshot that has to wait for a slot
+        behind trajectory work reports the node as it was, or not at all.
         """
         if self.sandbox_manager is None:
             return {}

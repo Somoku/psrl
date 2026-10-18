@@ -1,4 +1,5 @@
 import logging
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -9,7 +10,7 @@ from torch import Tensor
 from torch.distributed.tensor import DTensor
 
 from psrl.utils.common.http_utils import find_available_port
-from psrl.utils.common.worker_naming import train_client_name
+from psrl.utils.common.worker_naming import gen_client_name, train_client_name
 from psrl.utils.logger import (
     EventType,
     deprecated,
@@ -19,6 +20,7 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.nixl import NIXLMetaServer
+from psrl.utils.nixl.handshake_notif import NotifKind, encode
 from psrl.utils.ps_mode import uses_nixl
 from psrl.utils.ray import add_busy_polling_lock
 from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
@@ -34,6 +36,7 @@ from psrl.workers.ps.version_barrier import (
     PublishOutcome,
     VersionBarrier,
 )
+from psrl.workers.ps.write_state import Admission, Commit, WriteState
 
 psrl_logger = get_ps_logger()
 
@@ -153,6 +156,16 @@ class PSManager(RequestStatusTracker):
 
         self._exclusive_push_locked = False
         self._shared_pull_count = 0
+
+        # v2 write gate: epochs, admitted pulls, certified holders, commit validation.
+        # Only meaningful where readers read the trainer's live parameters; `validate_config`
+        # resolves `await_write_gate`, and every method below degrades to the old behaviour
+        # when it is false (PS data plane, cast paths, colocate).
+        self._write_state = WriteState(version=self.model_store.version_tag)
+        # Strict boolean: `auto` is resolved by `validate_config`; an unresolved string
+        # must not read as enabled.
+        self._write_gate_enabled = self.psrl_config.nixl.get("await_write_gate", False) is True
+        self._preempt_ack_timeout_s = float(self.psrl_config.nixl.get("preempt_ack_timeout_ms", 100)) / 1e3
 
         self.grpc_state_server = None
         self.grpc_state_port: int | None = None
@@ -951,27 +964,44 @@ class PSManager(RequestStatusTracker):
         rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId],
     ):
         """Update the rollout instance model version to the latest model version."""
+        self._update_rollout_instance_model_version_tag(rollout_instance_ids)
+
+    def _update_rollout_instance_model_version_tag(
+        self,
+        rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId],
+        version: int | None = None,
+    ):
+        """Record ``version`` (default: the latest published one) for these instances.
+
+        The explicit form exists for a repaired pull: the reader landed an older version
+        from certified holders after the writer moved on, and recording the *latest*
+        version against those bytes would make the staleness ledger claim a version the
+        instance does not hold. Stale-but-honest is the property every consumer relies on.
+        """
         if not isinstance(rollout_instance_ids, list):
             rollout_instance_ids = [rollout_instance_ids]
 
+        target = self.model_store.version_tag if version is None else int(version)
         for rollout_instance_id in rollout_instance_ids:
             assert rollout_instance_id in self.rollout_instance_tracker, (
                 f"Unregistered rollout instance: {rollout_instance_id}."
             )
+            if self._write_gate_enabled:
+                # The certified-holder ledger used to repair a preempted reader. Recording
+                # it here covers both the commit path and versions reached outside a pull.
+                self._write_state.record_published(rollout_instance_id, target)
 
-            if self.rollout_instance_tracker[rollout_instance_id].version_tag != self.model_store.version_tag:
+            if self.rollout_instance_tracker[rollout_instance_id].version_tag != target:
                 # NOTE(lhy): The coordinator is unnecessary when initialization keeps the version at zero.
                 assert self.rollout_coordinator is not None, (
                     "Rollout coordinator is not set. Please set it before updating rollout instance model version."
                 )
-                self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
+                self.rollout_instance_tracker[rollout_instance_id].version_tag = target
                 self.rollout_coordinator.set_rollout_instance_model_version.remote(
                     rollout_instance_id=rollout_instance_id,
-                    version_tag=self.model_store.version_tag,
+                    version_tag=target,
                 )
-                psrl_logger.info(
-                    f"Updated rollout instance: {rollout_instance_id}. Model version: {self.model_store.version_tag}."
-                )
+                psrl_logger.info(f"Updated rollout instance: {rollout_instance_id}. Model version: {target}.")
 
     # ------- PS NIXL CONTROL PLANE -------
 
@@ -1169,19 +1199,27 @@ class PSManager(RequestStatusTracker):
         )
         return self.ps_nixl_train_storage_client_names
 
-    def get_nixl_version_state(self) -> tuple[int, frozenset[str], frozenset[int]]:
-        """Return the model version, the trainer ranks holding it, and the invalid versions.
+    @_state_locked
+    def get_nixl_version_state(self) -> tuple[int, frozenset[str], frozenset[int], int, str]:
+        """Return the model version, trainer holders, invalid versions, and write state.
 
-        One call, because a reader needs all three before it decides what to read. The
-        holder set drives D1 source filtering. The invalid set drives E1 recovery: a
-        version whose drain budget expired is marked here, and a reader that finds its own
-        version listed re-pulls the current one instead of leaving a stale mark unread.
+        One call, because a reader needs all of them before it decides what to read. The
+        holder set drives D1 source filtering. The invalid set drives E1 recovery. The
+        ``(write_epoch, write_state)`` pair is the v2 admission/commit token: a pull that
+        starts while ``write_state != "open"`` is refused, and a pull that spans an epoch
+        change cannot commit unless it repaired through certified holders.
 
         An empty holder set means nothing has been published yet or direct supply is off.
         `pull_engine` treats an empty set as "no filter", so other ps_modes are unaffected.
         """
         version = self.model_store.version_tag if self.model_store is not None else 0
-        return version, self._nixl_version_holders, self._publish_barrier.invalidated_versions()
+        return (
+            version,
+            self._nixl_version_holders,
+            self._publish_barrier.invalidated_versions(),
+            self._write_state.epoch,
+            self._write_state.state,
+        )
 
     def get_ps_nixl_gen_storage_client_names(self) -> list[str]:
         """Get the NIXL gen storage client name of the PS worker group."""
@@ -1232,52 +1270,199 @@ class PSManager(RequestStatusTracker):
         assert self._exclusive_push_locked, "Exclusive push lock is not locked"
         self._exclusive_push_locked = False
 
-    def _try_acquire_shared_pull_lock(self) -> bool:
-        """
-        Try to acquire the shared pull lock.
-        Returns True if acquired, False if a push is in progress.
+    def _try_acquire_shared_pull_lock(
+        self,
+        rollout_instance_id: RolloutInstanceId | None = None,
+        version: int | None = None,
+    ) -> int | None:
+        """Admit a pull and return the writer epoch it must carry to commit.
 
-        This method ensures that:
-        - No push is in progress (_exclusive_push_locked == False)
-        Multiple pull operations can run concurrently.
+        Returns None while an exclusive push holds the lock, while the v2 write gate is
+        closed, or while this instance is pinned as a repair holder. With the write gate
+        enabled the admission records ``start_epoch`` in `WriteState`; the pull carries the
+        returned value back to `finish_shared_pull`, which validates it against the epoch
+        the writer bumps before touching parameters. Without the gate the sentinel -1 is
+        returned so callers still see a successful admission (0 is a valid epoch).
         """
         if self._exclusive_push_locked:
-            return False
+            return None
+        epoch = -1
+        if self._write_gate_enabled:
+            if rollout_instance_id is None:
+                return None
+            admission: Admission = self._write_state.begin_pull(
+                rollout_instance_id,
+                self.model_store.version_tag if version is None else version,
+            )
+            if not admission.admitted:
+                psrl_logger.debug(
+                    f"Pull admission denied for {rollout_instance_id}: {admission.reason}."
+                )
+                return None
+            epoch = admission.token.start_epoch if admission.token is not None else -1
         self._shared_pull_count += 1
-        return True
+        return epoch
 
-    def _release_shared_pull_lock(self):
-        """Release the shared pull lock."""
+    def _release_shared_pull_lock(self, rollout_instance_id: RolloutInstanceId | None = None):
+        """Release the shared pull lock, abandoning the pull token it admitted."""
         assert self._shared_pull_count > 0, "Shared pull lock count is already 0"
         self._shared_pull_count -= 1
+        if self._write_gate_enabled and rollout_instance_id is not None:
+            # A release without a commit means the body did not land: drop the token so a
+            # later acknowledgement or commit cannot be attributed to it.
+            self._write_state.abort_pull(rollout_instance_id)
 
     def finish_shared_pull(
         self,
         rollout_instance_ids: "RolloutInstanceId | list[RolloutInstanceId] | None" = None,
+        repaired: bool = False,
+        reader: RolloutInstanceId | None = None,
+        pull_epoch: int | None = None,
+        landed_version: int | None = None,
     ) -> int | None:
         """Commit a pull's version and release its shared lock in one round trip (C2).
 
-        These are the two halves of "this pull finished" and always happen together, so
-        charging two round trips for them is the cost C2 exists to remove.
+        With the v2 write gate enabled, this is the **commit point** of optimistic
+        concurrency control: the pull may only be recorded if no writer's epoch moved
+        during it, or if the reader acknowledged the preemption before that write and
+        repaired every unfinished key from certified holders. A rejected pull returns
+        ``None`` and must not serve its bytes; the caller re-pulls the next version.
 
         Order matters and is not interchangeable: the version is committed *before* the
-        lock is released. Releasing first would open a window where a push can take the
-        exclusive lock and advance the version, after which this commit would record the
-        newer version against an instance that pulled the older bytes -- a staleness
-        ledger that disagrees with what was actually generated, which nothing downstream
-        can detect.
+        lock is released. Releasing first would open a window where a push can advance the
+        version, after which this commit would record the newer version against an
+        instance that pulled the older bytes -- a staleness ledger that disagrees with what
+        was actually generated, which nothing downstream can detect.
 
         The release still happens if the commit raises, since a lock that is never
         released stalls every later pull, which is a worse failure than a lost version
         update that the next sync re-derives.
         """
         version: int | None = None
+        token_reader = reader
+        if token_reader is None and rollout_instance_ids is not None:
+            ids = rollout_instance_ids if isinstance(rollout_instance_ids, list) else [rollout_instance_ids]
+            token_reader = ids[0] if ids else None
         try:
+            if self._write_gate_enabled and token_reader is not None:
+                decision: Commit = self._write_state.finish_pull(
+                    token_reader,
+                    repaired=repaired,
+                    pull_epoch=pull_epoch,
+                    landed_version=landed_version,
+                )
+                if not decision.accepted:
+                    psrl_logger.warning(
+                        f"Pull commit rejected for {token_reader}: {decision.reason}. "
+                        "The instance holds bytes from more than one version and must re-pull."
+                    )
+                    return None
+                if rollout_instance_ids is not None:
+                    version = decision.version
+                    self._update_rollout_instance_model_version_tag(
+                        rollout_instance_ids, version=self.model_store.version_tag if version is None else version
+                    )
+                return version
             if rollout_instance_ids is not None:
                 version = self.pull_model_state_dict_nixl(rollout_instance_ids)
         finally:
-            self._release_shared_pull_lock()
+            self._release_shared_pull_lock(token_reader)
         return version
+
+    # ------- WRITE GATE (v2): optimistic commit validation -------
+
+    def _send_preempts(self, batch) -> None:
+        """Tell every in-flight reader that its trainer source is about to be overwritten.
+
+        The payload carries the same-node holders of the version being read, so a reader
+        can repair the keys it had not finished instead of waiting for the next version.
+        A reader that misses the notice is still safe: its commit is rejected by the
+        epoch check in `finish_shared_pull`.
+        """
+        if self.nixl_meta_server is None or not batch.readers:
+            return
+        infos = self.nixl_meta_server.client_infos
+        # Group holders by node once. Building the list per reader would be O(readers x
+        # holders), which at 10k instances is 10^8 comparisons per training step.
+        holders_by_node: dict[str, list[str]] = {}
+        for instance in batch.holders:
+            holder = gen_client_name(instance[0], instance[1])
+            holder_info = infos.get(holder)
+            if holder_info is not None:
+                holders_by_node.setdefault(holder_info.node_ip, []).append(holder)
+        for instance in batch.readers:
+            client = gen_client_name(instance[0], instance[1])
+            info = infos.get(client)
+            if info is None or not info.agent_name:
+                # A reader whose metadata has not arrived cannot be preempted; its commit
+                # is still validated against the epoch, so correctness does not depend on it.
+                psrl_logger.warning(f"Write gate could not preempt {client}: no NIXL agent metadata.")
+                continue
+            holders = [holder for holder in holders_by_node.get(info.node_ip, ()) if holder != client]
+            payload = encode(
+                NotifKind.PULL_PREEMPT,
+                {
+                    client: {
+                        "epoch": batch.epoch,
+                        "version": batch.version,
+                        "holders": holders,
+                    }
+                },
+            )
+            self.nixl_meta_server.agent.send_notif(info.agent_name, payload)
+
+    def _drain_preempt_acks(self, epoch: int) -> None:
+        if self.nixl_meta_server is not None:
+            self.nixl_meta_server.drain_pull_acks(epoch, self._write_state.ack)
+
+    @_state_locked
+    def begin_write(self) -> int | None:
+        """Close the current version and preempt its readers before the optimizer writes.
+
+        Called by the trainer's representative rank *before* the first optimizer step of
+        an update. Returns the write epoch, or None when the gate is disabled. The wait is
+        bounded by `preempt_ack_timeout_ms` and is a control-plane round trip, not a data
+        drain: a reader that does not acknowledge before the deadline is handled by commit
+        validation (it cannot land the old version).
+        """
+        if not self._write_gate_enabled:
+            return None
+        batch = self._write_state.begin_write()
+        started = time.time()
+        self._send_preempts(batch)
+        deadline = started + self._preempt_ack_timeout_s
+        while time.time() < deadline:
+            self._drain_preempt_acks(batch.epoch)
+            if len(self._write_state.acked(batch.epoch)) >= len(batch.readers):
+                break
+            time.sleep(0.0005)
+        # Drain once more: acknowledgements that arrive during the last sleep still count
+        # for the commit validation, even though the write may already have started.
+        self._drain_preempt_acks(batch.epoch)
+        self._write_state.start_writing()
+        psrl_logger.info(
+            f"Write gate closed: epoch={batch.epoch}, version={batch.version}, "
+            f"preempted={len(batch.readers)}, acknowledged={len(self._write_state.acked(batch.epoch))}, "
+            f"holders={len(batch.holders)}, waited_ms={(time.time() - started) * 1e3:.2f}."
+        )
+        return batch.epoch
+
+    def abort_write(self) -> None:
+        """Keep the version closed after a failed update; the next write recovers."""
+        if self._write_gate_enabled:
+            self._write_state.abort_write()
+
+    def get_write_state(self) -> dict:
+        """Observability for tests and the coordinator: epoch, state, holders, in-flight."""
+        return {
+            "enabled": self._write_gate_enabled,
+            "version": self._write_state.version,
+            "epoch": self._write_state.epoch,
+            "state": self._write_state.state,
+            "inflight": sorted(self._write_state.inflight()),
+            "holders": sorted(self._write_state.holders(self._write_state.version)),
+            "acked": sorted(self._write_state.acked(self._write_state.epoch)),
+        }
 
     @_state_locked
     def init_model_version_for_resume(self, version: int):
@@ -1381,6 +1566,11 @@ class PSManager(RequestStatusTracker):
         self.model_store = ModelStore(
             version_tag=version_tag,
         )
+        # v2: publishing is what reopens the version. It happens after the optimizer wrote
+        # the parameters and the trainer wrote the version stamps, so a reader admitted
+        # from here on sees a complete version. Harmless when no gate was opened (resume,
+        # PS data plane): it simply records the new version and state `open`.
+        self._write_state.publish(version_tag)
         # D1 version-aware source selection: record that all known trainer ranks now hold
         # this version.  The holder set is the full trainer client list — every rank ran
         # `publish_version(v)` before rank 0 reached here (the barrier in

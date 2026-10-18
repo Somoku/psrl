@@ -76,6 +76,29 @@ publish_fp8_block: null
 # both are structurally safe and this stays False.
 await_readers_before_publish: auto
 
+# v2 write gate: optimistic commit validation for pulls against in-place optimizer writes.
+#
+# When enabled, the trainer closes the version before its first optimizer parameter write,
+# preempts in-flight readers with a control notification, and records `write_epoch`. A pull
+# may commit only if the epoch did not move during it, or if it acknowledged before the
+# write and repaired its unfinished keys from same-node holders of the same version. The
+# writer waits at most `preempt_ack_timeout_ms` (a notification round trip, not a drain),
+# so a slow reader cannot stall training.
+#
+# `auto` enables it where rollouts read the trainer's live parameter bytes: direct supply
+# at matched precision. Cast/FP8 rollouts read a separate published copy and PS modes read
+# PS memory, so both resolve to False. Explicit booleans override for fault injection.
+await_write_gate: auto
+# Bound on how long the optimizer waits for readers to record the preemption boundary.
+# Acknowledgements only need a control-plane round trip; the data read is invalidated,
+# not drained.
+preempt_ack_timeout_ms: 100
+
+# How long a reader waits for the next version after its pull was preempted and could not
+# be repaired from holders. It must cover one training step; the reader stays paused until
+# a complete version lands.
+preempt_repull_timeout_s: 600
+
 # How long that wait may last, in milliseconds.
 #
 # Bounded on purpose: a budget that can reach a step's duration would delay every publish

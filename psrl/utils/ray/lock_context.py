@@ -98,15 +98,18 @@ def exclusive_push_model_context_async(ps_manager, poll_interval=0.01):
     return _AsyncExclusivePushModelContext(ps_manager, poll_interval)
 
 
-def shared_pull_model_context_async(ps_manager, poll_interval=0.01, commit_instance_ids=None):
+def shared_pull_model_context_async(ps_manager, poll_interval=0.01, commit_instance_ids=None, reader=None):
     """
     An async context manager that ensures shared access during model pull.
     Allows multiple pull operations to run concurrently, but blocks if a push is in progress.
 
     Pass ``commit_instance_ids`` to commit those instances' version as part of releasing
-    the lock, which costs one round trip rather than two (item C2).
+    the lock, which costs one round trip rather than two (item C2). Pass ``reader`` -- the
+    instance id of the rank performing the pull -- to participate in the v2 write gate:
+    admission and commit are then recorded against a stable ``write_epoch``. Set
+    ``repaired`` before exit when the pull repaired preempted keys from certified holders.
     """
-    return _AsyncSharedPullModelContext(ps_manager, poll_interval, commit_instance_ids)
+    return _AsyncSharedPullModelContext(ps_manager, poll_interval, commit_instance_ids, reader)
 
 
 class RayLock:
@@ -336,7 +339,7 @@ class _AsyncSharedPullModelContext:
     Allows multiple pull operations to run concurrently, but blocks if a push is in progress.
     """
 
-    def __init__(self, ps_manager, poll_interval=0.01, commit_instance_ids=None):
+    def __init__(self, ps_manager, poll_interval=0.01, commit_instance_ids=None, reader=None):
         """
         Initialize the async shared pull model context.
 
@@ -348,11 +351,22 @@ class _AsyncSharedPullModelContext:
                 round trip instead of two; the committed version is then available as
                 `committed_version`. When None the exit only releases, which is what a
                 caller that has already committed needs.
+            reader: Instance id of the rank pulling. Required by the v2 write gate, which
+                admits the pull and validates its commit against the writer's epoch.
         """
         self.ps_manager = ps_manager
         self.poll_interval = poll_interval
         self.commit_instance_ids = commit_instance_ids
+        self.reader = reader
+        #: Set by the caller when the pull repaired preempted keys from certified holders.
+        self.repaired = False
         self.committed_version = None
+        #: Writer epoch recorded by the admission; the pull carries it back at commit.
+        self.start_epoch: int | None = None
+        #: Epoch the successful attempt actually read at (may be newer than admission).
+        self.pull_epoch: int | None = None
+        #: Version the engine actually landed, which can differ from the admission target.
+        self.landed_version: int | None = None
 
     async def __aenter__(self):
         """Enter the context, acquiring shared lock."""
@@ -363,8 +377,9 @@ class _AsyncSharedPullModelContext:
             # costs more round trips than an uncontended one, and averaging that away
             # would hide the cost the C2 criterion is about.
             GLOBAL_CONTROL_PLANE_METER.record("try_acquire_shared_pull_lock")
-            can_acquire = await self.ps_manager._try_acquire_shared_pull_lock.remote()
-            if can_acquire:
+            admitted = await self.ps_manager._try_acquire_shared_pull_lock.remote(self.reader)
+            if admitted is not None:
+                self.start_epoch = admitted
                 return self
             await asyncio.sleep(self.poll_interval)
 
@@ -378,10 +393,14 @@ class _AsyncSharedPullModelContext:
             # weights the instance never landed.
             GLOBAL_CONTROL_PLANE_METER.record("finish_shared_pull")
             self.committed_version = await self.ps_manager.finish_shared_pull.remote(
-                self.commit_instance_ids
+                self.commit_instance_ids,
+                repaired=self.repaired,
+                reader=self.reader,
+                pull_epoch=self.pull_epoch,
+                landed_version=self.landed_version,
             )
             return False
 
         GLOBAL_CONTROL_PLANE_METER.record("release_shared_pull_lock")
-        await self.ps_manager._release_shared_pull_lock.remote()
+        await self.ps_manager._release_shared_pull_lock.remote(self.reader)
         return False

@@ -166,6 +166,7 @@ def _cluster(members: dict[str, str], *, holders: dict[str, set[str]] | None = N
         release_member = NIXLMetaServer.release_member
         _holder_agents_of = NIXLMetaServer._holder_agents_of
         _forget_client = NIXLMetaServer._forget_client
+        _route_notif = NIXLMetaServer._route_notif
         _drain_notifs = NIXLMetaServer._drain_notifs
         _add_client = NIXLMetaServer._add_client
 

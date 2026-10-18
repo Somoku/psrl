@@ -62,6 +62,12 @@ class NotifKind(Enum):
     #: Peer -> server: this agent has executed the revocation. The half that makes the
     #: shrink safe; without it the server cannot distinguish "revoked" from "unreachable".
     LEAVE_ACK = "leave_ack"
+    #: Server -> reader: the trainer is about to overwrite the parameters this pull is
+    #: reading. The reader stops committing, acknowledges, and repairs the unfinished
+    #: keys from the holders listed in the payload (item E5, write gate).
+    PULL_PREEMPT = "pull_preempt"
+    #: Reader -> server: the boundary is recorded; pre-acknowledgement reads are safe.
+    PULL_PREEMPT_ACK = "pull_preempt_ack"
 
 
 @dataclass(frozen=True)

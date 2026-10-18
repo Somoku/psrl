@@ -139,6 +139,7 @@ class TestTheServerRoutesOnTheKind:
                 self._agents_reported = {kind: set() for kind in NotifKind}
 
             _add_client = NIXLMetaServer._add_client
+            _route_notif = NIXLMetaServer._route_notif
             _drain_notifs = NIXLMetaServer._drain_notifs
 
         return _Server()
@@ -278,6 +279,7 @@ class TestTheWaitNoLongerFreezesTheRoster:
                 self._agents_reported = {kind: set() for kind in NotifKind}
 
             _add_client = NIXLMetaServer._add_client
+            _route_notif = NIXLMetaServer._route_notif
             _drain_notifs = NIXLMetaServer._drain_notifs
             _wait_for = NIXLMetaServer._wait_for
 

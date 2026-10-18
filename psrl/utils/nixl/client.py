@@ -23,7 +23,6 @@ from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.device_ipc import RegionMapper, device_uuid, export_region
 from psrl.utils.nixl.handshake_notif import NotifKind, decode, encode
 from psrl.utils.nixl.leave_protocol import encode_leave_ack, revoke_descriptors
-from psrl.utils.nixl.partial_md import conn_info_only
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.moe_grouping import GroupedShards, entry_is_empty, local_shards_of
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
@@ -34,6 +33,7 @@ from psrl.utils.nixl.nixl_spec import (
     NIXLShardMetaInfo,
     NIXLTensorInfo,
 )
+from psrl.utils.nixl.partial_md import conn_info_only
 from psrl.utils.nixl.prepped_xfer import PreppedXferCache
 from psrl.utils.nixl.read_geometry import contiguous_strides, run_count
 from psrl.utils.nixl.strided_desc import (
@@ -548,6 +548,54 @@ class NIXLStorageClient:
         for agent_name, payloads in self.agent.get_new_notifs().items():
             merged.setdefault(agent_name, []).extend(payloads)
         return merged
+
+    def drain_pull_preempt(self, client_name: str) -> dict | None:
+        """Return a pending write-gate preemption for ``client_name``, if one arrived.
+
+        The pull engine polls this from its wait loops. Everything that is not ours is
+        pushed back into the foreign stash rather than dropped: `get_new_notifs` is
+        destructive, and handshake or membership mail may land while a pull is running.
+        A preemption already stashed by the chunk waiter is re-offered through
+        `take_foreign_notifs`, so ordering between the two drains does not matter.
+        """
+        found: dict | None = None
+
+        def _consume(agent_name: str, raw: bytes) -> bool:
+            nonlocal found
+            notif = decode(raw)
+            if notif is not None and notif.kind is NotifKind.PULL_PREEMPT:
+                entry = notif.entries.get(client_name)
+                if entry is not None:
+                    found = entry
+                    return True
+            return False
+
+        for agent_name, payloads in self.agent.get_new_notifs().items():
+            for raw in payloads:
+                if not _consume(agent_name, raw):
+                    self._stash_foreign_notif(agent_name, raw)
+        for agent_name, payloads in self.take_foreign_notifs().items():
+            for raw in payloads:
+                if not _consume(agent_name, raw):
+                    self._stash_foreign_notif(agent_name, raw)
+        if found is not None:
+            psrl_logger.info(
+                f"{client_name}: preempted for the write at epoch {found.get('epoch')}; "
+                f"{len(found.get('holders', ()))} same-node holder(s) available for repair."
+            )
+        return found
+
+    def send_pull_preempt_ack(self, epoch: int) -> None:
+        """Acknowledge a write-gate preemption over the notification channel.
+
+        A notification rather than a Ray call: the writer is a `PSManager` method that is
+        itself waiting for these acknowledgements, so a queued actor call would deadlock
+        behind it.
+        """
+        self.agent.send_notif(
+            self.server_name,
+            encode(NotifKind.PULL_PREEMPT_ACK, {self.client_name: {"epoch": int(epoch)}}),
+        )
 
     def handle_membership_notif(self, agent_name: str, raw: bytes) -> bool:
         """Consume ``raw`` if it is a membership message. True when it was ours.

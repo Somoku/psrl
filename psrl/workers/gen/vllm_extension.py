@@ -19,7 +19,7 @@ from psrl.utils.nixl import (
     NIXLClientType,
     NIXLStorageClient,
 )
-from psrl.utils.nixl.pull_engine import ChunkUnavailable, PullVerdict, TornPull
+from psrl.utils.nixl.pull_engine import ChunkUnavailable, PullPreempted, PullVerdict, TornPull
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -222,6 +222,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         participant_instances: list[int] | None = None,
         version_holders: frozenset[str] | None = None,
         target_version: int = -1,
+        pull_epoch: int | None = None,
     ) -> PullVerdict:
         """
         Pull the latest weights through the NIXL pull engine.
@@ -239,6 +240,9 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
                 ``target_version``.  Forwarded to ``pull_engine.pull`` for D1 version-aware source
                 filtering.  None means no filtering (backward-compatible default).
             target_version (int): Model version being pulled, for logging.  -1 means unknown.
+            pull_epoch (int | None): Writer epoch recorded by the coordinator when this pull
+                was admitted. A newer epoch preempts the pull; the engine acknowledges over
+                the notification channel and repairs unfinished keys from certified holders.
         """
         self.pull_times = getattr(self, "pull_times", 0) + 1
         allowed = None if participant_instances is None else set(participant_instances)
@@ -254,6 +258,8 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
                 participants,
                 version_holders=version_holders,
                 target_version=target_version,
+                pull_epoch=pull_epoch,
+                on_preempt_ack=self.nixl_storage_client.send_pull_preempt_ack,
             )
         except ChunkUnavailable as unavailable:
             # Nothing was written, so the instance is still consistent at its current version.
@@ -272,6 +278,16 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             psrl_logger.warning(f"{self.nixl_storage_client.client_name}: pull {self.pull_times} torn: {torn}")
             self._sync_pulled_versions(set())
             return PullVerdict(landed=False, versions=frozenset(), reason="torn")
+        except PullPreempted as preempted:
+            # The writer moved while this pull was reading and no certified holder could
+            # supply every unfinished key. The local bytes may mix versions; the caller
+            # waits for the next version and re-pulls it whole.
+            psrl_logger.warning(
+                f"{self.nixl_storage_client.client_name}: pull {self.pull_times} could not be "
+                f"repaired after preemption: {preempted}"
+            )
+            self._sync_pulled_versions(set())
+            return PullVerdict(landed=False, versions=frozenset(), reason="preempted")
         # D7: sources that failed mid-pull and were rerouted to a DP replica are confirmed
         # dead; promote them so the next pull skips them rather than re-discovering the
         # failure through another timed-out read.
@@ -292,9 +308,10 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             f"{report.seconds:.3f}s, upstream {report.upstream_bytes / 1e9:.2f} GB in {report.upstream_seconds:.3f}s, "
             f"peer {report.peer_bytes / 1e9:.2f} GB, {report.descriptors} descriptors, "
             f"{report.followers} follower(s), {report.fallback_keys} fallback key(s), "
-            f"{report.takeover_keys} key(s) taken over from a replica."
+            f"{report.takeover_keys} key(s) taken over from a replica"
+            + (", repaired from holders after preemption." if report.repaired else ".")
         )
-        return PullVerdict(landed=True, versions=frozenset(report.versions))
+        return PullVerdict(landed=True, versions=frozenset(report.versions), repaired=report.repaired)
 
     def _sync_pulled_versions(self, versions) -> None:
         """Record what the last pull read, for `pulled_version_set`.

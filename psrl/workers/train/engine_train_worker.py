@@ -1,5 +1,6 @@
 # Copyright (c) 2025, PSRL Authors.
 
+import functools
 import logging
 import os
 from contextlib import nullcontext
@@ -42,7 +43,6 @@ if not is_cuda_available and os.environ.get("TORCH_CUDA_ARCH_LIST") == "8.0":
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME  # noqa: E402
 from psrl.utils.common.worker_naming import train_client_name  # noqa: E402
-from psrl.utils.ps_mode import has_ps_data_plane  # noqa: E402
 from psrl.utils.logger import (  # noqa: E402
     DualOutputHandler,
     EventType,
@@ -56,6 +56,7 @@ from psrl.utils.nixl import (  # noqa: E402
     NIXLClientType,
     NIXLStorageClient,
 )
+from psrl.utils.ps_mode import has_ps_data_plane  # noqa: E402
 from psrl.utils.ray import exclusive_push_model_context  # noqa: E402
 from psrl.workers.train.base_train_worker import PSRL_BaseTrainWorker, TrainInterface  # noqa: E402
 
@@ -152,6 +153,8 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         # Host-side ref-policy snapshot (design §3.10.2). Built lazily by
         # capture_ref_backup() once the actor is initialised; None until then.
         self._ref_backup = None
+        #: True between the first optimizer write of an update and its push.
+        self._write_gate_open = False
 
     @property
     def is_train_representative_rank(self) -> bool:
@@ -553,29 +556,109 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         rather than deleted so callers do not need to be touched.
         """
 
+    def _write_gate_enabled_here(self) -> bool:
+        return (
+            self._is_actor
+            and self.actor is not None
+            and self.psrl_config.nixl.get("await_write_gate") is True
+        )
+
+    def _install_optimizer_write_gate(self) -> None:
+        """Close the pulled version before the optimizer writes its parameters (v2).
+
+        `engine.optimizer_step` is the point where Megatron's master→bf16 copy-back and
+        FSDP2's in-place update both happen, and it runs once per mini-batch. The gate is
+        opened on the first call of an update and stays open until publish, because every
+        mini-batch overwrites the same buffer while only one version is announced.
+        """
+        if not self._write_gate_enabled_here():
+            return
+        engine = self.actor.engine
+        if getattr(engine, "_psrl_write_gate_installed", False):
+            return
+        original = engine.optimizer_step
+
+        @functools.wraps(original)
+        def gated_optimizer_step(*args, **kwargs):
+            self._open_write_gate_once()
+            return original(*args, **kwargs)
+
+        engine.optimizer_step = gated_optimizer_step
+        engine._psrl_write_gate_installed = True
+        psrl_logger.info(f"{self.log_prefix}: installed the optimizer write gate.")
+
+    def _open_write_gate_once(self) -> None:
+        """Announce the upcoming write once per update, then synchronise the actor ranks.
+
+        Only rank 0 talks to the manager; every rank waits at a barrier so no rank can
+        start writing its shard before the epoch is recorded. The barrier is the same kind
+        of collective the optimizer already participates in, and the manager's wait is
+        bounded by `preempt_ack_timeout_ms`.
+        """
+        if self._write_gate_open or not self._write_gate_enabled_here():
+            return
+        if self.is_train_representative_rank:
+            ray.get(self.train_interface.ps_manager_handle.begin_write.remote())
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            torch.distributed.barrier()
+        self._write_gate_open = True
+
+    def _close_write_gate(self, published: bool) -> None:
+        """Finish the update. A publish reopens the version; an aborted update stays closed."""
+        if not self._write_gate_open:
+            return
+        self._write_gate_open = False
+        if published or not self.is_train_representative_rank:
+            return
+        # The parameters were written but no version was published. Opening the buffer
+        # would let readers commit a mixture, so keep it closed for the next write.
+        psrl_logger.warning(
+            f"{self.log_prefix}: update finished without publishing; keeping the version "
+            "closed so readers cannot serve the partially updated parameters."
+        )
+        ray.get(self.train_interface.ps_manager_handle.abort_write.remote())
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @gpu_memory_logger_decorator(log_only_rank_0=False)
     def update_actor(self, data: TensorDict) -> TensorDict:
         """Train the actor for one step, then push updated weights to the PS."""
-        with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
-            output = ActorRolloutRefWorker.update_actor(self, data)
-        # The actor's parameters changed; any cached ref snapshot is now stale.
-        if self._ref_backup is not None:
-            self._ref_backup.mark_modified()
-        push_model = tu.pop(data, key="push_model", default=True)
-        if not push_model:
-            return output
+        self._write_gate_open = False
+        self._install_optimizer_write_gate()
+        published = False
+        try:
+            with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
+                output = ActorRolloutRefWorker.update_actor(self, data)
+            # The actor's parameters changed; any cached ref snapshot is now stale.
+            if self._ref_backup is not None:
+                self._ref_backup.mark_modified()
+            push_model = tu.pop(data, key="push_model", default=True)
+            if not push_model:
+                return output
 
-        torch.cuda.synchronize()
-        context_manager = (
-            exclusive_push_model_context(self.train_interface.ps_manager_handle)
-            if self.is_train_representative_rank
-            else nullcontext()
-        )
-        with context_manager:
-            with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
-                PSRL_BaseTrainWorker.push_model(self)
-        return output
+            torch.cuda.synchronize()
+            # v2: with the write gate enabled the epoch protocol already excludes readers
+            # from the live buffer, and publish is a pure version flip (no bytes move at
+            # matched precision). Taking the shared/exclusive lock here would make publish
+            # wait for readers that are repairing from peers, which is the delay the gate
+            # exists to avoid -- and can deadlock a reader waiting for OPEN. Cast/PS paths
+            # keep the lock because their publish refreshes a shared copy.
+            gate_enabled = self.psrl_config.nixl.get("await_write_gate") is True
+            context_manager = (
+                exclusive_push_model_context(self.train_interface.ps_manager_handle)
+                if self.is_train_representative_rank and not gate_enabled
+                else nullcontext()
+            )
+            with context_manager:
+                with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
+                    PSRL_BaseTrainWorker.push_model(self)
+            published = True
+            return output
+        finally:
+            self._close_write_gate(published)
 
     def capture_ref_backup(self) -> None:
         """Snapshot the actor's current weights as the frozen reference policy.

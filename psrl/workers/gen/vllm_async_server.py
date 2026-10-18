@@ -69,6 +69,17 @@ if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
     get_encoding()
 
 psrl_logger = logging.getLogger(__file__)
+
+
+class _PullDeferred(RuntimeError):
+    """A pull must be retried after the writer publishes: it was preempted, or the version
+    closed before it could start.
+
+    Raised *inside* the shared pull lock so the lock's exit releases the admission; waiting
+    for the new version while holding it would deadlock against a publish that still takes
+    the exclusive side (cast/PS paths), and would keep the old version's reader count alive
+    for no reason.
+    """
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
@@ -1100,11 +1111,49 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         reader_id = (self.base_worker_id, data_parallel_rank)
         await ps_manager_handle.begin_read.remote(reader_id, reading_version)
         try:
-            lock = shared_pull_model_context_async(self.gen_interface.ps_manager_handle)
-            async with lock:
-                with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
-                    await self.pull_model(epoch, participants)
-                lock.commit_instance_ids = self._pull_commit_instance_ids
+            max_retries = max(2, int(self.psrl_config.nixl.get("preempt_repull_attempts", 2))) + 2
+            for attempt in range(max_retries):
+                lock = shared_pull_model_context_async(
+                    self.gen_interface.ps_manager_handle, reader=reader_id
+                )
+                async with lock:
+                    self._pull_used_epoch = None
+                    self._pull_landed_version = None
+                    self._pull_repaired = False
+                    try:
+                        with log_dual_events(
+                            "Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL
+                        ):
+                            await self.pull_model(epoch, participants)
+                    except _PullDeferred as deferred:
+                        # Release the admission before waiting: the writer's publish must not
+                        # wait on this reader's shared count, and the next attempt needs a
+                        # fresh epoch anyway.
+                        psrl_logger.warning(
+                            f"{self.base_worker_id}: pull deferred ({deferred}); waiting for "
+                            "the next published version."
+                        )
+                        lock.commit_instance_ids = None
+                        continue
+                    lock.commit_instance_ids = self._pull_commit_instance_ids
+                    lock.pull_epoch = self._pull_used_epoch
+                    lock.landed_version = self._pull_landed_version
+                    lock.repaired = self._pull_repaired
+                if lock.committed_version is not None:
+                    break
+                # The commit was rejected: the local bytes may mix versions. Wait for the
+                # writer to publish and pull again; exhausting the retries raises, so the
+                # replica is quarantined rather than serving a mixture.
+                psrl_logger.warning(
+                    f"{self.base_worker_id}: pull commit rejected (attempt {attempt + 1}); "
+                    "re-pulling the next published version."
+                )
+                if attempt + 1 >= max_retries:
+                    raise WeightRefreshFailed(
+                        f"{self.base_worker_id}: pull commit rejected after a write; the instance "
+                        "holds bytes from more than one version and must not generate."
+                    )
+                await self._wait_for_open_version(after=ps_version)
         finally:
             self._pull_commit_deferred = False
             await ps_manager_handle.end_read.remote(reader_id, reading_version)
@@ -1166,7 +1215,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             await self.resume_after_sync()
         return version
 
-    async def pull_model(self, epoch: int | None = None, participants: list[int] | None = None):
+    async def pull_model(
+        self,
+        epoch: int | None = None,
+        participants: list[int] | None = None,
+    ):
         # C2: clear before the pull, not after. A version left over from the previous
         # sync would be silently attributed to this one.
         self._last_pulled_model_version = None
@@ -1182,7 +1235,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             await self.collective_rpc(method="lmcache_clear_all_from_backend")
             psrl_logger.debug("Cleared LMCache backend after model weight update.")
 
-    async def nixl_pull_model(self, epoch: int | None, participants: list[int] | None) -> None:
+    async def nixl_pull_model(
+        self,
+        epoch: int | None,
+        participants: list[int] | None,
+    ) -> None:
         """
         Pull through the engine on every worker of this replica.
 
@@ -1228,7 +1285,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         psrl_logger.info("NIXL pull model done.")
 
     async def _pull_until_consistent(self, epoch: int, participants: list[int] | None) -> None:
-        """Pull until the weights hold one live version, or give up loudly.
+        """Pull until the weights hold one live version, or defer/raise.
 
         Each attempt is a whole pull, so each retry costs a full sync at steady state
         (0.02 to 0.16 s for an 8B model on one node, 2.4 s for 235B across two, FINDINGS
@@ -1237,6 +1294,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         A retry reads everything upstream itself. Epochs key peer diffusion signals and
         must never be reused, and an invented epoch would differ per replica, so followers
         would wait out the peer timeout before falling back anyway.
+
+        A write-gate preemption that cannot be repaired from holders raises
+        `_PullDeferred`: the caller releases its admission, waits for the writer to
+        publish, and pulls the next version through a fresh admission. Retrying inside
+        the current admission would leave a stale epoch and keep the old reader count
+        alive while the writer is trying to open the new version.
         """
         max_attempts = max(1, int(self.psrl_config.nixl.get("max_pull_attempts", 3)))
         ps_manager_handle = self.gen_interface.ps_manager_handle
@@ -1245,17 +1308,36 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         last_reason: str | None = None
         for attempt in range(1, max_attempts + 1):
             # Re-read the state every attempt: the version moved, so the first set was wrong.
-            target_version, version_holders, invalidated = await ps_manager_handle.get_nixl_version_state.remote()
+            (
+                target_version,
+                version_holders,
+                invalidated,
+                writer_epoch,
+                write_state,
+            ) = await ps_manager_handle.get_nixl_version_state.remote()
+            if write_state != "open":
+                raise _PullDeferred(f"version closed for a write (state={write_state})")
+            # The engine accepts a preemption notice for an epoch newer than the one it
+            # starts at. Admission may predate a completed write, so use the current epoch
+            # rather than the admission's; None disables the control path when the gate is off.
+            engine_epoch = (
+                writer_epoch if self.psrl_config.nixl.get("await_write_gate") is True else None
+            )
             verdicts = await self.engine.collective_rpc(
                 "nixl_pull_model_core",
-                args=(attempt_epoch, attempt_participants, version_holders, target_version),
+                args=(attempt_epoch, attempt_participants, version_holders, target_version, engine_epoch),
             )
+            self._pull_used_epoch = writer_epoch
+            self._pull_repaired = any(v.repaired for v in verdicts)
+            if any(not v.landed and v.reason == "preempted" for v in verdicts):
+                raise _PullDeferred("pull preempted by a parameter write and not repairable")
             landed = [v for v in verdicts if v.landed]
             if len(landed) == len(verdicts):
                 # Ranks landing different versions corrupt one instance just as mixing does.
                 landed_versions = frozenset().union(*(v.versions for v in landed))
                 # An empty set means the pull read no keys, which is a no-op rather than stale.
                 if not landed_versions or (len(landed_versions) == 1 and not landed_versions & invalidated):
+                    self._pull_landed_version = next(iter(landed_versions)) if landed_versions else None
                     return
                 last_reason = "invalidated" if landed_versions & invalidated else "torn"
                 last_versions = landed_versions
@@ -1286,6 +1368,21 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             f"{self.base_worker_id}: {max_attempts} pull attempt(s) did not land a single live "
             f"version (last {last_reason}, versions={sorted(last_versions)}). The weights mix "
             f"versions and must not generate. The next sync will re-pull."
+        )
+
+    async def _wait_for_open_version(self, after: int) -> int:
+        """Wait until the trainer's version is open and at least ``after``, then return it."""
+        ps_manager_handle = self.gen_interface.ps_manager_handle
+        timeout = float(self.psrl_config.nixl.get("preempt_repull_timeout_s", 600))
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            version, _, _, _, state = await ps_manager_handle.get_nixl_version_state.remote()
+            if state == "open" and version >= after:
+                return version
+            await asyncio.sleep(0.05)
+        raise WeightRefreshFailed(
+            f"{self.base_worker_id}: the trainer did not publish a new open version within "
+            f"{timeout}s; the instance must not generate while holding mixed bytes."
         )
 
     async def _assert_pulled_the_announced_version(self, announced: int) -> None:

@@ -166,22 +166,23 @@ class MinimalPSManagerHolder:
         if self.ps_nixl_train_storage_client_names:
             self._nixl_version_holders = frozenset(self.ps_nixl_train_storage_client_names)
 
-    def get_nixl_version_state(self) -> tuple[int, frozenset[str], frozenset[int]]:
+    def get_nixl_version_state(self) -> tuple[int, frozenset[str], frozenset[int], int, str]:
         version = self.model_store.version_tag if self.model_store is not None else 0
-        return version, self._nixl_version_holders, frozenset()
+        # The v2 write gate adds (epoch, state); this stand-in never has a write open.
+        return version, self._nixl_version_holders, frozenset(), 0, "open"
 
 
 class TestPSManagerHolders:
     def test_initial_state_empty_before_bind(self):
         ps = MinimalPSManagerHolder()
-        v, holders, _ = ps.get_nixl_version_state()
+        v, holders, _, _, _ = ps.get_nixl_version_state()
         assert v == 0
         assert holders == frozenset()
 
     def test_bind_direct_supply_populates_holders(self):
         ps = MinimalPSManagerHolder()
         ps.bind_direct_supply(4)
-        v, holders, _ = ps.get_nixl_version_state()
+        v, holders, _, _, _ = ps.get_nixl_version_state()
         assert v == 0
         assert holders == frozenset({"NIXLTrainClient_0", "NIXLTrainClient_1",
                                      "NIXLTrainClient_2", "NIXLTrainClient_3"})
@@ -190,7 +191,7 @@ class TestPSManagerHolders:
         ps = MinimalPSManagerHolder()
         ps.bind_direct_supply(2)
         ps.push_model_state_dict_nixl(3)
-        v, holders, _ = ps.get_nixl_version_state()
+        v, holders, _, _, _ = ps.get_nixl_version_state()
         assert v == 3
         assert holders == frozenset({"NIXLTrainClient_0", "NIXLTrainClient_1"})
 
@@ -200,7 +201,7 @@ class TestPSManagerHolders:
         ps.bind_direct_supply(3)
         for step in range(1, 5):
             ps.push_model_state_dict_nixl(step)
-            _, holders, _ = ps.get_nixl_version_state()
+            _, holders, _, _, _ = ps.get_nixl_version_state()
             assert len(holders) == 3, f"step {step}: expected 3 holders, got {len(holders)}"
 
     def test_no_holders_when_not_direct_supply(self):
@@ -209,7 +210,7 @@ class TestPSManagerHolders:
         ps.model_store = FakeModelStore(5)  # simulate a version existing
         # push without binding (non-direct-supply)
         ps.push_model_state_dict_nixl(6)
-        _, holders, _ = ps.get_nixl_version_state()
+        _, holders, _, _, _ = ps.get_nixl_version_state()
         # No train clients registered → holders is empty → pull_engine skips filtering
         assert holders == frozenset()
 
@@ -218,7 +219,7 @@ class TestPSManagerHolders:
         ps.bind_direct_supply(1)
         for v in [1, 2, 3, 10]:
             ps.push_model_state_dict_nixl(v)
-            reported_v, _, _ = ps.get_nixl_version_state()
+            reported_v, _, _, _, _ = ps.get_nixl_version_state()
             assert reported_v == v
 
 
@@ -233,7 +234,7 @@ class TestFilterWithHolders:
         ps = MinimalPSManagerHolder()
         ps.bind_direct_supply(4)
         ps.push_model_state_dict_nixl(7)
-        target_v, holders, _ = ps.get_nixl_version_state()
+        target_v, holders, _, _, _ = ps.get_nixl_version_state()
         assert target_v == 7
 
         upstream = {
@@ -248,7 +249,7 @@ class TestFilterWithHolders:
         ps = MinimalPSManagerHolder()
         ps.bind_direct_supply(3)
         ps.push_model_state_dict_nixl(8)
-        target_v, holders, _ = ps.get_nixl_version_state()
+        target_v, holders, _, _, _ = ps.get_nixl_version_state()
 
         # The actual upstream plan still lists all 3 trainers, but NIXLTrainClient_2
         # hasn't published v8 yet (the system-level guarantee is that once PSManager

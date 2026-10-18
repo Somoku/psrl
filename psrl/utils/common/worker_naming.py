@@ -195,6 +195,13 @@ def gen_client_instance(client_name: str) -> int:
     return int(client_name[len(prefix) :].split("_R", 1)[0])
 
 
+def gen_client_rank(client_name: str) -> int:
+    """Return the rank encoded in a gen client name made by `gen_client_name`."""
+    prefix = f"{NIXL_GEN_CLIENT_PREFIX}_{_role_infix(model_role_of(client_name))}I"
+    assert client_name.startswith(prefix), f"{client_name!r} is not a gen client name."
+    return int(client_name.rsplit("_R", 1)[1])
+
+
 def train_client_name(rank: int, model_role: str = DEFAULT_MODEL_ROLE) -> str:
     """
     Return the NIXL client name for a train (actor) worker.

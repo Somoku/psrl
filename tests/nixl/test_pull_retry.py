@@ -49,6 +49,9 @@ def _load_method():
             namespace: dict[str, object] = {
                 "WeightRefreshFailed": WeightRefreshFailed,
                 "psrl_logger": _LOGGER,
+                # The method raises this to defer to a fresh admission; the module that
+                # defines it imports vLLM, so use a stand-in with the same role.
+                "_PullDeferred": type("_PullDeferred", (RuntimeError,), {}),
             }
             exec(compile(module, str(_SERVER), "exec"), namespace)  # noqa: S102 - own source
             return namespace["_pull_until_consistent"]
@@ -83,7 +86,9 @@ class _PSManager:
     """Returns a fixed version state, raising if called more often than the engine."""
 
     def __init__(self, version: int, holders: frozenset[str], invalidated: frozenset[int]) -> None:
-        self._state = (version, holders, invalidated)
+        # (version, holders, invalidated, write_epoch, write_state): the v2 write gate adds
+        # the last two so a reader can detect that an optimizer write is in progress.
+        self._state = (version, holders, invalidated, 0, "open")
         self.calls = 0
 
     def _get(self):

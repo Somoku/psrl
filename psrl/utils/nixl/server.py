@@ -7,10 +7,10 @@ from copy import deepcopy
 from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
-from psrl.utils.common.worker_naming import model_role_of
+from psrl.utils.common.worker_naming import gen_client_instance, gen_client_rank, model_role_of
 from psrl.utils.nixl.block_fp8 import SCALE_SUFFIX
 from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLCommPlan, merge_comm_plans
-from psrl.utils.nixl.handshake_notif import NotifKind, decode
+from psrl.utils.nixl.handshake_notif import NotifKind, decode, encode
 from psrl.utils.nixl.join_admission import JoinDecision, JoinVerdict, classify_join
 from psrl.utils.nixl.leave_protocol import RevokeOutcome, encode_member_leave
 from psrl.utils.nixl.membership import Membership, MembershipChange, MembershipEvent
@@ -113,32 +113,64 @@ class NIXLMetaServer:
                 notif = decode(raw)
                 if notif is None:
                     continue
-                for client_name, payload in notif.entries.items():
-                    if notif.kind is NotifKind.LEAVE_ACK:
-                        # `client_name` here is the *leaver*, not a client of the
-                        # sending agent, so this must not reach `_add_client` below --
-                        # that would file the departing member as hosted by whoever
-                        # acked its removal. The acker's identity is the delivering
-                        # agent, which is also the granularity of the eviction.
-                        self._membership.record_revocation(client_name, agent_name)
-                        continue
-                    if notif.kind is NotifKind.MEMBER_LEAVE:
-                        # The server is the only sender; one arriving here means a
-                        # client addressed the wrong agent.
-                        psrl_logger.warning(f"Server received MEMBER_LEAVE for {client_name} from {agent_name}")
-                        continue
-                    if notif.kind is NotifKind.SHARDING:
-                        self.client_sharding_dicts[client_name] = payload
-                    elif notif.kind is NotifKind.CLIENT_INFO:
-                        self.client_infos[client_name] = NIXLClientInfo.deserialize(payload)
-                    elif notif.kind is NotifKind.TEMP_MAPPING:
-                        self._client_temp_mappings[client_name] = payload
-                    else:
-                        # Resharding re-sends both at once.
-                        self.client_infos[client_name] = NIXLClientInfo.deserialize(payload["info"])
-                        self._client_temp_mappings[client_name] = payload["temp_mapping"]
-                    self._add_client(agent_name, client_name)
-                    self._agents_reported[notif.kind].add(agent_name)
+                if notif.kind in (NotifKind.PULL_PREEMPT, NotifKind.PULL_PREEMPT_ACK):
+                    # Write-gate traffic is consumed by `drain_pull_acks` while a write is
+                    # closing. Anything left here is a late acknowledgement (the deadline
+                    # passed) or a reader-side message the server never sends; ignoring it
+                    # is correct either way.
+                    continue
+                self._route_notif(agent_name, notif)
+
+    def _route_notif(self, agent_name: str, notif) -> None:
+        """File one decoded handshake notification in its registry."""
+        for client_name, payload in notif.entries.items():
+            if notif.kind is NotifKind.LEAVE_ACK:
+                # `client_name` here is the *leaver*, not a client of the
+                # sending agent, so this must not reach `_add_client` below --
+                # that would file the departing member as hosted by whoever
+                # acked its removal. The acker's identity is the delivering
+                # agent, which is also the granularity of the eviction.
+                self._membership.record_revocation(client_name, agent_name)
+                continue
+            if notif.kind is NotifKind.MEMBER_LEAVE:
+                # The server is the only sender; one arriving here means a
+                # client addressed the wrong agent.
+                psrl_logger.warning(f"Server received MEMBER_LEAVE for {client_name} from {agent_name}")
+                continue
+            if notif.kind is NotifKind.SHARDING:
+                self.client_sharding_dicts[client_name] = payload
+            elif notif.kind is NotifKind.CLIENT_INFO:
+                self.client_infos[client_name] = NIXLClientInfo.deserialize(payload)
+            elif notif.kind is NotifKind.TEMP_MAPPING:
+                self._client_temp_mappings[client_name] = payload
+            else:
+                # Resharding re-sends both at once.
+                self.client_infos[client_name] = NIXLClientInfo.deserialize(payload["info"])
+                self._client_temp_mappings[client_name] = payload["temp_mapping"]
+            self._add_client(agent_name, client_name)
+        self._agents_reported[notif.kind].add(agent_name)
+
+    def drain_pull_acks(self, epoch: int, on_ack) -> None:
+        """Deliver write-gate acknowledgements to ``on_ack(instance, epoch)``.
+
+        Called from `PSManager.begin_write` while it waits for readers to record the
+        preemption boundary. Everything else drained here is routed normally, because
+        `get_new_notifs` is destructive and a membership message must not be lost just
+        because the trainer happened to be closing its write gate.
+        """
+        for agent_name, notif_list in self.agent.get_new_notifs().items():
+            for raw in notif_list:
+                notif = decode(raw)
+                if notif is None:
+                    continue
+                if notif.kind is NotifKind.PULL_PREEMPT_ACK:
+                    for client_name, payload in notif.entries.items():
+                        ack_epoch = int(payload.get("epoch", -1))
+                        on_ack((gen_client_instance(client_name), gen_client_rank(client_name)), ack_epoch)
+                    continue
+                if notif.kind is NotifKind.PULL_PREEMPT:
+                    continue
+                self._route_notif(agent_name, notif)
 
     def _wait_for(
         self,

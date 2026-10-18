@@ -228,6 +228,43 @@ def _resolve_version_barrier(config: DictConfig) -> None:
     )
 
 
+def _resolve_write_gate(config: DictConfig) -> None:
+    """Decide whether optimizer writes must preempt live readers, and record the decision.
+
+    The gate is needed exactly when rollouts read the trainer's **live parameter bytes**
+    and the optimizer overwrites them in place:
+
+    * direct supply (the train ranks are the source, no PS copy);
+    * matched precision (a cast or FP8 rollout reads a separate published copy, refreshed
+      under the existing publish lock);
+    * any rollout placement. `colocate_validate_and_train` only says validation shares
+      GPUs with training; a rollout fleet on other nodes still reads live parameters, so
+      the earlier "colocate means no shared memory" shortcut was wrong for that topology.
+
+    Written into the config so the value a run used is visible in its dump, and an
+    explicit boolean still wins (the failure-injection tests need to turn it off).
+    """
+    from psrl.utils.ps_mode import has_ps_data_plane
+
+    nixl = config.psrl.nixl
+    decided = nixl.get("await_write_gate", "auto")
+    if isinstance(decided, bool):
+        return
+
+    def _normalise(dtype: str) -> str:
+        return {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}.get(str(dtype), str(dtype))
+
+    direct = not has_ps_data_plane(config.psrl.ps_mode)
+    matched = _normalise(nixl.publish_train_dtype) == _normalise(nixl.publish_rollout_dtype)
+    unquantised = nixl.get("publish_fp8_block") is None
+    nixl.await_write_gate = bool(direct and matched and unquantised)
+    if nixl.await_write_gate and isinstance(nixl.get("await_readers_before_publish"), bool):
+        # The gate supersedes the publish-time drain for this path. Leaving both on would
+        # make publish invalidate versions that the gate already proved single-version and
+        # that readers are repairing.
+        nixl.await_readers_before_publish = False
+
+
 def _validate_nixl_lora(config: DictConfig) -> None:
     """Reject un-merged LoRA, which the weight transport cannot express (3.11).
 
@@ -462,6 +499,7 @@ def validate_config(
         _validate_nixl_lora(config)
         _resolve_version_barrier(config)
         _resolve_publish_cast(config)
+        _resolve_write_gate(config)
         assert not config.psrl.get("lmcache", {}).get("enable_p2p", False), (
             "psrl.lmcache.enable_p2p requires a PS to route through; it cannot be used "
             "with ps_mode=nixl_direct, where rollouts read train ranks directly"

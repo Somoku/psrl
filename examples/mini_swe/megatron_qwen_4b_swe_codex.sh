@@ -26,6 +26,47 @@ python -c "from examples.mini_swe.swebench_grader import grade_fresh_container; 
 ray status 2>/dev/null | head -5 || echo "WARNING: ray status failed"
 echo "=== Pre-flight done ==="
 
+# --- Reclaim sandboxes a previous run left behind ---
+# A run's sandboxes are normally removed by its own teardown. A run that was killed skips
+# that, and its sandboxes stay up with their harness agents inside, retrying against
+# whatever binds the gateway port next. This run would then open on a burst of
+# model_not_found from a previous run's agents, and the node would not get their memory
+# back. So the previous run's sandboxes go before this one starts.
+#
+# The sweep removes a container only when its owner lease is gone, so a run that is still
+# alive is untouched, and the lock it takes keeps it from racing that run's own collector.
+#
+# One window remains by design: an owner whose heartbeat is younger than the lease TTL is
+# not yet provably dead, so a run killed less than that ago is reclaimed by the node
+# collector a minute later rather than here.
+echo "=== Reclaiming sandboxes from previous runs ==="
+# The nodes come from the control plane's own fleet declaration, so this follows the
+# deployment rather than repeating a host list that can drift from it.
+SANDBOX_NODES=${SANDBOX_NODES:-$(python - "$PSRL_PATH" <<'PY'
+import json
+import os
+import sys
+
+try:
+    with open(os.path.join(sys.argv[1], "p3b", "deploy_control.json"), encoding="utf-8") as handle:
+        fleet = json.load(handle).get("fleet_nodes", [])
+except OSError:
+    fleet = []
+print(" ".join(node["address"].split(":")[0] for node in fleet))
+PY
+)}
+for node in ${SANDBOX_NODES:-$LOCAL_IP}; do
+    if [ "$node" = "$LOCAL_IP" ]; then
+        (cd "$PSRL_PATH" && python -m psrl.sandbox.reclaimer --once) ||
+            echo "WARNING: reclaiming sandboxes on $node failed"
+    else
+        ssh -n -o StrictHostKeyChecking=no "root@$node" \
+            ". /root/env/env.sh && cd $PSRL_PATH && /root/venv/bin/python -m psrl.sandbox.reclaimer --once" ||
+            echo "WARNING: reclaiming sandboxes on $node failed"
+    fi
+done
+echo "=== Sandbox reclamation done ==="
+
 # --- Model ---
 # Qwen3.5-4B has max_position_embeddings=262144, so do not patch config.json.
 HF_MODEL_PATH=/apdcephfs_zwfy_303760348/share_303760348/ls/models/Qwen3.5-4B
@@ -149,6 +190,12 @@ rollout_is_threshold=2.0
 use_dynamic_bsz=True
 offload=True
 
+# The in-process docker backend is dropped below rather than left as a fallback. It keeps
+# its own mirror of the node envelope (SandboxCapacityCoordinator) and charges each sandbox
+# its declared 30 GiB against it, which caps a step at 58 sandboxes per node, so a sandbox
+# that lands there never sees the service's measured pricing. With p3b alone every sandbox
+# goes through one ledger -- the one that prices from measurement -- and a step runs 256
+# concurrent sandboxes with no admission queue.
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
@@ -193,10 +240,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.rollout_gateway.tool_call_parser=qwen_xml \
     \
     gen_actor_rollout_ref.rollout.agent.sandbox.backends.p3b.endpoint=28.49.198.250:9000 \
+    gen_actor_rollout_ref.rollout.agent.overlong_filtering=True \
     \
     gen_actor_rollout_ref.rollout.agent.default_agent_loop=mini_swe_codex \
     gen_actor_rollout_ref.rollout.agent.traj_reward_mode=traj \
     gen_actor_rollout_ref.rollout.agent.sandbox.default_backend=p3b \
+    ~gen_actor_rollout_ref.rollout.agent.sandbox.backends.docker \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
@@ -264,6 +313,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     algorithm.rollout_correction.rollout_is=${rollout_is} \
     algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     algorithm.filter_groups.metric=reward_score \
+    algorithm.group_baseline_valid_only=True \
     psrl.group_post_process.enable=${enable_dynamic_sampling_filter} \
     psrl.group_post_process.name=dynamic_sampling_filter \
     \

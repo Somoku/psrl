@@ -1,18 +1,29 @@
 #!/bin/bash
+# GRPO on Qwen3-8B with Megatron, weights moved through the parameter server.
+#
+# This is the baseline arm of the direct-supply ablation. `qwen3_8b_megatron_direct.sh`
+# is the same run with `psrl.ps_mode=nixl_direct`, so the two must stay aligned on data,
+# batch sizes, step count, and validation. Compare their per-step training and
+# validation metrics to see whether direct supply carries the same weights the PS path
+# does.
+#
+# Training and rollout each take one full 8-GPU node. Start the Ray cluster with eight
+# GPUs per node (`PSRL_RAY_GPUS=8 scripts/start_nixl_cluster.sh <head> <worker>`) and
+# set `LOCAL_IP` to a cluster node, because `PSManager` is pinned there.
 set -xeuo pipefail
 
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
-HF_MODEL_PATH=${PSRL_PATH}/models/Qwen3-8B
-train_files=${PSRL_PATH}/data/retool_dapo/train.parquet
-test_files=${PSRL_PATH}/data/retool_aime2024/train.parquet
+HF_MODEL_PATH=${HF_MODEL_PATH:-${PSRL_PATH}/models/Qwen3-8B}
+train_files=${TRAIN_FILES:-/apdcephfs_zwfy10_303541817/share_303541817/ls/data/dapo/dapo-math-17k.parquet}
+test_files=${TEST_FILES:-/apdcephfs_zwfy10_303541817/share_303541817/ls/data/dapo/aime-2024.parquet}
 
 OUTPUT_DIR=${PSRL_PATH}/output
 mkdir -p "$OUTPUT_DIR"
 
-staleness=${1:-3}
+staleness=${STALENESS:-3}
 project_name=psrl_example
-experiment_name=GRPO-Qwen3-8B-fsdp-staleness_${staleness}
+experiment_name=GRPO-Qwen3-8B-megatron-staleness_${staleness}
 CKPTS_DIR=${OUTPUT_DIR}/ckpts/"${project_name}"/"${experiment_name}"
 LOG_DIR=${OUTPUT_DIR}/logs/$(date +%Y%m%d_%H%M%S)
 
@@ -20,10 +31,13 @@ mkdir -p "$LOG_DIR"
 mkdir -p "$CKPTS_DIR"
 
 
-train_batch_size=64
-rollout_N=8
+train_batch_size=${TRAIN_BATCH_SIZE:-16}
+rollout_N=${ROLLOUT_N:-8}
 
-nnodes=1
+# Ten steps and validation every five. The first validation runs before any update, so
+# the two arms share a common origin, and the last runs regardless of `test_freq`.
+total_training_steps=${TOTAL_TRAINING_STEPS:-10}
+test_freq=${TEST_FREQ:-5}
 
 TP=${TP:-4}
 PP=${PP:-1}
@@ -38,12 +52,12 @@ VAL_TP=1
 VAL_PP=1
 
 GEN_NNODES=1
-GEN_NGPUS_PER_NODE=4
+GEN_NGPUS_PER_NODE=8
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
 TRAIN_NNODES=1
-TRAIN_NGPUS_PER_NODE=4
+TRAIN_NGPUS_PER_NODE=8
 
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
@@ -67,6 +81,13 @@ val_rollot_n=1
 val_top_p=1.0
 val_top_k=-1
 val_do_sample=False
+
+
+# Refuse to start on a cluster where the roles can share a node. The same check guards
+# the direct script, so both ablation arms are placed identically.
+: "${LOCAL_IP:?LOCAL_IP must name a node in the Ray cluster.}"
+bash "$(dirname "$0")/check_two_node_split.sh" \
+    "$TRAIN_NGPUS_PER_NODE" "$GEN_INSTANCES" "$VAL_INSTANCES"
 
 
 python3 -m psrl.trainer.main_ppo --config-path=./config \
@@ -94,6 +115,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=$train_batch_size \
+    data.train_max_samples=${TRAIN_MAX_SAMPLES:-512} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.filter_overlong_prompts=True \
@@ -123,7 +145,6 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.actor.megatron.expert_model_parallel_size=$EP \
     train_actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=$ETP \
     train_actor_rollout_ref.actor.megatron.use_mbridge=True \
-    train_actor_rollout_ref.actor.megatron.vanilla_mbridge=False \
     train_actor_rollout_ref.actor.megatron.use_remove_padding=True \
     \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
@@ -144,6 +165,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=20480 \
+    gen_actor_rollout_ref.rollout.agent.default_agent_loop=generate_only_agent \
     gen_actor_rollout_ref.rollout.temperature=${train_temperature} \
     gen_actor_rollout_ref.rollout.top_p=${train_top_p} \
     gen_actor_rollout_ref.rollout.top_k=${train_top_k} \
@@ -152,12 +174,12 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","wandb"]' \
+    trainer.logger='["console"]' \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.val_before_train=False \
-    trainer.save_freq=200 \
-    trainer.test_freq=5 \
+    trainer.val_before_train=True \
+    trainer.save_freq=-1 \
+    trainer.test_freq=${test_freq} \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.total_training_steps=200 \
-    trainer.total_epochs=10 $@ 2>&1 | tee "${experiment_name}.log"
+    trainer.total_training_steps=${total_training_steps} \
+    trainer.total_epochs=1 $@ 2>&1 | tee "${experiment_name}.log"

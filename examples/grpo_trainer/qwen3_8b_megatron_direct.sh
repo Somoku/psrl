@@ -1,9 +1,20 @@
 #!/bin/bash
 # Trainer-direct supply in production (implementation items D3 / T2).
 #
-# Identical to `qwen3_8b_megatron.sh` apart from `psrl.ps_mode=nixl_direct` and a short
-# run length -- the point is to exercise the production code path, not to train a model.
-# Keeping everything else the same is what makes a failure attributable.
+# Same run as `qwen3_8b_megatron.sh` apart from `psrl.ps_mode=nixl_direct`, which is
+# the variable under test. Keeping everything else the same is what makes a failure
+# attributable to the transport.
+#
+# Training and rollout must run on separate nodes, one full 8-GPU node each. Start the
+# Ray cluster with eight GPUs per node (`PSRL_RAY_GPUS=8 scripts/start_nixl_cluster.sh
+# <head> <worker>`) and set `LOCAL_IP` to a cluster node, because `PSManager` is pinned
+# to `psrl.ps_manager_ip`. The preflight below refuses to start on a layout that would
+# let both roles share a node.
+#
+# This script is one arm of an ablation. `qwen3_8b_megatron.sh` is the same run with
+# `psrl.ps_mode=nixl_cpu`, so the two must stay aligned on data, batch sizes, step
+# count, and validation. Compare their per-step training and validation metrics to see
+# whether direct supply carries the same weights the PS path does.
 #
 # Why this script has to exist before the PS can be deleted: `direct_supply` in the e2e
 # harness is a *test* config key, and the harness never reads `ps_mode`. So the harness
@@ -11,20 +22,16 @@
 # that answers that, and until it passes, removing `PSStorageWorker` would leave every
 # `examples/*.sh` (all of which set `nixl_cpu`) with no transport.
 #
-# Two training steps, because one does not exercise a *second* weight version.
-#
-# One deviation from the base script beyond ps_mode: `megatron.vanilla_mbridge` is
-# dropped. Commit ef79ce9 bumped the vendored verl and that field no longer exists in
-# `McoreEngineConfig`, so Hydra refuses the override. The base scripts still carry it,
-# which means they target the *cluster's* older verl rather than the one this tree
-# vendors -- a pre-existing mismatch, unrelated to direct supply.
+# Ten training steps, with validation before training and every five steps after. Ten
+# steps are enough to observe several weight versions and a reward trend without
+# turning the ablation into a long run.
 set -xeuo pipefail
 
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
 HF_MODEL_PATH=${HF_MODEL_PATH:-${PSRL_PATH}/models/Qwen3-8B}
-train_files=${TRAIN_FILES:-/apdcephfs_zwfy10/share_303541817/yunsonzhang/data/dapo_math_mixed.parquet}
-test_files=${TEST_FILES:-/apdcephfs_zwfy10/share_303541817/yunsonzhang/data/aime_math_mixed.parquet}
+train_files=${TRAIN_FILES:-/apdcephfs_zwfy10_303541817/share_303541817/ls/data/dapo/dapo-math-17k.parquet}
+test_files=${TEST_FILES:-/apdcephfs_zwfy10_303541817/share_303541817/ls/data/dapo/aime-2024.parquet}
 
 OUTPUT_DIR=${PSRL_PATH}/output
 mkdir -p "$OUTPUT_DIR"
@@ -44,10 +51,13 @@ mkdir -p "$LOG_DIR"
 mkdir -p "$CKPTS_DIR"
 
 
-train_batch_size=${TRAIN_BATCH_SIZE:-8}
-rollout_N=${ROLLOUT_N:-2}
+train_batch_size=${TRAIN_BATCH_SIZE:-16}
+rollout_N=${ROLLOUT_N:-8}
 
-nnodes=1
+# Ten steps and validation every five. The first validation runs before any update, so
+# the two arms share a common origin, and the last runs regardless of `test_freq`.
+total_training_steps=${TOTAL_TRAINING_STEPS:-10}
+test_freq=${TEST_FREQ:-5}
 
 TP=${TP:-4}
 PP=${PP:-1}
@@ -68,13 +78,18 @@ GEN_PP=1
 VAL_TP=1
 VAL_PP=1
 
-GEN_NNODES=1
-GEN_NGPUS_PER_NODE=4
+# Each role asks for a whole node's exposed GPUs. Pools are STRICT_PACK and the
+# trainer creates the train pool before the rollout pools, so training (eight
+# 0.9-GPU bundles) claims one node and the rollout instances no longer fit beside
+# it. With the same GPU count exposed on its own node, every rollout instance lands
+# on the other node.
+GEN_NNODES=${GEN_NNODES:-1}
+GEN_NGPUS_PER_NODE=${GEN_NGPUS_PER_NODE:-8}
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=1
-TRAIN_NGPUS_PER_NODE=4
+TRAIN_NNODES=${TRAIN_NNODES:-1}
+TRAIN_NGPUS_PER_NODE=${TRAIN_NGPUS_PER_NODE:-8}
 
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
@@ -104,6 +119,13 @@ val_top_k=-1
 val_do_sample=False
 
 
+# Refuse to start on a cluster where the roles can share a node. The same check guards
+# the baseline script, so both ablation arms are placed identically.
+: "${LOCAL_IP:?LOCAL_IP must name a node in the Ray cluster.}"
+bash "$(dirname "$0")/check_two_node_split.sh" \
+    "$TRAIN_NGPUS_PER_NODE" "$GEN_INSTANCES" "$VAL_INSTANCES"
+
+
 python3 -m psrl.trainer.main_ppo --config-path=./config \
     --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -130,6 +152,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=$train_batch_size \
+    data.train_max_samples=${TRAIN_MAX_SAMPLES:-512} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.filter_overlong_prompts=True \
@@ -191,9 +214,9 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     trainer.logger='["console"]' \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.save_freq=${SAVE_FREQ:--1} \
-    trainer.test_freq=-1 \
+    trainer.test_freq=${test_freq} \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.total_training_steps=2 \
+    trainer.total_training_steps=${total_training_steps} \
     trainer.total_epochs=1 $@ 2>&1 | tee "${experiment_name}.log"

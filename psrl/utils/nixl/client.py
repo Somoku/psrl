@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import pickle
 import time
@@ -391,6 +392,16 @@ class NIXLStorageClient:
         if self._fp8_block is None:
             return state_dict
         derived = dict(state_dict)
+
+        # First pass: validate and size the scale shards this client owns. They are
+        # allocated together below, because NIXL registers regions, not shards: one
+        # small tensor per weight is one UCX MR each, and a block-FP8 trainer owns
+        # hundreds per rank (thousands at 235B). Measured on Qwen3-8B: 257 regions
+        # took 8.5-9.2 s to register on every wake, while every other phase of the
+        # switch stayed under 0.1 s. One allocation per device collapses that to one
+        # region; the shards become contiguous views of it.
+        specs = []
+        elements_per_device: dict[torch.device, int] = defaultdict(int)
         for scale_key, sharding in sharding_dict.items():
             base = scale_key[: -len(SCALE_SUFFIX)] if scale_key.endswith(SCALE_SUFFIX) else None
             if base is None or scale_key in state_dict or base not in state_dict or sharding.is_empty:
@@ -407,10 +418,25 @@ class NIXLStorageClient:
                     f"{base}: this trainer holds a {tuple(t.shape)} shard, which does not hold whole "
                     f"{self._fp8_block} quantisation tiles. The trainer must not cut a weight inside a tile."
                 )
-            scales = tuple(
-                torch.empty(scale_shape(t.shape, self._tile_of(t, scale_tile)), dtype=torch.float32, device=t.device)
-                for t in tensors
-            )
+            shapes = [scale_shape(t.shape, self._tile_of(t, scale_tile)) for t in tensors]
+            specs.append((scale_key, base, sharding, entry, tensors, scale_tile, shapes))
+            for t, shape in zip(tensors, shapes):
+                elements_per_device[t.device] += math.prod(shape)
+
+        pools = {
+            device: torch.empty(elements, dtype=torch.float32, device=device)
+            for device, elements in elements_per_device.items()
+        }
+        offsets: dict[torch.device, int] = defaultdict(int)
+
+        for scale_key, base, sharding, entry, tensors, scale_tile, shapes in specs:
+            scales = []
+            for t, shape in zip(tensors, shapes):
+                pool, offset = pools[t.device], offsets[t.device]
+                elements = math.prod(shape)
+                scales.append(pool[offset : offset + elements].view(shape))
+                offsets[t.device] = offset + elements
+            scales = tuple(scales)
             self._assert_whole_tiles(scale_key, scales, sharding, isinstance(entry, GroupedShards))
             scale_entry = (
                 GroupedShards(scales, entry.shard_indices, entry.shard_mesh)
@@ -1414,6 +1440,8 @@ class NIXLStorageClient:
             # Skip when every reader is same-node: no remote NIC needs these pages,
             # and the registration cost (O(#shards)) is pure overhead at MoE scale.
             if not meta_only and self._mtype_to_reg_region_lists and self._should_register_rdma():
+                _t_registration = time.time()
+                n_regions = 0
                 for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
                     if not reg_list:
                         continue
@@ -1421,6 +1449,15 @@ class NIXLStorageClient:
                     # adjacent virtual regions is invalid for RDMA and UCX.
                     reg_descs = self._register_memory(mem_type, reg_list)
                     self._track_registered_desc(reg_descs)
+                    n_regions += len(reg_list)
+                # Registration is a page-lock + MR step whose cost tracks the number of
+                # mapped bytes, not the shard count. It sits on the switch path whenever
+                # a cast/FP8 publish copy was freed on sleep; separating it from the
+                # descriptor work is what tells an operator which half to attack.
+                psrl_logger.info(
+                    f"{self.client_name}: [timing] registered {n_regions} region(s) with NIXL "
+                    f"in {time.time() - _t_registration:.3f}s"
+                )
 
                 # Precompute {shard_idx: local_pos} once per key: O(1) lookup vs O(S) list.index()
                 shard_pos_cache: dict[str, dict] = {
@@ -1596,6 +1633,7 @@ class NIXLStorageClient:
         by_dtype: dict[torch.dtype, list[tuple[str, int, torch.Tensor]]] = defaultdict(list)
         for key, local_pos, view, dtype in requests:
             by_dtype[dtype].append((key, local_pos, view))
+        _t_copies = time.time()
         for dtype, entries in by_dtype.items():
             flat = torch.empty(sum(view.numel() for _, _, view in entries), dtype=dtype, device=self.device)
             self._record_region_registration(flat)
@@ -1613,6 +1651,9 @@ class NIXLStorageClient:
             f"{len(requests) - casts} fragmented), {self.publish_copy_bytes / 2**20:.1f} MiB resident."
         )
         self.refresh_publish_copies()
+        psrl_logger.info(
+            f"{self.client_name}: publish copies allocated and refreshed in {time.time() - _t_copies:.3f}s"
+        )
 
     @torch.no_grad()
     def refresh_publish_copies(self) -> None:

@@ -139,6 +139,19 @@ def _resolve_publish_cast(config: DictConfig) -> None:
     assert quantization in (None, "fp8"), (
         f"Direct supply publishes block FP8 only, got rollout quantization {quantization!r}."
     )
+    # A validate instance is a separate vLLM engine built from the train-side rollout
+    # config; it reads the same published bytes as the rollout fleet. If the two disagree
+    # on quantization, one side loads bf16 while the source advertises FP8 and its first
+    # pull fails on a dtype assertion -- after startup, during a validation wake.
+    validate_rollout = config.train_actor_rollout_ref.rollout
+    validate_quantization = validate_rollout.get("quantization")
+    if config.psrl.colocate_validate_and_train:
+        assert validate_quantization == quantization, (
+            "Validation and generation rollouts consume the same published weight format, so "
+            "they must agree on quantization: "
+            f"train_actor_rollout_ref.rollout.quantization={validate_quantization!r} but "
+            f"gen_actor_rollout_ref.rollout.quantization={quantization!r}."
+        )
     # verl's online FP8 rollout is block quantised on 128 x 128 tiles.
     nixl.publish_fp8_block = [128, 128] if quantization == "fp8" else None
 

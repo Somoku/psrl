@@ -1,31 +1,42 @@
 #!/bin/bash
-# Validate direct supply with FP8 generation (bf16 train → FP8 rollout).
+# Direct supply with block-FP8 rollout and BF16 training.
 #
-# This is the most common production FP8 path: the trainer stays in bf16 and
-# publishes a quantised copy at the publish point.  The transport harness
-# verifies both the FP8 bytes and the block-scale values bit-exactly.
+# The trainer stays in BF16. At each publish point it quantizes a copy of the weights
+# into 128x128 block FP8 (scales travel with the bytes, `psrl.nixl.publish_fp8_block`),
+# and the rollout engines run vLLM with `quantization=fp8`. This is the production FP8
+# path: no FP8 master weights, no training-side quantization error.
 #
-# What this covers beyond `qwen3_8b_megatron_direct.sh`:
-#   - psrl.nixl.publish_fp8_block is set automatically by validate_config when
-#     gen quantization is "fp8"; this exercises that code path end to end.
-#   - The fused FP8 kernel at the publish point (§6 in FINDINGS) runs on every
-#     weight-sync step.
-#   - Diffusion is on: designate publishes a bf16 copy, followers receive FP8.
+# The run is aligned with `qwen3_8b_megatron_direct.sh` on data, batch sizes, step count,
+# placement, and validation; `quantization=fp8` on the generation rollout is the only
+# difference. Compare the two arms' per-step training and validation metrics to see what
+# the extra quantization costs; a failure in one arm and not the other is attributable to
+# this path.
 #
-# Expected stable-state sync time: ≈0.040 s (Qwen3-8B, TP4, single-node).
-# Two training steps, same as the bf16 baseline, so a failure is attributable
-# to the FP8 path and not to anything else that differs.
+# The write gate is off here by design: `_resolve_write_gate` enables it only when the
+# rollout reads the trainer's live parameter bytes. An FP8 rollout reads a separately
+# published copy, refreshed under the existing publish lock, so the optimizer never
+# overwrites memory a reader is using.
+#
+# Training and rollout each take a full 8-GPU node. Start the Ray cluster with eight
+# GPUs per node (`PSRL_RAY_GPUS=8 scripts/start_nixl_cluster.sh <head> <worker>`) and set
+# `LOCAL_IP` to a cluster node, because `PSManager` is pinned to `psrl.ps_manager_ip`. The
+# preflight below refuses to start on a layout that would let both roles share a node.
+#
+# Ten training steps, with validation before training and every five steps after, as in
+# the BF16 arm.
 set -xeuo pipefail
 
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
 HF_MODEL_PATH=${HF_MODEL_PATH:-${PSRL_PATH}/models/Qwen3-8B}
-train_files=${TRAIN_FILES:-/apdcephfs_zwfy10/share_303541817/yunsonzhang/data/dapo_math_mixed.parquet}
-test_files=${TEST_FILES:-/apdcephfs_zwfy10/share_303541817/yunsonzhang/data/aime_math_mixed.parquet}
+train_files=${TRAIN_FILES:-/apdcephfs_zwfy10_303541817/share_303541817/ls/data/dapo/dapo-math-17k.parquet}
+test_files=${TEST_FILES:-/apdcephfs_zwfy10_303541817/share_303541817/ls/data/dapo/aime-2024.parquet}
 
 OUTPUT_DIR=${PSRL_PATH}/output
 mkdir -p "$OUTPUT_DIR"
 
+# `STALENESS` rather than `$1`: a trailing `$@` forwards extra Hydra overrides, and a
+# positional read would consume the first of them and leave it in `$@`.
 staleness=${STALENESS:-3}
 project_name=psrl_example
 experiment_name=GRPO-Qwen3-8B-megatron-direct-fp8gen-staleness_${staleness}
@@ -35,8 +46,11 @@ LOG_DIR=${OUTPUT_DIR}/logs/$(date +%Y%m%d_%H%M%S)
 mkdir -p "$LOG_DIR"
 mkdir -p "$CKPTS_DIR"
 
-train_batch_size=${TRAIN_BATCH_SIZE:-8}
-rollout_N=${ROLLOUT_N:-2}
+train_batch_size=${TRAIN_BATCH_SIZE:-16}
+rollout_N=${ROLLOUT_N:-8}
+
+total_training_steps=${TOTAL_TRAINING_STEPS:-10}
+test_freq=${TEST_FREQ:-5}
 
 TP=${TP:-4}
 PP=${PP:-1}
@@ -50,17 +64,18 @@ GEN_PP=1
 VAL_TP=1
 VAL_PP=1
 
-GEN_NNODES=1
-GEN_NGPUS_PER_NODE=4
+GEN_NNODES=${GEN_NNODES:-1}
+GEN_NGPUS_PER_NODE=${GEN_NGPUS_PER_NODE:-8}
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) ))
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} ))
 
-TRAIN_NNODES=1
-TRAIN_NGPUS_PER_NODE=4
+TRAIN_NNODES=${TRAIN_NNODES:-1}
+TRAIN_NGPUS_PER_NODE=${TRAIN_NGPUS_PER_NODE:-8}
 
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) ))
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} ))
 
+# data length config
 max_prompt_length=2048
 max_response_length=8192
 
@@ -78,6 +93,11 @@ val_top_k=-1
 val_do_sample=False
 
 
+: "${LOCAL_IP:?LOCAL_IP must name a node in the Ray cluster.}"
+bash "$(dirname "$0")/check_two_node_split.sh" \
+    "$TRAIN_NGPUS_PER_NODE" "$GEN_INSTANCES" "$VAL_INSTANCES"
+
+
 python3 -m psrl.trainer.main_ppo --config-path=./config \
     --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -85,6 +105,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     psrl.staleness=${staleness} \
     psrl.staleness_buffer_entries=${train_batch_size} \
     psrl.ps_mode=nixl_direct \
+    psrl.checkpoint.use_dcp_save=False \
     psrl.logging_path=${LOG_DIR} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -103,6 +124,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=$train_batch_size \
+    data.train_max_samples=${TRAIN_MAX_SAMPLES:-512} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.filter_overlong_prompts=True \
@@ -146,12 +168,14 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${max_token_len_per_gpu} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=20480 \
+    train_actor_rollout_ref.rollout.quantization=fp8 \
     \
     gen_actor_rollout_ref.rollout.name=vllm \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=20480 \
+    gen_actor_rollout_ref.rollout.agent.default_agent_loop=generate_only_agent \
     gen_actor_rollout_ref.rollout.temperature=${train_temperature} \
     gen_actor_rollout_ref.rollout.top_p=${train_top_p} \
     gen_actor_rollout_ref.rollout.top_k=${train_top_k} \
@@ -161,12 +185,12 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","wandb"]' \
+    trainer.logger='["console"]' \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.val_before_train=False \
-    trainer.save_freq=200 \
-    trainer.test_freq=5 \
+    trainer.val_before_train=True \
+    trainer.save_freq=${SAVE_FREQ:--1} \
+    trainer.test_freq=${test_freq} \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.total_training_steps=2 \
-    trainer.total_epochs=10 $@ 2>&1 | tee "${experiment_name}.log"
+    trainer.total_training_steps=${total_training_steps} \
+    trainer.total_epochs=1 $@ 2>&1 | tee "${experiment_name}.log"

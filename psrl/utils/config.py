@@ -305,6 +305,28 @@ def _validate_nixl_lora(config: DictConfig) -> None:
         )
 
 
+def _validate_megatron_fp8_param(config: DictConfig) -> None:
+    """Reject persistent FP8 parameters, which this engine cannot build.
+
+    `fp8_param` asks Transformer Engine to keep linear weights as `QuantizedTensor`s.
+    That only happens when the model is constructed inside `fp8_model_init`; the
+    engine builds it directly, so the flag leaves bf16 parameters while changing the
+    FP8 backward's weight-gradient accounting. A run with it set looks healthy for
+    one step and then degrades sharply. FP8 hybrid autocast (`fp8=hybrid` with
+    `fp8_param=False`) is the supported FP8 training path.
+    """
+    if config.train_actor_rollout_ref.actor.strategy != "megatron":
+        return
+    overrides = config.train_actor_rollout_ref.actor.megatron.get("override_transformer_config") or {}
+    if overrides.get("fp8_param", False):
+        raise ValueError(
+            "train_actor_rollout_ref.actor.megatron.override_transformer_config.fp8_param "
+            "is not supported: the engine does not build the model inside TE's fp8_model_init, "
+            "so the parameters stay bf16 and the first optimizer update corrupts training. "
+            "Use FP8 hybrid autocast (fp8=hybrid, fp8_param=False)."
+        )
+
+
 def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
@@ -330,6 +352,7 @@ def validate_config(
         )
     if rollout_routing_replay and actor_router_replay != "R3":
         raise ValueError("Rollout routing replay is only valid with the actor engine's router_replay.mode='R3'.")
+    _validate_megatron_fp8_param(config)
 
     train_n_gpus = config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
     if not config.train_actor_rollout_ref.actor.use_dynamic_bsz:

@@ -6,8 +6,10 @@
 >
 > 状态：**BF16 / FP32 train → blockwise FP8 rollout 已落地**（`psrl/utils/nixl/block_fp8.py`，
 > 落地项 F2、F3、F6、F7，F4 只含 tile 切分的拒绝），含 vLLM 细化的 MoE scale 网格（§3 例外 1）。
-> **Megatron FP8 train（TE `fp8_param`，per-tensor current scaling）→ blockwise FP8 rollout 已落地**，
-> 走发布副本重量化，不是零拷贝（§10 表中 tensorwise 一行）。实测见 `weight_transport_FINDINGS.md` §5–§6。
+> **FP8 train（TE hybrid autocast，bf16 参数）→ blockwise FP8 rollout 已落地**，走发布副本
+> 重量化，不是零拷贝（§10 表中 tensorwise 一行）。TE 常驻 FP8 参数（`fp8_param`）在训练引擎
+> 路径上不可用：模型不在 `fp8_model_init` 内构建，开启会破坏首次更新，配置校验拒绝（见 §10）。
+> 实测见 `weight_transport_FINDINGS.md` §5–§6、§12。
 > 零拷贝的 FP8-native、MXFP8 与 colocate 指针交接未做。
 
 ---
@@ -469,7 +471,7 @@ PSRL 对 scale 做同一件事，且比 amax 更简单——§3 已证明 scale 
 | Megatron | bf16 | blockwise | Hopper+ | 支持。**Hopper 上 BF16 训练的推荐配置** |
 | Megatron | bf16 | MXFP8 | SM100+ | 支持，wire 贵 3%，量化精度更好 |
 | Megatron | fp8 (TE `fp8_param`, blockwise recipe) | blockwise + FP32 scale | **Hopper，CUDA ≥ 12.9** | 设计上零转换零缓冲。**未落地**：本集群 CUDA 12.8，TE 的 `Float8BlockScaling` 不可用 |
-| Megatron | fp8 (TE `fp8_param`, tensorwise / delayed) | blockwise | Hopper+ | **已落地**。per-tensor 字节不能直接给 block FP8，trainer 从 FP8 字节反量化后按 128 tile 重量化进发布副本 |
+| Megatron | fp8 (TE `fp8_param`, tensorwise / delayed) | blockwise | Hopper+ | **训练引擎路径拒绝**：模型不在 `fp8_model_init` 内构建，flag 不会产生 QuantizedTensor，却会改坏 FP8 反向的 weight-grad 记账（第 2 步 entropy/grad 爆掉）。FP8 hybrid autocast（bf16 参数）支持并已端到端验证 |
 | Megatron | fp8 (TE) | blockwise + power-of-2 | — | **拒绝**：po2 与常驻 fp8 参数互斥（硬件约束，非本设计限制） |
 | Megatron | fp8 (TE) | MXFP8 | **SM100+** | 支持。**B300 级集群的目标形态**，colocate 零拷贝 |
 | FSDP2 | fp32 / bf16 | blockwise / MXFP8 | 按 wire | 支持（cast 路径，冲突恒为零） |

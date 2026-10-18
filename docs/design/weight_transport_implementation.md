@@ -305,7 +305,10 @@ def classify_join(current_finest, new_mesh, all_tensor_shapes):
 - 传输字节相对 bf16 **减半**
 - `weight` 与其 `scale` 在同一个 commit group（原子性）
 
-**验证**：L2（精度矩阵的 fp8 行）
+**验证**：L1 量化器逐位；L2 精度矩阵 fp8 行；生产 e2e 覆盖两条 FP8 训练路径
+（`qwen3_8b_megatron_direct_fp8gen.sh`：bf16 训练 + FP8 rollout；
+`qwen3_8b_megatron_fp8train_direct.sh`：FP8 hybrid 训练 + FP8 rollout），均 10 步 0 错误
+且最终验证与 bf16 训练臂一致（FINDINGS §12）。
 
 ---
 

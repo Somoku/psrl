@@ -1,29 +1,41 @@
 #!/bin/bash
-# Validate direct supply with FP8 training (Megatron FP8 train → FP8 rollout).
+# Direct supply with FP8 training and FP8 rollout.
 #
-# The trainer stores weights as per-tensor scaled FP8 via Transformer Engine (`fp8_param`).
-# The publish point reads those FP8 bytes, re-quantises into block-FP8 (128×128 tile), and
-# the rollout receives FP8 directly — no bf16 intermediate on the wire.
+# The trainer runs its linear matmuls in FP8 through Transformer Engine's hybrid
+# autocast: parameters stay in bf16 and each linear quantises its weight and
+# activations per tensor for the GEMMs. At the publish point the bf16 shards are
+# quantised into 128x128 block FP8, and the rollout and validate engines load
+# that format (`quantization=fp8`).
 #
-# Covered transport path (FINDINGS §5):
-#   "Megatron FP8 train TP2 → TP2  FP8→FP8  ✅  0.287 / 0.035 s  18.9 GB"
-#   "Megatron FP8 train TP2·PP2 → TP4  FP8→FP8  ✅  0.290 / 0.021 s  9.4 GB"
+# The run is aligned with `qwen3_8b_megatron_direct.sh` on data, batch sizes,
+# step count, placement, and validation. The differences are `quantization=fp8`
+# on both rollout roles and the Megatron FP8 switches, so a failure or a metric
+# gap is attributable to this precision path.
 #
-# Requirements:
-#   - TE `fp8_param` works on this cluster (CUDA ≥ 12.0, hardware H800/H20 with FP8 support).
-#   - The cluster's CUDA is 12.8 so TE blockwise recipe (`fp8_recipe=blockwise`) is NOT
-#     available (needs CUDA ≥ 12.9); this script uses `tensorwise` (per-tensor current scaling),
-#     which is what §5 measured.  Set TRAIN_FP8_RECIPE=tensorwise explicitly to be clear.
+# Transformer Engine's blockwise FP8 recipe needs CUDA >= 12.9; this cluster runs
+# 12.8, so training uses `tensorwise` (per-tensor current scaling). The publish
+# side still produces block FP8, which is what vLLM loads.
 #
-# Note: DeepGEMM is not compiled on CUDA 12.8 (see FINDINGS §7), so FP8 MoE kernel
-# performance numbers do not apply here; the correctness test (layout check) still works.
+# Persistent FP8 parameters (`fp8_param`) are off. They require the model to be
+# built inside TE's `fp8_model_init`, which this engine does not do; setting the
+# flag alone leaves the weights in bf16 but changes the backward's weight-grad
+# accounting, and the first update corrupts the policy.
+#
+# Training and rollout each take a full 8-GPU node. Start the Ray cluster with
+# eight GPUs per node (`PSRL_RAY_GPUS=8 scripts/start_nixl_cluster.sh <head>
+# <worker>`) and set `LOCAL_IP` to a cluster node, because `PSManager` is pinned
+# to `psrl.ps_manager_ip`. The preflight refuses a layout that would let both
+# roles share a node.
+#
+# Ten training steps, with validation before training and every five steps after,
+# as in the other ablation arms.
 set -xeuo pipefail
 
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
 HF_MODEL_PATH=${HF_MODEL_PATH:-${PSRL_PATH}/models/Qwen3-8B}
-train_files=${TRAIN_FILES:-/apdcephfs_zwfy10/share_303541817/yunsonzhang/data/dapo_math_mixed.parquet}
-test_files=${TEST_FILES:-/apdcephfs_zwfy10/share_303541817/yunsonzhang/data/aime_math_mixed.parquet}
+train_files=${TRAIN_FILES:-/apdcephfs_zwfy10_303541817/share_303541817/ls/data/dapo/dapo-math-17k.parquet}
+test_files=${TEST_FILES:-/apdcephfs_zwfy10_303541817/share_303541817/ls/data/dapo/aime-2024.parquet}
 
 OUTPUT_DIR=${PSRL_PATH}/output
 mkdir -p "$OUTPUT_DIR"
@@ -37,36 +49,45 @@ LOG_DIR=${OUTPUT_DIR}/logs/$(date +%Y%m%d_%H%M%S)
 mkdir -p "$LOG_DIR"
 mkdir -p "$CKPTS_DIR"
 
-train_batch_size=${TRAIN_BATCH_SIZE:-8}
-rollout_N=${ROLLOUT_N:-2}
+train_batch_size=${TRAIN_BATCH_SIZE:-16}
+rollout_N=${ROLLOUT_N:-8}
 
-# TP2 training to match the measured "FP8 train TP2 → TP2" cell.
-TP=${TP:-2}
+total_training_steps=${TOTAL_TRAINING_STEPS:-10}
+test_freq=${TEST_FREQ:-5}
+
+TP=${TP:-4}
 PP=${PP:-1}
 CP=${CP:-1}
 EP=${EP:-1}
 ETP=${ETP:-1}
 
-# FP8 recipe for TE: tensorwise = per-tensor current scaling (works on CUDA 12.8).
+# Transformer Engine FP8 switches. `hybrid` keeps the non-linear ops in bf16;
+# `tensorwise` is the recipe available on this cluster's CUDA.
 TRAIN_FP8_RECIPE=${TRAIN_FP8_RECIPE:-tensorwise}
+# Keep the weights in bf16 and quantise them for each FP8 matmul. `fp8_param`
+# (persistent FP8 parameters) needs the model to be built inside TE's
+# `fp8_model_init`, which this engine does not do; setting it alone leaves the
+# parameters in bf16 and changes the backward's weight-grad accounting.
+TRAIN_FP8_PARAM=${TRAIN_FP8_PARAM:-False}
 
-GEN_TP=${GEN_TP:-2}
+GEN_TP=${GEN_TP:-1}
 GEN_PP=1
 
 VAL_TP=1
 VAL_PP=1
 
-GEN_NNODES=1
-GEN_NGPUS_PER_NODE=4
+GEN_NNODES=${GEN_NNODES:-1}
+GEN_NGPUS_PER_NODE=${GEN_NGPUS_PER_NODE:-8}
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) ))
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} ))
 
-TRAIN_NNODES=1
-TRAIN_NGPUS_PER_NODE=4
+TRAIN_NNODES=${TRAIN_NNODES:-1}
+TRAIN_NGPUS_PER_NODE=${TRAIN_NGPUS_PER_NODE:-8}
 
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) ))
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} ))
 
+# data length config
 max_prompt_length=2048
 max_response_length=8192
 
@@ -84,6 +105,11 @@ val_top_k=-1
 val_do_sample=False
 
 
+: "${LOCAL_IP:?LOCAL_IP must name a node in the Ray cluster.}"
+bash "$(dirname "$0")/check_two_node_split.sh" \
+    "$TRAIN_NGPUS_PER_NODE" "$GEN_INSTANCES" "$VAL_INSTANCES"
+
+
 python3 -m psrl.trainer.main_ppo --config-path=./config \
     --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -91,6 +117,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     psrl.staleness=${staleness} \
     psrl.staleness_buffer_entries=${train_batch_size} \
     psrl.ps_mode=nixl_direct \
+    psrl.checkpoint.use_dcp_save=False \
     psrl.logging_path=${LOG_DIR} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -109,6 +136,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=$train_batch_size \
+    data.train_max_samples=${TRAIN_MAX_SAMPLES:-512} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.filter_overlong_prompts=True \
@@ -139,9 +167,9 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=$ETP \
     train_actor_rollout_ref.actor.megatron.use_mbridge=True \
     train_actor_rollout_ref.actor.megatron.use_remove_padding=True \
-    train_actor_rollout_ref.actor.megatron.fp8=hybrid \
-    train_actor_rollout_ref.actor.megatron.fp8_recipe=${TRAIN_FP8_RECIPE} \
-    train_actor_rollout_ref.actor.megatron.fp8_param=True \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.fp8=hybrid \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.fp8_recipe=${TRAIN_FP8_RECIPE} \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.fp8_param=${TRAIN_FP8_PARAM} \
     \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
@@ -155,12 +183,14 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${max_token_len_per_gpu} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=20480 \
+    train_actor_rollout_ref.rollout.quantization=fp8 \
     \
     gen_actor_rollout_ref.rollout.name=vllm \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=20480 \
+    gen_actor_rollout_ref.rollout.agent.default_agent_loop=generate_only_agent \
     gen_actor_rollout_ref.rollout.temperature=${train_temperature} \
     gen_actor_rollout_ref.rollout.top_p=${train_top_p} \
     gen_actor_rollout_ref.rollout.top_k=${train_top_k} \
@@ -170,12 +200,12 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","wandb"]' \
+    trainer.logger='["console"]' \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.val_before_train=False \
-    trainer.save_freq=200 \
-    trainer.test_freq=5 \
+    trainer.val_before_train=True \
+    trainer.save_freq=${SAVE_FREQ:--1} \
+    trainer.test_freq=${test_freq} \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.total_training_steps=2 \
-    trainer.total_epochs=10 $@ 2>&1 | tee "${experiment_name}.log"
+    trainer.total_training_steps=${total_training_steps} \
+    trainer.total_epochs=1 $@ 2>&1 | tee "${experiment_name}.log"

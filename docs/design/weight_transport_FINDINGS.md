@@ -603,3 +603,22 @@ client/planner/engine 验证有 holder 时修复落地同一版本、无 holder 
 和 scale 是各自独立的分配，每实例 439 个 region，唤醒时注册约 14.5 s；bf16 同路径也
 需要数百个 region，因此净差约 5 s。这部分属于 vLLM 分配布局，不影响每步同步热路径。
 
+
+### 12.1 FP8 training + FP8 rollout（direct）
+
+配置：`qwen3_8b_megatron_fp8train_direct.sh`，布局与 §12 相同，训练侧额外打开 TE
+`fp8=hybrid` / `fp8_recipe=tensorwise`；发布点仍是 bf16 shard → 128×128 block FP8
+副本（与 FP8-gen / BF16-train 场景相同的 wire 格式，逐位判据在该场景已通过）。
+
+**结论：10/10 步、0 错误；初始验证 0.1986，最终验证 0.6520**（与 BF16 训练臂相同）；
+训练 reward 均值 0.392 vs 0.452（差 +0.059，CI [−0.178, +0.059]），entropy、grad norm、
+loss、response length 全部落在噪声区间。性能：pull 9.44 GB / 0.40–0.64 s（bf16 direct
+为 16.38 GB / 1.02 s），publish 0.02–0.24 s，`update_actor` 均值 21.3 s（BF16 训练
+21.5 s），trainer 切换 1.25–2.12 s，validate 切换 26.3–27.4 s。
+
+**`fp8_param` 必须关闭。** TE 的常驻 FP8 参数只有当模型在 `fp8_model_init` 内构建时
+才会产生 `QuantizedTensor`；本引擎直接构建模型（`get_fp8_context(is_init=True)` 没有
+调用者），所以该 flag 不会改变参数 dtype，却会改变 FP8 反向的 weight-grad 记账。
+实测打开后：第 1 步指标正常（entropy 0.14、grad 0.54），第 2 步 entropy 跳到 7.4、
+grad norm 到 600，随后 response length 全部撞到 8192、reward 归零。关闭后训练稳定。
+`validate_config` 现在在启动期拒绝 `fp8_param=True`（`tests/unit/test_fp8_training_config.py`）。

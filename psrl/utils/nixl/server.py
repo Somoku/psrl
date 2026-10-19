@@ -759,8 +759,20 @@ class NIXLMetaServer:
             dst_agent_names (List[str]): List of destination agent names
             update_client_names (List[str]): List of updated client names to broadcast
         """
-        sources = set(update_client_names)
-        self._broadcast_grouped({agent: sources for agent in dst_agent_names})
+        sources = sorted(set(update_client_names))
+        plan = {
+            "sources": {
+                name: {
+                    "info": self.client_infos[name].serialize(),
+                    "temp_mapping": self._client_temp_mappings[name],
+                }
+                for name in sources
+            },
+            "destinations": {
+                agent: {"sources": sources, "conn_info": b""} for agent in dst_agent_names
+            },
+        }
+        self._broadcast_grouped(plan)
 
     def broadcast_update_client_infos_to_readers(self, update_client_names: list[str]) -> list[str]:
         """Send each destination only the updated infos its readers consume.

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -315,6 +316,21 @@ class P3bSession(SandboxSession):
 # silence budget (`timing.OwnerSilenceTTL` in p3b).
 OWNER_HEARTBEAT_INTERVAL_S = 30.0
 
+# The node reclaims an owner's sandboxes after this many missed beats, so the interval
+# above is a third of the silence budget by construction. Named here because the renewal
+# loop has to be able to say how close it is to losing everything.
+_OWNER_SILENCE_BEATS = 3
+
+# A renewal that has not come back in this long is abandoned rather than waited on. It has
+# to be well under one beat: a call that is allowed to run for the whole interval cannot
+# be distinguished from a loop that has stopped running.
+OWNER_RENEW_TIMEOUT_S = 10.0
+
+# How many consecutive misses before the renewal stops being a warning. Two, because the
+# budget is three: at two the next failure is the one that takes the sandboxes, and there
+# is still one beat left in which something can be done about it.
+_RENEWAL_MISSES_BEFORE_ALARM = 2
+
 
 class P3bBackend(SandboxBackend):
     """The p3b service as a PSRL backend.
@@ -423,23 +439,50 @@ class P3bBackend(SandboxBackend):
             self._heartbeat_task = asyncio.create_task(self._renew_owner_loop())
 
     async def _renew_owner_loop(self) -> None:
+        # Three properties this loop has to have, each of which it did not:
+        #
+        # 1. **A hung renewal must not eat the next beat.** The sleep came first and the
+        #    call was awaited inline with no deadline, so one slow renewal pushed every
+        #    later one out by however long it took. Under a loaded control plane that is
+        #    exactly the shape that lets a node's silence budget expire.
+        # 2. **The cadence is a period, not a gap.** Sleep the remainder of the interval
+        #    rather than the whole interval after the call, so the beats are evenly spaced
+        #    however long the call itself took.
+        # 3. **Failures have to be visible before they become reclamations.** A single
+        #    miss is harmless -- the node's budget is three beats wide -- but a run of
+        #    them means this worker is about to lose every sandbox it holds, and that was
+        #    previously only discoverable from the 409 the next exec happened to hit.
+        missed = 0
         while not self._closed:
-            await asyncio.sleep(OWNER_HEARTBEAT_INTERVAL_S)
-            if self._closed:
-                return
+            started = time.monotonic()
             try:
-                await self._client.renew_owner(self._owner_id)
+                async with asyncio.timeout(OWNER_RENEW_TIMEOUT_S):
+                    await self._client.renew_owner(self._owner_id)
+                if missed:
+                    psrl_logger.info(
+                        "Sandbox owner renewal recovered for owner %r after %d missed beat(s).",
+                        self._owner_id,
+                        missed,
+                    )
+                missed = 0
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                # The next beat retries. A renewal the fleet missed is not a
-                # reason to stop renewing, and the node's silence budget is
-                # three beats wide, so a single failure reclaims nothing.
-                psrl_logger.warning(
-                    "Sandbox owner renewal failed for owner %r; the next beat retries.",
+            except Exception as exc:
+                missed += 1
+                # One missed beat costs nothing; the second means one more will cost every
+                # sandbox this worker holds. Say so at the level that gets read.
+                log = psrl_logger.error if missed >= _RENEWAL_MISSES_BEFORE_ALARM else psrl_logger.warning
+                log(
+                    "Sandbox owner renewal failed for owner %r (%d consecutive miss(es), "
+                    "the node reclaims after %d): %r. Every sandbox this worker holds is at risk.",
                     self._owner_id,
-                    exc_info=True,
+                    missed,
+                    _OWNER_SILENCE_BEATS,
+                    exc,
                 )
+            remaining = OWNER_HEARTBEAT_INTERVAL_S - (time.monotonic() - started)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
 
     async def create(self, spec: SandboxSpec) -> SandboxSession:
         self._require_open()

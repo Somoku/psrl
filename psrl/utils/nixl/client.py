@@ -167,6 +167,7 @@ class NIXLStorageClient:
         client_group_id: int = -1,  # -1 is the default client group
         logging_path: str | None = None,
         enable_prog_thread: bool = True,
+        pairwise_descriptors: bool = True,
     ):
         self.client_name = client_name
         self.server_name = server_name
@@ -175,6 +176,12 @@ class NIXLStorageClient:
         # self.device = torch.device("cuda:0" if use_gpu else "cpu")
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}" if use_gpu else "cpu")
         self.client_type = client_type
+        # Pairwise PS transfers (`client_read`/`client_write`) address a remote peer by
+        # serialized descriptors, so that path needs them. Direct supply does not: its
+        # pull engine derives remote descriptors from `read_addrs` + strides + shard
+        # metadata. Skipping the serialization keeps client infos small, which is what
+        # the switch-time broadcast and the meta server exchange carry.
+        self._pairwise_descriptors = bool(pairwise_descriptors)
         self.server_ip = nixl_config.server_ip
         self.server_port = nixl_config.server_port
         self.max_pinned_temp_memory_slots = (
@@ -739,6 +746,44 @@ class NIXLStorageClient:
         self._registered_descs[desc_bytes] = desc
         return desc_bytes
 
+    def _allocator_segment_report(self) -> str:
+        """How many CUDA allocator segments cover the registered regions, best effort.
+
+        NIXL registration costs one MR per allocation. If many tensors come from a few
+        allocator segments, registering each segment once is the zero-copy way to cut
+        that count. `memory_snapshot` does not see CuMem-pool mappings (sleep mode), so
+        a base outside every reported segment is called out rather than miscounted.
+        """
+        if self.device.type != "cuda":
+            return "allocator segments: n/a (non-CUDA)"
+        try:
+            snapshot = torch.cuda.memory_snapshot()
+        except Exception as exc:  # pragma: no cover - depends on the driver
+            return f"allocator segments: unavailable ({exc!r})"
+        segments = [(b["address"], b["total_size"]) for b in snapshot if b.get("total_size")]
+        bases = [
+            region[0]
+            for reg_list in self._mtype_to_reg_region_lists.values()
+            for region in reg_list
+        ]
+
+        def segment_of(addr: int) -> int | None:
+            for base, size in segments:
+                if base <= addr < base + size:
+                    return base
+            return None
+
+        found = {segment_of(base) for base in bases}
+        outside = None in found
+        found.discard(None)
+        matched = len(bases) - (1 if outside else 0)
+        detail = (
+            " plus at least one region outside the caching allocator (CuMem pool)"
+            if outside
+            else ""
+        )
+        return f"allocator segments: {len(found)} cover {matched} region(s){detail}"
+
     def _record_region_registration(self, tensor: torch.Tensor) -> tuple[int, int, int, str]:
         """Record the base storage registration entry for a tensor view.
 
@@ -983,6 +1028,103 @@ class NIXLStorageClient:
                     f"{self.client_name}: tensor {key} shard {shard_idx} is a strided tensor "
                     "but its span is not covered by a registered region"
                 )
+
+    def _serialize_descriptors_if_pairwise(self, tensor_infos, shard_pos_cache) -> None:
+        """Serialize pairwise descriptors only on runs that can use them."""
+        if not self._pairwise_descriptors:
+            psrl_logger.info(
+                f"{self.client_name}: direct-supply pull path; descriptors are derived by readers"
+            )
+            return
+        self._serialize_pairwise_descriptors(tensor_infos, shard_pos_cache)
+
+    def _serialize_pairwise_descriptors(self, tensor_infos, shard_pos_cache) -> None:
+        """Serialize the descriptors a pairwise PS transfer addresses its peer by.
+
+        Direct supply derives remote descriptors on the reader from `read_addrs` +
+        strides + shard metadata, so it never needs these bytes on the wire; only
+        `client_read` / `client_write` do. Serializing a strided shard expands it to
+        one descriptor per row, which is what makes an update-info payload grow with
+        the parameter count and its shape.
+        """
+        # --- contig_desc_slice_map ---
+        contig_by_memtype: dict[str, list[tuple]] = defaultdict(list)
+        for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
+            slice_addr, slice_len, device_id, mem_type = slice_info
+            contig_by_memtype[mem_type].append((key, shard_idx, slice_addr, slice_len, device_id))
+
+        for mem_type, entries in contig_by_memtype.items():
+            batch_tuples = [(addr, length, dev) for (_, _, addr, length, dev) in entries]
+            xfer_descs = self.agent.get_xfer_descs(batch_tuples, mem_type=mem_type)
+            assert xfer_descs.descCount() == len(entries), (
+                f"{self.client_name}: get_xfer_descs returned {xfer_descs.descCount()} descs "
+                f"for {len(entries)} contig inputs (mem_type={mem_type})."
+            )
+            desc_type = xfer_descs.getType()
+            for i, (key, shard_idx, _, _, _) in enumerate(entries):
+                single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
+                desc_bytes = self.agent.get_serialized_descs(single)
+                local_pos = shard_pos_cache[key][shard_idx]
+                tensor_infos[key].desc_bytes_list[local_pos] = desc_bytes
+
+        # --- temp_desc_slice_map ---
+        temp_by_memtype: dict[str, list[tuple]] = defaultdict(list)
+        for (key, shard_idx), slice_info in self.temp_desc_slice_map.items():
+            slice_addr, slice_len, device_id, mem_type = slice_info
+            temp_by_memtype[mem_type].append((key, shard_idx, slice_addr, slice_len, device_id))
+
+        for mem_type, entries in temp_by_memtype.items():
+            batch_tuples = [(addr, length, dev) for (_, _, addr, length, dev) in entries]
+            xfer_descs = self.agent.get_xfer_descs(batch_tuples, mem_type=mem_type)
+            assert xfer_descs.descCount() == len(entries), (
+                f"{self.client_name}: get_xfer_descs returned {xfer_descs.descCount()} descs "
+                f"for {len(entries)} temp inputs (mem_type={mem_type})."
+            )
+            desc_type = xfer_descs.getType()
+            for i, (key, shard_idx, _, _, _) in enumerate(entries):
+                single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
+                desc_bytes = self.agent.get_serialized_descs(single)
+                self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
+                local_pos = shard_pos_cache[key][shard_idx]
+                tensor_infos[key].temp_desc_bytes_list[local_pos] = desc_bytes
+
+        n_strided = self._serialize_strided_descs(tensor_infos, shard_pos_cache)
+        if n_strided:
+            # Report the descriptor count, not just the shard count. A strided
+            # shard expands to one descriptor per row, and `postXferReq` charges
+            # ~2.1-4us *per descriptor* -- so this line is the difference between
+            # a transfer that costs microseconds and one that costs seconds.
+            #
+            # The old message said only "no staging copy", which reads as a win
+            # and hid the cost entirely: locating it took several cluster runs
+            # when one log line would have done. Avoiding the staging copy is
+            # genuinely cheaper only while the row count stays small.
+            rows = [layout.row_count for layout, _mem_type in self.strided_desc_slice_map.values()]
+            total_descs = sum(rows)
+            worst = max(rows, default=0)
+            est_ms = total_descs * STRIDED_US_PER_DESCRIPTOR / 1e3
+            psrl_logger.info(
+                f"{self.client_name}: {n_strided} strided shard(s) registered in place "
+                f"(no staging copy): {total_descs} descriptor(s), worst shard "
+                f"{worst} rows, est. submit cost {est_ms:.1f}ms at "
+                f"{STRIDED_US_PER_DESCRIPTOR}us/descriptor"
+            )
+            if worst > STRIDED_ROW_BUDGET:
+                # A shard is sharded on its inner (contiguous) dimension, which is
+                # what makes it strided at all. Row-parallel layers (`o_proj`,
+                # `down_proj`) are sharded on the input dimension and so hit this;
+                # column-parallel layers never do. Matching the two sides on that
+                # dimension removes the re-shard and the expansion with it.
+                psrl_logger.warning(
+                    f"{self.client_name}: worst strided shard expands to {worst} "
+                    f"descriptors (budget {STRIDED_ROW_BUDGET}), costing about "
+                    f"{worst * STRIDED_US_PER_DESCRIPTOR / 1e3:.1f}ms to submit for "
+                    f"bytes that transfer in microseconds. This comes from "
+                    f"re-sharding a row-parallel weight on its input dimension; "
+                    f"aligning the input-dimension shard count between train and "
+                    f"rollout removes it."
+                )
+
 
     def register_local_tensors(
         self,
@@ -1456,7 +1598,7 @@ class NIXLStorageClient:
                 # descriptor work is what tells an operator which half to attack.
                 psrl_logger.info(
                     f"{self.client_name}: [timing] registered {n_regions} region(s) with NIXL "
-                    f"in {time.time() - _t_registration:.3f}s"
+                    f"in {time.time() - _t_registration:.3f}s. {self._allocator_segment_report()}"
                 )
 
                 # Precompute {shard_idx: local_pos} once per key: O(1) lookup vs O(S) list.index()
@@ -1472,84 +1614,7 @@ class NIXLStorageClient:
                 )
                 _t_xfer_descs = time.time()
 
-                # --- contig_desc_slice_map ---
-                contig_by_memtype: dict[str, list[tuple]] = defaultdict(list)
-                for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
-                    slice_addr, slice_len, device_id, mem_type = slice_info
-                    contig_by_memtype[mem_type].append((key, shard_idx, slice_addr, slice_len, device_id))
-
-                for mem_type, entries in contig_by_memtype.items():
-                    batch_tuples = [(addr, length, dev) for (_, _, addr, length, dev) in entries]
-                    xfer_descs = self.agent.get_xfer_descs(batch_tuples, mem_type=mem_type)
-                    assert xfer_descs.descCount() == len(entries), (
-                        f"{self.client_name}: get_xfer_descs returned {xfer_descs.descCount()} descs "
-                        f"for {len(entries)} contig inputs (mem_type={mem_type})."
-                    )
-                    desc_type = xfer_descs.getType()
-                    for i, (key, shard_idx, _, _, _) in enumerate(entries):
-                        single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
-                        desc_bytes = self.agent.get_serialized_descs(single)
-                        local_pos = shard_pos_cache[key][shard_idx]
-                        tensor_infos[key].desc_bytes_list[local_pos] = desc_bytes
-
-                # --- temp_desc_slice_map ---
-                temp_by_memtype: dict[str, list[tuple]] = defaultdict(list)
-                for (key, shard_idx), slice_info in self.temp_desc_slice_map.items():
-                    slice_addr, slice_len, device_id, mem_type = slice_info
-                    temp_by_memtype[mem_type].append((key, shard_idx, slice_addr, slice_len, device_id))
-
-                for mem_type, entries in temp_by_memtype.items():
-                    batch_tuples = [(addr, length, dev) for (_, _, addr, length, dev) in entries]
-                    xfer_descs = self.agent.get_xfer_descs(batch_tuples, mem_type=mem_type)
-                    assert xfer_descs.descCount() == len(entries), (
-                        f"{self.client_name}: get_xfer_descs returned {xfer_descs.descCount()} descs "
-                        f"for {len(entries)} temp inputs (mem_type={mem_type})."
-                    )
-                    desc_type = xfer_descs.getType()
-                    for i, (key, shard_idx, _, _, _) in enumerate(entries):
-                        single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
-                        desc_bytes = self.agent.get_serialized_descs(single)
-                        self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
-                        local_pos = shard_pos_cache[key][shard_idx]
-                        tensor_infos[key].temp_desc_bytes_list[local_pos] = desc_bytes
-
-                n_strided = self._serialize_strided_descs(tensor_infos, shard_pos_cache)
-                if n_strided:
-                    # Report the descriptor count, not just the shard count. A strided
-                    # shard expands to one descriptor per row, and `postXferReq` charges
-                    # ~2.1-4us *per descriptor* -- so this line is the difference between
-                    # a transfer that costs microseconds and one that costs seconds.
-                    #
-                    # The old message said only "no staging copy", which reads as a win
-                    # and hid the cost entirely: locating it took several cluster runs
-                    # when one log line would have done. Avoiding the staging copy is
-                    # genuinely cheaper only while the row count stays small.
-                    rows = [layout.row_count for layout, _mem_type in self.strided_desc_slice_map.values()]
-                    total_descs = sum(rows)
-                    worst = max(rows, default=0)
-                    est_ms = total_descs * STRIDED_US_PER_DESCRIPTOR / 1e3
-                    psrl_logger.info(
-                        f"{self.client_name}: {n_strided} strided shard(s) registered in place "
-                        f"(no staging copy): {total_descs} descriptor(s), worst shard "
-                        f"{worst} rows, est. submit cost {est_ms:.1f}ms at "
-                        f"{STRIDED_US_PER_DESCRIPTOR}us/descriptor"
-                    )
-                    if worst > STRIDED_ROW_BUDGET:
-                        # A shard is sharded on its inner (contiguous) dimension, which is
-                        # what makes it strided at all. Row-parallel layers (`o_proj`,
-                        # `down_proj`) are sharded on the input dimension and so hit this;
-                        # column-parallel layers never do. Matching the two sides on that
-                        # dimension removes the re-shard and the expansion with it.
-                        psrl_logger.warning(
-                            f"{self.client_name}: worst strided shard expands to {worst} "
-                            f"descriptors (budget {STRIDED_ROW_BUDGET}), costing about "
-                            f"{worst * STRIDED_US_PER_DESCRIPTOR / 1e3:.1f}ms to submit for "
-                            f"bytes that transfer in microseconds. This comes from "
-                            f"re-sharding a row-parallel weight on its input dimension; "
-                            f"aligning the input-dimension shard count between train and "
-                            f"rollout removes it."
-                        )
-
+                self._serialize_descriptors_if_pairwise(tensor_infos, shard_pos_cache)
                 psrl_logger.info(
                     f"{self.client_name}: [timing] register_local_tensors batch xfer_descs done in "
                     f"{time.time() - _t_xfer_descs:.3f}s"
@@ -1847,9 +1912,11 @@ class NIXLStorageClient:
         assert self._is_connected, "Not connected to server"
         if self.local_client_info is None:
             raise RuntimeError("Local client info not registered.")
+        serialized = self.local_client_info.serialize()
+        psrl_logger.info(f"{self.client_name}: client info {len(serialized) / 1e6:.3f} MB.")
         self.agent.send_notif(
             self.server_name,
-            encode(NotifKind.CLIENT_INFO, {self.client_name: self.local_client_info.serialize()}),
+            encode(NotifKind.CLIENT_INFO, {self.client_name: serialized}),
         )
 
     def send_local_temp_mapping(self):
@@ -1960,13 +2027,18 @@ class NIXLStorageClient:
             dst_agent_names: List of destination agent names.
         """
         assert self._is_connected, "Not connected to server"
+        serialized = self.local_client_info.serialize()
         payload_dict = {
             self.client_name: {
-                "info": self.local_client_info.serialize(),
+                "info": serialized,
                 "temp_mapping": self._temp_desc_bytes_mapping,
             }
         }
         payload = encode(NotifKind.UPDATE_INFO, payload_dict)
+        psrl_logger.info(
+            f"{self.client_name}: client info {len(serialized) / 1e6:.3f} MB "
+            f"(payload {len(payload) / 1e6:.3f} MB) to {len(dst_agent_names)} agent(s)."
+        )
         for dst_agent_name in dst_agent_names:
             self.agent.send_notif(dst_agent_name, payload)
 

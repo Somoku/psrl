@@ -2810,11 +2810,22 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         return broadcast_plan
 
     def _broadcast_updated_client_infos_from_ps_manager(self, updated_client_names: list):
-        """Broadcast updated client infos from PS manager to all nixl clients.
+        """Broadcast updated client infos to the clients that read them.
 
         Args:
             updated_client_names (list): List of updated client names to broadcast.
         """
+        if not has_ps_data_plane(self.config.psrl.ps_mode):
+            # Direct supply: a client that does not read any of the updated clients
+            # cannot observe the change, so neither the payload nor its acknowledgement
+            # belongs on the switch path. This is the common case for a validation wake,
+            # where the woken instances are destinations and nobody reads them.
+            readers = ray.get(
+                self.ps_manager_handle.nixl_broadcast_update_client_infos_to_readers.remote(updated_client_names)
+            )
+            self._wait_for_updated_client_infos(readers)
+            return
+
         src_agent_names = [NIXL_META_SERVER_NAME]
         dst_agent_names = []
         # 1. PS storage workers -- none under direct supply, where the rollouts read the
@@ -2864,6 +2875,37 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # 3. actor workers
         futures.extend(self.actor_wg.execute_all_async("nixl_wait_for_update_infos", 1))
         ray.get(futures)
+
+    def _wait_for_updated_client_infos(self, reader_clients: list[str]) -> None:
+        """Wait for the single update notification every reader agent received.
+
+        Waits are scoped with the broadcast: a client that was not sent an update must
+        not wait for one. The actor group is all-or-nothing (its API has no per-rank
+        form), so it is only waited on when at least one train rank reads an updated
+        client.
+        """
+        if not reader_clients:
+            return
+        readers = set(reader_clients)
+        futures = []
+        train_names = {train_client_name(i) for i in range(self.actor_wg.world_size)}
+        if readers & train_names:
+            futures.extend(self.actor_wg.execute_all_async("nixl_wait_for_update_infos", 1))
+
+        for role in ("rollout", "validate"):
+            handles = self.tag_to_server_handles.get(role, [])
+            if not handles:
+                continue
+            names = self._gen_client_names(role)
+            ranks_per_instance = self._ranks_per_instance(role)
+            start = 0
+            for handle, ranks in zip(handles, ranks_per_instance):
+                instance_names = set(names[start : start + ranks])
+                start += ranks
+                if instance_names & readers:
+                    futures.append(handle.nixl_wait_for_update_infos.remote(1))
+        if futures:
+            ray.get(futures)
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe

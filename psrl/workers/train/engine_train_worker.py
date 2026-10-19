@@ -199,6 +199,7 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             worker_index=self.rank,
             logging_path=self.psrl_config.logging_path,
             enable_prog_thread=enable_prog_thread,
+            pairwise_descriptors=has_ps_data_plane(self.psrl_config.ps_mode),
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 

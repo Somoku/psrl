@@ -56,7 +56,7 @@ from psrl.utils.logger import (
     log_dual_events,
 )
 from psrl.utils.nixl.pull_engine import WeightRefreshFailed
-from psrl.utils.ps_mode import uses_nixl
+from psrl.utils.ps_mode import has_ps_data_plane, uses_nixl
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
 from psrl.workers.gen.smg_adapter import build_worker_registration_payload, cfg_get, is_cache_aware_method
@@ -963,6 +963,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 self.psrl_config.nixl,
                 self.get_replica_idx(),
                 self.psrl_config.logging_path,
+                # Direct supply derives remote descriptors on the reader; serializing
+                # them here would put one descriptor per strided row into every client
+                # info, and those infos are what switch-time updates carry.
+                has_ps_data_plane(self.psrl_config.ps_mode),
             ),
         )
 

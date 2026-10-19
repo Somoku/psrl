@@ -1070,6 +1070,52 @@ class PSManager(RequestStatusTracker):
         """
         self.nixl_meta_server.broadcast_update_client_infos(dst_agent_names, update_client_names)
 
+    def nixl_broadcast_update_client_infos_to_readers(self, update_client_names: list[str]) -> list[str]:
+        """Broadcast only to clients that read the updated ones; return those clients.
+
+        Every agent caches every client info, but only a reader of an updated client can
+        observe the change; a non-reader's copy is never consulted. Sending to all
+        destinations made an entire fleet deserialize one large payload per switch, and
+        waiting for the acknowledgement serialized the switch behind it. The plan
+        inversion also covers peer-diffusion followers, which read their designate
+        without appearing in any plan direction.
+
+        Returns the reader client names that were actually sent to, so the caller can
+        wait on exactly those and on nothing else.
+        """
+        readers = self.nixl_meta_server.readers_of(update_client_names)
+        infos = self.nixl_meta_server.client_infos
+
+        # A reader is a single client (one rank), but the acknowledgement is issued per
+        # instance: every rank of the instance calls `wait_for_update_infos(1)`. Send to
+        # all of the instance's clients so a non-reader rank does not wait forever; the
+        # payload is metadata-only under direct supply, so the extra copies are small.
+        siblings: dict[str, set[str]] = {}
+        for name in infos:
+            group = name.rsplit("_R", 1)[0] if "_R" in name else name.rsplit("_", 1)[0]
+            siblings.setdefault(group, set()).add(name)
+
+        delivered: set[str] = set()
+        dst_agents: set[str] = set()
+        for reader in readers:
+            group = siblings.get(
+                reader.rsplit("_R", 1)[0] if "_R" in reader else reader.rsplit("_", 1)[0],
+                {reader},
+            )
+            for name in group:
+                info = infos.get(name)
+                if info is None or not info.agent_name:
+                    continue
+                delivered.add(name)
+                dst_agents.add(info.agent_name)
+        if dst_agents:
+            self.nixl_meta_server.broadcast_update_client_infos(sorted(dst_agents), update_client_names)
+        psrl_logger.info(
+            f"Broadcast {len(update_client_names)} updated client info(s) to "
+            f"{len(delivered)} reader client(s) on {len(dst_agents)} agent(s)."
+        )
+        return sorted(delivered)
+
     def bind_ps_worker_group(self, ps_worker_group: PSWorkerGroup):
         """Bind the PS worker group to the PSManager.
 

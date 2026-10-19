@@ -176,6 +176,17 @@ NIXL dereg → 释放显存 → 对侧分配显存 → **重新握手**（`nixl_
 verl / SkyRL 的 colocate 快，是因为它们**根本不把权重挪出显存**。PSRL 慢的原因不在 NIXL，
 在于把「同一块物理显存在 train 与 rollout 间交接」实现成了「经由 host 的一次完整往返」。
 
+**切换期 `UPDATE_INFO` 的两条规则**（实测见 FINDINGS §13）：
+
+1. **只发给读者。** 更新后的 client info 只有它的读者会消费。目的地由 comm plan 反查
+   （含 peer-diffusion follower，见 `descriptor_readers_by_source`），没有读者时既不发广播
+   也不等待 ack。发出的目的地要覆盖读者所在实例的**所有 rank**，因为 ack 是实例级的。
+2. **不发派生数据。** descriptor 是由 `read_addrs` + stride + shard meta 派生的：direct supply
+   的 pull 引擎在读者侧本地构造，info 只携带几何与地址。PS 的 pairwise 传输
+   （`client_read`/`client_write`）仍按远端 descriptor 寻址，所以只在 PS 数据面上序列化它们。
+
+这两条把切换期载荷从 `O(展开行数)` 降到 `O(shard 数)`，把 fan-out 从全 fleet 降到读者数。
+
 ---
 
 ## 2. 外部方案调研：各自解决了哪一块

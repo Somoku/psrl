@@ -339,6 +339,9 @@ class TrainClientActor:
             replica_idx=0,
             worker_index=rank,
             logging_path=log_dir,
+            # Mirror production: direct supply derives remote descriptors on the reader,
+            # so the source's info carries geometry rather than expanded descriptors.
+            pairwise_descriptors=bool(model_config.get("pairwise_descriptors", True)),
         )
 
         if engine_type in ("fsdp", "fsdp2", "fsdp_hybrid"):
@@ -862,6 +865,7 @@ class GenClientActor:
             replica_idx=0,
             worker_index=rank,
             logging_path=log_dir,
+            pairwise_descriptors=bool(model_config.get("pairwise_descriptors", True)),
         )
 
         llm_kwargs = {

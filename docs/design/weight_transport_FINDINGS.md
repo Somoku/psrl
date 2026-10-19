@@ -622,3 +622,63 @@ loss、response length 全部落在噪声区间。性能：pull 9.44 GB / 0.40�
 实测打开后：第 1 步指标正常（entropy 0.14、grad 0.54），第 2 步 entropy 跳到 7.4、
 grad norm 到 600，随后 response length 全部撞到 8192、reward 归零。关闭后训练稳定。
 `validate_config` 现在在启动期拒绝 `fp8_param=True`（`tests/unit/test_fp8_training_config.py`）。
+
+## 13. 验证切换：去掉派生描述符、按读者广播
+
+现象：validate 切换 26.4–27.7 s，trainer 切换 1.14–2.12 s。按阶段拆分（fp8gen，19:35 与
+09:12 两次切换）：
+
+| 阶段 | 优化前 | 优化后 |
+|---|---|---|
+| vLLM 引擎唤醒（`wake up tags ['weights']`） | 0.17 s | 0.17 s |
+| **validate 实例 NIXL 重注册** | **14.5–15.6 s（439 region）** | 13.2–15.6 s（未变） |
+| **`UPDATE_INFO` 广播 + ack** | **6.4 s（8 条 info 发给 24 个 agent）** | ~0（8 条 info 发给 8 个读者） |
+| validate pull | 0.8–1.3 s | 0.3–0.9 s |
+| trainer offload / KV 唤醒 / resume | ~3–4 s | ~3 s |
+| **合计** | **26.4–27.7 s** | **17.8–18.8 s（−32%）** |
+
+根因（第一性原理）与对应修复：
+
+1. **client info 携带的是派生数据。** strided shard 的远程 descriptor 在源端按行展开
+   （单个 validate 实例 **1,188,864 个 descriptor**），而 direct-supply 的 pull 引擎在读者侧
+   用 `read_addrs` + stride + `shard_meta_infos` 已经能构造同样的描述符（`pull_engine._spec`）。
+   把展开结果序列化进 info 再发给所有成员，是纯冗余。修复：direct 模式不再序列化
+   pairwise descriptor（`pairwise_descriptors=False`），读者侧派生；PS 的
+   `client_read`/`client_write` 仍需要它们，保持原样。validate 的单实例 info 从展开的
+   MB 级降到 **0.127 MB**。
+2. **广播给了不消费它的人。** 只有读者会使用更新后的 info；validate 实例是 pull destination，
+   没有读者时广播与 ack 是纯切换开销。修复：目的地由 comm plan 反查
+   （`descriptor_readers_by_source`，含 peer-diffusion follower），并补齐读者所在实例的所有
+   rank（ack 是实例级的）。本场景广播为 8 个读者 / 8 个 agent。
+3. 注册成本按 **region 数** 计：validate 每个权重（FP8 再加 scale）是独立分配，439 region；
+   trainer 是 Megatron flat buffer + 合并后的 scale 池，6 region / 0.2 s。这是剩余 18 s 的
+   唯一主项，见 §13.1。
+
+验证：
+- 坐标判据加 `+model.pairwise_descriptors=false`（读者侧派生描述符）：4 gen client ×
+  399 key × 2 轮 **逐位通过，0 失败**。
+- 生产 10 步（fp8gen，GSM8K）：0 错误；初始验证 0.1941、最终 0.6535（优化前 0.1964 /
+  0.6520）；训练 reward 0.4437 vs 0.4516（CI 重叠），entropy/grad/loss/长度全部在噪声内。
+- 复杂度：info 载荷 `O(#shard × 常量)`（原 `O(展开行数)`）；广播 `O(readers)`（原 `O(fleet)`）。
+  万卡 + TB MoE 下，meta server 的序列化从 GB 级降到 KB/MB 级，fan-out 与 ack 只与 plan 中的
+  读者数成正比。
+
+### 13.1 剩余的注册成本与后续方案
+
+instrumentation（`_allocator_segment_report`）：validate 实例的 439 个 region 落在 **151 个
+CUDA allocator segment** 中；trainer 的 6 个 region 落在 5 个 segment。注册耗时与 region 数
+近似线性（~30–35 ms/region，两次运行一致）。
+
+- **segment 粒度注册（零额外显存，建议下一步）**：同一 segment 内的张量只注册一次，预计
+  439 → 151 region，注册 13–15 s → ~5 s，切换再降 ~8 s。风险：expandable segments 的 VA
+  区间不能整段注册；CuMem pool 的分配不在 snapshot 中（本次全部落在普通 allocator）；
+  IPC handle 按 allocation 导出，需把 `read_bases` 与注册 region 解耦。
+- **同节点跨 GPU 的 IPC/peer copy（零注册，需 PoC）**：源按 allocation 导出 IPC handle，
+  读者在另一块 GPU 上映射后走 `cudaMemcpyPeerAsync`，目的显存不需要 NIXL MR。H20 同节点
+  NVLink 具备 P2P；收益是把 validate 注册从切换路径上完全移除，代价是一条新的数据路径与
+  per-allocation handle 管理。
+- **上游对照**：vLLM 的 sharded RDT（NIXL pull）不解模型参数，而是在 worker 侧维护
+  `num_rdt_buffers` 个 layer-sized 接收缓冲、注册这几个缓冲后拷入参数（[docs](https://docs.vllm.ai/en/latest/training/weight_transfer/sharded_rdt/)）。
+  它用少量额外显存换掉了 per-parameter 注册；本设计明确不采用时间换显存，因此 segment
+  注册或 IPC peer copy 是更合适的方向。vLLM 的 RFC #48312 也在系统化 weight-reload 的
+  正确性问题（storage identity、版本化 cache 等），与本设计的 v2 门闩目标一致。

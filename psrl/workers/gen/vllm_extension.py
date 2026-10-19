@@ -101,6 +101,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         nixl_config: DictConfig,
         replica_idx: int,
         logging_path: str | None = None,
+        pairwise_descriptors: bool = True,
     ):
         # NIXL attributes
         self.unified_state_dict = None
@@ -116,6 +117,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             worker_index=self.get_instance_local_rank(),
             # client_group_id=instance_id,
             logging_path=logging_path,
+            pairwise_descriptors=pairwise_descriptors,
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 

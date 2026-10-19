@@ -67,6 +67,8 @@ class NIXLMetaServer:
         #: make_unified_sharding, read by join admission and the observability log.
         self.finest_shard_meshes: dict[str, dict[int, int]] = {}
         self.comm_plan: NIXLCommPlan | None = None
+        #: source -> key -> readers, rebuilt with the plan; see `readers_of`.
+        self._descriptor_readers: dict[str, dict[str, set[str]]] = {}
         self._client_temp_mappings: dict[str, dict] = {}
 
         # Per-kind rosters rather than three "handshake finished" booleans. A boolean
@@ -598,10 +600,35 @@ class NIXLMetaServer:
                 by_role.setdefault(model_role_of(name), {})[name] = info
             plans = [planner.make_comm_plan(infos) for _, infos in sorted(by_role.items())]
             self.comm_plan = plans[0] if len(plans) == 1 else merge_comm_plans(plans)
+            # One inversion serves every switch-time broadcast. Recomputing it per
+            # broadcast is O(#clients x #keys), which at 10k clients and a TB-scale MoE
+            # is millions of dictionary steps on a path that must stay control-plane
+            # cheap.
+            from psrl.utils.nixl.registration_policy import descriptor_readers_by_source  # noqa: PLC0415
+
+            self._descriptor_readers = descriptor_readers_by_source(self.comm_plan)
         except Exception as e:
             psrl_logger.error(f"Failed to make communication plan: {e}")
             raise e
         psrl_logger.info(f"Communication plan made after {time.time() - start} seconds.")
+
+    def readers_of(self, client_names) -> set[str]:
+        """Clients whose cached infos must change when ``client_names`` re-register.
+
+        The inverse of the plan plus peer-diffusion delegation, because a same-node
+        follower reads its designate without appearing in any plan direction. An empty
+        set means nobody reads these clients: their new addresses cannot affect any
+        transfer, so neither the broadcast nor the waiting acknowledgement is needed.
+        """
+        readers: set[str] = set()
+        for name in client_names:
+            for key_readers in self._descriptor_readers.get(name, {}).values():
+                # Drop only the source reading itself. Removing every updated client
+                # would also drop a client that reads a *different* updated source in
+                # the same round, which is exactly the peer-diffusion case where several
+                # instances re-register together.
+                readers.update(reader for reader in key_readers if reader != name)
+        return readers
 
     def notify_all_client_shardings(self):
         """
@@ -744,6 +771,10 @@ class NIXLMetaServer:
         # waits for an update info that never arrives -- both switch directions hang
         # until the handshake budget expires, with nothing logged on either side.
         payload = encode(NotifKind.UPDATE_INFO, payload_dict)
+        psrl_logger.info(
+            f"{self.server_name}: update-info payload {len(payload) / 1e6:.2f} MB for "
+            f"{len(update_client_names)} client(s) to {len(dst_agent_names)} agent(s)."
+        )
 
         for agent_name in dst_agent_names:
             # Send notification with updated client infos

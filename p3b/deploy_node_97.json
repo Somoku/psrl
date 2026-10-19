@@ -8,7 +8,7 @@
   },
   "node": {
     "memory_mb": 1400000,
-    "cpu_millis": 180000,
+    "cpu_millis": 256000,
     "disk_mb": 4000000,
     "gpu_indices": [],
     "local_cpu_ceiling": 0.95,
@@ -34,7 +34,7 @@
       "shrink_after": 3,
       "shrink_step": 0.25,
       "growth_horizon_s": 60,
-      "start_limit_mb": 8192,
+      "start_limit_mb": 12288,
       "limit_sample_interval_s": 0.2,
       "reap_foreign": false
     },

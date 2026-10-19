@@ -493,6 +493,18 @@ class SandboxClient:
             locality_hit_ratio=float(reply.get("locality_hit_ratio", 0.0)),
         )
 
+    async def fleet_detail(self) -> dict:
+        """Return the fleet view exactly as the control plane reports it.
+
+        `fleet()` is the metric hook: it names the handful of numbers a caller acts on.
+        This is the operator's view -- every field the nodes publish, including each
+        class's headroom and the envelope each node is admitting against. It is a raw
+        mapping rather than a dataclass precisely because its job is to be complete: a
+        telemetry consumer wants whatever the node publishes today, without this SDK
+        deciding which of those fields are worth carrying.
+        """
+        return await self._call("fleet", {})
+
     async def provision_status(self, ticket: str) -> ProvisionStatus:
         """Return how a create with this ticket is progressing.
 

@@ -85,6 +85,11 @@ type ElasticConfig struct {
 	// without this a class can be priced at its idle rate while every sandbox in it is
 	// being throttled. Zero takes the default.
 	ThrottledAbove float64
+	// ThrottleDwell is how many consecutive samples a sandbox must be throttled before the
+	// ledger charges it its whole quota rather than the rate it measured. One is too eager:
+	// a single tool call that wants more than its share would set the class's price for the
+	// rest of the episode.
+	ThrottleDwell int
 
 	// StartLimitMB is the kernel limit a sandbox is created under: its guarantee, and the
 	// level its limit is never lowered below while it lives.
@@ -185,6 +190,9 @@ func ElasticConfigWithDefaults(cfg ElasticConfig) ElasticConfig {
 	if cfg.ThrottledAbove <= 0 {
 		cfg.ThrottledAbove = DefaultThrottledAbove
 	}
+	if cfg.ThrottleDwell <= 0 {
+		cfg.ThrottleDwell = DefaultThrottleDwell
+	}
 	if cfg.GrowthHorizonS <= 0 {
 		cfg.GrowthHorizonS = DefaultGrowthHorizonS
 	}
@@ -238,6 +246,15 @@ func ElasticConfigWithDefaults(cfg ElasticConfig) ElasticConfig {
 // DefaultThrottledAbove is the share of an interval a sandbox spends throttled before the
 // controller treats its measured CPU rate as truncated by the quota.
 const DefaultThrottledAbove = 0.10
+
+// DefaultThrottleDwell is how many consecutive samples a sandbox must be throttled before
+// the ledger charges it its whole quota.
+//
+// Three: at the 200ms cadence that is 600ms of being held down, which a real burst
+// clears easily and an idle sandbox never reaches. It is the same asymmetry the
+// controller applies to bounds -- quick to believe a sandbox needs more, slow to keep
+// believing it.
+const DefaultThrottleDwell = 3
 
 // DefaultGrowthHorizonS is how far ahead admission reserves a class's growth. One minute
 // covers a sampling interval, a fleet report and the time a batch takes to arrive at that
@@ -915,6 +932,9 @@ type elastic struct {
 	// sandbox may be shrunk.
 	cpuThrottledNanos map[string]int64
 	cpuThrottle       map[string]float64
+	// throttleRun counts consecutive throttled samples per sandbox, which is what the
+	// quota substitution waits on.
+	throttleRun map[string]int
 	// lastSample is when the previous tick read the domain, which is the interval a rate
 	// is taken over.
 	lastSample time.Time
@@ -1007,6 +1027,12 @@ func (n *Node) ElasticTick(ctx context.Context) ElasticReport {
 	if measured > 0 {
 		report.ThrottledPct = throttledTotal / float64(measured)
 	}
+	// Throttling is the feedback term for CPU packing, in the role that utilization plays
+	// for memory: memory asks how full the machine is, CPU asks how much the kernel is
+	// already refusing. Without a reading the gate falls back to the declared CPU envelope,
+	// because "the reservations are generous" is exactly the claim an unmeasured node
+	// cannot make.
+	n.admission.SetThrottle(report.ThrottledPct)
 	report.BudgetMB = n.elasticBudgetMB()
 	report.BudgetCPUMillis = n.elasticBudgetCPUMillis()
 
@@ -1107,7 +1133,19 @@ func (n *Node) cpuDemand(child cgroup.Child, elapsed time.Duration) (int64, bool
 	// at least the whole quota. Substituting it replaces a number we know is truncated
 	// with one we know is true, which is what lets a class's price follow a burst instead
 	// of sitting at the idle rate while every sandbox in it is being throttled.
+	//
+	// The substitution is gated on throttling that *persists*, for the same reason a
+	// scale-up is allowed on one sample but a scale-down is not: one throttled interval is
+	// a tool call that wanted more than its share, and pricing the class at the full quota
+	// for the rest of the episode on the strength of it is how the charge ends up near the
+	// limit while the sandboxes are using a fifth of it. Sustained throttling is the
+	// sandbox being held down, which is the thing worth paying for.
 	if throttled >= n.elastic.cfg.ThrottledAbove {
+		n.elastic.throttleRun[child.ID]++
+	} else {
+		n.elastic.throttleRun[child.ID] = 0
+	}
+	if n.elastic.throttleRun[child.ID] >= n.elastic.cfg.ThrottleDwell {
 		if quota := cgroup.QuotaToMillis(child.CPUQuotaMicros); quota > rate {
 			rate = quota
 		}
@@ -1413,5 +1451,6 @@ func (n *Node) elasticAudit() {
 		delete(n.elastic.cpuRateMillis, sandboxID)
 		delete(n.elastic.cpuThrottledNanos, sandboxID)
 		delete(n.elastic.cpuThrottle, sandboxID)
+		delete(n.elastic.throttleRun, sandboxID)
 	}
 }

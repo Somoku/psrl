@@ -138,6 +138,18 @@ type Config struct {
 	// to the point where the node starts refusing would mean the overcommit is
 	// handing out capacity the next request is rejected for.
 	UtilizationTarget float64
+	// CPUOvercommit is how far above the declared CPU envelope the node may promise when
+	// nothing is being throttled, and ThrottleTarget is the share of the interval spent
+	// throttled at which that expansion is fully withdrawn.
+	//
+	// They exist because CPU is compressible and memory is not. Over-subscribing memory
+	// risks an OOM kill, which destroys a sandbox; over-subscribing CPU risks throttling,
+	// which slows a tool call. So the two dimensions get the same mechanism -- a declared
+	// base that is expanded by measurement -- but different signals: memory asks how full
+	// the machine is, CPU asks how much the kernel is already refusing.
+	CPUOvercommit float64
+	// ThrottleTarget is the throttled share at which CPUOvercommit has been fully spent.
+	ThrottleTarget float64
 	// AdmissionReserve is a share of the envelope that no running sandbox may consume, so
 	// there is always somewhere for a later request to go.
 	//
@@ -267,6 +279,16 @@ type Admission struct {
 	growthTotal      map[string]Resources
 	owners           map[string]time.Time
 	pressure         Pressure
+	// throttlePct is the share of the last interval the sandboxes spent stopped for
+	// exceeding their CPU quota, and throttleAt when it was read. It is the feedback term
+	// for CPU overcommit: throttling is the kernel saying the packing is too tight, and it
+	// is the only signal that distinguishes "the reservations are generous" from "they are
+	// wrong".
+
+	// An unusable reading withdraws the expansion rather than reading as zero: a node that
+	// cannot measure throttling cannot claim there is none.
+	throttlePct float64
+	throttleAt  time.Time
 	// observed is what the measured domain is actually using, and observedValid says
 	// whether that reading can be trusted. The ledger charges reservations, which are an
 	// estimate; when the estimate is low the measurement is the truth, so headroom is
@@ -317,6 +339,12 @@ func NewAdmission(cfg Config) (*Admission, error) {
 	if cfg.DemandTTL <= 0 {
 		cfg.DemandTTL = DefaultDemandTTL
 	}
+	if cfg.CPUOvercommit <= 0 {
+		cfg.CPUOvercommit = DefaultCPUOvercommit
+	}
+	if cfg.ThrottleTarget <= 0 {
+		cfg.ThrottleTarget = DefaultThrottleTarget
+	}
 	if cfg.AdmissionReserve < 0 || cfg.AdmissionReserve >= 1 {
 		cfg.AdmissionReserve = DefaultAdmissionReserve
 	}
@@ -345,6 +373,23 @@ const DefaultObservedMaxAge = 15 * time.Second
 // claim, and far shorter than an episode, so a caller that gave up does not hold capacity
 // idle for the whole rollout.
 const DefaultDemandTTL = 2 * time.Minute
+
+// DefaultCPUOvercommit is how far CPU reservations may over-subscribe when nothing is
+// being throttled.
+//
+// Two, against a memory factor of 1.5 on the same nodes: CPU is the compressible
+// dimension, so being wrong costs latency rather than episodes, and the agent workload is
+// sparse -- a sandbox declares the cores one tool call may want and uses a fraction of one
+// between calls. Measured on this cluster, reservations ran about nine times actual use,
+// so a factor of two still leaves the packing well inside reality.
+const DefaultCPUOvercommit = 2.0
+
+// DefaultThrottleTarget is the throttled share at which that expansion is fully spent.
+//
+// Ten percent of the interval, matching the threshold at which a sandbox's measured rate
+// is treated as truncated by its quota: any sustained throttling at all is the kernel
+// saying the reservations are no longer generous.
+const DefaultThrottleTarget = 0.10
 
 // DefaultAdmissionReserve is the share of the envelope kept for admissions. Ten percent
 // costs a tenth of the density and buys the guarantee that a later wave -- grading, or the
@@ -500,6 +545,19 @@ func (a *Admission) Held() []Grant {
 		out = append(out, grant)
 	}
 	return out
+}
+
+// SetThrottle records the share of the last interval the sandboxes spent throttled.
+//
+// Zero is a measurement, not an absence of one; `throttleAt` is what says the reading is
+// current. A node that has stopped reading the domain must fall back to its declared CPU
+// envelope, because the claim that CPU reservations overstate demand is exactly the claim
+// a stale or missing measurement cannot support.
+func (a *Admission) SetThrottle(pct float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.throttlePct = pct
+	a.throttleAt = time.Now()
 }
 
 // SetPressure records what the node measures about itself.
@@ -743,7 +801,43 @@ func (a *Admission) effectiveEnvelopeLocked() Resources {
 	}
 	scale := 1 + (a.cfg.Overcommit-1)*headroomFraction
 	envelope.MemoryMB = int64(float64(envelope.MemoryMB) * scale)
+	envelope.CPUMillis = int64(float64(envelope.CPUMillis) * a.cpuScaleLocked())
 	return envelope
+}
+
+// cpuScaleLocked is how far the CPU envelope may be expanded right now.
+//
+// It mirrors the memory term exactly, with throttling in the role that utilization plays
+// there: memory is withdrawn as the machine fills, CPU is withdrawn as the kernel starts
+// refusing work. Both are proportional rather than a step, so the node converges instead
+// of oscillating between over-subscribing and refusing on alternate samples.
+//
+// Absent, stale or unusable measurements withdraw the expansion completely.
+func (a *Admission) cpuScaleLocked() float64 {
+	if a.cfg.CPUOvercommit <= 1 || a.cfg.ThrottleTarget <= 0 {
+		return 1
+	}
+	if a.throttleAt.IsZero() || !a.observedUsableLocked() {
+		return 1
+	}
+	if time.Since(a.throttleAt) > a.throttleMaxAge() {
+		return 1
+	}
+	headroom := (a.cfg.ThrottleTarget - a.throttlePct) / a.cfg.ThrottleTarget
+	if headroom <= 0 {
+		return 1
+	}
+	if headroom > 1 {
+		headroom = 1
+	}
+	return 1 + (a.cfg.CPUOvercommit-1)*headroom
+}
+
+func (a *Admission) throttleMaxAge() time.Duration {
+	if a.cfg.ObservedMaxAge > 0 {
+		return a.cfg.ObservedMaxAge
+	}
+	return DefaultObservedMaxAge
 }
 
 // Overcommitted reports the memory multiple the node is currently admitting at.

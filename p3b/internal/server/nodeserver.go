@@ -122,6 +122,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 			cpuRateMillis:         map[string]int64{},
 			cpuThrottledNanos:     map[string]int64{},
 			cpuThrottle:           map[string]float64{},
+			throttleRun:           map[string]int{},
 			previousPrice:         map[string]node.Resources{},
 			classCount:            map[string]int{},
 		}

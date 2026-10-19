@@ -667,6 +667,11 @@ func (c *Control) Fleet(context.Context, *v1.Empty) (*v1.FleetReport, error) {
 			Granted:       placementHeadroomToProto(view.Granted),
 			Observed:      placementHeadroomToProto(view.Observed),
 			ThrottledPct:  view.ThrottledPct,
+			Envelope:      placementHeadroomToProto(view.Envelope),
+			ClassHeadroom: map[string]*v1.Headroom{},
+		}
+		for class, headroom := range view.ClassHeadroom {
+			reported.ClassHeadroom[class] = placementHeadroomToProto(headroom)
 		}
 		for _, hosted := range view.Backends {
 			reported.Backends = append(reported.Backends, &v1.BackendView{Name: hosted.Name})

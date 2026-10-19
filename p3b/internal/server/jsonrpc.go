@@ -683,6 +683,32 @@ func compactBase64(raw string) string {
 	return string(out)
 }
 
+// headroomMap and classHeadroomMap render headroom for the wire. They take the proto type
+// so a field added to the report is carried without this file naming it again.
+
+func headroomMap(h *v1.Headroom) map[string]any {
+	if h == nil {
+		return nil
+	}
+	return map[string]any{
+		"memory_mb":  h.GetMemoryMb(),
+		"cpu_millis": h.GetCpuMillis(),
+		"gpu_count":  h.GetGpuCount(),
+		"disk_mb":    h.GetDiskMb(),
+	}
+}
+
+func classHeadroomMap(m map[string]*v1.Headroom) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for class, h := range m {
+		out[class] = headroomMap(h)
+	}
+	return out
+}
+
 func (j *JSONListener) fleet(ctx context.Context) (any, error) {
 	report, err := j.control.Fleet(ctx, &v1.Empty{})
 	if err != nil {
@@ -694,6 +720,12 @@ func (j *JSONListener) fleet(ctx context.Context) (any, error) {
 		for _, b := range node.GetBackends() {
 			hosted = append(hosted, b.GetName())
 		}
+		// The ledger travels with the measurement, not instead of it. This handler used to
+		// hand-build a map naming only the utilisation, which silently threw away the
+		// envelope, each class's headroom, and everything added to the report since -- so
+		// no caller could tell a node that was refusing because it was full from one that
+		// was refusing because it was charging too much. Built from the report rather than
+		// enumerated here, so it cannot fall behind the report again.
 		nodes = append(nodes, map[string]any{
 			"node_id":        node.GetNodeId(),
 			"backends":       hosted,
@@ -702,6 +734,11 @@ func (j *JSONListener) fleet(ctx context.Context) (any, error) {
 			"mem_used_pct":   node.GetMemUsedPct(),
 			"gpu_free":       node.GetGpuFree(),
 			"draining":       node.GetDraining(),
+			"envelope":       headroomMap(node.GetEnvelope()),
+			"class_headroom": classHeadroomMap(node.GetClassHeadroom()),
+			"granted":        headroomMap(node.GetGranted()),
+			"observed":       headroomMap(node.GetObserved()),
+			"throttled_pct":  node.GetThrottledPct(),
 		})
 	}
 	return map[string]any{

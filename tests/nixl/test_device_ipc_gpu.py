@@ -21,15 +21,15 @@ from psrl.utils.nixl.device_ipc import RegionMapper, device_uuid, export_region,
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC needs a GPU")
 
 
-def _reader(handle, base, offset_bytes, shape, strides, queue):
+def _reader(handle, base, nbytes, offset_bytes, shape, strides, queue):
     """Child: map the exporter's region and read a strided view through the exporter's addresses."""
     try:
         torch.cuda.set_device(0)
         mapper = RegionMapper(torch.device("cuda:0"))
-        adopted = mapper.adopt("source", {base: handle})
+        adopted = mapper.adopt("source", {base: (handle, nbytes)})
         address = base + offset_bytes
-        nbytes = (max((n - 1) * o for n, o in zip(shape, strides)) + 1) * 2
-        found = mapper.resolve("source", address, nbytes)
+        span = (max((n - 1) * o for n, o in zip(shape, strides)) + 1) * 2
+        found = mapper.resolve("source", address, span)
         region, offset = found
         view = torch.as_strided(region.view(torch.bfloat16), shape, strides, offset // 2)
         out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
@@ -39,10 +39,10 @@ def _reader(handle, base, offset_bytes, shape, strides, queue):
         queue.put((False, False, repr(exc)))
 
 
-def _run_reader(exported, base, offset_bytes, shape, strides):
+def _run_reader(exported, base, nbytes, offset_bytes, shape, strides):
     context = mp.get_context("spawn")
     queue = context.Queue()
-    process = context.Process(target=_reader, args=(exported, base, offset_bytes, shape, strides, queue))
+    process = context.Process(target=_reader, args=(exported, base, nbytes, offset_bytes, shape, strides, queue))
     process.start()
     try:
         return queue.get(timeout=120)
@@ -62,6 +62,7 @@ def test_a_reader_on_the_same_device_sees_the_exporter_bytes():
     adopted, resolved, values = _run_reader(
         exported,
         arena.untyped_storage().data_ptr(),
+        arena.untyped_storage().nbytes(),
         offset_bytes,
         tuple(column.shape),
         tuple(column.stride()),
@@ -88,6 +89,53 @@ def test_the_device_identity_survives_cuda_visible_devices():
     uuid = device_uuid(torch.device("cuda:0"))
     assert uuid and uuid != "0", "the identity must not be the ordinal, which is per process"
     assert device_uuid(torch.device("cpu")) == ""
+
+
+def _region_export(device, size, queue):
+    torch.cuda.set_device(device)
+    tensor = torch.arange(size, dtype=torch.bfloat16, device=device)
+    queue.put((tensor.untyped_storage().data_ptr(), tensor.untyped_storage().nbytes(), export_region(tensor)))
+    queue.get(timeout=300)  # keep the exporter alive until the reader is done
+
+
+def _peer_reader(handle, base, nbytes, local_index, source_index, queue):
+    """Child on another GPU of the same node: import and copy over NVLink/PCIe."""
+    try:
+        torch.cuda.set_device(local_index)
+        device = torch.device("cuda", local_index)
+        mapper = RegionMapper(device)
+        assert mapper.adopt("source", {base: (handle, nbytes)}, torch.device("cuda", source_index))
+        found = mapper.resolve("source", base, nbytes)
+        assert found is not None
+        region, offset = found
+        typed = region.view(torch.bfloat16)
+        out = torch.empty(typed.shape, dtype=torch.bfloat16, device=device)
+        out.copy_(typed)
+        queue.put(torch.equal(out, torch.arange(typed.numel(), dtype=torch.bfloat16, device=device)))
+    except Exception as exc:
+        queue.put(repr(exc))
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="a peer copy needs two GPUs")
+def test_a_reader_on_another_gpu_of_the_node_copies_over_peer_access():
+    context = mp.get_context("spawn")
+    export_queue = context.Queue()
+    result_queue = context.Queue()
+    exporter = context.Process(target=_region_export, args=(1, 1 << 16, export_queue))
+    exporter.start()
+    try:
+        base, nbytes, handle = export_queue.get(timeout=180)
+        assert handle is not None
+        assert torch.cuda.can_device_access_peer(0, 1), "the test host must connect GPUs 0 and 1"
+        reader = context.Process(target=_peer_reader, args=(handle, base, nbytes, 0, 1, result_queue))
+        reader.start()
+        try:
+            assert result_queue.get(timeout=180) is True
+        finally:
+            reader.join(timeout=60)
+        export_queue.put(None)  # let the exporter exit
+    finally:
+        exporter.join(timeout=60)
 
 
 def test_the_region_view_covers_the_whole_storage():

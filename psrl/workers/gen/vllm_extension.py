@@ -312,6 +312,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             f"{self.nixl_storage_client.client_name}: pull {self.pull_times} (epoch {epoch}) took "
             f"{report.seconds:.3f}s, upstream {report.upstream_bytes / 1e9:.2f} GB in {report.upstream_seconds:.3f}s, "
             f"peer {report.peer_bytes / 1e9:.2f} GB, {report.descriptors} descriptors, "
+            f"ipc {report.ipc_bytes / 1e9:.2f} GB ({report.ipc_peer_bytes / 1e9:.2f} GB cross-GPU), "
             f"{report.followers} follower(s), {report.fallback_keys} fallback key(s), "
             f"{report.takeover_keys} key(s) taken over from a replica"
             + (", repaired from holders after preemption." if report.repaired else ".")

@@ -288,9 +288,14 @@ class NIXLStorageClient:
 
         # mem_type -> [(base_addr, nbytes, device_id, mem_type)] tuples for storage registration
         self._mtype_to_reg_region_lists: dict[str, list[tuple[int, int, int, str]]] = {}
-        self._ipc_regions: dict[int, object] = {}
+        self._ipc_regions: dict[int, tuple[object, int]] = {}
+        #: Why the first few readable allocations could not be exported, for the report.
+        self._ipc_export_errors: list[str] = []
         self._region_mapper: RegionMapper | None = None
         self._reg_regions: set[tuple[int, int, int, str]] = set()
+        #: Whether this registration pass actually handed regions to NIXL. False after a
+        #: topology-based skip; a later NIXL read then registers on demand (3.7.4).
+        self._rdma_registered = True
 
         # Register the containing CUDA allocator segment once instead of each tensor
         # allocation. `auto` disables it where the allocator does not map its VA range
@@ -507,7 +512,7 @@ class NIXLStorageClient:
         return (1,) * (tensor.dim() - 2) + tuple(tile or self._fp8_block)
 
     def region_mapper(self) -> RegionMapper:
-        """Regions imported from sources that share this process's device (design 3.7.2.1)."""
+        """Regions imported from sources this process can reach without a NIC (3.7.2.1, 3.7.4)."""
         if self._region_mapper is None:
             self._region_mapper = RegionMapper(self.device)
         return self._region_mapper
@@ -891,13 +896,16 @@ class NIXLStorageClient:
         if region not in self._reg_regions:
             self._reg_regions.add(region)
             self._mtype_to_reg_region_lists.setdefault(mem_type, []).append((reg_base, reg_nbytes, device_id, ""))
-        # One IPC handle per allocation, so a reader sharing this GPU copies rather than
-        # reading through NIXL. Export is best effort: an allocation the allocator cannot
-        # share falls back to NIXL.
+        # One IPC handle per allocation, so a reader on this device or another device of
+        # this node copies rather than reading through NIXL. The size travels with the
+        # handle because the reader locates a span before it imports it. Export is best
+        # effort: an allocation the allocator cannot share falls back to NIXL.
         if mem_type == "cuda" and base_addr not in self._ipc_regions:
-            handle = export_region(tensor)
+            handle, error = export_region(tensor, explain=True)
             if handle is not None:
-                self._ipc_regions[base_addr] = handle
+                self._ipc_regions[base_addr] = (handle, nbytes)
+            elif len(self._ipc_export_errors) < 3:
+                self._ipc_export_errors.append(error)
         return base_addr, nbytes, device_id, mem_type
 
     def _build_xfer_desc_bytes(self, addr: int, length: int, device_id: int, mem_type: str) -> bytes:
@@ -1017,6 +1025,29 @@ class NIXLStorageClient:
             dlist[i, 2] = device_id
         descs = nixlBind.nixlRegDList(self.agent.nixl_mems[mem_type], dlist)
         return self.agent.register_memory(descs)
+
+    def ensure_rdma_registered(self) -> None:
+        """
+        Pay the registration a topology-based skip deferred, if a NIXL read now needs it.
+
+        The pull engine calls this before preparing a transfer. In pure colocate it never
+        runs; it exists so a source that unexpectedly cannot be exported (a CuMem pool, an
+        allocation from outside the caching allocator) degrades into the slow path instead
+        of failing the pull. The region list is the same one the skipped pass built.
+        """
+        if self._rdma_registered:
+            return
+        _t0 = time.time()
+        for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
+            if not reg_list:
+                continue
+            reg_descs = self._register_memory(mem_type, reg_list)
+            self._track_registered_desc(reg_descs)
+        self._rdma_registered = True
+        psrl_logger.warning(
+            f"{self.client_name}: deferred RDMA registration ran because a read fell back to NIXL "
+            f"({time.time() - _t0:.3f}s). A source could not be served by IPC/peer copy."
+        )
 
     # NOTE(lhy): High level registration amortizes the expensive low level NIXL API
     # while preserving complete tensor coverage.
@@ -1243,6 +1274,7 @@ class NIXLStorageClient:
             # The allocator's segment map must be current before any region is recorded:
             # the map is what maps an allocation to the extent registered for it.
             self._refresh_segment_extents()
+            self._ipc_export_errors = []
         if (
             self.enable_tms_for_temp_buffers
             and self.local_client_info is not None
@@ -1256,8 +1288,10 @@ class NIXLStorageClient:
                         continue
                     reg_descs = self._register_memory(mem_type, reg_list)
                     self._track_registered_desc(reg_descs)
+                self._rdma_registered = True
             else:
-                psrl_logger.info(f"{self.client_name}: skipping RDMA registration (all readers are same-node)")
+                self._rdma_registered = False
+                psrl_logger.info(f"{self.client_name}: skipping RDMA registration (no edge needs NIXL)")
 
             # Rebuild descriptors by memory type to reduce get_xfer_descs round-trips to O(mem_types).
             # Precompute shard positions for O(1) lookup instead of repeated O(S) list.index calls.
@@ -1676,9 +1710,14 @@ class NIXLStorageClient:
                 )
 
             # Batch register all tensors and cache the reg list once.
-            # Skip when every reader is same-node: no remote NIC needs these pages,
-            # and the registration cost (O(#shards)) is pure overhead at MoE scale.
-            if not meta_only and self._mtype_to_reg_region_lists and self._should_register_rdma():
+            # Skip when every edge this client participates in is same-node and copyable:
+            # no NIC needs these pages, and the registration cost (O(#shards)) is pure
+            # overhead at MoE scale. A later NIXL read registers on demand.
+            register_rdma = not meta_only and self._should_register_rdma()
+            self._rdma_registered = register_rdma or meta_only or not self._mtype_to_reg_region_lists
+            if not register_rdma and not meta_only:
+                psrl_logger.info(f"{self.client_name}: skipping RDMA registration (no edge needs NIXL)")
+            if register_rdma and self._mtype_to_reg_region_lists:
                 _t_registration = time.time()
                 n_regions = 0
                 for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
@@ -1689,6 +1728,7 @@ class NIXLStorageClient:
                     reg_descs = self._register_memory(mem_type, reg_list)
                     self._track_registered_desc(reg_descs)
                     n_regions += len(reg_list)
+                self._rdma_registered = True
                 # Registration is a page-lock + MR step whose cost tracks the number of
                 # mapped bytes, not the shard count. It sits on the switch path whenever
                 # a cast/FP8 publish copy was freed on sleep; separating it from the
@@ -1720,6 +1760,34 @@ class NIXLStorageClient:
                     f"{time.time() - _t_xfer_descs:.3f}s"
                 )
 
+            # Which readable addresses have no IPC handle. Readers decide per shard they
+            # actually pull; `missing_exports_block_readers` decides the source side
+            # (design 3.7.4).
+            ipc_bases = {
+                base for info in tensor_infos.values() for base in info.read_bases if base is not None
+            }
+            ipc_missing = frozenset(base for base in ipc_bases if base not in self._ipc_regions)
+            ipc_complete = bool(ipc_bases) and not ipc_missing
+            if ipc_missing:
+                psrl_logger.info(
+                    f"{self.client_name}: {len(ipc_missing)}/{len(ipc_bases)} readable allocation(s) have no IPC "
+                    f"handle; same-node readers of those shards register with NIXL. "
+                    f"First error: {self._ipc_export_errors[0] if self._ipc_export_errors else 'unknown'}"
+                )
+            if not meta_only and not self._rdma_registered and ipc_missing:
+                from psrl.utils.nixl.registration_policy import missing_exports_block_readers  # noqa: PLC0415
+
+                # Registering because *any* allocation failed to export would undo the
+                # reader-side skip for clients nobody reads -- every vLLM instance's
+                # allocator refuses IPC export. Only a reader that will actually pull a
+                # missing shard needs this side registered (3.7.4).
+                if missing_exports_block_readers(self._comm_plan, self.client_name, tensor_infos, ipc_missing):
+                    psrl_logger.info(
+                        f"{self.client_name}: a reader pulls a shard with no IPC handle; "
+                        "registering RDMA for the same-node fallback"
+                    )
+                    self.ensure_rdma_registered()
+
             # Create the client info
             self.local_client_info = NIXLClientInfo(
                 name=self.client_name,
@@ -1737,6 +1805,8 @@ class NIXLStorageClient:
                 agent_name=self.agent.name,
                 device_uuid=device_uuid(self.device),
                 ipc_regions=dict(self._ipc_regions),
+                ipc_complete=ipc_complete,
+                ipc_missing=ipc_missing,
             )
             psrl_logger.debug(
                 f"Local client info is built, "
@@ -1897,6 +1967,8 @@ class NIXLStorageClient:
         # `registration_epoch` guards against remotely, so drop them with the registrations.
         self._region_mapper = None
         self._ipc_regions = {}
+        self._ipc_export_errors = []
+        self._rdma_registered = False
         # Deregister all registered regions.
         self._deregister_all_descs()
         # Publish copies and derived FP8 scales are GPU tensors this client owns, rebuilt
@@ -2176,6 +2248,11 @@ class NIXLStorageClient:
                         continue
                     for client_name, info_and_temp_mapping in parsed.entries.items():
                         self._all_client_infos[client_name] = NIXLClientInfo.deserialize(info_and_temp_mapping["info"])
+                        # A re-registered source has new allocations, so any mapping of the
+                        # old ones points at freed memory. Drop the catalog with the info it
+                        # came from; the next read imports the new handles (design 3.7.4).
+                        if self._region_mapper is not None:
+                            self._region_mapper.forget(client_name)
                         # Re-registered memory carries new keys, so the remote metadata must be loaded again.
                         if self._target_client_connected.pop(client_name, False):
                             self.agent.remove_remote_agent(self._all_client_infos[client_name].agent_name)
@@ -2206,47 +2283,86 @@ class NIXLStorageClient:
     def _should_register_rdma(self) -> bool:
         """Whether this client must register its tensors with NIXL.
 
-        When every reader in the comm plan is on the same node as this client, no remote
-        NIC will ever issue a GET against these pages — the IPC copy path handles them
-        instead (design §3.7.2.1). Registering anyway costs one `nixlRegDList` call plus
-        `get_xfer_descs`/`get_serialized_descs` per region, which at MoE scale is the
-        same O(#shards) cost that drove §3.5.5.
+        Registration exists to let a NIC reach these pages. It is needed when this client
+        is on either end of a cross-node transfer, and it is pure overhead when every edge
+        it participates in is same-node and can be served by IPC/peer copy (design 3.7.4).
+        Registering anyway costs one `nixlRegDList` call plus `get_xfer_descs` /
+        `get_serialized_descs` per region, which at MoE scale is the O(#shards) cost of
+        §3.5.5; in colocate it was the largest item of the validate switch.
 
-        **A pull-side client always registers.** Its tensors are also the *destination* of
-        its own pulls, and NIXL requires the local side of a transfer to be registered.
-        The plan's "who reads me" only answers whether *others* need remote access; with
-        no remote readers a sleeping validate instance skipped registration entirely and
-        then failed its upstream pull with `NIXL_ERR_NOT_FOUND` on
-        `prep_xfer_dlist(NIXL_INIT_AGENT, ...)`. Readers whose every source is a
-        same-device IPC copy could still skip, but proving that per deployment is not
-        worth the registration it saves.
+        The reader direction is the expensive one to get wrong in the other way. NIXL
+        requires the local side of a transfer to be registered, so a reader may skip only
+        when *every shard it pulls* comes from a same-node source allocation that has an
+        IPC handle. One unexportable buffer a reader never touches does not force it to
+        register. If a skip turns out wrong at transfer time, `ensure_rdma_registered`
+        pays the deferred registration rather than failing.
+
+        PS involvement always registers: the PS transfer path needs serialized
+        descriptors, and its clients are a different data plane.
 
         Falls back to True when the plan or the client infos are not yet populated:
-        without them we cannot prove the deployment is pure colocate, so the safe answer
-        is to register.
+        without them we cannot prove every edge is copyable, so the safe answer is to
+        register.
         """
-        if self.client_type is NIXLClientType.PULL_SIDE:
-            return True
         if self._comm_plan is None or not self._all_client_infos:
             return True
-        # A client that moves bytes through NIXL needs its own descriptors serialized and
-        # its memory registered even when no one reads it remotely: its local side is the
-        # source of a push or the destination of a pull. The train client is exactly that
-        # case in PS mode -- its shards may be read only by a same-node PS worker, but it
-        # still writes them to the PS every step and pulls them back after a wake.
-        # Skipping registration left `desc_bytes_list` unset and made the first trainer
-        # pull fall into the temp-buffer path with no mapping (KeyError on embed_tokens).
         plan = self._comm_plan
-        for mapping in (
-            plan.push_to_ps_plan,
-            plan.train_pull_from_ps_plan,
-            plan.rollout_pull_from_ps_plan,
-        ):
-            if mapping.get(self.client_name):
-                return True
-        from psrl.utils.nixl.registration_policy import needs_rdma_registration  # noqa: PLC0415
+        # A client that moves bytes through NIXL's PS plans needs its own descriptors
+        # serialized and its memory registered even when no one reads it remotely. The
+        # train client is exactly that case in PS mode -- its shards may be read only by
+        # a same-node PS worker, but it still writes them to the PS every step and pulls
+        # them back after a wake. Skipping registration left `desc_bytes_list` unset and
+        # made the first trainer pull fall into the temp-buffer path with no mapping
+        # (KeyError on embed_tokens).
+        if plan.push_to_ps_plan.get(self.client_name) or plan.train_pull_from_ps_plan.get(self.client_name):
+            return True
+        from psrl.utils.nixl.registration_policy import (  # noqa: PLC0415
+            all_sources_copyable,
+            needs_rdma_registration,
+        )
 
-        return needs_rdma_registration(plan, self._all_client_infos, self.client_name)
+        if needs_rdma_registration(plan, self._all_client_infos, self.client_name):
+            return True
+        if self.client_type is not NIXLClientType.PULL_SIDE:
+            return False
+        if getattr(self, "device", None) is None or self.device.type != "cuda":
+            return True  # IPC and peer copy are CUDA primitives; anything else needs NIXL
+        copyable, reason = all_sources_copyable(plan, self._all_client_infos, self.client_name)
+        if copyable and not self._sources_peer_reachable(plan):
+            copyable, reason = False, "a same-node GPU is not peer-reachable"
+        if not copyable:
+            psrl_logger.info(f"{self.client_name}: registering RDMA ({reason})")
+        return not copyable
+
+    def _sources_peer_reachable(self, plan) -> bool:
+        """Whether every source's GPU is visible here and connected by a peer path.
+
+        `all_sources_copyable` is pure plan arithmetic; this is the runtime half of the
+        same question. On a CPU-only process there is nothing to check -- the caller has
+        already refused to skip for non-CUDA clients -- so no objection is reported.
+        """
+        if not torch.cuda.is_available():
+            return True
+        from psrl.utils.nixl.device_ipc import local_device  # noqa: PLC0415
+        from psrl.utils.nixl.registration_policy import sources_by_reader  # noqa: PLC0415
+
+        local = self.device.index or 0
+        for per_source in sources_by_reader(plan, self.client_name).values():
+            for source in per_source:
+                info = self._all_client_infos.get(source)
+                if info is None:
+                    return False
+                if not info.device_uuid:
+                    continue  # no CUDA identity to check; `ipc_complete` already vouched
+                target = local_device(info.device_uuid)
+                if target is None:
+                    # Same-node (checked by `all_sources_copyable`) but hidden by this
+                    # process's CUDA_VISIBLE_DEVICES. IPC still maps it with lazy peer
+                    # access, so visibility is not a reason to register (3.7.4).
+                    continue
+                if target.index != local and not torch.cuda.can_device_access_peer(local, target.index):
+                    return False
+        return True
 
     def _is_reader_of(self, source: str) -> bool:
         """Whether this client reads from ``source`` according to the comm plan.

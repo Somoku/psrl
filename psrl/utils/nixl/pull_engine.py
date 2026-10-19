@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from psrl.utils.nixl.device_ipc import local_device
+from psrl.utils.nixl.network_topology import get_local_ip
 from psrl.utils.nixl.nixl_spec import NIXLClientType
 from psrl.utils.nixl.read_geometry import coalesce, pair_runs, view_runs
 
@@ -71,8 +73,9 @@ class _Spec:
     staged: list[_Staged]
     versions: set[int]
     nbytes: int
-    # `(destination view, source view)` pairs for a source that shares this process's device.
-    # Reading those through NIXL costs 7.7x a device copy, so they are copied, not transferred.
+    # `(destination view, source view)` pairs for a source reachable without a NIC: the
+    # same device, or another GPU of this node. NIXL costs 7.7x a device copy, so these
+    # are copied, not transferred (3.7.2.1, 3.7.4).
     ipc: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
 
 
@@ -228,6 +231,8 @@ class PullReport:
     failed_sources: set[str] = field(default_factory=set)
     # Bytes copied from a source that shares this device, rather than transferred (3.7.2.1).
     ipc_bytes: int = 0
+    # Bytes copied from a source on another device of this node, over NVLink/PCIe (3.7.4).
+    ipc_peer_bytes: int = 0
     #: The pull was preempted by an optimizer write and finished by re-reading its
     #: unfinished keys from certified same-node holders of the same version.
     repaired: bool = False
@@ -262,6 +267,9 @@ class NIXLPullEngine:
         # Sources that failed during the current pull.
         self.failed: set[str] = set()
         self.agent = client.agent
+        #: This node's identity, resolved once: `_ipc_cells` asks it per source and a
+        #: hostname lookup on that path would repeat hundreds of times per pull.
+        self._local_ip = get_local_ip()
         self.staging_bytes = int(staging_bytes)
         self.peer_timeout_s = float(peer_timeout_s)
         self._specs: dict[tuple[str, str], _Spec] = {}
@@ -296,6 +304,8 @@ class NIXLPullEngine:
         self._pull_started = 0.0
         #: Preemption notices are polled at control-plane latency, not per 50 µs transfer poll.
         self._control_poll_interval_s = 5e-4
+        #: Bytes copied from a same-node source on another GPU (diagnostics, 3.7.4).
+        self._ipc_peer_bytes = 0
 
     # ------------------------------------------------------------------ geometry
 
@@ -395,29 +405,58 @@ class NIXLPullEngine:
 
     def _ipc_cells(self, source, remote_info, shards, positions, cells) -> list | None:
         """
-        `(destination, source)` view pairs when `source` shares this device, else None.
+        `(destination, source)` view pairs when `source` is reachable without a NIC, else None.
 
-        The source views are strided over the mapped region exactly as the remote descriptors
+        Two topologies qualify: the source is on this device (a plain device copy) or on
+        another device of this node with peer access (`cudaMemcpyPeer`, NVLink/PCIe). The
+        source views are strided over the mapped region exactly as the remote descriptors
         would have addressed it, so the copy moves the same bytes the transfer would have.
+        Anything else -- another node, an unexportable allocation, no peer path -- returns
+        None and the read goes through NIXL.
         """
         info = self.client.all_client_infos[source]
+        if not info.ipc_regions or self.client.device.type != "cuda":
+            return None
         mapper = self.client.region_mapper()
-        if not info.ipc_regions or info.device_uuid != mapper.uuid or self.client.device.type != "cuda":
+        local_index = self.client.device.index or 0
+        same_device = info.device_uuid == mapper.uuid
+        if same_device or info.node_ip == self._local_ip:
+            # A same-node source is reachable, including one this process cannot see:
+            # per-instance `CUDA_VISIBLE_DEVICES` hides the other GPUs of the node, but
+            # `cudaIpcOpenMemHandle` still maps them with lazy peer access, and the copy
+            # runs at NVLink speed (measured bit-exact at 390 GB/s with the source GPU
+            # invisible). The imported storage must be attributed to a *local* ordinal
+            # either way -- the exporter's numbering means a different physical GPU here
+            # whenever the two processes were pinned differently.
+            target = local_device(info.device_uuid) if not same_device else None
+            target = torch.device("cuda", local_index) if target is None else target
+            if target.index != local_index and not torch.cuda.can_device_access_peer(local_index, target.index):
+                return None
+        else:
+            return None  # another node: only NIXL can reach it
+        if not mapper.knows(source) and not mapper.adopt(source, info.ipc_regions, target):
             return None
-        if not mapper.knows(source) and not mapper.adopt(source, info.ipc_regions):
-            return None
-        pairs = []
-        for shard, (local, local_runs, _remote_runs, remote_strides, _version, _region) in zip(shards, cells):
+        pairs, nbytes = [], 0
+        for shard, (local, local_runs, remote_runs, remote_strides, _version, _region) in zip(shards, cells):
             pos = positions[shard]
             address = remote_info.read_addrs[pos]
             itemsize = local.element_size()
-            found = mapper.resolve(source, address, local_runs.total_bytes)
+            # The span the view addresses, not just the bytes it moves: a strided shard
+            # reaches past its covered byte count, and `locate` bounds-checks the span.
+            span = (
+                int(remote_runs.starts[-1]) + remote_runs.run_bytes - address
+                if remote_runs.count
+                else 0
+            )
+            found = mapper.resolve(source, address, span)
             if found is None or found[1] % itemsize:
                 return None  # unmapped, or a view that would not start on an element boundary
             region, offset = found
             typed = region.view(local.dtype)
             view = torch.as_strided(typed, tuple(local.shape), tuple(remote_strides), offset // itemsize)
             pairs.append((local, view))
+            nbytes += local_runs.total_bytes
+        self._ipc_peer_bytes += 0 if same_device else nbytes
         return pairs
 
     def _restage(self, spec: _Spec, cells: list) -> None:
@@ -508,6 +547,9 @@ class NIXLPullEngine:
         reads_pool: bool = False,
     ) -> _Handle:
         count = int(local.shape[0])
+        # A colocate reader skips NIXL registration because every source is copyable. If a
+        # read still lands here, one source was not; register now rather than fail the pull.
+        self.client.ensure_rdma_registered()
         dev = self.client.device.index or 0
         local_mem = "VRAM" if self.client.device.type == "cuda" else "DRAM"
         local_rows = np.stack([local, lengths, np.full(count, dev, dtype=np.int64)], axis=1).astype(np.uint64)
@@ -679,7 +721,7 @@ class NIXLPullEngine:
             posted.append(h)
         return posted
 
-    def _wait(self, handles: list[_Handle], timeout: float | None = None) -> None:
+    def _wait(self, handles: list[_Handle], timeout: float | None = None, copies=()) -> None:
         """
         Wait for every handle, polling them together and recording when each source finished.
 
@@ -687,12 +729,24 @@ class NIXLPullEngine:
         raising, so the other handles still complete and the caller can re-read that source's
         keys from a replica. A late completion from a merely slow source writes the same
         version's bytes, so it cannot corrupt the re-read.
+
+        `copies` are `(event, keys)` pairs for IPC/peer copies this phase issued. They are
+        polled alongside the transfers so a preemption sees exactly which copied keys had
+        drained before the writer was about to overwrite their source.
         """
         timeout = self.read_timeout_s if timeout is None else timeout
         start = time.time()
         pending = list(handles)
-        while pending:
+        copies = list(copies)
+        while pending or copies:
             self._poll_pull_control()
+            remaining_copies = []
+            for event, keys in copies:
+                if event.query():
+                    self._note_copied(keys)
+                else:
+                    remaining_copies.append((event, keys))
+            copies = remaining_copies
             self._check_preempted()
             still = []
             for h in pending:
@@ -711,11 +765,12 @@ class NIXLPullEngine:
                     continue
                 still.append(h)
             pending = still
-            if pending:
+            if pending or copies:
                 if time.time() - start > timeout:
-                    late = sorted({h.source for h in pending})
-                    psrl_logger.warning(f"{self.client.client_name}: reads from {late} exceeded {timeout}s.")
-                    self.failed.update(late)
+                    if pending:
+                        late = sorted({h.source for h in pending})
+                        psrl_logger.warning(f"{self.client.client_name}: reads from {late} exceeded {timeout}s.")
+                        self.failed.update(late)
                     return
                 time.sleep(5e-5)
 
@@ -729,38 +784,58 @@ class NIXLPullEngine:
                 item.local_view.copy_(source, non_blocking=True)
 
     def _run(self, phase: _Phase) -> None:
-        self._finish(self._start(phase))
+        handles, copy = self._start(phase)
+        self._finish(handles, copy)
 
-    def _finish(self, direct: list[_Handle]) -> None:
-        self._wait(direct)
+    def _finish(self, direct: list[_Handle], copy=None) -> None:
+        copies = [] if copy is None else ([copy] if isinstance(copy, tuple) else copy)
+        self._wait(direct, copies=copies)
+        for event, keys in copies:
+            event.synchronize()
+            self._note_copied(keys)
         if self._copy_stream is not None:
             self._copy_stream.synchronize()
 
-    def _start(self, phase: _Phase) -> list[_Handle]:
-        """Post the direct reads, run the staged rounds to completion, and return the direct handles."""
+    def _note_copied(self, keys: frozenset[str] | set[str]) -> None:
+        """Mark keys served only by IPC/peer copies complete, once the copy stream has run them."""
+        for key in keys:
+            if self._key_outstanding.get(key, 0) <= 0:
+                self._completed_keys.add(key)
+
+    def _start(self, phase: _Phase) -> tuple[list[_Handle], tuple[torch.cuda.Event, frozenset[str]] | None]:
+        """Post the direct reads, run the staged rounds, and return the handles to wait on.
+
+        Also returns, when this phase copied keys instead of transferring them, the event
+        after which those copies are known complete. Preemption classification has to see
+        that event: a peer copy from the trainer is reading the same pages the optimizer is
+        about to write, exactly like a NIXL read, so calling the keys complete before the
+        copy hardware drains would certify torn bytes.
+        """
         if self._copy_stream is None and self.client.device.type == "cuda":
             self._copy_stream = torch.cuda.Stream(device=self.client.device)
         direct = self._post(phase.direct)
+        copy = None
         if phase.ipc:
-            # Same device reads are copies, issued on the copy stream that `_finish` waits for.
-            # The views are detached because a shard is often an output of `chunk`, which autograd
-            # refuses to let anyone write into; the transfer path wrote raw addresses and never
-            # met that rule. Weights are data here, so stepping outside autograd is the point.
+            transferred = {key for handle in phase.direct for key in handle.keys} | {
+                key for handles in phase.rounds for handle in handles for key in handle.keys
+            }
+            copy_keys = frozenset(phase.keys - transferred)
+            # Copies are issued on the copy stream that `_finish` waits for. The views are
+            # detached because a shard is often an output of `chunk`, which autograd refuses
+            # to let anyone write into; the transfer path wrote raw addresses and never met
+            # that rule. Weights are data here, so stepping outside autograd is the point.
             with (
                 torch.no_grad(),
                 torch.cuda.stream(self._copy_stream) if self._copy_stream is not None else nullcontext(),
             ):
                 for destination, origin in phase.ipc:
                     destination.detach().copy_(origin.detach(), non_blocking=True)
-            # A key served only by same-device copies never touches the trainer, so a write
-            # cannot tear it; count it as complete for preemption classification.
-            transferred = {key for handle in phase.direct for key in handle.keys} | {
-                key for handles in phase.rounds for handle in handles for key in handle.keys
-            }
-            for key in phase.keys - transferred:
-                remaining = self._key_outstanding.get(key, 0)
-                if remaining <= 0:
-                    self._completed_keys.add(key)
+                if copy_keys and self._copy_stream is not None:
+                    event = torch.cuda.Event()
+                    event.record(self._copy_stream)
+                    copy = (event, copy_keys)
+            if copy is None:
+                self._note_copied(copy_keys)
         slot_free: list[torch.cuda.Event | None] = [None, None]
         in_flight: list[tuple[int, list[_Handle]]] = []
 
@@ -783,7 +858,7 @@ class NIXLPullEngine:
             in_flight.append((index, self._post(handles)))
         while in_flight:
             finish_oldest()
-        return direct
+        return direct, copy
 
     # ------------------------------------------------------------------ pull
 
@@ -1123,6 +1198,7 @@ class NIXLPullEngine:
         self._key_outstanding = {}
         self._next_control_poll = 0.0
         self._repairing = False
+        self._ipc_peer_bytes = 0
         upstream, peer, followers = self._assign(lambda c: participants is None or c in participants)
         self._pull_keys = set(upstream) | {key for keys in peer.values() for key in keys}
         # D1 version-aware source selection: keep only trainer sources that have published
@@ -1194,24 +1270,26 @@ class NIXLPullEngine:
 
         upstream_done = start
 
-        def peer_wave(w: int) -> list[_Handle]:
+        def peer_wave(w: int) -> tuple[list[_Handle], list]:
             """Wait for this wave's designates, start reading them, and read any late designate's keys upstream."""
             wanted = peer_waves[w]
             if not wanted:
-                return []
+                return [], []
             ready = self._await(waiter, epoch, _READY + w, set(wanted))
             specs = [
                 self._spec(d, key, list(self.client.local_client_info.tensor_infos[key].sharding.shard_indices))
                 for d in sorted(ready)
                 for key in wanted[d]
             ]
-            handles = []
+            handles, copies = [], []
             if specs:
                 phase = self._phase(specs)
                 stats["peer_bytes"] += phase.nbytes
                 stats["descriptors"] += phase.descriptors
                 stats["ipc"] += phase.ipc_bytes
-                handles = self._start(phase)
+                handles, copy = self._start(phase)
+                if copy is not None:
+                    copies.append(copy)
             late = set(wanted) - ready
             if late:
                 psrl_logger.warning(
@@ -1224,15 +1302,18 @@ class NIXLPullEngine:
                 fallback = self._phase(self._upstream_specs(keys))
                 versions.update(fallback.versions)
                 self._run(fallback)
-            return handles
+            return handles, copies
 
         pending_peer: list[_Handle] = []
+        pending_copies: list = []
         for w in range(self.waves):
             phase = self._phase(self._upstream_specs(up_waves[w])) if up_waves[w] else None
-            direct = self._start(phase) if phase is not None else []
+            direct, copy = self._start(phase) if phase is not None else ([], None)
             if w > 0:
-                pending_peer += peer_wave(w - 1)
-            self._finish(direct)
+                handles, copies = peer_wave(w - 1)
+                pending_peer += handles
+                pending_copies += copies
+            self._finish(direct, copy)
             if phase is not None:
                 versions.update(phase.versions)
                 stats["upstream_bytes"] += phase.nbytes
@@ -1246,8 +1327,10 @@ class NIXLPullEngine:
             if followers:
                 publisher.publish(epoch, _READY + w, sorted(followers))
         upstream_done = time.time()
-        pending_peer += peer_wave(self.waves - 1)
-        self._finish(pending_peer)
+        handles, copies = peer_wave(self.waves - 1)
+        pending_peer += handles
+        pending_copies += copies
+        self._finish(pending_peer, pending_copies)
         lost_designates = self.failed.intersection(peer)
         if lost_designates:
             plan = self.client.comm_plan.rollout_pull_from_ps_plan[self.client.client_name]
@@ -1291,6 +1374,7 @@ class NIXLPullEngine:
             sources=dict(self.source_trace),
             takeover_keys=stats["takeover"],
             ipc_bytes=stats["ipc"],
+            ipc_peer_bytes=self._ipc_peer_bytes,
             failed_sources=set(self.failed),
         )
 

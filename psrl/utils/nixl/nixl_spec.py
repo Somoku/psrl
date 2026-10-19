@@ -597,9 +597,19 @@ class NIXLClientInfo:
     agent_name: str = ""
     # Identity of this client's device across processes, so a reader can tell it shares the GPU.
     device_uuid: str = ""
-    # CUDA IPC handle per registered region, keyed by the region's base address in this process.
-    # A reader on the same device maps these and copies instead of reading through NIXL (3.7.2.1).
-    ipc_regions: dict[int, object] = dc_field(default_factory=dict)
+    # CUDA IPC handle per allocation, keyed by the allocation's base address in this process,
+    # valued `(handle, nbytes)`. A reader on the same device, or on another device of this
+    # node, maps the handle and copies instead of reading through NIXL (3.7.2.1, 3.7.4).
+    # The size travels here because the reader locates a span before it imports it.
+    ipc_regions: dict[int, tuple[object, int]] = dc_field(default_factory=dict)
+    # Whether every readable address has an IPC handle. Kept for reports; the decisions
+    # use `ipc_missing`, per shard (3.7.4).
+    ipc_complete: bool = False
+    #: Readable allocation bases the allocator could not export. A reader checks the
+    #: shards it actually pulls against this, so one unexportable buffer does not force
+    #: every same-node reader to register; the source side uses it to keep a fallback
+    #: alive for exactly those readers (3.7.4).
+    ipc_missing: frozenset[int] = dc_field(default_factory=frozenset)
     # Connection-info-only bytes: same agent identity without region descriptors (~401 B, constant
     # regardless of region count). Non-readers load only this at add_remote_agent time, which keeps
     # join cost at O(members) instead of O(members x regions). Readers load this first, then `meta`.

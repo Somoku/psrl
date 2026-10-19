@@ -3183,6 +3183,100 @@ FP8-native train（第二行）是唯一两列都是 `0.5×M` 的配置——
 这是 FP8 与 colocate 在本设计里真正合流的地方，也是 colocate 的推荐配置。
 
 
+#### 3.7.4 同节点跨 GPU：按拓扑移除注册（设计与实测）
+
+**问题。** colocate 的 validate 实例是 pull 的目的地：它每次 wake 都要把 439 个分配注册
+给 NIXL（151 个 allocator segment，5.06 s），占 7.3–9.8 s validate 切换的七成。注册存在的
+理由只有一个——让**网卡**能寻址目的显存。validate 实例在 colocate 下的所有源（trainer rank
+与同节点 peer）都在本节点内，没有任何一个字节需要经过 NIC。
+
+**第一性原理：传输原语应当与拓扑匹配。** 同设备 → CUDA IPC 映射 + 设备拷贝（已实现，
+`_ipc_cells`）；同节点跨设备 → IPC 映射 + **P2P 拷贝**（`cudaMemcpyPeerAsync` / NVLink，
+本设计新增）；跨节点 → NIXL/RDMA（保留）。MR 只对第三种边有意义，因此注册策略应从
+「默认注册」改为「**只对跨节点边注册**」：
+
+```
+client 需要 MR  ⇔  它有一个跨节点源（作为读者）
+                或  它有一个跨节点读者（作为源）
+否则：不注册，只导出 IPC handle（0.017 ms/handle），供同节点读者映射
+```
+
+**机制。** 源端已有的 `export_region`（`reduce_tensor`，整个 allocation 一个 handle，
+353 B/个）与读者端的 `RegionMapper` 可以直接复用，不需要新的导出格式：
+
+1. `_spec` 判断源与本机 `node_ip` 相同且 `torch.cuda.can_device_access_peer(local, src)`
+   → 生成 peer-cell：`RegionMapper` 导入源 region，得到 **源设备上** 的张量；读者用
+   `local.copy_(view, non_blocking=True)` 在 copy stream 上完成跨设备 P2P 拷贝。
+   源 region 的 strided 视图用与 `_ipc_cells` 完全相同的 `as_strided` 构造，字节语义不变。
+2. **按需导入**：`adopt` 目前映射源的全部 handle；改为只映射本次计划实际读取的 shard
+   对应的 region（`read_bases[positions[shard]]`）。读者只为其片外的分配付出 1 ms/handle。
+3. **handle epoch**：源在 wake 时重新注册，旧 handle 指向已释放的显存。`UPDATE_INFO` 到达时
+   对源调用 `RegionMapper.forget`，下一次拉取重新导入。这条对**现有同设备 IPC 路径同样必要**
+   ——当前 `forget` 从未被调用，靠读者自己的 sleep 清空 mapper 掩盖了这一隐患。
+4. **失败回退**：`export_region` 是 best-effort（CuMem pool、非 caching-allocator 内存可能
+   无法导出）。跳过 MR 的读者一旦遇到不可导出的源，回退到**同节点的上游 trainer**（colocate
+   下同设备/同节点，IPC 可读）；若上游在跨节点，则读者本来就必须注册，不会走到这里。
+   计划/注册阶段把「不可导出」当作跨节点边处理，保证回退路径始终有 MR。
+
+**PoC 实测（H20，同节点两 GPU，NVLink P2P）：**
+
+| 量 | 实测 |
+|---|---|
+| `can_device_access_peer(1,0)` | True |
+| `reduce_tensor` 导出（353 B/handle） | **0.017 ms/handle**（256 个 16 MiB 张量共 4 ms） |
+| `cudaIpcOpenMemHandle` 导入 | **0.83–1.66 ms/handle** |
+| 跨 GPU 拷贝 1.5 GiB | 4.3–4.5 ms，**361–377 GB/s** |
+| 跨 GPU 拷贝 16 MiB（预热后） | 0.07 ms，226 GB/s |
+
+**成本模型与预期收益。** 一次 validate wake 的读者读取整个模型（TP1），约 439 个分配：
+
+| 项 | 现状（NIXL MR + pull） | peer copy |
+|---|---|---|
+| 注册 / 导入 | 5.06 s（151 segment） | **~0.44 s**（439 分配 × 1 ms，按需导入） |
+| 数据搬运（9.44 GB） | 0.8–1.3 s（~12 GB/s 端到端） | **~0.03 s**（360 GB/s） |
+| 源端导出 | — | ~0.008 s（439 × 0.017 ms，可与唤醒并行） |
+| **validate 切换** | **7.3–9.8 s** | **~2.5–3.5 s**（其余为 wake/offload/resume） |
+
+打开成本是唯一不可忽略的新项，且是 **O(本 rank 实际读取的分配数)**、与集群规模无关、
+各 rank 并行；TB 级 MoE 上每个 rank 读到的分配数由其 shard 份额决定，不会随 fleet 增长。
+若打开成本在超多小分配场景成为主项，可进一步评估 CUDA VMM 的 `cuMemGetHandleForAddressRange`
+（按 VA 区间导出，一个 handle 覆盖多个映射）——它要求源端使用 VMM 分配（本集群的 cumem
+allocator 正是），属于第二阶段的优化。
+
+**与 peer diffusion 的关系。**
+
+- **可行，且不改变扩散语义。** 扩散决定「谁读谁」（designate / follower），传输原语只决定
+  「怎么读」。同节点 follower 读 designate 正是 peer copy 的目标形态；版本提交、共享锁、
+  v2 门闩与抢占仍由 pull 引擎/协调器执行，与 NIXL 路径完全相同。
+- **收益分场景。** colocate 验证：peer 是主要字节源（实测 8.28 GB peer / 1.16 GB upstream），
+  peer copy 同时去掉 follower 的 MR 并把搬运提到 NVLink 速率——这是切换优化的主收益。
+  disaggregate rollout：designate 仍要为跨节点 upstream 注册（一次性），followers 的 MR
+  可以省掉（一次性），但 peer 的 NIXL 整张量读实测已达 365 GB/s（FINDINGS §2），**带宽上没有
+  收益**。因此对 disaggregate 的扩散，peer copy 只是「少注册一次」，不是热路径优化。
+- **冲突与边界。** NIXL 仍是控制面与跨节点数据面的唯一通道；peer copy 只在同节点、P2P 可达、
+  且源已导出的 cell 上启用。扩散的静态 plan、版本戳、驱逐/重广播原样保留；新增的唯一不变量是
+  **源重新注册必须使映射失效**（epoch/forget），否则会读到已释放显存——这是本设计明确要求
+  与现有 `_ipc_cells` 一并修复的点。跨节点绝不能走 IPC（`can_device_access_peer` 跨节点为
+  False，且 IPC handle 不跨节点）。
+
+**对整体架构的影响。**
+
+1. **plan 描述意图，执行层选择原语**：为每个 `(reader, key, source)` 增加 transport hint
+   （`ipc` / `peer` / `nixl`），由节点与设备拓扑推导；注册策略成为 plan 的函数，而不是部署
+   模式的函数。同一套原语覆盖 colocate、disaggregate、单机与多机。
+2. **MR 从「每个目的地」变成「跨节点边」**：colocate 验证与单机部署不再有注册开销；多机
+   rollout 的注册保持一次性。规模上，注册成本从 O(模型分配数 × 每次切换) 降为
+   O(跨节点客户端 × 一次性)。
+3. **数据面路径与拓扑一致**：同设备 399–447 GB/s、同节点 P2P 361–377 GB/s、跨节点 49 GB/s/
+   bond，不再让同节点流量绕道 RDMA 协议栈（同设备 NIXL READ 实测仅 52 GB/s）。
+
+**实施与验证计划。**（1）`_peer_cells` + 按需 `adopt` + `UPDATE_INFO` 时 `forget`，单节点
+双 GPU 逐字节 PoC；（2）注册策略改为跨节点边判定，`needs_rdma_registration` 的输入加入
+transport hint，CPU 单测覆盖 colocate/disaggregate/混合三种拓扑；（3）colocate e2e 测
+validate 切换（目标 ~2.5–3.5 s）、disaggregate e2e 确认无回归；（4）坐标判据两轮逐位，
+校验 peer 路径的字节与版本。
+
+
 ### 3.8 FP8：贯穿全链路的 wire 格式
 
 > 本节给出 wire 形态与精度矩阵。**两种目标组合（rollout FP8 + train FP8、

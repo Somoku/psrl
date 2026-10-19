@@ -724,10 +724,11 @@ peer follower。单实例 info 在 direct 模式下已是元数据级（0.12–0
 ### 13.3 剩余的冷路径成本与下一步
 
 - 注册已从 13–15 s 降到 5 s（151 个 segment），仍是 validate 切换（7.3–9.8 s）中的最大项。
-  segment 数由 allocator 的打包程度决定。下一步是**同节点跨 GPU 的 IPC/peer copy**：源按
-  allocation 导出 IPC handle，读者在另一块 GPU 上映射后 `cudaMemcpyPeerAsync` 写入本地参数，
-  目的显存不需要 NIXL MR，可把注册从切换路径上移除；H20 同节点 NVLink 具备 P2P，先在单节点
-  做逐字节 PoC，再处理 per-allocation handle 与失败回退。
+  segment 数由 allocator 的打包程度决定。下一步是**同节点跨 GPU 的 IPC/peer copy**（设计见
+  `weight_transport.md` §3.7.4）：源按 allocation 导出 IPC handle（实测 0.017 ms/handle），
+  读者按需导入（0.83–1.66 ms/handle）后 `cudaMemcpyPeerAsync` 写入本地参数（实测
+  361–377 GB/s），目的显存不需要 NIXL MR。预期一次 validate wake 的 439 个分配约 0.44 s
+  导入 + 0.03 s 搬运，切换降到 ~2.5–3.5 s；H20 同节点 P2P 已由 PoC 确认。
 - 上游对照：vLLM 的 sharded RDT 用少量 layer-sized 接收缓冲加一次拷贝来规避逐参数注册
   （时间换显存的路线，本设计不采用）；RFC #48312 正在系统化 weight-reload 的正确性问题
   （storage identity、版本化 cache），与本设计的 v2 门闩目标一致。

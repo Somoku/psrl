@@ -387,8 +387,8 @@ func preflight(configPath string, log *slog.Logger) error {
 		LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 		Overcommit:        cfg.Node.Overcommit,
 		UtilizationTarget: cfg.Node.UtilizationTarget,
-		// A share of the envelope no sandbox may spend, so a later wave always has
-		// somewhere to land.
+		// A share of the envelope no running sandbox may spend, so a later wave --
+		// grading, or the next batch -- always has somewhere to land.
 		AdmissionReserve: cfg.Node.AdmissionReserve,
 		LeaseTTL:         timing.OwnerLease,
 	})
@@ -460,6 +460,11 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 		LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 		Overcommit:        cfg.Node.Overcommit,
 		UtilizationTarget: cfg.Node.UtilizationTarget,
+		// A share of the envelope no running sandbox may spend, so a later wave --
+		// grading, or the next batch -- always has somewhere to land. Previously
+		// only the preflight check passed this, so every node ran with a reserve
+		// of zero and the first wave could take the whole envelope.
+		AdmissionReserve: cfg.Node.AdmissionReserve,
 		// The node reclaims a running sandbox once its owner has been silent for
 		// OwnerSilenceTTL, so this gate tracks the heartbeat rather than the
 		// control plane's quota lease.
@@ -652,6 +657,11 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 			LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 			Overcommit:        cfg.Node.Overcommit,
 			UtilizationTarget: cfg.Node.UtilizationTarget,
+			// A share of the envelope no running sandbox may spend, so a later wave --
+			// grading, or the next batch -- always has somewhere to land. Previously
+			// only the preflight check passed this, so every node ran with a reserve
+			// of zero and the first wave could take the whole envelope.
+			AdmissionReserve: cfg.Node.AdmissionReserve,
 			// The node reclaims a running sandbox once its owner has been silent
 			// for OwnerSilenceTTL, so this gate tracks the heartbeat rather than
 			// the control plane's quota lease.

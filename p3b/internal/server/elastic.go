@@ -1171,7 +1171,18 @@ func (n *Node) throttledFraction(child cgroup.Child, elapsed time.Duration) floa
 	if delta <= 0 {
 		return 0
 	}
-	return float64(delta) / float64(elapsed.Nanoseconds())
+	// Clamped to one interval. cgroup v1's `throttled_time` is the sum over the tasks in
+	// the cgroup, not wall time: four spinners held down together accumulate four seconds
+	// of throttling per second. Divided by the interval that yields values well above one
+	// -- measured at 2.0 on this cluster. An unnormalised "share of the interval" above
+	// one is not a share at all, and because it is the term that withdraws CPU overcommit,
+	// it turned a proportional control law into a switch: any throttling at all read as
+	// infinitely far past the target, so the expansion was always fully withdrawn.
+	fraction := float64(delta) / float64(elapsed.Nanoseconds())
+	if fraction > 1 {
+		return 1
+	}
+	return fraction
 }
 
 // sandboxBusy reports whether work is happening in a sandbox.

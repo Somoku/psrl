@@ -369,9 +369,14 @@ type nodeViewWire struct {
 	Draining              bool                    `json:"draining"`
 	ClassReserveMB        map[string]int64        `json:"class_reserve_mb"`
 	ClassReserveCPUMillis map[string]int64        `json:"class_reserve_cpu_millis"`
-	ImageDigests          []string                `json:"image_digests"`
-	ImageReferences       []string                `json:"image_references"`
-	Labels                []string                `json:"labels"`
+	// What the node promised and what it measured, carried across with the utilisation:
+	// see Control.Fleet for why the two have to travel together.
+	Granted         headroomWire `json:"granted"`
+	Observed        headroomWire `json:"observed"`
+	ThrottledPct    float64      `json:"throttled_pct"`
+	ImageDigests    []string     `json:"image_digests"`
+	ImageReferences []string     `json:"image_references"`
+	Labels          []string     `json:"labels"`
 }
 
 type backendCapWire struct {
@@ -403,6 +408,11 @@ func nodeViewToWire(view placement.NodeView) nodeViewWire {
 		ClassHeadroom:         make(map[string]headroomWire, len(view.ClassHeadroom)),
 		ClassReserveMB:        view.ClassReserveMB,
 		ClassReserveCPUMillis: view.ClassReserveCPUMillis,
+		Granted: headroomWire{MemoryMB: view.Granted.MemoryMB, CPUMillis: view.Granted.CPUMillis,
+			GPUCount: view.Granted.GPUCount, DiskMB: view.Granted.DiskMB},
+		Observed: headroomWire{MemoryMB: view.Observed.MemoryMB, CPUMillis: view.Observed.CPUMillis,
+			GPUCount: view.Observed.GPUCount, DiskMB: view.Observed.DiskMB},
+		ThrottledPct: view.ThrottledPct,
 	}
 	for class, h := range view.ClassHeadroom {
 		w.ClassHeadroom[class] = headroomWire{
@@ -440,9 +450,14 @@ func nodeViewFromWire(w nodeViewWire) placement.NodeView {
 		ClassHeadroom:         make(map[string]placement.Headroom, len(w.ClassHeadroom)),
 		ClassReserveMB:        w.ClassReserveMB,
 		ClassReserveCPUMillis: w.ClassReserveCPUMillis,
-		ImageDigests:          make(map[string]struct{}, len(w.ImageDigests)),
-		ImageReferences:       make(map[string]struct{}, len(w.ImageReferences)),
-		Labels:                make(map[string]struct{}, len(w.Labels)),
+		Granted: placement.Headroom{MemoryMB: w.Granted.MemoryMB, CPUMillis: w.Granted.CPUMillis,
+			GPUCount: w.Granted.GPUCount, DiskMB: w.Granted.DiskMB},
+		Observed: placement.Headroom{MemoryMB: w.Observed.MemoryMB, CPUMillis: w.Observed.CPUMillis,
+			GPUCount: w.Observed.GPUCount, DiskMB: w.Observed.DiskMB},
+		ThrottledPct:    w.ThrottledPct,
+		ImageDigests:    make(map[string]struct{}, len(w.ImageDigests)),
+		ImageReferences: make(map[string]struct{}, len(w.ImageReferences)),
+		Labels:          make(map[string]struct{}, len(w.Labels)),
 		Envelope: placement.Headroom{
 			MemoryMB: w.Envelope.MemoryMB, CPUMillis: w.Envelope.CPUMillis,
 			GPUCount: w.Envelope.GPUCount, DiskMB: w.Envelope.DiskMB,

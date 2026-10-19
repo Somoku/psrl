@@ -93,6 +93,14 @@ type NodeView struct {
 	// accounting them apart would admit twice what the node has.
 	ClassHeadroom map[string]Headroom
 	Envelope      Headroom
+	// What the node has promised and what it measures, published together: a fleet view
+	// that only says how busy a node is cannot say whether it is refusing because the
+	// machine is full or because it is charging more than the sandboxes use.
+	Granted  Headroom
+	Observed Headroom
+	// Share of the interval the sandboxes spent throttled: the term that withdraws CPU
+	// overcommit, so it belongs wherever the envelope is published.
+	ThrottledPct float64
 
 	LiveSandboxes int
 	CPUUsedPct    float64

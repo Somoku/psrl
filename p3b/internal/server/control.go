@@ -664,6 +664,9 @@ func (c *Control) Fleet(context.Context, *v1.Empty) (*v1.FleetReport, error) {
 			MemUsedPct:    view.MemUsedPct,
 			GpuFree:       view.GPUFree,
 			Draining:      view.Draining,
+			Granted:       placementHeadroomToProto(view.Granted),
+			Observed:      placementHeadroomToProto(view.Observed),
+			ThrottledPct:  view.ThrottledPct,
 		}
 		for _, hosted := range view.Backends {
 			reported.Backends = append(reported.Backends, &v1.BackendView{Name: hosted.Name})

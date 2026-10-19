@@ -182,6 +182,13 @@ func quotaHeadroomToProto(a quota.Amount) *v1.Headroom {
 	return &v1.Headroom{MemoryMb: a.MemoryMB, CpuMillis: a.CPUMillis, GpuCount: a.GPUCount, DiskMb: a.DiskMB}
 }
 
+// placementHeadroomToProto is headroomToProto for the placement type. The two exist
+// because placement speaks the service's own units and the wire speaks MiB and
+// millicores; a conversion that guessed would silently swap them.
+func placementHeadroomToProto(r placement.Headroom) *v1.Headroom {
+	return &v1.Headroom{MemoryMb: r.MemoryMB, CpuMillis: r.CPUMillis, GpuCount: r.GPUCount, DiskMb: r.DiskMB}
+}
+
 func placementHeadroom(r node.Resources) placement.Headroom {
 	return placement.Headroom{MemoryMB: r.MemoryMB, CPUMillis: r.CPUMillis, GPUCount: r.GPUCount, DiskMB: r.DiskMB}
 }

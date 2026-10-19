@@ -458,6 +458,24 @@ func (n *Node) View() placement.NodeView {
 			GPUCount: envelope.GetGpuCount(), DiskMB: envelope.GetDiskMb(),
 		}
 	}
+	// The ledger crosses into placement for the same reason it crosses onto the wire: a
+	// scheduler, an operator and a test all need to see what the node promised beside
+	// what it measured. Placement itself does not consume these -- it ranks on class
+	// headroom -- but the fleet report is built from this view, and dropping them here
+	// is what made the controller unverifiable from outside.
+	if granted := proto.GetGranted(); granted != nil {
+		view.Granted = placement.Headroom{
+			MemoryMB: granted.GetMemoryMb(), CPUMillis: granted.GetCpuMillis(),
+			GPUCount: granted.GetGpuCount(), DiskMB: granted.GetDiskMb(),
+		}
+	}
+	if observed := proto.GetObserved(); observed != nil {
+		view.Observed = placement.Headroom{
+			MemoryMB: observed.GetMemoryMb(), CPUMillis: observed.GetCpuMillis(),
+			GPUCount: observed.GetGpuCount(), DiskMB: observed.GetDiskMb(),
+		}
+	}
+	view.ThrottledPct = proto.GetThrottledPct()
 	for class, headroom := range proto.GetClassHeadroom() {
 		view.ClassHeadroom[class] = placement.Headroom{
 			MemoryMB: headroom.GetMemoryMb(), CPUMillis: headroom.GetCpuMillis(),

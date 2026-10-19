@@ -17,13 +17,15 @@ from collections import OrderedDict
 
 import pytest
 import torch
-from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLClientInfo, NIXLClientType
+from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLClientInfo, NIXLClientType, NIXLCommPlan
 from psrl.utils.nixl.nixl_spec import NIXLSharding, NIXLShardMetaInfo, NIXLTensorInfo
 from psrl.utils.nixl.registration_policy import (
+    all_sources_copyable,
     keys_read_across_nodes,
     needs_rdma_registration,
     readers_by_source,
     registration_report,
+    sources_by_reader,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -51,17 +53,26 @@ def _tensor_info(shard_count: int, owned: list[int]) -> NIXLTensorInfo:
         temp_desc_bytes_list=[None] * len(owned),
         sharding=sharding,
         shard_meta_infos=[meta] * len(owned),
+        # One readable allocation per shard; the policy checks these against ipc_regions.
+        read_bases=[_base(i) for i in sorted(owned)],
     )
 
 
+def _base(shard: int) -> int:
+    return 0x1000 * (shard + 1)
+
+
 def _client(name, client_type, node_ip, shard_count=2, owned=(0, 1)):
+    owned = list(owned)
     return NIXLClientInfo(
         name=name,
         node_ip=node_ip,
         node_gpu_id=0,
         type=client_type,
-        tensor_infos={key: _tensor_info(shard_count, list(owned)) for key in KEYS},
+        tensor_infos={key: _tensor_info(shard_count, owned) for key in KEYS},
         meta=b"",
+        # Fully exportable by default, so a test opts into the failure it is about.
+        ipc_regions={_base(shard): (None, 512) for shard in sorted(owned)},
     )
 
 
@@ -322,20 +333,30 @@ class TestClientShouldRegisterRdma:
         from psrl.utils.nixl.registration_policy import needs_rdma_registration
         assert needs_rdma_registration(plan, clients, "train0") is False
 
-    def test_a_pull_side_client_always_registers_for_its_own_destination(self):
-        """No remote reader does not mean no registration: the client pulls *into* the
-        memory, and NIXL requires the local side of a transfer to be registered. A woken
-        validate instance skipped it and then failed upstream reads with NOT_FOUND."""
-        from psrl.utils.nixl.client import NIXLStorageClient
+    def test_a_pull_side_client_with_unprovable_sources_registers(self):
+        """The old unconditional True is now conditional, but every unknown still answers
+        register: a reader pulls *into* its memory and NIXL requires the local side of a
+        transfer to be registered, so a skip needs positive proof of copyability."""
+        clients = _direct_supply_cluster(rollout_nodes=1)
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+        del clients["train0"]  # the source's export capability can no longer be observed
 
         class _Stub:
             client_type = NIXLClientType.PULL_SIDE
-            _comm_plan = object()
-            _all_client_infos = {"x": object()}
-            client_name = "gen0"
+            device = torch.device("cuda", 0)
+            _comm_plan = plan
+            _all_client_infos = clients
+            client_name = "gen0_0"
 
             def _should_register_rdma(self_):
+                from psrl.utils.nixl.client import NIXLStorageClient
+
                 return NIXLStorageClient._should_register_rdma(self_)
+
+            def _sources_peer_reachable(self_, plan_):
+                from psrl.utils.nixl.client import NIXLStorageClient
+
+                return NIXLStorageClient._sources_peer_reachable(self_, plan_)
 
         assert _Stub()._should_register_rdma() is True
 
@@ -368,4 +389,194 @@ class TestClientShouldRegisterRdma:
             def _should_register_rdma(self_):
                 return NIXLStorageClient._should_register_rdma(self_)
 
+            def _sources_peer_reachable(self_, plan_):
+                return NIXLStorageClient._sources_peer_reachable(self_, plan_)
+
         assert _Stub()._should_register_rdma() is True
+
+
+class TestReaderSideRegistration:
+    """A reader skips its registration only when every source it pulls from is copyable.
+
+    This is the half that dominated the colocate validate switch: the reader's own
+    weights are the destination of every read, so a NIXL read needs them registered --
+    but in pure colocate no read goes through NIXL (design 3.7.4).
+    """
+
+    def test_same_node_exportable_sources_let_the_reader_skip(self):
+        clients = _direct_supply_cluster(rollout_nodes=1)
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+
+        copyable, reason = all_sources_copyable(plan, clients, "gen0_0")
+
+        assert copyable, reason
+
+    def test_a_remote_source_forces_reader_registration(self):
+        clients = _direct_supply_cluster(rollout_nodes=2)
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+
+        copyable, reason = all_sources_copyable(plan, clients, "gen1_0")
+
+        assert not copyable
+        assert "another node" in reason
+
+    def test_a_source_that_cannot_export_forces_reader_registration(self):
+        clients = _direct_supply_cluster(rollout_nodes=1)
+        clients["train0"].ipc_regions.clear()
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+
+        copyable, reason = all_sources_copyable(plan, clients, "gen0_0")
+
+        assert not copyable
+        assert "export" in reason
+
+    def test_an_unknown_source_forces_reader_registration(self):
+        clients = _direct_supply_cluster(rollout_nodes=1)
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+        del clients["train0"]
+
+        assert all_sources_copyable(plan, clients, "gen0_0")[0] is False
+
+    def test_a_reader_with_no_plan_entry_answers_register(self):
+        clients = _direct_supply_cluster(rollout_nodes=1)
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+
+        assert all_sources_copyable(plan, clients, "train0")[0] is False
+
+    def test_a_peer_designate_is_a_source_for_its_followers(self):
+        """Follower reads the designate, not the trainer, and the designate may be the
+        only edge that decides whether the follower's registration is needed."""
+        clients = _direct_supply_cluster(rollout_nodes=1)
+        plan = NIXLCommPlan(
+            push_to_ps_plan={},
+            rollout_pull_from_ps_plan={"gen0_1": {"w0": {"train0": [(0,), (1,)]}}},
+            train_pull_from_ps_plan={},
+            peer_groups={"gen0_1": {"w0": ("gen0_0", "gen0_1")}},
+        )
+
+        assert sources_by_reader(plan, "gen0_1") == {"w0": {"gen0_0": [(0,), (1,)]}}
+        assert sources_by_reader(plan, "gen0_0") == {}
+
+
+class TestReaderSkipWiring:
+    """`_should_register_rdma` must answer both directions for a PULL_SIDE client."""
+
+    def _verdict(self, clients, name):
+        from psrl.utils.nixl.client import NIXLStorageClient
+
+        plan = CommunicationPlanner(peer_diffusion=False).make_comm_plan(clients)
+
+        class _Stub:
+            client_type = NIXLClientType.PULL_SIDE
+            device = torch.device("cuda", 0)
+            _comm_plan = plan
+            _all_client_infos = clients
+            client_name = name
+
+            def _should_register_rdma(self_):
+                return NIXLStorageClient._should_register_rdma(self_)
+
+            def _sources_peer_reachable(self_, plan_):
+                return NIXLStorageClient._sources_peer_reachable(self_, plan_)
+
+        return _Stub()._should_register_rdma()
+
+    def test_a_colocate_reader_skips_registration(self):
+        clients = _direct_supply_cluster(rollout_nodes=1)
+
+        assert self._verdict(clients, "gen0_0") is False
+
+    def test_a_disaggregate_reader_registers(self):
+        clients = _direct_supply_cluster(rollout_nodes=2)
+
+        assert self._verdict(clients, "gen1_0") is True
+
+    def test_a_local_designate_makes_a_remote_upstream_irrelevant_to_the_follower(self):
+        """Disaggregate plus peer diffusion: the follower reads its same-node designate,
+        so its own registration can be skipped even though the plan names a remote
+        trainer. The trainer keeps its registration for the designate."""
+        clients = {
+            "train0": _client("train0", NIXLClientType.PUSH_SIDE, TRAIN_NODE),
+            "gen0_0": _client("gen0_0", NIXLClientType.PULL_SIDE, ROLLOUT_NODE),
+            "gen0_1": _client("gen0_1", NIXLClientType.PULL_SIDE, ROLLOUT_NODE),
+        }
+        plan = NIXLCommPlan(
+            push_to_ps_plan={},
+            rollout_pull_from_ps_plan={"gen0_1": {"w0": {"train0": [(0,), (1,)]}}},
+            train_pull_from_ps_plan={},
+            peer_groups={"gen0_1": {"w0": ("gen0_0", "gen0_1")}},
+        )
+
+        assert sources_by_reader(plan, "gen0_1") == {"w0": {"gen0_0": [(0,), (1,)]}}
+        assert all_sources_copyable(plan, clients, "gen0_1")[0] is True
+
+    def test_exportability_is_judged_per_shard_the_reader_wants(self):
+        """One buffer the allocator cannot export must not force every same-node reader
+        to register: only readers that actually pull that shard need NIXL."""
+        clients = _direct_supply_cluster(rollout_nodes=1)
+        clients["train0"].ipc_regions.pop(_base(1))
+        one_shard = NIXLCommPlan(
+            push_to_ps_plan={},
+            rollout_pull_from_ps_plan={"gen0_0": {"w0": {"train0": [(0,)]}}},
+            train_pull_from_ps_plan={},
+            peer_groups={},
+        )
+        both_shards = NIXLCommPlan(
+            push_to_ps_plan={},
+            rollout_pull_from_ps_plan={"gen0_0": {"w0": {"train0": [(0,), (1,)]}}},
+            train_pull_from_ps_plan={},
+            peer_groups={},
+        )
+
+        assert all_sources_copyable(one_shard, clients, "gen0_0")[0] is True
+        copyable, reason = all_sources_copyable(both_shards, clients, "gen0_0")
+        assert not copyable
+        assert "cannot export" in reason
+
+
+class TestSourceSideFallback:
+    """A source that skipped registration registers only if a reader pulls a missing shard.
+
+    Every vLLM allocator refuses IPC export (measured: 435/435 allocations), so a rule
+    that registered on any missing allocation would undo the reader-side skip for every
+    validate instance -- clients nobody reads.
+    """
+
+    def _plan(self, sources_for_reader):
+        return NIXLCommPlan(
+            push_to_ps_plan={},
+            rollout_pull_from_ps_plan=sources_for_reader,
+            train_pull_from_ps_plan={},
+            peer_groups={},
+        )
+
+    def test_nobody_reads_means_no_registration(self):
+        from psrl.utils.nixl.registration_policy import missing_exports_block_readers
+
+        clients = _direct_supply_cluster(rollout_nodes=1)
+        plan = self._plan({"gen0_0": {"w0": {"train0": [(0,)]}}})
+
+        assert missing_exports_block_readers(plan, "gen0_0", clients["gen0_0"].tensor_infos, frozenset({_base(0)})) is False
+
+    def test_a_reader_of_the_missing_shard_forces_registration(self):
+        from psrl.utils.nixl.registration_policy import missing_exports_block_readers
+
+        clients = _direct_supply_cluster(rollout_nodes=1)
+        plan = self._plan({"gen0_0": {"w0": {"train0": [(0,), (1,)]}}})
+
+        assert missing_exports_block_readers(plan, "train0", clients["train0"].tensor_infos, frozenset({_base(1)})) is True
+
+    def test_a_reader_of_only_exportable_shards_does_not(self):
+        from psrl.utils.nixl.registration_policy import missing_exports_block_readers
+
+        clients = _direct_supply_cluster(rollout_nodes=1)
+        plan = self._plan({"gen0_0": {"w0": {"train0": [(0,)]}}})
+
+        assert missing_exports_block_readers(plan, "train0", clients["train0"].tensor_infos, frozenset({_base(1)})) is False
+
+    def test_an_unknown_plan_answers_register(self):
+        from psrl.utils.nixl.registration_policy import missing_exports_block_readers
+
+        clients = _direct_supply_cluster(rollout_nodes=1)
+
+        assert missing_exports_block_readers(None, "train0", clients["train0"].tensor_infos, frozenset({1})) is True

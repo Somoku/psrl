@@ -250,6 +250,17 @@ class CommunicationPlanner:
                 continue
             for key, per_source in key_plans.items():
                 shards = tuple(sorted(shard for shard_list in per_source.values() for shard in shard_list))
+                # Diffusion exists to collapse an expensive upstream read. When every
+                # source of this key is already on the reader's node, the read is a
+                # device copy and the extra designate hop only adds a reader's memory
+                # to the path -- and a reader-side buffer is often not IPC-exportable,
+                # which would force the followers to register after all (3.7.4).
+                if not any(
+                    node_of.get(source) != node_of[pull_client]
+                    for source, source_shards in per_source.items()
+                    if source_shards
+                ):
+                    continue
                 wanted.setdefault((node_of[pull_client], key, shards), []).append(pull_client)
                 tensor_info = info.tensor_infos[key]
                 positions = {s: i for i, s in enumerate(tensor_info.sharding.shard_indices)}

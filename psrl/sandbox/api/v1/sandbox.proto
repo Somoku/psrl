@@ -465,6 +465,20 @@ message NodeView {
   // be refused rather than served at a weaker level.
   repeated BackendView backends = 16;
 
+  // What the node has promised, and what it measures. Published together with the
+  // utilisation above because the utilisation alone cannot answer the question an
+  // admission controller is judged on: is it refusing because the machine is full, or
+  // because it is charging more than the sandboxes use? Those look identical from the
+  // measured side and are opposites in what to do about them, so a scheduler, an
+  // operator, and a test all need both numbers on the same row.
+  Headroom granted = 17;
+  Headroom observed = 18;
+  // Share of the interval the sandboxes spent stopped for exceeding their CPU quota.
+  // This is the feedback term that withdraws CPU overcommit, so it has to be visible
+  // wherever the envelope is: otherwise a node that has stopped expanding looks
+  // exactly like one that never could.
+  double throttled_pct = 19;
+
   reserved 2, 13, 14, 15;
   reserved "backend", "host_mounts", "features", "resume_level";
 }

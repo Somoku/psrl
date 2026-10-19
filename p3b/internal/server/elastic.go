@@ -935,6 +935,10 @@ type elastic struct {
 	// throttleRun counts consecutive throttled samples per sandbox, which is what the
 	// quota substitution waits on.
 	throttleRun map[string]int
+	// lastThrottledPct is the most recent throttling measurement, published with the
+	// envelope it governs: a report that disagrees with the decision it explains is
+	// worse than no report.
+	lastThrottledPct float64
 	// lastSample is when the previous tick read the domain, which is the interval a rate
 	// is taken over.
 	lastSample time.Time
@@ -1033,6 +1037,7 @@ func (n *Node) ElasticTick(ctx context.Context) ElasticReport {
 	// because "the reservations are generous" is exactly the claim an unmeasured node
 	// cannot make.
 	n.admission.SetThrottle(report.ThrottledPct)
+	n.elastic.lastThrottledPct = report.ThrottledPct
 	report.BudgetMB = n.elasticBudgetMB()
 	report.BudgetCPUMillis = n.elasticBudgetCPUMillis()
 

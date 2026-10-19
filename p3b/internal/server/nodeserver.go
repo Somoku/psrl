@@ -370,6 +370,21 @@ func (n *Node) Report(context.Context, *v1.Empty) (*v1.NodeView, error) {
 	return n.view(), nil
 }
 
+// throttledPct is the share of the last interval the sandboxes spent stopped for
+// exceeding their CPU quota, for the wire.
+//
+// Read from the controller rather than recomputed, so the number the fleet publishes is
+// the same number admission used to decide the envelope.
+func (n *Node) throttledPct() float64 {
+	// Guarded before the lock: a node with the controller off has no controller to lock.
+	if n.elastic == nil {
+		return 0
+	}
+	n.elastic.mu.Lock()
+	defer n.elastic.mu.Unlock()
+	return n.elastic.lastThrottledPct
+}
+
 func (n *Node) view() *v1.NodeView {
 	// One sample per report, used for both admission and the wire fields. Calling it
 	// twice made the reported CPU figure a rate over the microseconds between two
@@ -381,7 +396,15 @@ func (n *Node) view() *v1.NodeView {
 	out := &v1.NodeView{
 		NodeId:        n.nodeID,
 		ClassHeadroom: map[string]*v1.Headroom{},
-		Envelope:      headroomToProto(report.Envelope),
+		Envelope:      headroomToProto(report.EffectiveEnvelope),
+		// What the node promised, what it measured, and whether the kernel is refusing
+		// work. Published together because the utilisation above cannot answer the
+		// question this controller is judged on: is it refusing because the machine is
+		// full, or because it is charging more than the sandboxes use? Identical from
+		// the measured side, opposite in what to do about them.
+		Granted:       headroomToProto(report.Granted),
+		Observed:      headroomToProto(report.Observed),
+		ThrottledPct:  n.throttledPct(),
 		LiveSandboxes: int32(life.Resident),
 		CpuUsedPct:    pressure.CPUUsedPct,
 		MemUsedPct:    pressure.MemUsedPct,

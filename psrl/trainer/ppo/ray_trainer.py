@@ -2818,12 +2818,44 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if not has_ps_data_plane(self.config.psrl.ps_mode):
             # Direct supply: a client that does not read any of the updated clients
             # cannot observe the change, so neither the payload nor its acknowledgement
-            # belongs on the switch path. This is the common case for a validation wake,
-            # where the woken instances are destinations and nobody reads them.
-            readers = ray.get(
-                self.ps_manager_handle.nixl_broadcast_update_client_infos_to_readers.remote(updated_client_names)
+            # belongs on the switch path. The fan-out runs on every train rank's agent:
+            # one agent sending serially is O(readers) and does not scale to a fleet.
+            delivered, plan = ray.get(
+                self.ps_manager_handle.nixl_plan_update_broadcast.remote(updated_client_names)
             )
-            self._wait_for_updated_client_infos(readers)
+            if plan:
+                reports = ray.get(self.actor_wg.execute_all_async("nixl_send_update_infos", plan))
+                sent_agents = sum(report["agents"] for report in reports)
+                if sent_agents != len(plan["destinations"]):
+                    raise RuntimeError(
+                        f"Update fan-out covered {sent_agents} of "
+                        f"{len(plan['destinations'])} destination agent(s); readers would "
+                        "wait out the handshake budget."
+                    )
+                psrl_logger.info(
+                    f"Update fan-out: {len(updated_client_names)} client(s) to "
+                    f"{len(delivered)} reader(s) over {len(reports)} train rank(s), "
+                    f"{sum(report['bytes'] for report in reports) / 1e6:.2f} MB."
+                )
+            # Bounded acknowledgement: a notification that lands nowhere must not stall
+            # the switch for the full handshake budget. The meta server has every
+            # destination loaded, so it can always deliver the same update.
+            ack_timeout_s = float(self.config.psrl.nixl.get("fanout_ack_timeout_ms", 10000)) / 1e3
+            try:
+                self._wait_for_updated_client_infos(delivered, timeout=ack_timeout_s)
+            except (TimeoutError, ray.exceptions.RayTaskError) as exc:
+                if not isinstance(exc, TimeoutError) and "Timeout waiting" not in str(exc):
+                    raise
+                psrl_logger.warning(
+                    f"Update fan-out was not acknowledged within {ack_timeout_s:.1f}s; "
+                    "re-sending through the meta server."
+                )
+                delivered = ray.get(
+                    self.ps_manager_handle.nixl_broadcast_update_client_infos_to_readers.remote(
+                        updated_client_names
+                    )
+                )
+                self._wait_for_updated_client_infos(delivered)
             return
 
         src_agent_names = [NIXL_META_SERVER_NAME]
@@ -2876,13 +2908,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         futures.extend(self.actor_wg.execute_all_async("nixl_wait_for_update_infos", 1))
         ray.get(futures)
 
-    def _wait_for_updated_client_infos(self, reader_clients: list[str]) -> None:
+    def _wait_for_updated_client_infos(self, reader_clients: list[str], timeout: float | None = None) -> None:
         """Wait for the single update notification every reader agent received.
 
         Waits are scoped with the broadcast: a client that was not sent an update must
         not wait for one. The actor group is all-or-nothing (its API has no per-rank
         form), so it is only waited on when at least one train rank reads an updated
-        client.
+        client. ``timeout`` bounds each wait, so a lost notification surfaces at the
+        switch instead of at the handshake budget.
         """
         if not reader_clients:
             return
@@ -2890,7 +2923,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         futures = []
         train_names = {train_client_name(i) for i in range(self.actor_wg.world_size)}
         if readers & train_names:
-            futures.extend(self.actor_wg.execute_all_async("nixl_wait_for_update_infos", 1))
+            futures.extend(self.actor_wg.execute_all_async("nixl_wait_for_update_infos", 1, timeout))
 
         for role in ("rollout", "validate"):
             handles = self.tag_to_server_handles.get(role, [])
@@ -2903,7 +2936,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 instance_names = set(names[start : start + ranks])
                 start += ranks
                 if instance_names & readers:
-                    futures.append(handle.nixl_wait_for_update_infos.remote(1))
+                    futures.append(handle.nixl_wait_for_update_infos.remote(1, timeout))
         if futures:
             ray.get(futures)
 

@@ -343,6 +343,9 @@ class RolloutCoordinator(
                             in 'full' mode ('rollout', 'validate', 'all')
         """
         await self._is_init_nixl_client.wait()
+        psrl_logger.info(
+            f"Running NIXL protocol (tag={full_tag!r}) on {len(self.server_handles)} instance(s)."
+        )
 
         if full_tag == "all":
             rollout_tag = "full"

@@ -203,6 +203,52 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
+    def nixl_send_update_infos(self, plan: dict) -> dict:
+        """Send this rank's share of an update-info fan-out.
+
+        The meta server serializes each updated source once and describes, per
+        destination agent, the sources it reads plus its connection metadata. Every
+        train rank sends an interleaved slice of those destinations from its own agent,
+        turning an O(readers) serial loop into O(readers / n_train_ranks). The reader
+        still receives exactly one notification, so its acknowledgement is unchanged.
+        """
+        from psrl.utils.nixl.handshake_notif import NotifKind, encode  # noqa: PLC0415
+
+        client = getattr(self, "nixl_storage_client", None)
+        if client is None or not plan:
+            return {"rank": self.rank, "agents": 0, "bytes": 0}
+        destinations = plan["destinations"]
+        sources = plan["sources"]
+        ordered = sorted(destinations)
+        mine = ordered[self.rank :: self.world_size]
+        sent_bytes = 0
+        for agent_name in mine:
+            entry = destinations[agent_name]
+            conn_info = entry.get("conn_info")
+            if conn_info:
+                # Refresh the destination each fan-out. The destination re-registers
+                # between switches; an entry cached across that boundary can leave the
+                # notification queued nowhere, and the failure is a silent stall for
+                # the whole acknowledgement budget.
+                try:
+                    client.agent.remove_remote_agent(agent_name)
+                except Exception:
+                    pass  # never added, or already gone
+                try:
+                    client.agent.add_remote_agent(conn_info)
+                except Exception as exc:
+                    psrl_logger.warning(
+                        f"{self.log_prefix}: could not load update destination "
+                        f"{agent_name}: {exc!r}"
+                    )
+            payload = encode(
+                NotifKind.UPDATE_INFO,
+                {name: sources[name] for name in entry["sources"]},
+            )
+            client.agent.send_notif(agent_name, payload)
+            sent_bytes += len(payload)
+        return {"rank": self.rank, "agents": len(mine), "bytes": sent_bytes}
+
     def nixl_convert_params(self):
         """Convert model parameters to NIXL's unified sharding format.
 

@@ -967,10 +967,27 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 # them here would put one descriptor per strided row into every client
                 # info, and those infos are what switch-time updates carry.
                 has_ps_data_plane(self.psrl_config.ps_mode),
+                self._resolve_segment_registration(),
             ),
         )
-
         self._is_init_nixl_client.set()
+
+    def _resolve_segment_registration(self) -> bool:
+        """Whether this engine may register allocator segments instead of allocations.
+
+        `launch_server` enables expandable segments exactly when sleep mode is off; their
+        VA range is mapped on demand, so a page-locking registration of the whole range
+        is unsafe. The worker cannot observe that setting, so the decision is made here
+        and passed down.
+        """
+        mode = self.psrl_config.nixl.get("segment_registration", "auto")
+        if isinstance(mode, bool):
+            return mode
+        if not self.config.enable_sleep_mode:
+            return False
+        from psrl.utils.nixl.client import _expandable_segments_enabled  # noqa: PLC0415
+
+        return not _expandable_segments_enabled()
 
     async def nixl_convert_params(self):
         await self._is_init_model.wait()
@@ -980,12 +997,15 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         )
 
     async def nixl_protocol(self, mode: str = "full"):
+        psrl_logger.info(f"vLLM server NIXL protocol (mode={mode!r}): waiting for initialization.")
         await self._is_init_model.wait()
         await self._is_init_nixl_client.wait()
+        psrl_logger.info(f"vLLM server NIXL protocol (mode={mode!r}): dispatching to workers.")
         await self.collective_rpc(
             method="nixl_protocol",
             args=(self.model_config, mode),
         )
+        psrl_logger.info(f"vLLM server NIXL protocol (mode={mode!r}) done.")
 
     async def nixl_wake_up(self, tags: list[str] | None = None):
         await self._is_init_nixl_client.wait()
@@ -1007,11 +1027,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             args=(dst_agent_names,),
         )
 
-    async def nixl_wait_for_update_infos(self, info_num: int):
+    async def nixl_wait_for_update_infos(self, info_num: int, timeout: float | None = None):
         await self._is_init_nixl_client.wait()
         await self.collective_rpc(
             method="nixl_wait_for_update_infos",
-            args=(info_num,),
+            args=(info_num, timeout),
         )
 
     ###### KV Cache Management ######

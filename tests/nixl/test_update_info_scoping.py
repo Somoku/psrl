@@ -1,4 +1,4 @@
-"""Update-info broadcasts go only to clients that read the updated ones.
+"""Update-info broadcasts go only to readers, and only with what they read.
 
 Every agent caches every client info, but only a reader of an updated client can
 observe the change. Broadcasting to the whole fleet made each switch pay for a large
@@ -6,24 +6,51 @@ payload per destination and wait for every acknowledgement. A validation wake is
 sharpest case: the woken instances are pull destinations, so the direct-supply plan has
 no reader for them and the broadcast is pure cost.
 
-A peer-diffusion follower reads its designate without appearing in any plan direction,
-so the reader set comes from `descriptor_readers_by_source`, not from the three plan
-fields alone.
+Two properties are pinned here:
+
+* destinations come from the plan inversion (which includes peer-diffusion followers,
+  who read their designate without appearing in any plan direction);
+* each destination receives only the updated sources its readers actually read, and
+  every rank of a reader instance is included because the acknowledgement is per
+  instance.
 """
 
 from __future__ import annotations
 
 import pytest
-from psrl.utils.nixl.client import NIXLStorageClient
+from psrl.utils.nixl.handshake_notif import decode
 from psrl.utils.nixl.server import NIXLMetaServer
 from psrl.workers.ps.ps_manager import PSManager
 
 pytestmark = pytest.mark.cpu_test
 
 
-def _server(readers: dict) -> NIXLMetaServer:
+class _Info:
+    def __init__(self, agent_name: str):
+        self.agent_name = agent_name
+        self.conn_info_meta = b"conn:" + agent_name.encode()
+        self.meta = b"meta:" + agent_name.encode()
+
+    def serialize(self) -> bytes:
+        return self.agent_name.encode()
+
+
+class _AgentStub:
+    def __init__(self):
+        self.sent: list[tuple[str, bytes]] = []
+
+    def send_notif(self, agent_name: str, payload: bytes):
+        self.sent.append((agent_name, payload))
+
+
+def _server(readers: dict, infos: dict | None = None) -> NIXLMetaServer:
+    infos = infos or {}
     server = NIXLMetaServer.__new__(NIXLMetaServer)
+    server.server_name = "meta"
     server._descriptor_readers = readers
+    server.client_infos = infos
+    server._client_temp_mappings = {name: {} for name in infos}
+    server.agent = _AgentStub()
     return server
 
 
@@ -44,66 +71,141 @@ def test_a_client_nobody_reads_has_no_destinations():
 
 
 def test_an_updated_client_is_not_its_own_reader():
-    """A self-reference in the plan would make every source wait for a broadcast it
-    does not need and cannot use."""
     server = _server({"train0": {"w": {"train0", "gen0"}}})
 
     assert server.readers_of(["train0"]) == {"gen0"}
 
 
-class _Info:
-    def __init__(self, agent_name: str):
-        self.agent_name = agent_name
+def test_each_destination_gets_only_the_sources_its_readers_read():
+    infos = {
+        "NIXLTrainClient_0": _Info("agent-t0"),
+        "NIXLTrainClient_1": _Info("agent-t1"),
+        # One instance, two ranks, each reading a different trainer rank.
+        "NIXLGenClient_I1_R0": _Info("agent-r0"),
+        "NIXLGenClient_I1_R1": _Info("agent-r1"),
+    }
+    readers = {
+        "NIXLTrainClient_0": {"w": {"NIXLGenClient_I1_R0"}},
+        "NIXLTrainClient_1": {"w": {"NIXLGenClient_I1_R1"}},
+    }
+    server = _server(readers, infos)
+
+    delivered = server.broadcast_update_client_infos_to_readers(["NIXLTrainClient_0", "NIXLTrainClient_1"])
+
+    # Both ranks of the instance are acknowledged, even the one that reads only one source.
+    assert delivered == ["NIXLGenClient_I1_R0", "NIXLGenClient_I1_R1"]
+    payloads = {agent: decode(payload).entries for agent, payload in server.agent.sent}
+    assert set(payloads) == {"agent-r0", "agent-r1"}
+    assert set(payloads["agent-r0"]) == {"NIXLTrainClient_0"}
+    assert set(payloads["agent-r1"]) == {"NIXLTrainClient_1"}
 
 
-class _ServerStub:
-    def __init__(self, readers: set[str], clients: dict | None = None):
-        self.client_infos = clients or {"gen0": _Info("agent0"), "gen1": _Info("agent1")}
-        self._readers = readers
-        self.calls: list[tuple[list[str], list[str]]] = []
+def test_the_plan_carries_only_each_destinations_sources():
+    infos = {
+        "NIXLTrainClient_0": _Info("agent-t0"),
+        "NIXLTrainClient_1": _Info("agent-t1"),
+        "NIXLGenClient_I1_R0": _Info("agent-r0"),
+        "NIXLGenClient_I1_R1": _Info("agent-r1"),
+    }
+    readers = {
+        "NIXLTrainClient_0": {"w": {"NIXLGenClient_I1_R0"}},
+        "NIXLTrainClient_1": {"w": {"NIXLGenClient_I1_R1"}},
+    }
+    server = _server(readers, infos)
 
-    def readers_of(self, names):
-        return set(self._readers)
+    delivered, plan = server.plan_update_broadcast(["NIXLTrainClient_0", "NIXLTrainClient_1"])
 
-    def broadcast_update_client_infos(self, dst_agents, update_client_names):
-        self.calls.append((list(dst_agents), list(update_client_names)))
+    assert delivered == ["NIXLGenClient_I1_R0", "NIXLGenClient_I1_R1"]
+    assert plan["destinations"]["agent-r0"]["sources"] == ["NIXLTrainClient_0"]
+    assert plan["destinations"]["agent-r1"]["sources"] == ["NIXLTrainClient_1"]
+    assert plan["destinations"]["agent-r0"]["conn_info"] == b"conn:agent-r0"
+    # Sources are serialized once, however many destinations receive them.
+    assert set(plan["sources"]) == {"NIXLTrainClient_0", "NIXLTrainClient_1"}
+    assert server.agent.sent == [], "planning must not send"
 
 
-def test_the_manager_sends_once_per_reader_agent_and_returns_the_waiters():
-    manager = PSManager.__new__(PSManager)
-    manager.nixl_meta_server = stub = _ServerStub({"gen1"})
+def test_a_rank_only_sends_its_slice_of_the_fan_out():
+    """The fan-out is spread across the train ranks' agents: one agent sending every
+    notification is O(readers) and does not scale."""
+    from psrl.workers.train.engine_train_worker import PSRL_EngineTrainWorker
 
-    delivered = manager.nixl_broadcast_update_client_infos_to_readers(["gen0"])
+    class _Agent:
+        def __init__(self):
+            self.sent = []
+            self.added = []
+            self.removed = []
 
-    assert delivered == ["gen1"]
-    assert stub.calls == [(["agent1"], ["gen0"])]
+        def add_remote_agent(self, conn_info):
+            self.added.append(conn_info)
+
+        def remove_remote_agent(self, agent_name):
+            self.removed.append(agent_name)
+
+        def send_notif(self, agent_name, payload):
+            self.sent.append(agent_name)
+
+    class _Client:
+        def __init__(self):
+            self.agent = _Agent()
+
+    class _Worker:
+        nixl_send_update_infos = PSRL_EngineTrainWorker.nixl_send_update_infos
+
+    worker = _Worker()
+    worker.rank = 1
+    worker.world_size = 4
+    worker.log_prefix = "rank1"
+    worker._update_dest_agents = set()
+    worker.nixl_storage_client = _Client()
+    plan = {
+        "sources": {"src": {"info": b"info", "temp_mapping": {}}},
+        "destinations": {
+            f"agent{i}": {"sources": ["src"], "conn_info": f"conn{i}".encode()} for i in range(8)
+        },
+    }
+
+    report = worker.nixl_send_update_infos(plan)
+
+    assert report["rank"] == 1
+    assert report["agents"] == 2
+    assert worker.nixl_storage_client.agent.sent == ["agent1", "agent5"]
+    assert worker.nixl_storage_client.agent.added == [b"conn1", b"conn5"]
+    # Every fan-out refreshes the destination: it re-registers between switches, and a
+    # cached entry can leave the notification queued nowhere.
+    worker.nixl_storage_client.agent.added.clear()
+    worker.nixl_storage_client.agent.removed.clear()
+    worker.nixl_send_update_infos(plan)
+    assert worker.nixl_storage_client.agent.removed == ["agent1", "agent5"]
+    assert worker.nixl_storage_client.agent.added == [b"conn1", b"conn5"]
+
+
+def test_no_reader_means_no_payload_and_no_wait():
+    infos = {"NIXLGenClient_I1_R0": _Info("agent-r0")}
+    server = _server({"NIXLGenClient_I1_R0": {}}, infos)
+
+    assert server.broadcast_update_client_infos_to_readers(["NIXLGenClient_I1_R0"]) == []
+    assert server.agent.sent == []
 
 
 def test_a_reader_without_metadata_is_not_reported_as_waiting():
     """It cannot receive the payload, so the caller must not wait on it: that would sit
     until the handshake budget expired."""
+    infos = {"NIXLGenClient_I1_R0": _Info("")}
+    server = _server({"NIXLTrainClient_0": {"w": {"NIXLGenClient_I1_R0"}}}, infos)
+
+    assert server.broadcast_update_client_infos_to_readers(["NIXLTrainClient_0"]) == []
+    assert server.agent.sent == []
+
+
+def test_the_manager_returns_the_delivered_clients():
+    class _Server:
+        def broadcast_update_client_infos_to_readers(self, names):
+            return ["NIXLGenClient_I1_R0"]
+
     manager = PSManager.__new__(PSManager)
-    manager.nixl_meta_server = stub = _ServerStub({"missing"})
+    manager.nixl_meta_server = _Server()
 
-    assert manager.nixl_broadcast_update_client_infos_to_readers(["gen0"]) == []
-    assert stub.calls == []
-
-
-def test_every_rank_of_a_reader_instance_is_sent_to():
-    """The acknowledgement is per instance: each rank calls `wait_for_update_infos`, so a
-    rank that was left out would wait until the handshake budget expired."""
-    clients = {
-        "NIXLGenClient_I1_R0": _Info("agent-r0"),
-        "NIXLGenClient_I1_R1": _Info("agent-r1"),
-        "NIXLGenClient_I2_R0": _Info("agent-other"),
-    }
-    manager = PSManager.__new__(PSManager)
-    manager.nixl_meta_server = stub = _ServerStub({"NIXLGenClient_I1_R0"}, clients)
-
-    delivered = manager.nixl_broadcast_update_client_infos_to_readers(["NIXLTrainClient_0"])
-
-    assert delivered == ["NIXLGenClient_I1_R0", "NIXLGenClient_I1_R1"]
-    assert stub.calls == [(["agent-r0", "agent-r1"], ["NIXLTrainClient_0"])]
+    assert manager.nixl_broadcast_update_client_infos_to_readers(["train0"]) == ["NIXLGenClient_I1_R0"]
 
 
 class TestDescriptorSerializationIsGated:
@@ -116,6 +218,8 @@ class TestDescriptorSerializationIsGated:
 
     @staticmethod
     def _client(pairwise: bool):
+        from psrl.utils.nixl.client import NIXLStorageClient
+
         client = NIXLStorageClient.__new__(NIXLStorageClient)
         client.client_name = "gen0"
         client._pairwise_descriptors = pairwise

@@ -367,11 +367,12 @@ class PSRL_BaseTrainWorker:
             dst_agent_names = [dst_agent_names]
         self.nixl_storage_client.send_local_info_to(dst_agent_names)
 
-    def nixl_wait_for_update_infos(self, info_num: int):
+    def nixl_wait_for_update_infos(self, info_num: int, timeout: float | None = None):
         """Wait for infos of updated clients for global synchronization.
 
         Args:
             info_num (int): Number of infos to wait for.
+            timeout (float | None): Bound on the wait; None uses the handshake budget.
         """
         self.nixl_storage_client.wait_for_update_infos(info_num)
 

@@ -62,6 +62,18 @@ publish_rollout_dtype: null
 # Tile of the block FP8 the rollout loads, or null when it loads unquantised weights.
 publish_fp8_block: null
 
+# Registration granularity for CUDA memory.
+#
+# NIXL registration costs roughly a fixed budget per region (~30 ms on H20), and a
+# vLLM instance holds one allocation per weight (plus one per FP8 scale), so a wake
+# that re-registers it is dominated by region count. Registering the containing CUDA
+# allocator segment once, instead of each allocation, keeps the same memory and the
+# same zero-copy data path. `auto` enables it unless expandable segments are in use
+# (their VA range is mapped on demand and must not be registered whole); tensors the
+# snapshot cannot place fall back to per-allocation registration. `off` restores the
+# per-allocation behaviour.
+segment_registration: auto
+
 # Whether publishing waits for readers of the previous version to drain (item E1).
 #
 # `auto` means "decide from the backend and precision"; `validate_config` replaces it and
@@ -98,6 +110,13 @@ preempt_ack_timeout_ms: 100
 # be repaired from holders. It must cover one training step; the reader stays paused until
 # a complete version lands.
 preempt_repull_timeout_s: 600
+
+# Bound on waiting for an update fan-out to be acknowledged. Updates are sent from every
+# train rank's agent (the fan-out width scales with training parallelism); if a
+# notification lands nowhere, the same update is re-sent through the meta server, which
+# has every destination loaded. Without a bound a lost notification stalls the switch
+# until the handshake budget expires.
+fanout_ack_timeout_ms: 10000
 
 # How long that wait may last, in milliseconds.
 #

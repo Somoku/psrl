@@ -663,22 +663,57 @@ grad norm 到 600，随后 response length 全部撞到 8192、reward 归零。�
   万卡 + TB MoE 下，meta server 的序列化从 GB 级降到 KB/MB 级，fan-out 与 ack 只与 plan 中的
   读者数成正比。
 
-### 13.1 剩余的注册成本与后续方案
+### 13.1 segment 粒度注册（已落地）
 
-instrumentation（`_allocator_segment_report`）：validate 实例的 439 个 region 落在 **151 个
-CUDA allocator segment** 中；trainer 的 6 个 region 落在 5 个 segment。注册耗时与 region 数
-近似线性（~30–35 ms/region，两次运行一致）。
+instrumentation（`_allocator_segment_report`）：validate 实例的 439 个 allocation 落在 **151 个
+CUDA allocator segment** 中；trainer 的 6 个 allocation 落在 5 个 segment。注册耗时与 region 数
+近似线性（~30–35 ms/region，多次运行一致）。
 
-- **segment 粒度注册（零额外显存，建议下一步）**：同一 segment 内的张量只注册一次，预计
-  439 → 151 region，注册 13–15 s → ~5 s，切换再降 ~8 s。风险：expandable segments 的 VA
-  区间不能整段注册；CuMem pool 的分配不在 snapshot 中（本次全部落在普通 allocator）；
-  IPC handle 按 allocation 导出，需把 `read_bases` 与注册 region 解耦。
-- **同节点跨 GPU 的 IPC/peer copy（零注册，需 PoC）**：源按 allocation 导出 IPC handle，
-  读者在另一块 GPU 上映射后走 `cudaMemcpyPeerAsync`，目的显存不需要 NIXL MR。H20 同节点
-  NVLink 具备 P2P；收益是把 validate 注册从切换路径上完全移除，代价是一条新的数据路径与
-  per-allocation handle 管理。
-- **上游对照**：vLLM 的 sharded RDT（NIXL pull）不解模型参数，而是在 worker 侧维护
-  `num_rdt_buffers` 个 layer-sized 接收缓冲、注册这几个缓冲后拷入参数（[docs](https://docs.vllm.ai/en/latest/training/weight_transfer/sharded_rdt/)）。
-  它用少量额外显存换掉了 per-parameter 注册；本设计明确不采用时间换显存，因此 segment
-  注册或 IPC peer copy 是更合适的方向。vLLM 的 RFC #48312 也在系统化 weight-reload 的
-  正确性问题（storage identity、版本化 cache 等），与本设计的 v2 门闩目标一致。
+**实现**：`psrl.nixl.segment_registration`（默认 `auto`）。注册前对 caching allocator 做一次
+`memory_snapshot()`，把每个张量 allocation 映射到其所属 segment；同一 segment 只登记一个
+NIXL region。`read_bases` 与 IPC handle 仍按 allocation 保留（一个 segment 可能含多个
+allocation，各自有 IPC handle），因此数据路径不变、显存占用不变。expandable segments
+（`vLLM` 在 sleep 关闭时启用）的 VA 按需映射，不能整段注册；vLLM server 知道这个设置，
+启动时把解析结果传给 client，snapshot 里出现 expandable 段或无法定位的 allocation
+（CuMem pool、注册后才分配的发布副本）逐 allocation 回退。
+
+**实测（Qwen3-8B，2 节点）：**
+
+| 场景 | 优化前 | 优化后 |
+|---|---|---|
+| validate 实例注册 | 439 region / 13.2–15.6 s | **151 region / 5.06 s** |
+| trainer 注册 | 6 region / 0.17–0.22 s | 5 region / 0.17 s |
+| validate 切换（含注册、pull、offload） | 17.8–18.8 s | **7.57–8.87 s** |
+| 10 步运行 | 0 错误 | 0 错误（初始 0.1948，最终 0.6141） |
+| 坐标判据（433 allocation 的小模型） | 435 region / ~13 s | **113 region / 1.06 s，399×4×2 两轮逐位通过** |
+
+注册时间从 13–15 s 降到 5 s，与“151 × 34 ms”的线性模型一致；切换从 26.4–27.7 s 累计降到
+7.6–8.9 s（两轮优化合计约 −71%）。风险与回退路径：expandable segments 自动关闭该模式；
+snapshot 无法覆盖的 allocation 逐 allocation 注册。
+
+### 13.2 广播 fan-out 的大规模评估与并行化
+
+**评估。** 广播目的地只包含读者，但读者数随 fleet 增长：trainer 唤醒时是所有读它的 rollout
+实例（有 peer diffusion 时为每节点 designate，仍随节点数增长）；validate 唤醒时是同节点
+peer follower。单实例 info 在 direct 模式下已是元数据级（0.12–0.23 MB），但一个 agent 串行
+发 O(readers) 次：按实测每通知 ~10–40 ms 计，万卡规模（10^3–10^4 读者）需要数十秒到分钟，
+是切换路径的新瓶颈。**结论：有必要并行化。**
+
+**实现。** meta server 不再自己发送，而是生成可序列化的发送计划：每个更新源序列化一次，
+每个目的地只带它读取的源子集与连接元数据（`plan_update_broadcast`）。trainer 的每个 rank
+用**自己的 NIXL agent** 发送 `destinations[rank::world_size]` 这一片（`nixl_send_update_infos`），
+首次发送前用 conn-info 把目的地 agent 加入本地元数据。读者仍只收到一个通知，ack 语义不变；
+发送量从 O(readers) 降为 O(readers / n_train_ranks)，并可随训练并行度扩展。发送计数与计划
+不一致时 trainer 直接报错，而不是让读者等到握手超时。
+
+**实测与两个修正：**
+
+- 8/16 个目的地的 fan-out 在 **1.68–2.38 s** 内完成（含目的地刷新），validate 切换 **8.03 s**；
+- **重复切换最初丢失通知**：train rank 缓存了目的地的 agent 元数据，而目的地在上一轮 wake
+  中重新注册后缓存条目不再可用，通知被静默丢弃，读者一直等到握手预算（实测 20 分钟后
+  超时）。修正：**每次 fan-out 前 `remove_remote_agent` + `add_remote_agent` 刷新目的地**；
+  修正后同一 6 步序列（3 次切换、含两次 trainer 唤醒）全部通过，无回退；
+- **ack 有界**（`fanout_ack_timeout_ms`，默认 10 s）：若通知仍未到达，meta server 用它
+  已有的完整元数据重发同一更新（保证路径），读者不会因一条丢失的通知挂起到握手超时。
+  修正后的序列中该回退一次都没有触发。
+

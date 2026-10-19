@@ -759,38 +759,144 @@ class NIXLMetaServer:
             dst_agent_names (List[str]): List of destination agent names
             update_client_names (List[str]): List of updated client names to broadcast
         """
-        # Prepare notification data with updated client infos
-        payload_dict = {}
-        for client_name in update_client_names:
-            payload_dict[client_name] = {
-                "info": self.client_infos[client_name].serialize(),
-                "temp_mapping": self._client_temp_mappings[client_name],
-            }
-        # Tagged, as every other handshake notification the server sends is. A bare
-        # pickle decodes to `None` on the client, which files it as foreign and then
-        # waits for an update info that never arrives -- both switch directions hang
-        # until the handshake budget expires, with nothing logged on either side.
-        payload = encode(NotifKind.UPDATE_INFO, payload_dict)
-        psrl_logger.info(
-            f"{self.server_name}: update-info payload {len(payload) / 1e6:.2f} MB for "
-            f"{len(update_client_names)} client(s) to {len(dst_agent_names)} agent(s)."
-        )
+        sources = set(update_client_names)
+        self._broadcast_grouped({agent: sources for agent in dst_agent_names})
 
-        for agent_name in dst_agent_names:
-            # Send notification with updated client infos
+    def broadcast_update_client_infos_to_readers(self, update_client_names: list[str]) -> list[str]:
+        """Send each destination only the updated infos its readers consume.
+
+        The full inversion answers "who reads this source"; a destination that reads one
+        of eight updated clients has no use for the other seven, and at fleet scale the
+        difference between one source and all of them is the difference between a
+        notification per reader and a payload the size of the update.
+
+        Returns the client names that were sent to, so the caller waits on exactly those.
+        """
+        delivered, plan = self.plan_update_broadcast(update_client_names)
+        if not plan:
+            return delivered
+        total_bytes, agents = self._broadcast_grouped(plan)
+        psrl_logger.info(
+            f"{self.server_name}: updated {len(update_client_names)} client(s) to "
+            f"{len(delivered)} reader client(s) on {agents} agent(s), "
+            f"{total_bytes / 1e6:.2f} MB of notifications."
+        )
+        return delivered
+
+    def plan_update_broadcast(self, update_client_names: list[str]) -> tuple[list[str], dict]:
+        """Build the per-destination update without sending it.
+
+        The plan is picklable so a caller with its own NIXL agents (the trainer ranks)
+        can fan it out in parallel. One agent sending serially is O(readers) and does not
+        scale to a fleet; the payload per destination is already limited to the sources
+        that destination reads.
+
+        Returns ``(delivered_client_names, plan)`` where ``plan`` is
+        ``{"sources": {name: {...}}, "destinations": {agent: {"sources": [...],
+        "conn_info": bytes}}}`` and is empty when nobody reads the updated clients.
+        """
+        readers = self.readers_of(update_client_names)
+        if not readers:
+            psrl_logger.info(
+                f"{self.server_name}: no readers for {len(update_client_names)} updated client(s); "
+                "nothing to broadcast."
+            )
+            return [], {}
+
+        infos = self.client_infos
+        siblings: dict[str, set[str]] = {}
+        for name in infos:
+            siblings.setdefault(self._instance_group(name), set()).add(name)
+
+        source_readers = {
+            source: {
+                reader
+                for key_readers in self._descriptor_readers.get(source, {}).values()
+                for reader in key_readers
+                if reader != source
+            }
+            for source in update_client_names
+        }
+
+        group_sources: dict[str, set[str]] = {}
+        for reader in readers:
+            group = self._instance_group(reader)
+            needed = {source for source, rs in source_readers.items() if reader in rs}
+            if needed:
+                group_sources.setdefault(group, set()).update(needed)
+
+        delivered: set[str] = set()
+        updates_by_agent: dict[str, set[str]] = {}
+        conn_info: dict[str, bytes] = {}
+        for group, sources in group_sources.items():
+            for name in siblings.get(group, {group}):
+                info = infos.get(name)
+                if info is None or not info.agent_name:
+                    continue
+                delivered.add(name)
+                # A rank that reads none of the updated sources still receives an empty
+                # payload: its acknowledgement loop is per instance and would otherwise
+                # wait until the handshake budget expired.
+                needed = {source for source in sources if name in source_readers[source]}
+                updates_by_agent.setdefault(info.agent_name, set()).update(needed)
+                if info.agent_name not in conn_info:
+                    conn_info[info.agent_name] = info.conn_info_meta or info.meta
+
+        if not updates_by_agent:
+            return [], {}
+        sources = {
+            name: {
+                "info": infos[name].serialize(),
+                "temp_mapping": self._client_temp_mappings[name],
+            }
+            for names in updates_by_agent.values()
+            for name in names
+        }
+        plan = {
+            "sources": sources,
+            "destinations": {
+                agent: {"sources": sorted(names), "conn_info": conn_info.get(agent, b"")}
+                for agent, names in updates_by_agent.items()
+            },
+        }
+        return sorted(delivered), plan
+
+    @staticmethod
+    def _instance_group(client_name: str) -> str:
+        """The naming prefix shared by every rank of one client instance."""
+        return client_name.rsplit("_R", 1)[0] if "_R" in client_name else client_name.rsplit("_", 1)[0]
+
+    def _broadcast_grouped(self, plan: dict) -> tuple[int, int]:
+        """Encode one payload per destination from ``plan`` and send it.
+
+        Returns ``(bytes, agents)``.
+        """
+        destinations = plan["destinations"]
+        if not destinations:
+            return 0, 0
+        sources = plan["sources"]
+        total_bytes = 0
+        started = time.time()
+        for agent_name, entry in destinations.items():
+            payload = encode(
+                NotifKind.UPDATE_INFO, {name: sources[name] for name in entry["sources"]}
+            )
+            total_bytes += len(payload)
             try:
                 self.agent.send_notif(agent_name, payload)
             except Exception as e:
                 raise RuntimeError(
                     f"{self.server_name}: Failed to send update client infos to agent {agent_name}: {e}, "
                     f"connected clients: {self.connected_clients}, "
-                    f"dst agent names: {dst_agent_names}, "
-                    f"update client names: {update_client_names}"
+                    f"dst agents: {sorted(destinations)}, sources: {entry['sources']}"
                 ) from e
-
-        psrl_logger.debug(
-            f"Broadcast update client infos to agents: {dst_agent_names}, include clients: {update_client_names}"
+        elapsed = time.time() - started
+        psrl_logger.info(
+            f"{self.server_name}: broadcast to {len(destinations)} agent(s), "
+            f"{total_bytes / 1e6:.2f} MB in {elapsed:.3f}s "
+            f"({total_bytes / 1e6 / max(elapsed, 1e-9):.1f} MB/s)."
         )
+        return total_bytes, len(destinations)
 
     def shutdown(self):
         """

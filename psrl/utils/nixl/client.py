@@ -1,3 +1,4 @@
+import bisect
 import logging
 import math
 import os
@@ -58,6 +59,21 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 # Utility function to combine tag, shard_idx, src_client, target_client, key
+def _expandable_segments_enabled() -> bool:
+    """Whether the caching allocator reserves VA on demand instead of mapping it whole.
+
+    An expandable segment's pages appear and disappear as blocks are allocated and
+    freed, so a page-locking registration of the whole range would pin memory that the
+    allocator may later unmap. Segment-granularity registration is disabled there.
+    """
+    for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        conf = os.environ.get(var, "")
+        for part in conf.split(","):
+            if part.strip().replace(" ", "") == "expandable_segments:True":
+                return True
+    return False
+
+
 def _is_quantized(tensor) -> bool:
     """
     Whether `tensor` holds the FP8 bytes of a per tensor scaled FP8 parameter (Megatron `fp8_param`).
@@ -168,6 +184,7 @@ class NIXLStorageClient:
         logging_path: str | None = None,
         enable_prog_thread: bool = True,
         pairwise_descriptors: bool = True,
+        segment_registration: bool | None = None,
     ):
         self.client_name = client_name
         self.server_name = server_name
@@ -274,6 +291,22 @@ class NIXLStorageClient:
         self._ipc_regions: dict[int, object] = {}
         self._region_mapper: RegionMapper | None = None
         self._reg_regions: set[tuple[int, int, int, str]] = set()
+
+        # Register the containing CUDA allocator segment once instead of each tensor
+        # allocation. `auto` disables it where the allocator does not map its VA range
+        # whole (expandable segments), because registering such a range would pin pages
+        # the allocator may unmap. Callers that know their allocator mode (the vLLM
+        # server, which decides whether to enable expandable segments) pass it in.
+        if segment_registration is None:
+            segment_mode = getattr(nixl_config, "segment_registration", "auto")
+            if isinstance(segment_mode, str) and segment_mode == "auto":
+                segment_mode = not _expandable_segments_enabled()
+            segment_registration = bool(segment_mode)
+        self._segment_registration = bool(segment_registration) and use_gpu
+        #: (base, size) of every caching-allocator segment, refreshed per registration.
+        self._segment_extents: list[tuple[int, int]] = []
+        #: Every distinct tensor allocation seen, for the registration report.
+        self._storage_bases: set[int] = set()
 
         # Mapping from (key, shard_idx) to registered desc slice info
         self.contig_desc_slice_map: dict[tuple[str, tuple[int, ...]], tuple[int, int, int, str]] = {}
@@ -756,6 +789,11 @@ class NIXLStorageClient:
         """
         if self.device.type != "cuda":
             return "allocator segments: n/a (non-CUDA)"
+        if self._segment_registration:
+            return (
+                f"allocator segments: {len(self._segment_extents)} hold "
+                f"{len(self._storage_bases)} allocation(s)"
+            )
         try:
             snapshot = torch.cuda.memory_snapshot()
         except Exception as exc:  # pragma: no cover - depends on the driver
@@ -784,28 +822,83 @@ class NIXLStorageClient:
         )
         return f"allocator segments: {len(found)} cover {matched} region(s){detail}"
 
-    def _record_region_registration(self, tensor: torch.Tensor) -> tuple[int, int, int, str]:
-        """Record the base storage registration entry for a tensor view.
+    def _refresh_segment_extents(self) -> None:
+        """Snapshot the caching allocator's segments for this registration round.
 
-        Returns a storage key tuple of (base_addr, nbytes, device_id, mem_type).
+        A segment is a cudaMalloc allocation the allocator carves tensors out of. Its
+        address range is fully mapped (unlike an expandable segment, whose pages are
+        mapped on demand), so one NIXL region can cover every tensor in it.
+        """
+        self._segment_extents = []
+        if not self._segment_registration:
+            return
+        try:
+            snapshot = torch.cuda.memory_snapshot()
+        except Exception as exc:  # pragma: no cover - depends on the driver
+            psrl_logger.warning(
+                f"{self.client_name}: memory_snapshot unavailable ({exc!r}); "
+                "registering each allocation."
+            )
+            self._segment_registration = False
+            return
+        extents: list[tuple[int, int]] = []
+        for segment in snapshot:
+            base = int(segment.get("address", 0) or 0)
+            size = int(segment.get("total_size", 0) or 0)
+            if base <= 0 or size <= 0:
+                continue
+            if str(segment.get("segment_type", "")).startswith("expandable"):
+                # The VA range is reserved but pages are mapped on demand; registering
+                # it whole would pin pages the allocator later unmaps.
+                psrl_logger.warning(
+                    f"{self.client_name}: expandable segments detected; registering each allocation."
+                )
+                self._segment_registration = False
+                return
+            extents.append((base, size))
+        extents.sort()
+        self._segment_extents = extents
+
+    def _registration_extent(self, base: int, nbytes: int) -> tuple[int, int]:
+        """The extent to register for an allocation: its containing segment, or itself."""
+        extents = self._segment_extents
+        if not extents:
+            return base, nbytes
+        index = bisect.bisect_right(extents, (base, float("inf"))) - 1
+        if index >= 0:
+            segment_base, segment_size = extents[index]
+            if segment_base <= base and base + nbytes <= segment_base + segment_size:
+                return segment_base, segment_size
+        return base, nbytes
+
+    def _record_region_registration(self, tensor: torch.Tensor) -> tuple[int, int, int, str]:
+        """Record the registration covering a tensor view.
+
+        Returns the **allocation** key ``(base_addr, nbytes, device_id, mem_type)``:
+        `read_bases` and IPC handles are per allocation and must keep pointing at the
+        tensor's own storage. The extent actually handed to NIXL may be larger -- the
+        whole allocator segment -- and is deduplicated separately.
         """
         storage = tensor.untyped_storage()
         base_addr = storage.data_ptr()
         nbytes = storage.nbytes()
         device_id = tensor.get_device() if tensor.is_cuda else 0
         mem_type = "cuda" if tensor.is_cuda else "cpu"
-        storage_region = (base_addr, nbytes, device_id, mem_type)
-        if storage_region not in self._reg_regions:
-            self._reg_regions.add(storage_region)
-            self._mtype_to_reg_region_lists.setdefault(mem_type, []).append((base_addr, nbytes, device_id, ""))
-            # One IPC handle per region, so a reader sharing this GPU copies rather than reading
-            # through NIXL. A handful of regions hold every shard, so this does not grow with the
-            # model. Export is best effort: a region the allocator cannot share falls back to NIXL.
-            if mem_type == "cuda":
-                handle = export_region(tensor)
-                if handle is not None:
-                    self._ipc_regions[base_addr] = handle
-        return storage_region
+        self._storage_bases.add(base_addr)
+
+        reg_base, reg_nbytes = self._registration_extent(base_addr, nbytes)
+        region = (reg_base, reg_nbytes, device_id, mem_type)
+        if region not in self._reg_regions:
+            self._reg_regions.add(region)
+            self._mtype_to_reg_region_lists.setdefault(mem_type, []).append((reg_base, reg_nbytes, device_id, ""))
+        # One IPC handle per allocation, so a reader sharing this GPU copies rather than
+        # reading through NIXL. Export is best effort: an allocation the allocator cannot
+        # share falls back to NIXL.
+        if mem_type == "cuda" and base_addr not in self._ipc_regions:
+            handle = export_region(tensor)
+            if handle is not None:
+                self._ipc_regions[base_addr] = handle
+        return base_addr, nbytes, device_id, mem_type
 
     def _build_xfer_desc_bytes(self, addr: int, length: int, device_id: int, mem_type: str) -> bytes:
         """Build serialized xfer descriptors for a contiguous slice."""
@@ -1146,6 +1239,10 @@ class NIXLStorageClient:
         """
 
         self._drop_pull_engine()
+        if not meta_only:
+            # The allocator's segment map must be current before any region is recorded:
+            # the map is what maps an allocation to the extent registered for it.
+            self._refresh_segment_extents()
         if (
             self.enable_tms_for_temp_buffers
             and self.local_client_info is not None
@@ -1597,8 +1694,11 @@ class NIXLStorageClient:
                 # a cast/FP8 publish copy was freed on sleep; separating it from the
                 # descriptor work is what tells an operator which half to attack.
                 psrl_logger.info(
-                    f"{self.client_name}: [timing] registered {n_regions} region(s) with NIXL "
-                    f"in {time.time() - _t_registration:.3f}s. {self._allocator_segment_report()}"
+                    f"{self.client_name}: [timing] registered {n_regions} region(s) for "
+                    f"{len(self._storage_bases)} allocation(s) with NIXL in "
+                    f"{time.time() - _t_registration:.3f}s "
+                    f"(segment_registration={self._segment_registration}). "
+                    f"{self._allocator_segment_report()}"
                 )
 
                 # Precompute {shard_idx: local_pos} once per key: O(1) lookup vs O(S) list.index()
@@ -1819,6 +1919,8 @@ class NIXLStorageClient:
             self.xfer_handles = {}
             self._reg_regions = set()
             self._mtype_to_reg_region_lists = {}
+            self._segment_extents = []
+            self._storage_bases = set()
             self.contig_desc_slice_map = {}
             self.strided_desc_slice_map = {}
 

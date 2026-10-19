@@ -186,6 +186,10 @@ verl / SkyRL 的 colocate 快，是因为它们**根本不把权重挪出显存*
    （`client_read`/`client_write`）仍按远端 descriptor 寻址，所以只在 PS 数据面上序列化它们。
 
 这两条把切换期载荷从 `O(展开行数)` 降到 `O(shard 数)`，把 fan-out 从全 fleet 降到读者数。
+3. **fan-out 由 train rank 的 agent 并行发出。** 读者数随 fleet 增长（万卡下 O(10^3–10^4)），
+   单个 agent 串行发送会成为切换瓶颈。meta server 只生成发送计划（更新源序列化一次，
+   每个目的地只带它读取的源子集与 conn-info），各 train rank 用自己的 NIXL agent 发送
+   交错切片；读者仍只收到一个通知，ack 语义不变。发送覆盖数与计划不一致时 trainer 直接报错。
 
 ---
 
@@ -888,6 +892,14 @@ colocate 下 rollout 已暂停，不存在「读的字节是否被改写」这�
 数计，而不是按 shard 数。因此 block FP8 的 scale 不能每权重一个 tensor：Qwen3-8B
 每 rank 会从个位数 region 涨到 257 个，唤醒多花约 9 秒。所有 scale 合并进一块按设备
 分配的 float32 池，各 shard 作为连续 view，注册回到 6 个 region、0.1 秒级。
+
+**注册粒度取 allocator segment，不取单个 tensor 分配。** 对侧是 vLLM 引擎时，每个权重
+（FP8 再加 scale）都是独立分配，一个实例数百个 region，注册因此主导切换。caching
+allocator 的 segment 是整段映射的 cudaMalloc 分配，一个 NIXL region 可以覆盖其中的全部
+张量：注册前用 `memory_snapshot()` 建立 allocation→segment 映射，同一 segment 只登记一次。
+`read_bases` / IPC handle 仍按 allocation 保留，数据路径与显存占用不变。expandable
+segments 的 VA 按需映射，必须关闭该模式（vLLM server 知道自己的 sleep 设置并显式传入）；
+snapshot 无法定位的分配（CuMem pool、注册后才创建）逐分配回退。
 
 
 **副本还顺带消除了源端 strided。** 同精度下若读方切得比 trainer 细（gen TP 大于 train TP 的

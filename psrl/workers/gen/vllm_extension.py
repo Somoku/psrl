@@ -102,6 +102,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         replica_idx: int,
         logging_path: str | None = None,
         pairwise_descriptors: bool = True,
+        segment_registration: bool | None = None,
     ):
         # NIXL attributes
         self.unified_state_dict = None
@@ -118,6 +119,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             # client_group_id=instance_id,
             logging_path=logging_path,
             pairwise_descriptors=pairwise_descriptors,
+            segment_registration=segment_registration,
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
@@ -202,11 +204,12 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             dst_agent_names = [dst_agent_names]
         self.nixl_storage_client.send_local_info_to(dst_agent_names)
 
-    def nixl_wait_for_update_infos(self, info_num: int):
+    def nixl_wait_for_update_infos(self, info_num: int, timeout: float | None = None):
         """Wait for infos of updated clients for global synchronization.
 
         Args:
             info_num (int): Number of infos to wait for.
+            timeout (float | None): Bound on the wait; None uses the handshake budget.
         """
         self.nixl_storage_client.wait_for_update_infos(info_num)
 

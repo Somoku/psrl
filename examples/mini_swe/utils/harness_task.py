@@ -166,9 +166,7 @@ async def collect_git_patch(
     try:
         payload = await session.read_bytes(patch_path)
     except Exception as exc:
-        raise RuntimeError(
-            f"Could not read the collected harness patch from {patch_path!r}: {exc!r}"
-        ) from exc
+        raise RuntimeError(f"Could not read the collected harness patch from {patch_path!r}: {exc!r}") from exc
     if len(payload) >= _PATCH_SIZE_WARNING_BYTES:
         psrl_logger.warning(
             "Harness patch for task %r is %d bytes. Grading it in full, but a patch this size is "
@@ -188,9 +186,17 @@ async def _read_collector_diagnostics(session: SandboxSession, diag_path: str) -
     """
     try:
         payload = await session.read_bytes(diag_path)
-    except Exception:
-        psrl_logger.warning(
-            "Could not read the patch-collector diagnostics from %r.", diag_path, exc_info=True
-        )
-        return "<unavailable>"
+    except Exception as exc:
+        # The file is the only record of which tool the sandbox was missing, so losing it
+        # loses the diagnosis. `read_bytes` is one way to reach it and not the only one:
+        # fall back to the exec channel, which survives on backends whose file reads do
+        # not, and report both failures inline rather than in a log line nobody reads.
+        read_error = f"read_bytes failed: {exc!r}"
+        try:
+            shown = await session.exec(f"cat {shlex.quote(diag_path)}", timeout_s=30)
+        except Exception as exec_exc:
+            return f"<unavailable: {read_error}; cat failed: {exec_exc!r}>"
+        if shown.exit_code != 0:
+            return f"<unavailable: {read_error}; cat exited {shown.exit_code}>"
+        return (shown.stdout or "").strip() or f"<empty; {read_error}>"
     return payload.decode(errors="replace").strip() or "<empty>"

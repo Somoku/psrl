@@ -718,11 +718,26 @@ class PSManager(RequestStatusTracker):
                 f"Checking abort for version: {version_to_abort}. "
                 f"Required buffer range: {buffer_range}. Ready buffers: {ready_buffer_ids}."
             )
-            if buffer_range.issubset(ready_buffer_ids):
-                curr_abort_versions.add(version_to_abort)
-                self.check_abort_versions.discard(version_to_abort)
-            else:
+            # A version's requests are disposable only once its own buffer no longer needs
+            # them, and `buffer_range` does not always say so: when the instance has moved
+            # past the version's whole window the range is empty and `issubset` answers
+            # true for nothing at all. Retiring a version whose buffer is still pending
+            # kills the only work that can complete it -- the buffer can never fill, the
+            # trainer waits forever, and every refill lands in a window that is retired as
+            # soon as it starts.
+            #
+            # Consumed buffers are deleted from the inventory, so "not ready" here means
+            # precisely what is needed: the buffer exists and the trainer is waiting on it.
+            if version_to_abort in self.staleness_inventory.get_buffers_not_ready():
+                psrl_logger.info(
+                    f"Not aborting version {version_to_abort}: its buffer is still not ready, "
+                    f"so its running requests are the ones that will complete it."
+                )
                 break
+            if not buffer_range.issubset(ready_buffer_ids):
+                break
+            curr_abort_versions.add(version_to_abort)
+            self.check_abort_versions.discard(version_to_abort)
 
         psrl_logger.info(
             f"Aborting versions: {curr_abort_versions}. Trigger buffer: {buffer_id}. The buffer is ready."

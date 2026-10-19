@@ -658,12 +658,28 @@ class RequestStatusTracker:
         assert version >= 0, "Version must be a non-negative integer."
 
         abort_request_ids = set()
+        lowest_still_running = None
         for req_id, info in self._request_infos.items():
             if req_id in self._abort_request_ids:
                 continue
-            if not info.is_validate and info.model_version == version:
+            if info.is_validate:
+                continue
+            if info.model_version == version:
                 abort_request_ids.add(req_id)
-        self._running_min_version = max(self._running_min_version, version + 1)
+            elif lowest_still_running is None or info.model_version < lowest_still_running:
+                lowest_still_running = info.model_version
+        # Advance the floor on evidence, not on the decision.
+        #
+        # Declaring "everything running is past this version" at the moment we decide to
+        # retire it is an assertion about a migration that has not been observed. If any
+        # tracked request is still on this version or an older one, the floor stays where
+        # the evidence puts it -- otherwise the tracker and the gateway disagree about
+        # which requests exist, and the requests the tracker has forgotten are exactly the
+        # ones the gateway then aborts with nobody accounting for them.
+        if lowest_still_running is None or lowest_still_running > version:
+            self._running_min_version = max(self._running_min_version, version + 1)
+        elif lowest_still_running < self._running_min_version:
+            self._running_min_version = lowest_still_running
         return abort_request_ids
 
     def update_request_version(self, request_id: list[int] | int, new_version: int):

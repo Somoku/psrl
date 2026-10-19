@@ -199,6 +199,13 @@ class HarnessRuntime:
     max_turns: int | None = None
 
 
+# The sentinel the gateway returns on an aborted request, echoed by the CLI into its
+# event stream. Kept as a literal here because the CLI's output is bytes this service
+# does not parse; matching the code is enough and parsing the JSON would couple this
+# to the CLI's schema.
+_ABORT_SENTINEL = "request_aborted"
+
+
 @dataclass(frozen=True)
 class HarnessResult:
     """Small process result retained outside the disposable sandbox."""
@@ -214,6 +221,20 @@ class HarnessResult:
     # The output files keep whatever the CLI had produced, so a `keep` caller can still
     # collect the partial trajectory and grade it.
     timed_out: bool = False
+
+    def aborted_by_gateway(self) -> bool:
+        """Report that the CLI stopped because the gateway aborted its request.
+
+        The abort reaches the CLI as an ordinary HTTP error on an LLM call *inside the
+        sandbox*, so by the time this service sees it, it looks like any other harness
+        failure. That is the whole problem: an abort is not a failure of the harness, and
+        treating it as one both retries work that was deliberately abandoned and feeds the
+        breaker that exists to catch a genuinely broken CLI.
+
+        Detected from the sentinel the gateway returns, which the CLI echoes into its own
+        event stream. See `psrl.utils.common.http_utils` for the sentinel's definition.
+        """
+        return _ABORT_SENTINEL in (self.stdout_tail or "") or _ABORT_SENTINEL in (self.stderr_tail or "")
 
     def diagnostic_text(self) -> str:
         """Return bounded, actionable process diagnostics for rollout failures."""
@@ -272,13 +293,27 @@ class Harness(ABC):
         mkdir = "mkdir -p " + " ".join(shlex.quote(d) for d in directories if d)
         check = await self.sandbox.exec(f"{mkdir} && test -x {shlex.quote(exe)}", timeout_s=60)
         if check.exit_code != 0:
-            raise RuntimeError(
-                f"Harness executable {exe!r} is missing or not executable in the sandbox "
-                f"(exit {check.exit_code}). "
-                f"Mount the {self.config.kind!r} runtime tree at {self.config.runtime_mount!r} and ensure "
-                f"<runtime-root>/{self.config.kind}/bin/{self.config.executable} exists on the worker. "
+            # `test -x` answers 1 for "not there or not executable" and nothing else. Any
+            # other code is the probe failing, not the mount: a sandbox that cannot run
+            # `mkdir`, or one whose filesystem is gone, reports something else entirely.
+            # Reporting both as "missing or not executable" sent a hunt for a mount
+            # problem that was really a container being torn down underneath the episode.
+            details = (
                 f"stdout={check.stdout[-self.config.output_tail_chars :]!r}, "
                 f"stderr={check.stderr[-self.config.output_tail_chars :]!r}."
+            )
+            if check.exit_code == 1:
+                raise RuntimeError(
+                    f"Harness executable {exe!r} is missing or not executable in the sandbox. "
+                    f"Mount the {self.config.kind!r} runtime tree at {self.config.runtime_mount!r} and ensure "
+                    f"<runtime-root>/{self.config.kind}/bin/{self.config.executable} exists on the worker. "
+                    f"{details}"
+                )
+            raise RuntimeError(
+                f"Harness executable probe for {exe!r} failed (exit {check.exit_code}), which is "
+                f"not the same as the mount being absent: the sandbox could not run the probe "
+                f"at all, so the episode is lost to an infrastructure fault rather than to a "
+                f"missing runtime tree. {details}"
             )
         await self._prepare(runtime)
 

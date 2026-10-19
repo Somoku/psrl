@@ -13,7 +13,10 @@ from typing import Any
 from omegaconf import DictConfig
 
 from psrl.sandbox import SandboxFeature, SandboxLease, SandboxSession, SnapshotKind, SnapshotRef, SyncSandboxManager
-from psrl.utils.common.http_utils import SESSION_TURN_ACCOUNTING_KEY
+from psrl.utils.common.http_utils import (
+    SESSION_TURN_ACCOUNTING_KEY,
+    RequestAbortedByGatewayError,
+)
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.harness import (
     STOP_REASON_MAX_TURNS,
@@ -487,6 +490,25 @@ class HarnessAgentLoop(SessionAgentLoop):
 
             if not training_data or any(item["num_turns"] <= 0 or not item["response_ids"] for item in training_data):
                 harness_result = await harness.collect_diagnostics(harness_result)
+                if harness_result.aborted_by_gateway():
+                    # The gateway aborted this episode's model requests, so there is no
+                    # trajectory to collect and there never will be. Raised as an abort
+                    # rather than as a rollout error for three reasons that all matter:
+                    # an abort is deliberate, so the episode is dropped rather than kept --
+                    # `needs_manager_retry()` is false for ABORTED because PSManager has
+                    # already cleared the entry, and asking for a refill here would
+                    # double-count it. What raising it as an abort buys is that the episode
+                    # is not evidence the harness is broken, so it must not feed the
+                    # breaker that exists to catch a genuinely broken CLI.
+                    psrl_logger.info(
+                        "Harness produced no trajectory because the gateway aborted its requests; "
+                        "reporting the episode as aborted rather than failed."
+                    )
+                    raise RequestAbortedByGatewayError(
+                        request_id=str(request.request_id),
+                        message="gateway aborted the episode's model requests during a turn",
+                    )
+
                 await self._dump_harness_training_data(
                     request,
                     training_data,

@@ -709,6 +709,9 @@ peer follower。单实例 info 在 direct 模式下已是元数据级（0.12–0
 **实测与两个修正：**
 
 - 8/16 个目的地的 fan-out 在 **1.68–2.38 s** 内完成（含目的地刷新），validate 切换 **8.03 s**；
+- **最终 10 步（Qwen3-8B/GSM8K）：0 错误、0 回退**；validate 切换 **7.33 / 8.31 / 9.76 s**，
+  trainer 切换 **1.66 / 1.74 / 1.88 s**；最终验证 **0.6672**；训练 reward、entropy、grad、
+  loss、response length 与不含 fan-out 的运行全部在 95% CI 内；
 - **重复切换最初丢失通知**：train rank 缓存了目的地的 agent 元数据，而目的地在上一轮 wake
   中重新注册后缓存条目不再可用，通知被静默丢弃，读者一直等到握手预算（实测 20 分钟后
   超时）。修正：**每次 fan-out 前 `remove_remote_agent` + `add_remote_agent` 刷新目的地**；
@@ -717,3 +720,14 @@ peer follower。单实例 info 在 direct 模式下已是元数据级（0.12–0
   已有的完整元数据重发同一更新（保证路径），读者不会因一条丢失的通知挂起到握手超时。
   修正后的序列中该回退一次都没有触发。
 
+
+### 13.3 剩余的冷路径成本与下一步
+
+- 注册已从 13–15 s 降到 5 s（151 个 segment），仍是 validate 切换（7.3–9.8 s）中的最大项。
+  segment 数由 allocator 的打包程度决定。下一步是**同节点跨 GPU 的 IPC/peer copy**：源按
+  allocation 导出 IPC handle，读者在另一块 GPU 上映射后 `cudaMemcpyPeerAsync` 写入本地参数，
+  目的显存不需要 NIXL MR，可把注册从切换路径上移除；H20 同节点 NVLink 具备 P2P，先在单节点
+  做逐字节 PoC，再处理 per-allocation handle 与失败回退。
+- 上游对照：vLLM 的 sharded RDT 用少量 layer-sized 接收缓冲加一次拷贝来规避逐参数注册
+  （时间换显存的路线，本设计不采用）；RFC #48312 正在系统化 weight-reload 的正确性问题
+  （storage identity、版本化 cache），与本设计的 v2 门闩目标一致。

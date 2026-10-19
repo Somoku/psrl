@@ -1,14 +1,15 @@
 #!/bin/bash
-# Direct supply with block-FP8 rollout and BF16 training.
+# Direct supply with block-FP8 rollout, optionally with FP8 training.
 #
-# The trainer stays in BF16. At each publish point it quantizes a copy of the weights
-# into 128x128 block FP8 (scales travel with the bytes, `psrl.nixl.publish_fp8_block`),
-# and the rollout engines run vLLM with `quantization=fp8`. This is the production FP8
-# path: no FP8 master weights, no training-side quantization error.
+# The publish point quantises the trainer's shards into 128x128 block FP8 (scales
+# travel with the bytes, `psrl.nixl.publish_fp8_block`), and the rollout and validate
+# engines run vLLM with `quantization=fp8`. `TRAIN_FP8=true` additionally runs the
+# trainer's GEMMs in FP8 through Transformer Engine hybrid autocast; parameters stay
+# in bf16 either way, so the wire is identical and only training compute changes.
 #
 # The run is aligned with `qwen3_8b_megatron_direct.sh` on data, batch sizes, step count,
-# placement, and validation; `quantization=fp8` on the generation rollout is the only
-# difference. Compare the two arms' per-step training and validation metrics to see what
+# placement, and validation; `quantization=fp8` on both rollout roles is the only
+# difference. Compare the arms' per-step training and validation metrics to see what
 # the extra quantization costs; a failure in one arm and not the other is attributable to
 # this path.
 #
@@ -39,7 +40,25 @@ mkdir -p "$OUTPUT_DIR"
 # positional read would consume the first of them and leave it in `$@`.
 staleness=${STALENESS:-3}
 project_name=psrl_example
-experiment_name=GRPO-Qwen3-8B-megatron-direct-fp8gen-staleness_${staleness}
+
+# FP8 training is opt-in. Persistent FP8 parameters (`fp8_param`) are not available:
+# they need the model to be built inside TE's `fp8_model_init`, which this engine does
+# not do, and enabling the flag alone corrupts the first update (config validation
+# refuses it). Hybrid autocast keeps the parameters in bf16.
+TRAIN_FP8=${TRAIN_FP8:-false}
+TRAIN_FP8_RECIPE=${TRAIN_FP8_RECIPE:-tensorwise}
+fp8_training_overrides=()
+train_tag=""
+if [ "${TRAIN_FP8}" = "true" ]; then
+    fp8_training_overrides=(
+        "+train_actor_rollout_ref.actor.megatron.override_transformer_config.fp8=hybrid"
+        "+train_actor_rollout_ref.actor.megatron.override_transformer_config.fp8_recipe=${TRAIN_FP8_RECIPE}"
+        "+train_actor_rollout_ref.actor.megatron.override_transformer_config.fp8_param=False"
+    )
+    train_tag="-fp8train"
+fi
+
+experiment_name=GRPO-Qwen3-8B-megatron-direct-fp8gen${train_tag}-staleness_${staleness}
 CKPTS_DIR=${OUTPUT_DIR}/ckpts/"${project_name}"/"${experiment_name}"
 LOG_DIR=${OUTPUT_DIR}/logs/$(date +%Y%m%d_%H%M%S)
 
@@ -155,6 +174,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=$ETP \
     train_actor_rollout_ref.actor.megatron.use_mbridge=True \
     train_actor_rollout_ref.actor.megatron.use_remove_padding=True \
+    ${fp8_training_overrides[@]+"${fp8_training_overrides[@]}"} \
     \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \

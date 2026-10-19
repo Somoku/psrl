@@ -606,7 +606,7 @@ client/planner/engine 验证有 holder 时修复落地同一版本、无 holder 
 
 ### 12.1 FP8 training + FP8 rollout（direct）
 
-配置：`qwen3_8b_megatron_fp8train_direct.sh`，布局与 §12 相同，训练侧额外打开 TE
+配置：`qwen3_8b_megatron_direct_fp8gen.sh TRAIN_FP8=true`，布局与 §12 相同，训练侧额外打开 TE
 `fp8=hybrid` / `fp8_recipe=tensorwise`；发布点仍是 bf16 shard → 128×128 block FP8
 副本（与 FP8-gen / BF16-train 场景相同的 wire 格式，逐位判据在该场景已通过）。
 

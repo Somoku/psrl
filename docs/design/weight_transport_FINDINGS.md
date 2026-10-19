@@ -723,12 +723,66 @@ peer follower。单实例 info 在 direct 模式下已是元数据级（0.12–0
 
 ### 13.3 剩余的冷路径成本与下一步
 
-- 注册已从 13–15 s 降到 5 s（151 个 segment），仍是 validate 切换（7.3–9.8 s）中的最大项。
-  segment 数由 allocator 的打包程度决定。下一步是**同节点跨 GPU 的 IPC/peer copy**（设计见
-  `weight_transport.md` §3.7.4）：源按 allocation 导出 IPC handle（实测 0.017 ms/handle），
-  读者按需导入（0.83–1.66 ms/handle）后 `cudaMemcpyPeerAsync` 写入本地参数（实测
-  361–377 GB/s），目的显存不需要 NIXL MR。预期一次 validate wake 的 439 个分配约 0.44 s
-  导入 + 0.03 s 搬运，切换降到 ~2.5–3.5 s；H20 同节点 P2P 已由 PoC 确认。
+- 注册曾是 validate 切换（7.3–9.8 s）中的最大项。该成本已由同节点 IPC/peer copy
+  消除（§13.4）：validate 切换降到 2.57 s，validate 实例不再注册。
 - 上游对照：vLLM 的 sharded RDT 用少量 layer-sized 接收缓冲加一次拷贝来规避逐参数注册
   （时间换显存的路线，本设计不采用）；RFC #48312 正在系统化 weight-reload 的正确性问题
   （storage identity、版本化 cache），与本设计的 v2 门闩目标一致。
+
+### 13.4 verify 切换的注册项已消除（同节点 IPC/peer copy，已落地）
+
+**结论：validate 切换 7.3–9.8 s → 2.57 s，trainer 切换 1.66–1.88 s → 1.68 s，
+0 次 deferred registration。** 数据（Qwen3-8B，fp8gen + GSM8K，2 节点）：
+
+| 量 | 优化前 | 优化后 |
+|---|---|---|
+| validate 切换（switch_to_rollout_mode） | 7.3–9.8 s | **2.57 / 2.11 / 1.90 s** |
+| trainer 切换（switch_to_trainer_mode） | 1.66–1.88 s | **1.68 / 1.63 / 1.56 s** |
+| validate 实例注册 | 151 region / 4.6–5.3 s | **跳过**（0 region） |
+| deferred RDMA（运行中回退补注册） | — | **0 次** |
+| 初始 / 最终验证（GSM8K acc） | 0.1948–0.1986 / 0.6520–0.6672 | **0.1986 / 0.6884** |
+| 训练 reward（10 步均值） | 0.4437–0.4516 | **0.457** |
+
+10 步全程 0 异常（`Traceback` 计数 0）；逐步 reward 0.719 / 0.445 / 0.250 / 0.133 /
+0.672 / 0.461 / 0.328 / 0.641 / 0.492 / 0.430，与历史运行的区间一致。
+
+**坐标判据（单节点，train 4 GPU + gen 4 GPU，`pairwise_descriptors=false`）：**
+两轮 **399 key × 4 client 逐位通过，0 失败**；所有字节走 `ipc`（32.76 GB），
+round 1 0.109 s、round 2 0.041 s（单 client 0.038 s，213–243 GB/s），
+`peer`（扩散）= 0、descriptors = 0、fallback = 0。train 与 gen 在不同 GPU 上，
+因此这就是跨 GPU peer 路径的逐位验收。同一判据在 2 节点（train/gen 各一节点）也通过，
+`ipc = 0`、走 NIXL，说明跨节点边没有被误判为可 IPC。
+
+**PoC（H20，同节点两 GPU）：**
+
+| 量 | 实测 |
+|---|---|
+| `reduce_tensor` 导出 | 14 µs/handle（400 个 1 MiB 分配，5.7 ms） |
+| `cudaIpcOpenMemHandle` 导入（warm） | 219 µs/handle（400 个 handle，87.7 ms） |
+| 跨 GPU 拷贝 1 GiB（目标已预热） | 2.7–2.8 ms，390–393 GB/s，逐位正确 |
+| 源 GPU 对读者不可见 + CVD 单卡 | 打开 12 ms，逐位正确，390 GB/s |
+| 首次写全新目标 | 该次 1.1 GB/s（页表建立），后续 390 GB/s |
+| exporter CVD=3 / importer CVD=5 | 导入 12 ms、拷贝逐位正确（设备序号翻译生效） |
+
+**三个实现期发现：**
+
+1. **设备编号必须翻译。** exporter 与 importer 对同一物理 GPU 的序号不同；把
+   `rebuild_cuda_tensor` 的 `storage_device` 重写为本地序号后，映射与拷贝都正确。
+2. **设备不可见不是障碍。** 每个 vLLM 实例只看见自己的 GPU，但同节点其他 GPU 的 IPC
+   handle 仍可打开（lazy peer access），且仍是 NVLink 速率。无需修改部署的可见性。
+3. **vLLM/TMS 的分配无法导出。** 435/435 个可读分配 `cudaIpcGetMemHandle` 返回
+   `cudaErrorInvalidValue`；trainer（标准 caching allocator）全部成功。因此：
+   - vLLM 实例只能做 peer copy 的**目的地**，不能做源；
+   - peer diffusion 只对**跨节点 upstream** 成组（`_make_peer_groups`），同节点 upstream
+     不再经过 vLLM 中转——这既避免多一跳，也让 validate 的源回到可导出的 trainer；
+   - 注册判定必须**逐 shard**（源的哪些分配不可导出、读者是否读它们），逐 client 的
+     「能否导出」会让所有 vLLM 读者无条件注册；
+   - 源侧回退也必须看「是否有读者要读缺失 shard」：validate 实例自己导不出任何分配，
+     但没人读它，所以它仍然跳过注册。
+4. **copy 完成的可见性。** peer copy 与 NIXL read 一样可能被 optimizer 写撕裂，因此
+   一个 copy 批次用 CUDA event 标记完成，抢占判据只在 event 信号后把这些 key 归为
+   completed；否则会把半拷贝的 key 认证为安全。
+
+**复杂度。** 注册成本从 O(模型分配数 × 每次切换) 降为 0（同节点）或 O(跨节点客户端)；
+导入成本 O(实际读取的分配数)，与 fleet 规模无关；数据面同节点 P2P 390 GB/s，跨节点仍是
+NIXL/RDMA。vLLM 作为 source 的 VMM 导出（`cuMemGetHandleForAddressRange`）是后续项。

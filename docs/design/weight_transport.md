@@ -2406,6 +2406,12 @@ vLLM 对这块 buffer 的意图写得最明确（`packed_tensor.py:324`）：
 所有权重（含布局转换产物）无条件 pack 进去，逐 bucket 送。
 **不做 per-key 的 IPC 判定**——初稿曾提出这一条，是过度设计，已移除。
 
+> `nixl_direct` 改变了这个前提，但**没有恢复被否决的那条**。直供下没有 wire buffer，
+> 源就是 trainer 的活分配，读者映射后仍然**无条件拷贝**到自己的参数里；逐 key 判定的
+> 只是「映射区间是否覆盖本次读」（`locate` 做边界检查、`offset` 做元素对齐），判错
+> 只会退回 NIXL，不会静默损坏。省下的是「把字节先打包进中转 buffer」的那次额外拷贝，
+> 不是去零拷贝（§3.7.4）。
+
 **一个值得直接采纳的实现细节**：verl 的 bucket 用 `torch.uint8` 作统一类型，
 各 dtype 的张量通过 `.view(dtype).view(shape)` 映射进去，
 并用 `alignment = weight.element_size()` 做对齐（`:131`）。
@@ -3193,88 +3199,118 @@ FP8-native train（第二行）是唯一两列都是 `0.5×M` 的配置——
 **第一性原理：传输原语应当与拓扑匹配。** 同设备 → CUDA IPC 映射 + 设备拷贝（已实现，
 `_ipc_cells`）；同节点跨设备 → IPC 映射 + **P2P 拷贝**（`cudaMemcpyPeerAsync` / NVLink，
 本设计新增）；跨节点 → NIXL/RDMA（保留）。MR 只对第三种边有意义，因此注册策略应从
-「默认注册」改为「**只对跨节点边注册**」：
+「默认注册」改为「**只对必须走 NIXL 的边注册**」。判定分两侧，都是逐 shard 的：
 
 ```
-client 需要 MR  ⇔  它有一个跨节点源（作为读者）
-                或  它有一个跨节点读者（作为源）
-否则：不注册，只导出 IPC handle（0.017 ms/handle），供同节点读者映射
+读者需要 MR  ⇔  它的某个源在跨节点
+            或  它要读的某个 shard 的源分配没有 IPC handle
+
+源需要 MR    ⇔  它有跨节点读者
+            或  某个读者要读的 shard 在它这里没有 IPC handle
 ```
+
+逐 shard 而不是逐 client 是必要的：vLLM 的 allocator 拒绝导出**全部**权重
+（实测 435/435 个分配 `cudaIpcGetMemHandle` 返回 `cudaErrorInvalidValue`），
+逐 client 的「可导出」位会让同节点所有读者白白注册。源侧同理：一个没人读的
+validate 实例即使自己导不出任何分配，也不需要注册——它的读者根本不存在。
 
 **机制。** 源端已有的 `export_region`（`reduce_tensor`，整个 allocation 一个 handle，
 353 B/个）与读者端的 `RegionMapper` 可以直接复用，不需要新的导出格式：
 
-1. `_spec` 判断源与本机 `node_ip` 相同且 `torch.cuda.can_device_access_peer(local, src)`
-   → 生成 peer-cell：`RegionMapper` 导入源 region，得到 **源设备上** 的张量；读者用
-   `local.copy_(view, non_blocking=True)` 在 copy stream 上完成跨设备 P2P 拷贝。
-   源 region 的 strided 视图用与 `_ipc_cells` 完全相同的 `as_strided` 构造，字节语义不变。
-2. **按需导入**：`adopt` 目前映射源的全部 handle；改为只映射本次计划实际读取的 shard
-   对应的 region（`read_bases[positions[shard]]`）。读者只为其片外的分配付出 1 ms/handle。
-3. **handle epoch**：源在 wake 时重新注册，旧 handle 指向已释放的显存。`UPDATE_INFO` 到达时
-   对源调用 `RegionMapper.forget`，下一次拉取重新导入。这条对**现有同设备 IPC 路径同样必要**
-   ——当前 `forget` 从未被调用，靠读者自己的 sleep 清空 mapper 掩盖了这一隐患。
-4. **失败回退**：`export_region` 是 best-effort（CuMem pool、非 caching-allocator 内存可能
-   无法导出）。跳过 MR 的读者一旦遇到不可导出的源，回退到**同节点的上游 trainer**（colocate
-   下同设备/同节点，IPC 可读）；若上游在跨节点，则读者本来就必须注册，不会走到这里。
-   计划/注册阶段把「不可导出」当作跨节点边处理，保证回退路径始终有 MR。
+1. `_spec` 判断源与本机 `node_ip` 相同且源已导出 handle → 生成 peer-cell：
+   `RegionMapper` 按需导入源 region，读者用 `local.copy_(view, non_blocking=True)` 在
+   copy stream 上完成设备拷贝。源 region 的 strided 视图用与 `_ipc_cells` 完全相同的
+   `as_strided` 构造，字节语义不变。
+2. **设备编号翻译。** exporter 与 importer 对同一物理 GPU 的序号通常不同（train rank
+   只看见 1 张卡时它是 0，validate 进程看见整节点时它是 `nvidia-smi` 序号）。handle
+   里记录的是 exporter 的序号，必须用 `device_uuid` 解析成本地序号后重写
+   `rebuild_cuda_tensor` 的 `storage_device` 参数；否则导入的张量会被记在错误的设备上。
+3. **设备不可见不构成障碍。** 每个 vLLM 实例的 `CUDA_VISIBLE_DEVICES` 只有它自己的
+   GPU，但 `cudaIpcOpenMemHandle` 仍能映射同节点其他 GPU 的 handle（lazy peer access），
+   实测逐位正确且 390 GB/s。因此无需改部署的可见性，也不需要 IPC 白名单。
+4. **按需导入**：`adopt` 只登记 handle 目录，第一次读到某个 allocation 时才打开它。
+   实测打开 219 µs/handle（400 个 warm），且首次打开有约 70–80 ms 的进程级 CUDA
+   context 初始化（一次性，不是每 handle）。按需导入让切换成本与**实际读取的分配数**
+   成正比，而不是与发布数成正比。
+5. **handle epoch**：源在 wake 时重新注册，旧 handle 指向已释放的显存。`UPDATE_INFO`
+   到达时对源调用 `RegionMapper.forget`，下一次拉取重新导入。这条对**现有同设备 IPC
+   路径同样必要**——`forget` 此前从未被调用。
+6. **完成的可见性**：一次 peer copy 也在读 writer 正在写的页，和 NIXL read 一样会被
+   抢占撕裂。因此 copy 批次用一个 CUDA event 标记完成，抢占判据只在 event 信号后才把
+   这些 key 归为 completed；否则会把半拷贝的 key 认证为安全。
+7. **失败回退**：`export_region` 是 best-effort。读者在计划阶段就检查源在本 shard 上
+   是否可导出；不可导出则该读者注册，同时源侧检测到「有读者要读缺失 shard」后也注册，
+   两条 NIXL 边同时存在，回退路径始终可用。若运行时导入意外失败，读者调用
+   `ensure_rdma_registered` 就地补注册（慢路径，仍正确）。
 
 **PoC 实测（H20，同节点两 GPU，NVLink P2P）：**
 
 | 量 | 实测 |
 |---|---|
-| `can_device_access_peer(1,0)` | True |
-| `reduce_tensor` 导出（353 B/handle） | **0.017 ms/handle**（256 个 16 MiB 张量共 4 ms） |
-| `cudaIpcOpenMemHandle` 导入 | **0.83–1.66 ms/handle** |
-| 跨 GPU 拷贝 1.5 GiB | 4.3–4.5 ms，**361–377 GB/s** |
-| 跨 GPU 拷贝 16 MiB（预热后） | 0.07 ms，226 GB/s |
+| `reduce_tensor` 导出 | **14 µs/handle**（400 个 1 MiB 分配，5.7 ms） |
+| `cudaIpcOpenMemHandle` 导入（warm） | **219 µs/handle**（同 400 个 handle，87.7 ms） |
+| 跨 GPU 拷贝 1 GiB（目标已预热） | 2.7–2.8 ms，**390–393 GB/s** |
+| 源 GPU 对读者**不可见**（CVD 单卡） | 打开 12 ms、逐位正确、**390 GB/s** |
+| 首次写入全新目标 | 该次 1.1 GB/s（页表建立），之后 390 GB/s |
+| vLLM/TMS 进程的分配导出 | **435/435 失败**（`cudaErrorInvalidValue`） |
 
-**成本模型与预期收益。** 一次 validate wake 的读者读取整个模型（TP1），约 439 个分配：
+最后一行改变了 peer diffusion 的结论：**vLLM 进程（TMS/CuMem 分配）只能做 peer copy
+的目的地，不能做源**。因此扩散只能折叠**跨节点**上游读；同节点上游已是设备拷贝，
+再经过一个 vLLM 中间实例既多一跳，又因中间实例不可导出而迫使 follower 注册。
+
+**成本模型与预期收益。** 一次 validate wake 的读者读取整个模型，约 439 个分配：
 
 | 项 | 现状（NIXL MR + pull） | peer copy |
 |---|---|---|
-| 注册 / 导入 | 5.06 s（151 segment） | **~0.44 s**（439 分配 × 1 ms，按需导入） |
-| 数据搬运（9.44 GB） | 0.8–1.3 s（~12 GB/s 端到端） | **~0.03 s**（360 GB/s） |
-| 源端导出 | — | ~0.008 s（439 × 0.017 ms，可与唤醒并行） |
-| **validate 切换** | **7.3–9.8 s** | **~2.5–3.5 s**（其余为 wake/offload/resume） |
+| 注册 / 导入 | 5.06 s（151 segment） | **0**（读者跳过注册） |
+| 数据搬运 | 0.8–1.3 s（~12 GB/s 端到端） | 设备拷贝，390 GB/s |
+| 源端导出 | — | 6 个 trainer 分配，<0.1 ms |
+| **validate 切换** | **7.3–9.8 s** | **2.57 s**（实测） |
 
 打开成本是唯一不可忽略的新项，且是 **O(本 rank 实际读取的分配数)**、与集群规模无关、
-各 rank 并行；TB 级 MoE 上每个 rank 读到的分配数由其 shard 份额决定，不会随 fleet 增长。
-若打开成本在超多小分配场景成为主项，可进一步评估 CUDA VMM 的 `cuMemGetHandleForAddressRange`
-（按 VA 区间导出，一个 handle 覆盖多个映射）——它要求源端使用 VMM 分配（本集群的 cumem
-allocator 正是），属于第二阶段的优化。
+各 rank 并行；TB 级 MoE 上每个 rank 读到的分配数由其 shard 份额决定，不会随 fleet
+增长。vLLM 侧的分配无法 IPC 导出时，用 CUDA VMM 的
+`cuMemGetHandleForAddressRange`（按 VA 区间导出，一个 fd 覆盖多个映射）是第二阶段
+让 vLLM 也能作为 source 的路径；它要求两端都用 VMM 分配与映射。
 
 **与 peer diffusion 的关系。**
 
-- **可行，且不改变扩散语义。** 扩散决定「谁读谁」（designate / follower），传输原语只决定
-  「怎么读」。同节点 follower 读 designate 正是 peer copy 的目标形态；版本提交、共享锁、
-  v2 门闩与抢占仍由 pull 引擎/协调器执行，与 NIXL 路径完全相同。
-- **收益分场景。** colocate 验证：peer 是主要字节源（实测 8.28 GB peer / 1.16 GB upstream），
-  peer copy 同时去掉 follower 的 MR 并把搬运提到 NVLink 速率——这是切换优化的主收益。
-  disaggregate rollout：designate 仍要为跨节点 upstream 注册（一次性），followers 的 MR
-  可以省掉（一次性），但 peer 的 NIXL 整张量读实测已达 365 GB/s（FINDINGS §2），**带宽上没有
-  收益**。因此对 disaggregate 的扩散，peer copy 只是「少注册一次」，不是热路径优化。
-- **冲突与边界。** NIXL 仍是控制面与跨节点数据面的唯一通道；peer copy 只在同节点、P2P 可达、
-  且源已导出的 cell 上启用。扩散的静态 plan、版本戳、驱逐/重广播原样保留；新增的唯一不变量是
-  **源重新注册必须使映射失效**（epoch/forget），否则会读到已释放显存——这是本设计明确要求
-  与现有 `_ipc_cells` 一并修复的点。跨节点绝不能走 IPC（`can_device_access_peer` 跨节点为
-  False，且 IPC handle 不跨节点）。
+- **扩散只应折叠跨节点读。** 设计初衷是「一次昂贵 upstream + 同节点 peer 读」；当
+  upstream 已经在同节点时，读者直接拷贝源就是设备速度，再加一个 designate 中转只会
+  多一跳，并把一个 vLLM 实例放进数据路径——而 vLLM 的分配无法 IPC 导出（见上表），
+  follower 反而必须注册。因此 `_make_peer_groups` 现在只对「至少一个源在别的节点」的
+  (reader, key) 成组。disaggregate rollout 的 trainer→gen 边跨节点，扩散保留；
+  colocate 与 validate（源是自己节点的 trainer）不再扩散。
+- **vLLM 实例只能做目的地。** IPC 导出在 trainer（标准 caching allocator）上成功，
+  在 vLLM/TMS 进程上 435/435 失败。所以 validate/gen 读者的 peer 源必须是 trainer；
+  「reader 服务 reader」在 vLLM 侧要等 VMM 导出（`cuMemGetHandleForAddressRange`）。
+- **不改变扩散语义。** 版本提交、共享锁、v2 门闩与抢占仍由 pull 引擎/协调器执行，
+  与 NIXL 路径完全相同；改变的是「谁读谁」的成组条件与搬运原语。
+- **冲突与边界。** NIXL 仍是控制面与跨节点数据面的唯一通道；peer copy 只在同节点、
+  可导出、且可映射的 cell 上启用。新增的不变量是**源重新注册必须使映射失效**
+  （`UPDATE_INFO` → `forget`），否则会读到已释放显存；跨节点绝不能走 IPC
+  （handle 不跨节点；`node_ip` 不同即拒绝）。
 
 **对整体架构的影响。**
 
-1. **plan 描述意图，执行层选择原语**：为每个 `(reader, key, source)` 增加 transport hint
-   （`ipc` / `peer` / `nixl`），由节点与设备拓扑推导；注册策略成为 plan 的函数，而不是部署
-   模式的函数。同一套原语覆盖 colocate、disaggregate、单机与多机。
-2. **MR 从「每个目的地」变成「跨节点边」**：colocate 验证与单机部署不再有注册开销；多机
-   rollout 的注册保持一次性。规模上，注册成本从 O(模型分配数 × 每次切换) 降为
-   O(跨节点客户端 × 一次性)。
-3. **数据面路径与拓扑一致**：同设备 399–447 GB/s、同节点 P2P 361–377 GB/s、跨节点 49 GB/s/
-   bond，不再让同节点流量绕道 RDMA 协议栈（同设备 NIXL READ 实测仅 52 GB/s）。
+1. **plan 描述意图，执行层选择原语**：`(reader, key, source)` 的传输由节点拓扑与源的
+   `ipc_regions` 推导；注册策略成为 plan 的函数，而不是部署模式的函数。同一套原语覆盖
+   colocate、disaggregate、单机与多机。
+2. **MR 从「每个目的地」变成「必须走 NIXL 的边」**：colocate 验证与单机部署不再有
+   注册开销；多机 rollout 的注册保持一次性。规模上，注册成本从
+   O(模型分配数 × 每次切换) 降为 O(跨节点客户端 × 一次性)。
+3. **数据面路径与拓扑一致**：同设备与同节点跨 GPU 走 HBM/NVLink 速率，不再让同节点
+   流量绕道 RDMA 协议栈。
 
-**实施与验证计划。**（1）`_peer_cells` + 按需 `adopt` + `UPDATE_INFO` 时 `forget`，单节点
-双 GPU 逐字节 PoC；（2）注册策略改为跨节点边判定，`needs_rdma_registration` 的输入加入
-transport hint，CPU 单测覆盖 colocate/disaggregate/混合三种拓扑；（3）colocate e2e 测
-validate 切换（目标 ~2.5–3.5 s）、disaggregate e2e 确认无回归；（4）坐标判据两轮逐位，
-校验 peer 路径的字节与版本。
+**实施与验证（已完成）。** `_peer_cells`（现为 `_ipc_cells` 的跨设备分支）+ 按需
+`adopt` + `UPDATE_INFO` 时 `forget` + 复制批次的 event 完成语义；注册策略改为两侧逐
+shard 判定；vLLM 源不可导出时的源侧回退；扩散只对跨节点上游成组。验证：
+（a）单节点双 GPU（含源 GPU 不可见）逐位 PoC；（b）坐标判据单节点 train 4 + gen 4，
+两轮 **399 key × 4 client 逐位通过、0 失败**，32.76 GB 全部走 `ipc`（0.041 s，
+213–243 GB/s/client）；同一判据 2 节点（跨节点）也通过且 `ipc = 0`；（c）2 节点 10 步
+fp8gen e2e（GSM8K）validate 切换 **2.57 / 2.11 / 1.90 s**（原 7.3–9.8 s）、trainer 切换
+**1.68 / 1.63 / 1.56 s**（原 1.66–1.88 s）、0 次 deferred registration、初始/最终验证
+0.1986 / 0.6884（历史 0.1948–0.1986 / 0.6520–0.6672）。
 
 
 ### 3.8 FP8：贯穿全链路的 wire 格式

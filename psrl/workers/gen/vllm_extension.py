@@ -299,6 +299,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         if report.failed_sources:
             self.nixl_storage_client.pull_engine().mark_unavailable(report.failed_sources)
         self.cuda_synchronize()
+        self._refresh_derived_weights()
         self._sync_pulled_versions(report.versions)
         # Every shard of one pull must come from one version. More than one means some
         # sources had republished mid-pull. Not asserted here: the caller retries.
@@ -318,6 +319,22 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             + (", repaired from holders after preemption." if report.repaired else ".")
         )
         return PullVerdict(landed=True, versions=frozenset(report.versions), repaired=report.repaired)
+
+    def _refresh_derived_weights(self) -> None:
+        """Rebuild parameters vLLM computes from transported ones.
+
+        MLA absorbs `kv_b_proj` into `W_UK_T`/`W_UV` after loading, and a pull rewrites
+        `kv_b_proj`, so those views are stale until regenerated. Only modules that expose
+        both attributes are touched; every other architecture pays one attribute check.
+        """
+        model = self.model_runner.model
+        dtype = getattr(getattr(self.model_runner, "model_config", None), "dtype", None)
+        for module in model.modules():
+            if not (hasattr(module, "W_UK_T") and hasattr(module, "kv_b_proj")):
+                continue
+            if dtype is None:
+                dtype = next(module.parameters()).dtype
+            module.process_weights_after_loading(dtype)
 
     def _sync_pulled_versions(self, versions) -> None:
         """Record what the last pull read, for `pulled_version_set`.

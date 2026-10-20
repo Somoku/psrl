@@ -566,11 +566,14 @@ class VllmConverter(BaseConverter):
                 else:
                     shard_dim = 1
             elif is_moe_experts_module(module):
-                if "w13" in param_name:
-                    shard_dim = 0
-                else:
-                    assert "w2" in param_name, f"MoE expert param can only be w13 or w2, got {param_name!r}."
+                if "w2" in param_name:
                     shard_dim = 1
+                else:
+                    # w13 and per-expert vectors such as DeepSeek-V3's router
+                    # `e_score_correction_bias` are cut along the expert dimension.
+                    # There is one value per local expert, so the same local rank
+                    # selection applies as for the expert matrices.
+                    shard_dim = 0
             elif isinstance(module, ReplicatedLinear):
                 # NOTE(zym): `ReplicatedLinear` carries the global TP size despite
                 # storing a replicated parameter.

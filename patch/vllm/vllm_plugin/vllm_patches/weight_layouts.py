@@ -106,6 +106,18 @@ def _deepseek_layout(model: Any) -> WeightLayoutPlan:
     if getattr(model.config, "topk_method", None) == "noaux_tc":
         builder.alias("experts.e_score_correction_bias", "gate.e_score_correction_bias")
     builder.exclude_substr("rotary_emb.inv_freq")
+    # MLA absorption is a runtime view of `kv_b_proj.weight`: vLLM derives W_UK_T and
+    # W_UV from it after loading. They are not checkpoint weights, and the reader
+    # recomputes them after every pull (`vLLMWorkerExtension._refresh_derived_weights`),
+    # so transporting them would be redundant and would make every layer's key set
+    # depend on a load-time transform.
+    builder.exclude_substr("mla_attn.mla_attn.W_UK_T")
+    builder.exclude_substr("mla_attn.mla_attn.W_UV")
+    # The fused experts module aliases the router's parameter
+    # (`experts.routed_experts.e_score_correction_bias`); the canonical `gate.*` copy is
+    # the one the trainer publishes, and a transform would otherwise emit the alias under
+    # a second name the trainer does not have.
+    builder.exclude_substr("experts.routed_experts.e_score_correction_bias")
     return builder.build()
 
 

@@ -1998,10 +1998,19 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
             ray.get(self.rollout_coordinator.start_lmcache_controller.remote())
 
-        # Rollout uses separate GPUs, so overlap its model loading with PS and actor initialization.
+        # Rollout uses separate GPUs, so overlap its model loading with PS and actor
+        # initialization. When it shares the trainer's GPUs that overlap is a memory
+        # race: vLLM sizes its KV cache from the memory free at startup, and a trainer
+        # that is already resident leaves it too little. Initialize the rollout servers
+        # first on the colocated path, before the actor loads.
+        self.colocate_rollout_and_train = bool(self.config.psrl.get("colocate_rollout_and_train", False))
         rollout_init_executor = ThreadPoolExecutor(max_workers=1)
-        rollout_init_future = rollout_init_executor.submit(self.init_rollout_servers, self.rollout_wg_list, "rollout")
-        psrl_logger.info("Launched rollout server init in background thread (before PS init)")
+        rollout_init_future = None
+        if not self.colocate_rollout_and_train:
+            rollout_init_future = rollout_init_executor.submit(
+                self.init_rollout_servers, self.rollout_wg_list, "rollout"
+            )
+            psrl_logger.info("Launched rollout server init in background thread (before PS init)")
 
         ps_nixl_futures = []
         model_init_futures = []
@@ -2185,9 +2194,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             psrl_logger.info("Initializing validation model")
             self.init_rollout_servers(self.validate_wg_list, tag="validate")
             # Wait for rollout init to complete (likely already done since it ran in parallel
-            # on separate GPUs during actor + validate initialization above)
-            rollout_init_future.result()
-            rollout_init_executor.shutdown(wait=False)
+            # on separate GPUs during actor + validate initialization above). When the GPUs
+            # are shared it was deferred so vLLM could size its cache first.
+            if rollout_init_future is not None:
+                rollout_init_future.result()
+                rollout_init_executor.shutdown(wait=False)
+            else:
+                self.init_rollout_servers(self.rollout_wg_list, tag="rollout")
             ray.get(model_init_futures)
             ray.get(self.rollout_coordinator.init_nixl_client.remote())
             ray.get(self.rollout_coordinator.nixl_convert_params.remote())
@@ -2212,6 +2225,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
                 psrl_logger.warning("[INIT-PAUSE] Pause call completed successfully.")
 
+            if rollout_init_future is None:
+                # Colocated: the rollout servers must size their KV cache before the
+                # trainer claims HBM on the same cards. Their weights stay dummy until
+                # the initial pull below.
+                psrl_logger.info("Initializing rollout model before the actor (colocated GPUs)")
+                self.init_rollout_servers(self.rollout_wg_list, tag="rollout")
+
             psrl_logger.info("Initializing actor model")
             self.actor_wg = all_wg["actor"]
             self.actor_wg.init_model("empty")
@@ -2221,8 +2241,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             # Wait for rollout to complete. Actor initialization overlapped with it.
             # Coordinator NIXL ops need rollout registered, so we must wait here.
-            rollout_init_future.result()
-            rollout_init_executor.shutdown(wait=False)
+            if rollout_init_future is not None:
+                rollout_init_future.result()
+                rollout_init_executor.shutdown(wait=False)
 
             ray.get(model_init_futures)
             ray.get(self.rollout_coordinator.init_nixl_client.remote())

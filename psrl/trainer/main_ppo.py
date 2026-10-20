@@ -239,6 +239,42 @@ def run_ppo(config, task_runner_class=None) -> None:
         ray.timeline(filename=timeline_json_file)
 
 
+def colocate_bundle_fractions(psrl_config) -> tuple[float, float, float]:
+    """Ray GPU-share per bundle for the (train, rollout, validate) worker groups.
+
+    Fractions are scheduling shares, not memory splits: every worker still sees the whole
+    card. ``(0.9, 1.0, 0.1)`` is validate-only colocation, where rollout has its own GPUs.
+    With ``colocate_rollout_and_train`` all three roles share one node, and the values are
+    chosen so each card hosts at most one worker of each role while they sum to no more
+    than one GPU:
+
+    * two train bundles do not fit (``2 * 0.6 > 1``),
+    * a second rollout bundle does not fit beside a train one (``0.6 + 2 * 0.3 > 1``),
+    * two validate bundles do not fit in the remainder (``0.6 + 0.3 + 2 * 0.09 > 1``).
+
+    Raises:
+        ValueError: the fractions exceed one GPU per card, or rollout colocation is
+            requested without validate colocation (the two share the switch that frees
+            the trainer before validation runs).
+    """
+    colocate_validate = bool(psrl_config.get("colocate_validate_and_train", False))
+    if bool(psrl_config.get("colocate_rollout_and_train", False)):
+        if not colocate_validate:
+            raise ValueError("colocate_rollout_and_train requires colocate_validate_and_train")
+        train = float(psrl_config.get("colocate_train_fraction", 0.6))
+        rollout = float(psrl_config.get("colocate_rollout_fraction", 0.3))
+        validate = float(psrl_config.get("colocate_validate_fraction", 0.09))
+        total = train + rollout + validate
+        if total > 1.0 + 1e-9:
+            raise ValueError(
+                "colocate bundle fractions must sum to at most 1 GPU per card, got "
+                f"train={train} + rollout={rollout} + validate={validate} = {total}"
+            )
+        return train, rollout, validate
+    train = 0.9 if colocate_validate else 1.0
+    return train, 1.0, (1.0 - train if colocate_validate else 0.0)
+
+
 @ray.remote(num_cpus=1)
 class TaskRunner:
     """Ray remote class for executing distributed PPO training tasks.
@@ -291,7 +327,11 @@ class TaskRunner:
         deployment_config = config.psrl.deployment
         # AGENT(VERL): use train_pool instead of global_pool
         train_pool_id = "train_pool"
-        train_bundle_resource_num = 0.9 if config.psrl.colocate_validate_and_train else 1.0
+        (
+            train_bundle_resource_num,
+            rollout_bundle_resource_num,
+            validate_bundle_resource_num,
+        ) = colocate_bundle_fractions(config.psrl)
         resource_pool_spec = {
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
         }
@@ -355,6 +395,9 @@ class TaskRunner:
                     deployment_config.rollout_ngpus_per_node_per_instance
                 ] * deployment_config.rollout_nnodes_per_instance
 
+        for rollout_pool_id in rollout_pool_id_list:
+            resource_num_per_bundle[rollout_pool_id] = rollout_bundle_resource_num
+
         # Set the resource pool spec for each validation instance.
         if config.psrl.colocate_validate_and_train:
             val_pool_id_list = [f"validate_pool_{i}" for i in range(deployment_config.n_validate_instances)]
@@ -363,7 +406,7 @@ class TaskRunner:
                 resource_pool_spec[validate_pool_id] = [
                     deployment_config.validate_ngpus_per_node_per_instance
                 ] * deployment_config.validate_nnodes_per_instance
-                resource_num_per_bundle[validate_pool_id] = 1.0 - train_bundle_resource_num
+                resource_num_per_bundle[validate_pool_id] = validate_bundle_resource_num
             self.mapping[PSRL_Role.Validate] = val_pool_id_list
 
         self.mapping[PSRL_Role.Rollout] = rollout_pool_id_list

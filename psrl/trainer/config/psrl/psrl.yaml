@@ -53,5 +53,18 @@ retry_ratio: 1.0
 # Whether to colocate validate and training workers
 colocate_validate_and_train: True
 
+# Colocate the generation workers on the trainer's GPUs. This is spatial sharing:
+# the trainer and the rollout engines stay resident together, so each vLLM instance
+# must lower `gpu_memory_utilization` to leave the trainer room. The fractions are
+# Ray scheduling shares, not memory splits (every worker still sees the whole card);
+# their values make at most one worker of each role land on a GPU:
+#   two train bundles do not fit (2 * 0.6 > 1),
+#   a second gen bundle does not fit beside a train one (0.6 + 2 * 0.3 > 1),
+#   and two validate bundles do not fit in the remainder (0.6 + 0.3 + 2 * 0.09 > 1).
+colocate_rollout_and_train: False
+colocate_train_fraction: 0.6
+colocate_rollout_fraction: 0.3
+colocate_validate_fraction: 0.09
+
 # Whether to dispatch requests to both rollout and validate instances
 fuse_rollout_with_validate: True

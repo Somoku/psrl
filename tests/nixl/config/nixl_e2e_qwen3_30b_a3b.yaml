@@ -1,0 +1,38 @@
+# @package _global_
+#
+# Qwen3-30B-A3B-Instruct (128-expert Qwen3 MoE) over direct supply.
+#
+# A different MoE parameter namespace from the DeepSeek-style bridge: the experts are
+# named `mlp.experts.<i>.*` with no shared expert, so it exercises the grouping path
+# independently. Train TP2 x EP4, rollout TP4.
+defaults:
+  - nixl_e2e_1node
+  - _self_
+
+test:
+  num_train: 8
+  num_gen: 8
+  direct_supply: true
+  rounds: 2
+  megatron:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+  gen:
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    load_format: dummy
+
+model:
+  path: ${oc.env:PSRL_MATRIX_MODELS}/Qwen3-30B-A3B-text
+  trust_remote_code: false
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
+  pairwise_descriptors: false
+
+logging:
+  path: ${oc.env:PSRL_REPO}/tests/nixl/log/qwen3_30b_a3b

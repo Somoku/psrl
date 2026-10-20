@@ -1,0 +1,40 @@
+# @package _global_
+#
+# Qwen3.5-4B (hybrid GDN + full attention) over direct supply.
+#
+# Same judge as the other cells: train fills parameters by coordinate, the rollout
+# verifies every byte of its declared layout after two pulls. The architecture is the
+# variable -- Qwen3.5 adds the linear-attention (GDN) parameter namespace (A_log, conv1d,
+# dt_bias) and tied embeddings, so it exercises mappings the dense Qwen3 path does not.
+defaults:
+  - nixl_e2e_1node
+  - _self_
+
+test:
+  num_train: 8
+  num_gen: 8
+  direct_supply: true
+  rounds: 2
+  megatron:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+  gen:
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    # The transfer overwrites every weight; only config and tokenizer are needed.
+    load_format: dummy
+
+model:
+  path: ${oc.env:PSRL_MATRIX_MODELS}/Qwen3.5-4B-text
+  trust_remote_code: false
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
+  pairwise_descriptors: false
+
+logging:
+  path: ${oc.env:PSRL_REPO}/tests/nixl/log/qwen35_4b

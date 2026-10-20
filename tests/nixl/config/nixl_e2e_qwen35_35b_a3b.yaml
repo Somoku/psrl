@@ -1,0 +1,38 @@
+# @package _global_
+#
+# Qwen3.5-35B-A3B (hybrid GDN attention + 256-expert MoE) over direct supply.
+#
+# Train TP2 x EP4 spreads the experts across eight ranks; the rollout runs TP2 (four
+# instances). This is the layout where expert shards, the router, and the linear-attention
+# parameters all have to line up at once.
+defaults:
+  - nixl_e2e_1node
+  - _self_
+
+test:
+  num_train: 8
+  num_gen: 8
+  direct_supply: true
+  rounds: 2
+  megatron:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+  gen:
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    load_format: dummy
+
+model:
+  path: ${oc.env:PSRL_MATRIX_MODELS}/Qwen3.5-35B-A3B-text
+  trust_remote_code: false
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
+  pairwise_descriptors: false
+
+logging:
+  path: ${oc.env:PSRL_REPO}/tests/nixl/log/qwen35_35b_a3b

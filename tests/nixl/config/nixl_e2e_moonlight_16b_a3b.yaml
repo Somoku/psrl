@@ -1,0 +1,36 @@
+# @package _global_
+#
+# Moonlight-16B-A3B (DeepSeek-V3-style MLA + 64 routed experts, 2 shared) over direct
+# supply. The MLA latent projections and the packed expert layout are the parts that
+# differ from every other architecture in the matrix.
+defaults:
+  - nixl_e2e_1node
+  - _self_
+
+test:
+  num_train: 8
+  num_gen: 8
+  direct_supply: true
+  rounds: 2
+  megatron:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+  gen:
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    load_format: dummy
+
+model:
+  path: ${oc.env:PSRL_MATRIX_MODELS}/Moonlight-16B-A3B-text
+  trust_remote_code: false
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
+  pairwise_descriptors: false
+
+logging:
+  path: ${oc.env:PSRL_REPO}/tests/nixl/log/moonlight_16b_a3b

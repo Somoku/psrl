@@ -1,0 +1,26 @@
+# @package _global_
+#
+# Qwen3.5-4B with train and rollout on the same eight GPUs. The judge is the same; the
+# arrangement exercises same-device CUDA IPC and the fractional placement used in
+# production colocation.
+defaults:
+  - nixl_e2e_qwen35_4b
+  - _self_
+
+test:
+  colocate: true
+  megatron:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+  gen:
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    load_format: dummy
+
+logging:
+  path: ${oc.env:PSRL_REPO}/tests/nixl/log/colocate_qwen35_4b

@@ -1,0 +1,23 @@
+# @package _global_
+#
+# Qwen3-8B trained with FSDP2 rather than Megatron. FSDP2 keeps one flat DTensor per
+# parameter instead of Megatron's fused buffers, so it exercises the other converter and
+# a different shard layout. Qwen3-8B is used because FSDP2 builds from the HF
+# checkpoint, and it is the full-weight dense checkpoint available locally.
+defaults:
+  - nixl_e2e_qwen35_4b
+  - _self_
+
+test:
+  train_engine_type: fsdp2
+  megatron:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+
+logging:
+  path: ${oc.env:PSRL_REPO}/tests/nixl/log/qwen35_4b_fsdp2
+
+model:
+  path: ${oc.env:PSRL_REPO}/models/Qwen3-8B

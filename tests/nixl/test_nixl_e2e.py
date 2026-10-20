@@ -603,10 +603,21 @@ class TrainClientActor:
             if requantize is not None:
                 requantize()
         rest = {k: v for k, v in self.state_dict.items() if k not in self.fp8_keys}
+        # Only tensors held in the train dtype are cast on publish. Parameters that are
+        # deliberately float32 (Qwen3.5's GDN A_log, router bias) travel as they are, so
+        # drawing their hash in the gen dtype would describe a conversion that never
+        # happens and the judge would reconstruct different bits.
+        cast, plain = {}, {}
+        for key, entry in rest.items():
+            tensor = _first_tensor(entry)
+            (cast if tensor.is_floating_point() and tensor.dtype == self.train_dtype else plain)[key] = entry
         self.judge_version = version
         self.coord_offsets = {
-            key: version for key in fill_by_layout(rest, self.sharding, version=version, wire_dtype=self.gen_dtype)
+            key: version for key in fill_by_layout(cast, self.sharding, version=version, wire_dtype=self.gen_dtype)
         }
+        self.coord_offsets.update(
+            {key: version for key in fill_by_layout(plain, self.sharding, version=version, wire_dtype=None)}
+        )
         self.coord_offsets.update({key: version for key in self.fp8_keys})
 
     def get_coord_offsets(self):
@@ -889,15 +900,24 @@ class GenClientActor:
         if model_config.get("gen_quantization") == "fp8":
             # The block FP8 that verl's rollout uses, quantised online from a bf16 checkpoint.
             llm_kwargs["quantization"] = "fp8"
+            ignored_layers = [
+                f"model.layers.{i}.mlp.gate" for i in range(model_config.get("num_layers", 128))
+            ]
+            # Some projections cannot be block-quantised and tensor-parallel at once: a
+            # shard that cuts a quantisation tile has no valid scale view. Qwen3.5's
+            # GDN `in_proj_ba` has 64 output rows, quantised in 64-row tiles, so TP2
+            # would cut one; it stays bf16, as it must in production too.
+            for suffix in model_config.get("fp8_ignored_layer_suffixes", []):
+                ignored_layers += [
+                    f"model.layers.{i}.{suffix}" for i in range(model_config.get("num_layers", 128))
+                ]
             llm_kwargs["hf_overrides"] = {
                 "quantization_config": {
                     "quant_method": "fp8",
                     "activation_scheme": "dynamic",
                     "fmt": "e4m3",
                     "weight_block_size": [128, 128],
-                    "ignored_layers": [
-                        f"model.layers.{i}.mlp.gate" for i in range(model_config.get("num_layers", 128))
-                    ],
+                    "ignored_layers": ignored_layers,
                 }
             }
         if self.gpu_memory_utilization is not None:

@@ -1,0 +1,42 @@
+# @package _global_
+#
+# Qwen3-235B-A22B (128 experts, 94 layers) over direct supply: the largest MoE the
+# two-node pool can hold. Train EP8 x TP1 puts one expert shard per rank; the rollout
+# runs TP4. This cell exists to measure byte volume and descriptor count at a scale
+# where the O(#shards) costs would show up.
+defaults:
+  - nixl_e2e_1node
+  - _self_
+
+test:
+  num_train: 8
+  num_gen: 8
+  direct_supply: true
+  rounds: 2
+  megatron:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    # No training happens in the judge, and at this size the DDP gradient buffer is
+    # what runs the card out of memory, not the weights.
+    wrap_with_ddp: false
+  gen:
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
+    # 235B bf16 is ~59 GiB per TP4 rank, so vLLM needs most of the card before it
+    # will reserve any KV blocks at all.
+    gpu_memory_utilization: 0.85
+    load_format: dummy
+
+model:
+  path: ${oc.env:PSRL_MATRIX_MODELS}/Qwen3-235B-A22B-text
+  trust_remote_code: false
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
+  pairwise_descriptors: false
+
+logging:
+  path: ${oc.env:PSRL_REPO}/tests/nixl/log/qwen3_235b_a22b

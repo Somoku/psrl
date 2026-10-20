@@ -1,0 +1,37 @@
+# @package _global_
+#
+# Qwen3.5-27B (full-attention 24 heads / 4 KV heads + GDN layers) over direct supply,
+# TP4 on both sides. Larger dense sibling of the 4B cell: more layers, wider
+# intermediate, a different head geometry, and enough bytes that per-client bandwidth
+# rather than setup dominates the steady-state pull.
+defaults:
+  - nixl_e2e_1node
+  - _self_
+
+test:
+  num_train: 8
+  num_gen: 8
+  direct_supply: true
+  rounds: 2
+  megatron:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+  gen:
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    load_format: dummy
+
+model:
+  path: ${oc.env:PSRL_MATRIX_MODELS}/Qwen3.5-27B-text
+  trust_remote_code: false
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
+  pairwise_descriptors: false
+
+logging:
+  path: ${oc.env:PSRL_REPO}/tests/nixl/log/qwen35_27b

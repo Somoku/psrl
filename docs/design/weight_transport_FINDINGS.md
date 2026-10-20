@@ -786,3 +786,45 @@ round 1 0.109 s、round 2 0.041 s（单 client 0.038 s，213–243 GB/s），
 **复杂度。** 注册成本从 O(模型分配数 × 每次切换) 降为 0（同节点）或 O(跨节点客户端)；
 导入成本 O(实际读取的分配数)，与 fleet 规模无关；数据面同节点 P2P 390 GB/s，跨节点仍是
 NIXL/RDMA。vLLM 作为 source 的 VMM 导出（`cuMemGetHandleForAddressRange`）是后续项。
+
+### 13.5 colocate rollout + train（生产部署，已落地）
+
+`qwen3_8b_megatron_direct_colocate.sh` 与 `qwen3_8b_megatron_direct.sh` 对齐（GSM8K、
+batch 16、rollout_N 8、TP4/DP2、10 步、val@0/5/10），只把 rollout 放到 trainer 的同一
+组 GPU 上：8 个 vLLM TP1 实例与 8 个 train rank 共卡，8 个 validate 实例在切换时唤醒。
+资源池按 train 0.6 / rollout 0.3 / validate 0.09 的 Ray 份额分配，使每张卡每种角色最多
+一个 worker（任意两个同角色 bundle 都放不下）。三个实现要点：
+
+1. **初始化顺序**：共享 GPU 时 rollout 服务器必须在 trainer 加载权重**之前**初始化。
+   原先 rollout 与 trainer 并行初始化，等 vLLM 按空闲显存规划 KV 时 trainer 已占约
+   27 GiB，部分卡只剩 2.56 GiB，`max_model_len=40960` 需要 5.62 GiB 直接启动失败。
+   现在先初始化 validate（睡下）、再 rollout、最后 actor；同时 `max_model_len` 设为
+   prompt+response = 10240，并按 0.3 的 `gpu_memory_utilization` 规划 KV。
+2. **显存共存**：trainer 与 rollout 常驻（约 65 GiB/卡，KV 9.48 GiB/实例）；validate
+   在训练期间睡眠，切换时 trainer 先让出显存再唤醒 validate。第一次全量运行用 0.45
+   利用率时，第 5 步 validate 唤醒在 CuMem `create_and_map` 处 OOM；降到 0.3 后 10 步
+   全程通过。
+3. **权重传输**：同一套同节点 IPC。16.38 GB/实例的拉取 **0.078–0.083 s**（约 200 GB/s/
+   实例），validate 与 rollout 全部跳过 NIXL 注册（12 条 skip，0 条 register，0 次
+   deferred）。
+
+**实测（Qwen3-8B/GSM8K，10 步，单节点 8 卡）：**
+
+| 指标 | colocate（8 卡） | direct（16 卡，同配置 bf16 基线） |
+|---|---|---|
+| 初始验证 acc | **0.1766** | 0.1706 |
+| 最终验证 acc | **0.6429** | 0.6998 |
+| 逐步 reward 均值 | 0.381 | 0.370 |
+| validate 切换 | **2.74 / 2.24 / 1.53 s** | 2.65 / 2.12 / 1.66 s |
+| trainer 切换 | **1.22 / 1.27 / 1.82 s** | 1.32 / 1.33 / 1.39 s |
+| 训练 step 时间 | 85–91 s | 24–36 s |
+| 错误 / 回退 | **0 / 0** | 0 / 0 |
+
+结论：**权重传输精度与部署方式无关**——初始验证与同精度 direct 基线差 0.6 pp，
+逐步 reward 均值一致；切换开销也一致，因为两种部署都走同节点 IPC。colocate 用一半
+GPU 换取约 2.5–3× 的 step 时间，这是共卡的预期代价，不是传输开销。最终验证 0.6429 vs
+0.6998 是单种子 RL 的批次组成差异（训练 reward 反而略高），不能归因于权重传输。
+
+**边界**：validate 与 rollout 分时（validate 唤醒前 trainer 让出显存），train 与
+rollout 是**空间共驻**而非分时；两个 vLLM 角色同时唤醒会超出 96 GiB 卡（实测 OOM），
+因此 validate 的 `max_model_len`/利用率必须按共享卡配置。

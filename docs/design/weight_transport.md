@@ -3313,6 +3313,32 @@ fp8gen e2e（GSM8K）validate 切换 **2.57 / 2.11 / 1.90 s**（原 7.3–9.8 s�
 0.1986 / 0.6884（历史 0.1948–0.1986 / 0.6520–0.6672）。
 
 
+#### 3.7.5 rollout 与 training 共卡部署
+
+`psrl.colocate_rollout_and_train=True` 让 rollout、train、validate 共享一个节点的 8 张卡。
+资源池按 **train 0.6 / rollout 0.3 / validate 0.09** 的 Ray 份额分配；份额只是调度账目，
+仍然每 worker 独占一张卡的可见性。取值保证每张卡每种角色最多一个 worker：任意两个同角色
+bundle 都放不下（`2×0.6>1`、`0.6+2×0.3>1`、`0.6+0.3+2×0.09>1`），份额之和 0.99 留出
+浮点余量。
+
+三条与传输无关但决定该部署能否成立的约束，均已实测：
+
+1. **初始化顺序**。rollout 服务器必须在 trainer 加载权重之前初始化，否则 vLLM 按已被
+   trainer 占用的空闲显存规划 KV，部分卡直接启动失败。共卡模式下先初始化 validate
+   （随后睡眠）、再 rollout、最后 actor；不共卡时仍保持 rollout 与 trainer 并行初始化。
+2. **显存配额**。trainer 与 rollout 常驻（约 65 GiB/卡），validate 训练时睡眠、切换时
+   唤醒；两个 vLLM 角色同时唤醒会超出 96 GiB 卡。因此 rollout/validate 的
+   `gpu_memory_utilization` 取 0.3，`max_model_len` 取 prompt+response（10240），而不是
+   模型原生的 40960。
+3. **权重传输不变**。共卡读者的源仍在同节点，走 §3.7.4 的 IPC：16.38 GB/实例
+   **0.078–0.083 s**，全部跳过 NIXL 注册，0 次回退。validate/trainer 切换分别
+   **2.74/1.53 s** 与 **1.22/1.82 s**，与不共卡部署相同——共卡不增加传输开销。
+
+实测（Qwen3-8B/GSM8K，10 步，8 卡）：初始/最终验证 **0.1766 / 0.6429**；同配置 bf16
+不共卡基线 0.1706 / 0.6998，逐步 reward 均值 0.381 vs 0.370。精度与传输一致，最终验证
+差异来自单种子 RL 的批次组成；训练 step 85–91 s vs 24–36 s，是共卡分摊 GPU 的预期代价
+（8 卡 vs 16 卡）。完整数据见 `weight_transport_FINDINGS.md` §13.5。
+
 ### 3.8 FP8：贯穿全链路的 wire 格式
 
 > 本节给出 wire 形态与精度矩阵。**两种目标组合（rollout FP8 + train FP8、

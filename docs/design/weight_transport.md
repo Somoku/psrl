@@ -3339,6 +3339,30 @@ bundle 都放不下（`2×0.6>1`、`0.6+2×0.3>1`、`0.6+0.3+2×0.09>1`），份
 差异来自单种子 RL 的批次组成；训练 step 85–91 s vs 24–36 s，是共卡分摊 GPU 的预期代价
 （8 卡 vs 16 卡）。完整数据见 `weight_transport_FINDINGS.md` §13.5。
 
+#### 3.7.6 架构 / 并行 / 精度覆盖（实测）
+
+传输层用坐标判据逐位验收（train 按 `(key, version, 全局坐标)` 填哈希，rollout 按自己的
+sharding 复核，两轮换版本），不跑完整 RL。覆盖与结论：
+
+| 维度 | 已验证的取值 |
+|---|---|
+| 架构 | Qwen3 dense（GQA）、Qwen3.5 dense（GDN 混合注意力）、Qwen3-MoE、Qwen3.5-MoE（256 experts）、DeepSeek-V3/MLA（Moonlight） |
+| 训练引擎 | Megatron、FSDP2 |
+| 并行 | TP 对齐（TP4→TP4、TP2→TP2）、TP 不匹配（TP4→TP2，staging 1 GiB）、EP4/EP8→TP2/TP4 重分片；共卡与 disaggregate |
+| 精度 | bf16→bf16、bf16→block FP8（位与 scale 逐位） |
+| 规模 | 486.78 GB/次同步（Qwen3-235B-A22B，8 个 gen GPU，稳态 3.29 s） |
+
+复杂度在实测范围内保持设计值：payload O(#shards)（单 client 0.07–0.4 MB）、
+注册 O(跨节点客户端 × allocator segment)（共卡为 0；235B 427 region/12.5 s 一次）、
+导入 O(读者实际触达的 allocation)（0.22 ms/handle）、wire 时间随字节线性
+（148 GB/s 聚合、8 读者）。EP→TP 重分片的发布副本是唯一随模型/并行组合增长的新项
+（235B 23.5 GiB/rank），由 `publish_copy_budget_mb` 封顶，需按显存预算配置。
+
+两个架构边界（均已写入 FINDINGS §14）：GDN 的 `linear_attn.in_proj_ba` 在 block FP8 下
+必须保持 bf16（64 行 tile 不能被 TP shard 切开），因此 **Qwen3.5 的 FP8-train + FP8-rollout
+组合当前不支持**；DeepSeek-V3/MLA 的 `W_UK_T`/`W_UV` 是 `kv_b_proj` 的运行时吸收结果，
+不参与传输，读者在每次 pull 落地后由 `_refresh_derived_weights` 重新吸收。
+
 ### 3.8 FP8：贯穿全链路的 wire 格式
 
 > 本节给出 wire 形态与精度矩阵。**两种目标组合（rollout FP8 + train FP8、

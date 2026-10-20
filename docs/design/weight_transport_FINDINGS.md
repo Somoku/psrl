@@ -828,3 +828,71 @@ GPU 换取约 2.5–3× 的 step 时间，这是共卡的预期代价，不是�
 **边界**：validate 与 rollout 分时（validate 唤醒前 trainer 让出显存），train 与
 rollout 是**空间共驻**而非分时；两个 vLLM 角色同时唤醒会超出 96 GiB 卡（实测 OOM），
 因此 validate 的 `max_model_len`/利用率必须按共享卡配置。
+
+---
+
+## 14. 模型架构 / 并行 / 精度覆盖矩阵（传输层逐位判据）
+
+本节只测**权重传输层**：train 侧按 `(key, version, 全局坐标)` 填哈希，rollout 侧按自己声明的
+sharding 逐位复核，两轮（第二轮换版本）。不跑完整 RL，因此每个格子 10–20 分钟可完成。
+所有格子使用 `tests/nixl/config/` 下的对应 yaml，判据见 §1。
+
+| # | 模型（架构） | 训练引擎 / 并行 | rollout 并行 | 部署 | 判据 | wire | round1 / round2 | descriptor | 备注 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | Qwen3-8B（GQA dense） | Megatron TP2 | TP2 | 2 节点 | 399/399 | 32.76 GB | — / 0.440 s | 723 | 基线 |
+| 2 | Qwen3.5-4B（GDN 混合 + 全程注意） | Megatron TP4 | TP2（TP 不匹配） | 2 节点 | 523/538 | 38.73 GB | 0.689 / 0.268 s | 1,053 | staged 1,040 MiB |
+| 3 | Qwen3.5-27B（GDN 混合，64 层） | Megatron TP4 | TP4 | 2 节点 | 1,043/1,058 | 107.59 GB | 1.199 / 0.888 s | 899 | — |
+| 4 | Qwen3.5-35B-A3B（MoE 256 experts） | Megatron TP2·EP4 | TP2 | 2 节点 | 853/873 | 84.18 GB | 3.125 / 0.999 s | 31,485 | publish 5,120 MiB/rank |
+| 5 | Qwen3-30B-A3B（Qwen3-MoE 128） | Megatron TP2·EP4 | TP2 | 2 节点 | 579/579 | 70.41 GB | — / 0.824 s | 19,011 | publish 4,608 MiB/rank |
+| 6 | Moonlight-16B-A3B（MLA + 64 experts） | Megatron TP2·EP4 | TP2 | 2 节点 | 403/403 | 41.59 GB | 1.501 / 0.441 s | 5,317 | publish 2,288 MiB/rank |
+| 7 | Qwen3-8B（FSDP2） | FSDP2 world 8 | TP2 | 2 节点 | 399/399 | 65.53 GB | 3.873 / 0.440 s | 2,464 | 另一套 converter |
+| 8 | Qwen3.5-4B + block FP8 rollout | Megatron TP4 (bf16) | TP2, FP8 | 2 节点 | 523/538 | 24.48 GB | 0.681 / 0.183 s | 3,869 | FP8 位与 scale 逐位 |
+| 9 | Qwen3.5-4B 共卡 | Megatron TP2 | TP2 | 单节点 8 卡共卡 | 523/538 | 38.73 GB | 0.038 / **0.010 s** | **0** | 全部 IPC，3.9 TB/s |
+| 10 | Qwen3-235B-A22B（128 experts, 94 层） | Megatron TP1·EP8 | TP4 | 2 节点 | 1,131/1,131 | **486.78 GB** | 8.131 / **3.292 s** | 36,865 | publish 23.5 GiB/rank；注册 427 region/12.5 s |
+
+**结论。**
+
+- **架构覆盖**：dense（Qwen3、Qwen3.5）、MoE（Qwen3-MoE、Qwen3.5-MoE、DeepSeek-V3/MLA）、
+  混合线性注意（Qwen3.5 的 GDN + full attention）、GQA、MLA 全部逐位通过。
+- **训练引擎**：Megatron 与 FSDP2 都通过；FSDP2 的 wire 字节是 Megatron TP2 的 2×
+  （8 rank 各持 1/8，4 个 rollout 实例各读全模型），steady-state 带宽相同。
+- **并行组合**：TP 对齐（27B TP4→TP4）与不匹配（4B TP4→TP2）都正确；不匹配时走
+  1 GiB staging，round2 仍达 21 GB/s/client。EP4→TP2 的 MoE 重分片由发布副本承担
+  （0.6–5 GiB/rank），descriptor 数从 3 万级降到可接受范围。
+- **精度**：bf16→bf16、bf16→block FP8 均逐位通过。FP8 下 wire 从 38.73 降到 24.48 GB
+  （≈ 0.63×；A_log、`in_proj_ba` 等非 2D/小块参数保持 bf16）。
+- **部署**：2 节点 disaggregate（NIXL，84–149 GB/s 聚合）与单节点共卡（IPC，3.9 TB/s）
+  都正确；共卡时 descriptor=0、staging=0。
+- **规模**：235B-A22B 一次同步搬运 **486.78 GB**，稳态 3.29 s（148 GB/s 聚合），
+  1,131 个 key 逐位通过。两节点 8 个 gen GPU 的字节量已经到半 TB 级，wire 时间随字节
+  线性增长；万卡 + TB MoE 下每个 rollout 节点只读自己 shard 份额，注册是每 wake 一次
+  （跨节点客户端）或 0（共卡），控制面载荷仍是 O(#shards)（235B 单 client info
+  0.4 MB 级）。235B 的 EP8→TP4 重分片产生 12,408 个 fragment、23.5 GiB/rank 发布副本，
+  这是该规模下唯一需要按显存预算调参的新项（`publish_copy_budget_mb`）。
+
+**新发现与修复。**
+
+1. **Tied embeddings 的判据缺陷（测试侧）**：Qwen3.5-4B 默认 `tie_word_embeddings=true`，
+   Megatron 的 `embed_tokens` 与 `lm_head` 共享同一 storage；判据按 key 独立填哈希时后填的
+   覆盖前一个，`lm_head` 必然「不一致」。测试改用 untied 配置（`tie_word_embeddings=false`）。
+   传输本身对共享 storage 是正确的（同一张量写一次）。
+2. **fp32 例外的判据缺陷（测试侧）**：GDN 的 `A_log` 必须以 float32 传输；原先按 rollout
+   dtype（bf16）生成哈希并上采到 fp32，判据却按 fp32 重建，必然不一致。现在只对
+   train dtype 的张量做 wire cast，fp32 参数按原 dtype 填/判。
+3. **DeepSeek-V3/MLA 的 converter 缺口（真实缺陷，已修）**：
+   - vLLM MLA 在 `process_weights_after_loading` 里把 `kv_b_proj.weight` 吸收成
+     `W_UK_T`/`W_UV` 参数；它们不是 checkpoint 权重，原 converter 会要求传输。
+     现在 layout 排除这两个 key，并在**每次 pull 落地后**由
+     `vLLMWorkerExtension._refresh_derived_weights` 重新吸收——否则 trainer 更新
+     `kv_b_proj` 后 rollout 的 decode 仍用旧矩阵。
+   - Fused experts 模块把 router bias 以 `experts.routed_experts.*` 别名再注册一次，
+     converter 会合成一个 trainer 没有的 `experts.routed_gate.*` key。现在排除别名，
+     只传 canonical 的 `mlp.gate.e_score_correction_bias`。
+   - `e_score_correction_bias` 是逐 expert 的 1D 参数，vLLM converter 原先只允许
+     w13/w2，已改为「非 w2 的 expert 参数沿 expert 维切分」。
+4. **GDN + block FP8 的 tile 约束（边界）**：`linear_attn.in_proj_ba` 输出 64 行，
+   vLLM 以 64 行 tile 量化；TP2 的 32 行 shard 会切进 tile，`scale_view` 拒绝。
+   该层必须保持 bf16（`ignored_layers`）；已加入测试配置并在文档记录。FP8-native
+   训练（TE `fp8_param`）对 GDN 同样会把它量化，与 rollout 的 bf16 例外冲突，
+   因此 **Qwen3.5 的 FP8-train + FP8-rollout 组合当前不支持**；Qwen3-8B 的该组合
+   已在 §12.1 端到端通过。

@@ -18,6 +18,9 @@ SUPPORTED_EVICTION_POLICIES = ("LRU", "IsolatedLRU", "noop")
 # Prefix-retention policies the MP server accepts.
 SUPPORTED_PIN_POLICIES = ("off", "all", "tagged")
 
+# Worker-to-server KV transfer paths the MP connector accepts.
+SUPPORTED_MP_TRANSFER_MODES = ("auto", "engine_driven", "lmcache_driven")
+
 # Alignment the MP server accepts. RDMA reads want a larger power of two.
 MIN_L1_ALIGN_BYTES = 4096
 RECOMMENDED_P2P_ALIGN_BYTES = 65536
@@ -157,6 +160,13 @@ class LMCacheConfig:
     # Interval in seconds between connector heartbeats to the MP server.
     heartbeat_interval_s: int = 10
 
+    # How KV reaches the MP server. PSRL runs vLLM's sleep mode, whose KV
+    # allocations are owned by a pluggable allocator and are not exportable
+    # through legacy CUDA IPC handles, so the worker-side copy path is the
+    # compatible default. Set "lmcache_driven" to request zero-copy IPC on a
+    # deployment whose KV memory is exportable.
+    mp_transfer_mode: str = "engine_driven"
+
     # Submit the LMCache lookup as soon as a request is scheduled.
     eager_prefetch: bool = False
 
@@ -242,12 +252,16 @@ class LMCacheConfig:
             dict: Keys consumed by `LMCacheMPConnector` via
                 `kv_transfer_config.kv_connector_extra_config`.
         """
+        assert self.mp_transfer_mode in SUPPORTED_MP_TRANSFER_MODES, (
+            f"mp_transfer_mode must be one of {SUPPORTED_MP_TRANSFER_MODES}, got {self.mp_transfer_mode!r}."
+        )
         extra = {
             "lmcache.mp.host": self.server_host,
             "lmcache.mp.port": self.server_port,
             "lmcache.mp.mq_timeout": self.mq_timeout_s,
             "lmcache.mp.heartbeat_interval": self.heartbeat_interval_s,
             "lmcache.mp.eager_prefetch": self.eager_prefetch,
+            "lmcache.mp.mp_transfer_mode": self.mp_transfer_mode,
         }
         if self.mp_server_urls:
             # The connector prefers `server_urls` over `host`/`port`, and

@@ -68,6 +68,7 @@ sequenceDiagram
 | `multi_version_kv` | bool | `True` | Tag entries with the model version |
 | `enable_p2p` | bool | `False` | Enable cross-instance KV transfer |
 | `p2p_transfer_engine` | str | `nixl` | Transfer engine, `nixl` or `mooncake_te` |
+| `mp_transfer_mode` | str | `engine_driven` | Worker-to-server path: `engine_driven` (compatible with sleep-mode allocations), `lmcache_driven` (zero-copy CUDA IPC), or `auto` |
 | `coordinator_host` | str | `${psrl.ps_manager_ip}` | Host of the shared MP coordinator |
 | `coordinator_port` | int | `9300` | Coordinator HTTP port |
 | `coordinator_event_reporting` | bool | `False` | Stream cache events to the coordinator |

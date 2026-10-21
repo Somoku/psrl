@@ -45,6 +45,20 @@ class TestLMCacheConfig:
         assert transfer["kv_role"] == "kv_both"
         assert transfer["kv_connector_extra_config"]["lmcache.mp.port"] == 5555
 
+    def test_engine_kwargs_use_the_copy_path_by_default(self):
+        # vLLM sleep-mode KV allocations are not CUDA-IPC exportable.
+        extra = LMCacheConfig(enable=True, server_port=5555).to_connector_extra_config()
+        assert extra["lmcache.mp.mp_transfer_mode"] == "engine_driven"
+
+    def test_engine_kwargs_forward_an_explicit_transfer_mode(self):
+        config = LMCacheConfig(enable=True, server_port=5555, mp_transfer_mode="lmcache_driven")
+        assert config.to_connector_extra_config()["lmcache.mp.mp_transfer_mode"] == "lmcache_driven"
+
+    def test_engine_kwargs_reject_an_unknown_transfer_mode(self):
+        config = LMCacheConfig(enable=True, server_port=5555, mp_transfer_mode="copy")
+        with pytest.raises(AssertionError):
+            config.to_engine_kwargs()
+
     def test_engine_kwargs_leave_hma_to_vllm(self):
         """LMCacheMPConnector declares SupportsHMA, so it must not be forced off."""
         kwargs = LMCacheConfig(enable=True, server_port=5555).to_engine_kwargs()

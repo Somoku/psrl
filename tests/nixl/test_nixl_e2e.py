@@ -544,7 +544,6 @@ class TrainClientActor:
                     ps_client_name,
                     key,
                     "train_push",
-                    merge_and_cache_xfer=False,
                 )
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, ps_client_name, shards_to_transfer))
@@ -562,7 +561,6 @@ class TrainClientActor:
                     )
                 )
         ray.get(futures)
-        # self.client.merge_and_finish_cached_xfer()
 
     def advance_version(self, base: int):
         """Refill the weights at a new coordinate base, standing in for a train step.

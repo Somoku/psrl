@@ -17,7 +17,7 @@ from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
 from psrl.utils.common.patch_utils import apply_tms_patch
-from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_tensor
 from psrl.utils.nixl import fp8_kernels
 from psrl.utils.nixl.block_fp8 import FP8_DTYPE, SCALE_SUFFIX, quantize_blockwise, scale_shape
 from psrl.utils.nixl.chunk_notify import ChunkCompletionPublisher, ChunkCompletionWaiter
@@ -36,7 +36,6 @@ from psrl.utils.nixl.nixl_spec import (
     NIXLTensorInfo,
 )
 from psrl.utils.nixl.partial_md import conn_info_only
-from psrl.utils.nixl.prepped_xfer import PreppedXferCache
 from psrl.utils.nixl.read_geometry import contiguous_strides, run_count
 from psrl.utils.nixl.strided_desc import (
     STRIDED_ROW_BUDGET,
@@ -152,23 +151,6 @@ def make_xfer_tag(
     return "\0".join((tag, src_client, tgt, key, ",".join(map(str, shard_idx)))).encode()
 
 
-@dataclass
-class PostedXfer:
-    """A transfer that NIXL has accepted but not yet completed.
-
-    Returned by `NIXLStorageClient.post_cached_xfer` so the caller can keep working
-    while the bytes move, then pass the batch to `wait_posted_xfer`. Carries the
-    identifying fields purely so failures and timeouts can name the transfer.
-    """
-
-    handle: object
-    op_type: str
-    tag: str
-    target_client: str
-    desc_count: int
-    posted_at: float
-
-
 class NIXLStorageClient:
     def __init__(
         self,
@@ -206,6 +188,11 @@ class NIXLStorageClient:
         )  # None means no pinned temp memory
         self.client_group_id = client_group_id
         self.enable_tms_for_temp_buffers = nixl_config.enable_tms_for_temp_buffers and use_gpu
+
+        self.merge_contiguous_xfer = bool(nixl_config.get("merge_contiguous_xfer", True))
+        self.enable_prepared_dlist = bool(nixl_config.get("enable_prepared_dlist", False))
+        self.capture_telemetry = bool(nixl_config.get("capture_telemetry", False))
+        self.enable_nixl_telemetry = bool(nixl_config.get("enable_nixl_telemetry", False))
         if self.enable_tms_for_temp_buffers:
             if torch_memory_saver is None:
                 raise ImportError("torch_memory_saver is required when nixl_config.enable_tms_for_temp_buffers=True")
@@ -220,13 +207,25 @@ class NIXLStorageClient:
             worker_ip = get_worker_info()[0]
             port_scanner = get_port_scanner(worker_ip)
             self.client_port = ray.get(port_scanner.find_free_port.remote())
-            self.agent = nixl_agent(self.client_name, nixl_agent_config(enable_prog_thread, True, self.client_port))
+            self.agent = nixl_agent(
+                self.client_name,
+                nixl_agent_config(
+                    enable_prog_thread=enable_prog_thread,
+                    enable_listen_thread=True,
+                    listen_port=self.client_port,
+                    capture_telemetry=self.capture_telemetry,
+                ),
+            )
         else:
             self.agent = binded_agent
 
         self.local_client_info: NIXLClientInfo | None = None
         self.xfer_handles: dict[bytes, Any] = {}  # xfer_tag -> handle
         self._is_connected = False
+
+        # Prepared descriptor-list cache for the opt-in prepared-transfer path.
+        # Cache key -> `(prepared_dlist_handle, shard_indices_in_dlist_order)`.
+        self._prepared_dlists: dict[tuple, tuple] = {}
 
         # Original tensor mapping for contiguous tensors
         self._original_tensor_mapping: dict[
@@ -279,7 +278,6 @@ class NIXLStorageClient:
 
         # Prepped dlists for the hot path (item A1). Holds raw addresses, so it must be
         # cleared whenever registered memory changes -- see deregister_all_local_tensors.
-        self._prepped_cache: PreppedXferCache | None = PreppedXferCache(self.agent, self.client_name)
         # Matches the meta server's budget. These were 1200s against the server's 600s,
         # so the server gave up first and the clients were still waiting when it did --
         # which is why a slow start reports "Timeout waiting for agents" on the server and
@@ -320,11 +318,10 @@ class NIXLStorageClient:
         self.strided_desc_slice_map: dict[tuple[str, tuple[int, ...]], tuple[StridedLayout, str]] = {}
         self.temp_desc_slice_map: dict[tuple[str, tuple[int, ...]], tuple[int, int, int, str]] = {}
 
-        # Optimization: merge multiple contiguous transfers into one
-        self._cached_xfer_descs = []  # [("READ", local_desc, remote_desc, target_agent, tag, target_client)]
-
         # Meta data
         self._target_client_connected: dict[str, bool] = {}  # target_client -> connected
+        #: Targets whose full descriptor metadata (rkeys) this agent has loaded.
+        self._full_meta_loaded: set[str] = set()
         self._unified_sharding_dict: dict[str, NIXLSharding] | None = None  # key -> sharding
         self._unified_sharding_dict_fetched = False
         self._all_client_infos: dict[str, NIXLClientInfo] = {}  # name -> ClientInfo
@@ -772,12 +769,6 @@ class NIXLStorageClient:
         """Get original tensor mapping"""
         return self._original_tensor_mapping
 
-    def get_temp_tensor_mapping(
-        self,
-    ) -> dict[tuple[str, tuple[int, ...]], torch.Tensor]:
-        """Get temp tensor mapping"""
-        return self._temp_tensor_mapping
-
     def _track_registered_desc(self, desc) -> bytes:
         """Cache registered desc object and return serialized bytes."""
         desc_bytes = self.agent.get_serialized_descs(desc)
@@ -908,11 +899,6 @@ class NIXLStorageClient:
                 self._ipc_export_errors.append(error)
         return base_addr, nbytes, device_id, mem_type
 
-    def _build_xfer_desc_bytes(self, addr: int, length: int, device_id: int, mem_type: str) -> bytes:
-        """Build serialized xfer descriptors for a contiguous slice."""
-        xfer_descs = self.agent.get_xfer_descs([(addr, length, device_id)], mem_type=mem_type)
-        return self.agent.get_serialized_descs(xfer_descs)
-
     def _deserialize_to_xfer_descs(self, desc_bytes: bytes):
         """Deserialize desc bytes and ensure xfer descriptors are returned."""
         descs = self.agent.deserialize_descs(desc_bytes)
@@ -962,12 +948,6 @@ class NIXLStorageClient:
         split = nixlBind.nixlXferDList(single.getType(), rows)
         return (split, remote_desc) if n_local == 1 else (local_desc, split)
 
-    def _ensure_xfer_descs(self, descs):
-        """Normalize reg/xfer descriptors to xfer list."""
-        if isinstance(descs, nixlBind.nixlRegDList):
-            return descs.trim()
-        return descs
-
     def _deregister_all_descs(self):
         """Deregister all cached descriptors in one pass."""
         if not self._registered_descs:
@@ -976,45 +956,6 @@ class NIXLStorageClient:
         self._registered_descs = {}
         for desc in descs:
             self.agent.deregister_memory(desc)
-
-    @deprecated("Do NOT use this on regions from _record_region_registration.")
-    def _merge_contiguous_regions(
-        self, region_list: list[tuple[int, int, int, str]]
-    ) -> list[tuple[int, int, int, str]]:
-        """Merge contiguous memory regions to reduce registration calls.
-
-        Args:
-            region_list: List of (base_addr, nbytes, device_id, mem_type) tuples.
-        Returns:
-            Merged list of (base_addr, nbytes, device_id, mem_type) tuples.
-
-        NOTE(lhy): Do NOT use this on regions from _record_region_registration.
-        Each entry there is one untyped_storage = one cudaMalloc allocation.
-        Merging two virtually-adjacent allocations is invalid for RDMA/UCX:
-        the pin is per-allocation, so check_xfer_state returns ERR at transfer time.
-        The deduplication in _reg_regions already provides the only safe batching:
-        multiple tensor views sharing the same storage are registered exactly once.
-        """
-        if not region_list:
-            return []
-
-        # Sort regions by base address
-        sorted_regions = sorted(region_list, key=lambda x: x[0])
-        merged_regions = []
-        current_base, current_size, current_device_id, current_mem_type = sorted_regions[0]
-
-        for base, size, device_id, mem_type in sorted_regions[1:]:
-            if current_base + current_size == base and current_device_id == device_id and current_mem_type == mem_type:
-                # Merge contiguous region
-                current_size += size
-            else:
-                # Append the current region and start a new one
-                merged_regions.append((current_base, current_size, current_device_id, current_mem_type))
-                current_base, current_size, current_device_id, current_mem_type = base, size, device_id, mem_type
-
-        # Append the last region
-        merged_regions.append((current_base, current_size, current_device_id, current_mem_type))
-        return merged_regions
 
     def _register_memory(self, mem_type: str, reg_list: list[tuple[int, int, int, str]]) -> nixlBind.nixlRegDList:
         """Register memory with NIXL."""
@@ -1074,46 +1015,6 @@ class NIXLStorageClient:
             tensor_infos[key].desc_bytes_list[local_pos] = desc_bytes
             written += 1
         return written
-
-    def _ensure_all_tensor_registered_low_level(self):
-        """Check if all tensors are registered."""
-        for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
-            slice_addr, slice_len, device_id, mem_type = slice_info
-            desc = nixlBind.nixlRegDList(self.agent.nixl_mems[mem_type], [(slice_addr, slice_len, device_id, "")])
-            try:
-                query_info = self.agent.query_memory(desc, "UCX")
-            except Exception as e:
-                raise RuntimeError(
-                    f"{self.client_name}: tensor {key} shard {shard_idx} is a contiguous tensor "
-                    f"but not registered: {e}"
-                ) from e
-            if query_info is None:
-                raise RuntimeError(
-                    f"{self.client_name}: tensor {key} shard {shard_idx} is a contiguous tensor but not registered"
-                )
-            else:
-                psrl_logger.info(
-                    f"{self.client_name}: tensor {key} shard {shard_idx} is a contiguous tensor and registered, "
-                    f"query info: {query_info}"
-                )
-        for (key, shard_idx), slice_info in self.temp_desc_slice_map.items():
-            slice_addr, slice_len, device_id, mem_type = slice_info
-            desc = nixlBind.nixlRegDList(self.agent.nixl_mems[mem_type], [(slice_addr, slice_len, device_id, "")])
-            try:
-                query_info = self.agent.query_memory(desc, "UCX")
-            except Exception as e:
-                raise RuntimeError(
-                    f"{self.client_name}: tensor {key} shard {shard_idx} is a temp tensor but not registered: {e}"
-                ) from e
-            if query_info is None:
-                raise RuntimeError(
-                    f"{self.client_name}: tensor {key} shard {shard_idx} is a temp tensor but not registered"
-                )
-            else:
-                psrl_logger.info(
-                    f"{self.client_name}: tensor {key} shard {shard_idx} is a temp tensor and registered, "
-                    f"query info: {query_info}"
-                )
 
     def _ensure_all_tensor_registered_high_level(self):
         """Check if all tensors are covered by our registered regions (no NIXL query)."""
@@ -1270,6 +1171,9 @@ class NIXLStorageClient:
         """
 
         self._drop_pull_engine()
+        # Re-registration changes the addresses/rkeys behind local descriptors, so
+        # cached prepared descriptor lists are invalid.
+        self._release_prepared_dlists(side="local")
         if not meta_only:
             # The allocator's segment map must be current before any region is recorded:
             # the map is what maps an allocation to the extent registered for it.
@@ -1955,14 +1859,10 @@ class NIXLStorageClient:
     def deregister_local_tensors(self):
         """Deregister all local tensors"""
         assert self.local_client_info is not None, "Local client info not registered."
+        # Release transfer/prepared handles before their backing memory is gone.
+        self._release_all_xfer_handles("deregister_local_tensors")
+        self._release_prepared_dlists(side="local")
         self._drop_pull_engine()
-        # Prepped dlists embed the addresses they were built from, so they must go before
-        # the memory they point at. Submitting a stale handle after deregistration would
-        # read freed pages -- the same hazard registration_epoch guards remotely
-        # (design 3.7.3.0a), except here it is entirely local and preventable.
-        prepped_cache = getattr(self, "_prepped_cache", None)
-        if prepped_cache is not None:
-            prepped_cache.clear()
         # An imported mapping outliving its exporter's allocation is the same hazard
         # `registration_epoch` guards against remotely, so drop them with the registrations.
         self._region_mapper = None
@@ -1988,7 +1888,6 @@ class NIXLStorageClient:
             self._pinned_slot_running_write_xfer = {}
             self._read_contiguous_event_cache = {}
             self._write_contiguous_event_cache = {}
-            self.xfer_handles = {}
             self._reg_regions = set()
             self._mtype_to_reg_region_lists = {}
             self._segment_extents = []
@@ -2153,6 +2052,7 @@ class NIXLStorageClient:
                     for client_name, info_bytes in all_client_infos.items():
                         info = NIXLClientInfo.deserialize(info_bytes)
                         self._all_client_infos[client_name] = info
+                        self._release_prepared_dlists(side="remote", target_client=client_name)
                     # Process communication plan
                     if notification_data.get("comm_plan"):
                         self._comm_plan = NIXLCommPlan.deserialize(notification_data["comm_plan"])
@@ -2164,6 +2064,7 @@ class NIXLStorageClient:
                     for client_name, info_bytes in all_client_infos.items():
                         info = NIXLClientInfo.deserialize(info_bytes)
                         self._all_client_infos[client_name] = info
+                        self._release_prepared_dlists(side="remote", target_client=client_name)
                         self._comm_plan = None
                 _t2 = time.time()
                 psrl_logger.info(
@@ -2253,9 +2154,12 @@ class NIXLStorageClient:
                         # came from; the next read imports the new handles (design 3.7.4).
                         if self._region_mapper is not None:
                             self._region_mapper.forget(client_name)
+                        # Prepared descriptor lists embed the old remote addresses too.
+                        self._release_prepared_dlists(side="remote", target_client=client_name)
                         # Re-registered memory carries new keys, so the remote metadata must be loaded again.
                         if self._target_client_connected.pop(client_name, False):
                             self.agent.remove_remote_agent(self._all_client_infos[client_name].agent_name)
+                        self._full_meta_loaded.discard(client_name)
                         self._drop_pull_engine()
                         self._all_temp_mappings[client_name] = info_and_temp_mapping["temp_mapping"]
                     already_recved_agents.add(agent_name)
@@ -2415,6 +2319,7 @@ class NIXLStorageClient:
                 except Exception as e:
                     psrl_logger.error(f"Error adding remote agent (descriptors) {target_client}: {e}")
                     raise e
+                self._full_meta_loaded.add(target_client)
         else:
             # Backward-compatible path: old client or meta-only registration.
             try:
@@ -2422,7 +2327,345 @@ class NIXLStorageClient:
             except Exception as e:
                 psrl_logger.error(f"Error adding remote agent {target_client}: {e}")
                 raise e
+            self._full_meta_loaded.add(target_client)
         self._target_client_connected[target_client] = True
+
+    def _ensure_full_metadata(self, target_client: str) -> None:
+        """Load the target's full descriptor metadata when this client addresses it.
+
+        The two-stage join loads only the connection bytes for non-readers, because
+        most clients neither read nor write a given peer. A WRITE addresses the
+        target's memory exactly as a READ does, and PS broadcast is the case the comm
+        plan does not describe at all (PS-to-PS), so the writer was left with a link
+        but no rkeys and NIXL answered NIXL_ERR_NOT_FOUND.
+        """
+        loaded = getattr(self, "_full_meta_loaded", None)
+        if loaded is None:
+            loaded = self._full_meta_loaded = set()
+        if target_client in loaded:
+            return
+        info = self._all_client_infos[target_client]
+        if info.meta:
+            self.agent.add_remote_agent(info.meta)
+        loaded.add(target_client)
+
+    def _release_xfer_handle(self, handle, context: str) -> None:
+        """Best-effort release of a NIXL transfer handle that is no longer needed."""
+        if handle is None:
+            return
+        try:
+            self.agent.release_xfer_handle(handle)
+        except Exception as e:
+            psrl_logger.warning(f"{self.client_name}: Failed to release xfer handle ({context}): {e}.")
+
+    def _release_all_xfer_handles(self, context: str) -> None:
+        """Release every tracked transfer handle.
+
+        Callers wait before reaching the sync points that invoke this, so a
+        still-pending handle means a call site forgot to wait. It is released on
+        a best-effort basis so one stuck request cannot block teardown.
+        """
+        if not self.xfer_handles:
+            return
+        for handle_key, handle in list(self.xfer_handles.items()):
+            self._release_xfer_handle(handle, f"{context}: {handle_key!r}")
+        self.xfer_handles = {}
+
+    def _release_prepared_dlists(self, side: str | None = None, target_client: str | None = None) -> None:
+        """Release cached prepared descriptor-list handles, optionally filtered.
+
+        Relies on the sync-point contract: no transfer built from a released list
+        is in flight when this runs.
+        """
+        for cache_key in list(self._prepared_dlists.keys()):
+            if side is not None and cache_key[0] != side:
+                continue
+            if target_client is not None and cache_key[1] != target_client:
+                continue
+            handle, _shard_idxs = self._prepared_dlists.pop(cache_key)
+            try:
+                self.agent.release_dlist_handle(handle)
+            except Exception as e:
+                psrl_logger.warning(f"{self.client_name}: Failed to release prepared dlist {cache_key!r}: {e}.")
+
+    def _await_and_release(
+        self,
+        handle_key: bytes,
+        key: str,
+        tag: str,
+        op_type: str,
+        target_client: str | None,
+        shard_idx: tuple[int, ...] | None,
+        info: NIXLTensorInfo,
+        timeout: float,
+    ) -> None:
+        """Wait for a posted transfer and release its handle.
+
+        ``shard_idx`` is ``None`` for a merged group transfer and the concrete
+        shard index for a per-shard (non-contiguous) transfer. READ transfers
+        through a temporary buffer are copied back to the original tensor here.
+        """
+        handle = self.xfer_handles.pop(handle_key, None)
+        if handle is None:
+            return
+        start = time.time()
+        try:
+            while True:
+                try:
+                    state = self.agent.check_xfer_state(handle)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Checking transfer state for ({key!r}, {tag!r}, {op_type}, shard {shard_idx!r}) "
+                        f"from {self.client_name!r} to {target_client!r} failed: {e}."
+                    ) from e
+                if state == "ERR":
+                    raise RuntimeError(
+                        f"Transfer error for ({key!r}, {tag!r}, {op_type}, shard {shard_idx!r}) "
+                        f"from {self.client_name!r} to {target_client!r}."
+                    )
+                if state == "DONE":
+                    break
+                if time.time() - start > timeout:
+                    raise TimeoutError(
+                        f"Timed out waiting for transfer ({key!r}, {tag!r}, {op_type}, shard {shard_idx!r}) "
+                        f"from {self.client_name!r} to {target_client!r}."
+                    )
+                time.sleep(0.001)  # 1ms backoff to avoid CPU starvation on PS nodes at large scale
+
+            # For non-contiguous shards, sync data back to the original tensor after READ.
+            if op_type == "READ" and shard_idx is not None:
+                local_pos = info.sharding.shard_indices.index(shard_idx)
+                if info.desc_bytes_list[local_pos] is None:
+                    original_tensor = self._get_local_original_tensor(key, shard_idx)
+                    if original_tensor is None:
+                        raise RuntimeError(f"No original tensor mapping found for key {key!r} shard {shard_idx!r}.")
+                    contiguous_tensor = self._get_local_temp_tensor(key, shard_idx)
+                    if contiguous_tensor is None:
+                        raise RuntimeError(f"No temporary tensor mapping found for key {key!r} shard {shard_idx!r}.")
+                    self._read_contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
+                    original_tensor.data.copy_(contiguous_tensor)
+                    self._read_contiguous_event_cache[(key, shard_idx)].record()
+                    psrl_logger.debug(
+                        f"Copied temporary contiguous tensor back to the original non-contiguous tensor "
+                        f"for key {key!r} shard {shard_idx!r}."
+                    )
+
+            if self.enable_nixl_telemetry:
+                # Telemetry needs `NIXL_TELEMETRY_ENABLE=true`, so a missing exporter must not fail the transfer.
+                try:
+                    telem = self.agent.get_xfer_telemetry(handle)
+                    psrl_logger.info(
+                        f"[nixl_telemetry] {self.client_name} key {key!r} to {target_client} shard {shard_idx}: "
+                        f"{telem.totalBytes} bytes, {telem.descCount} descs, "
+                        f"post {telem.postDuration}us, xfer {telem.xferDuration}us."
+                    )
+                except Exception as e:
+                    psrl_logger.debug(f"{self.client_name}: NIXL telemetry unavailable for key {key!r}: {e}.")
+        finally:
+            self._release_xfer_handle(handle, f"({key}, {tag}, {op_type}, shard {shard_idx})")
+
+    def _post_contiguous_group(
+        self,
+        op_type: str,
+        target_agent: str,
+        target_client: str,
+        key: str,
+        tag: str,
+        shards_to_transfer: list[tuple[int, ...]],
+        local_info: NIXLTensorInfo,
+        remote_info: NIXLTensorInfo,
+    ) -> set[tuple[int, ...]]:
+        """Post one NIXL request covering all contiguous shards of a key.
+
+        Returns the shards covered so the caller transfers the remaining
+        non-contiguous shards individually through their temporary buffers.
+        """
+        local_pos_map = {s: i for i, s in enumerate(local_info.sharding.shard_indices)}
+        remote_pos_map = {s: i for i, s in enumerate(remote_info.sharding.shard_indices)}
+        entries: list[tuple[tuple[int, ...], Any, Any]] = []
+        for shard_idx in shards_to_transfer:
+            assert shard_idx in local_pos_map and shard_idx in remote_pos_map, (
+                f"Shard {shard_idx!r} not found in local or remote shards for key {key!r}."
+            )
+            local_pos = local_pos_map[shard_idx]
+            remote_pos = remote_pos_map[shard_idx]
+            local_desc_bytes = local_info.desc_bytes_list[local_pos]
+            if local_desc_bytes is None:
+                continue
+            assert local_info.shard_meta_infos[local_pos].can_xfer_to(remote_info.shard_meta_infos[remote_pos]), (
+                f"Shard meta info mismatch for key {key!r} shard {shard_idx!r}: "
+                f"{local_info.shard_meta_infos[local_pos]!r} != {remote_info.shard_meta_infos[remote_pos]!r}."
+            )
+            remote_desc_bytes = remote_info.desc_bytes_list[remote_pos]
+            if remote_desc_bytes is None:
+                raise RuntimeError(
+                    f"{self.client_name}: Remote descriptor must be contiguous for client transfer, "
+                    f"but key {key!r} shard {shard_idx!r} in {target_client!r} is non-contiguous."
+                )
+            assert local_info.get_shard_size_bytes(local_pos) == remote_info.get_shard_size_bytes(remote_pos), (
+                f"Shard size mismatch for key {key!r} shard {shard_idx!r}: "
+                f"{local_info.get_shard_size_bytes(local_pos)} != {remote_info.get_shard_size_bytes(remote_pos)}."
+            )
+            entries.append(
+                (
+                    shard_idx,
+                    self._deserialize_to_xfer_descs(local_desc_bytes),
+                    self._deserialize_to_xfer_descs(remote_desc_bytes),
+                )
+            )
+        if not entries:
+            return set()
+        local_type = entries[0][1].getType()
+        remote_type = entries[0][2].getType()
+        merged: list[tuple[tuple[int, ...], Any, Any]] = []
+        for entry in entries:
+            _shard_idx, local_desc, remote_desc = entry
+            # A shard whose pair needs a descriptor split (the per-shard path's
+            # `_align_desc_counts`) or that spans a different memory type cannot join a
+            # single merged request. It stays with the caller's per-shard loop, which is
+            # the correct general path; merging is the fast path, not a requirement.
+            if local_desc.descCount() != 1 or remote_desc.descCount() != 1:
+                continue
+            if local_desc.getType() != local_type or remote_desc.getType() != remote_type:
+                continue
+            merged.append(entry)
+        if not merged:
+            return set()
+        local_desc_tuples = [local_desc[0] for _, local_desc, _ in merged]
+        remote_desc_tuples = [remote_desc[0] for _, _, remote_desc in merged]
+        group_shard_idxs = [shard_idx for shard_idx, _, _ in merged]
+        group_tag = make_xfer_tag(tag, self.client_name, target_client, key)
+        try:
+            if group_tag not in self.xfer_handles:
+                if self.enable_prepared_dlist:
+                    handle = self._make_prepped_group_xfer(
+                        op_type,
+                        target_agent,
+                        target_client,
+                        key,
+                        group_shard_idxs,
+                        local_type,
+                        remote_type,
+                        group_tag,
+                    )
+                else:
+                    merged_local = nixlBind.nixlXferDList(local_type, local_desc_tuples)
+                    merged_remote = nixlBind.nixlXferDList(remote_type, remote_desc_tuples)
+                    handle = self.agent.initialize_xfer(op_type, merged_local, merged_remote, target_agent, group_tag)
+                self.xfer_handles[group_tag] = handle
+            handle = self.xfer_handles[group_tag]
+        except Exception as e:
+            psrl_logger.warning(
+                f"{self.client_name}: merged {op_type} to {target_client!r} for key {key!r} could not be "
+                f"prepared ({e!r}); falling back to per-shard transfers."
+            )
+            self.xfer_handles.pop(group_tag, None)
+            return set()
+        if not handle:
+            psrl_logger.warning(
+                f"{self.client_name}: merged {op_type} to {target_client!r} for key {key!r} produced no handle; "
+                "falling back to per-shard transfers."
+            )
+            self.xfer_handles.pop(group_tag, None)
+            return set()
+        try:
+            state = self.agent.transfer(handle)
+        except Exception as e:
+            psrl_logger.warning(
+                f"{self.client_name}: posting merged {op_type} to {target_client!r} for key {key!r} failed "
+                f"({e!r}); falling back to per-shard transfers."
+            )
+            self.xfer_handles.pop(group_tag, None)
+            return set()
+        if state == "ERR":
+            psrl_logger.warning(
+                f"{self.client_name}: posting merged {op_type} to {target_client!r} for key {key!r} returned ERR; "
+                "falling back to per-shard transfers."
+            )
+            self.xfer_handles.pop(group_tag, None)
+            return set()
+        psrl_logger.debug(
+            f"{self.client_name}: Posted client {op_type} group transfer to {target_client!r} "
+            f"for key {key!r} with {len(merged)} merged shards."
+        )
+        return set(group_shard_idxs)
+
+    def _make_prepped_group_xfer(
+        self,
+        op_type: str,
+        target_agent: str,
+        target_client: str,
+        key: str,
+        shard_indices: list[tuple[int, ...]],
+        local_type: int,
+        remote_type: int,
+        notif_msg: bytes,
+    ):
+        """Create a transfer from cached prepared descriptor lists for both sides."""
+        local_handle, local_shards = self._get_or_create_prepared_dlist(
+            "local",
+            target_agent,
+            "",
+            key,
+            local_type,
+            self.local_client_info.get_tensor_info(key),
+        )
+        remote_handle, remote_shards = self._get_or_create_prepared_dlist(
+            "remote",
+            target_agent,
+            target_client,
+            key,
+            remote_type,
+            self._all_client_infos[target_client].get_tensor_info(key),
+        )
+        try:
+            local_indices = [local_shards.index(s) for s in shard_indices]
+            remote_indices = [remote_shards.index(s) for s in shard_indices]
+        except ValueError as e:
+            raise RuntimeError(
+                f"{self.client_name}: Prepared dlist for key {key!r} is missing a requested shard: {e}."
+            ) from e
+        return self.agent.make_prepped_xfer(
+            op_type, local_handle, local_indices, remote_handle, remote_indices, notif_msg
+        )
+
+    def _get_or_create_prepared_dlist(
+        self,
+        side: str,
+        target_agent: str,
+        target_client: str,
+        key: str,
+        mem_type: int,
+        info: NIXLTensorInfo,
+    ):
+        """Return `(prepared_dlist_handle, shard_indices)` for one side, building it on first use."""
+        cache_key = (side, target_client, key, mem_type)
+        cached = self._prepared_dlists.get(cache_key)
+        if cached is not None:
+            return cached
+        desc_tuples, shard_idxs = [], []
+        for pos, shard_idx in enumerate(info.sharding.shard_indices):
+            desc_bytes = info.desc_bytes_list[pos]
+            if desc_bytes is None:
+                continue
+            desc = self._deserialize_to_xfer_descs(desc_bytes)
+            if desc.getType() != mem_type:
+                continue
+            if desc.descCount() != 1:
+                # Served by the per-shard path, not by a prepared group dlist.
+                continue
+            desc_tuples.append(desc[0])
+            shard_idxs.append(shard_idx)
+        if not desc_tuples:
+            raise RuntimeError(
+                f"{self.client_name}: No {side} descriptors of memory type {mem_type!r} found for key {key!r}."
+            )
+        xfer_list = nixlBind.nixlXferDList(mem_type, desc_tuples)
+        agent_name = "NIXL_INIT_AGENT" if side == "local" else target_agent
+        handle = self.agent.prep_xfer_dlist(agent_name, xfer_list)
+        entry = (handle, shard_idxs)
+        self._prepared_dlists[cache_key] = entry
+        return entry
 
     def client_read(
         self,
@@ -2431,9 +2674,12 @@ class NIXLStorageClient:
         key: str,
         tag: str,
         comm_plan: NIXLCommPlan | None = None,
-        merge_and_cache_xfer: bool | None = False,
     ) -> list[tuple[int, ...]]:
         """Read from another client, supports shard alignment and communication plan.
+
+        All contiguous shards of the key are posted as a single merged NIXL
+        request. Non-contiguous shards fall back to one request per shard
+        through their temporary buffers.
 
         Args:
             target_agent: NIXL agent name of the remote worker to read from.
@@ -2444,13 +2690,10 @@ class NIXLStorageClient:
             comm_plan: Optional explicit communication plan overriding
                 ``self._comm_plan``. When ``None`` the stored plan is used.
                 A supplied plan takes precedence.
-            merge_and_cache_xfer: When ``True``, accumulate descriptors into an
-                internal cache for later bulk submission via
-                ``merge_and_finish_cached_xfer()`` instead of posting the
-                transfer immediately.
         """
         plan = comm_plan or self._comm_plan
         self._ensure_client_info_fetched(target_client)
+        self._ensure_full_metadata(target_client)
         # A source legitimately may not hold this key: under direct supply (item D3) the
         # sources are train ranks, and pipeline parallelism gives each rank only its own
         # stage's keys. Reading `remote_info` before consulting the plan raised KeyError
@@ -2476,8 +2719,15 @@ class NIXLStorageClient:
             for shard_idx in local_info.sharding.shard_indices:
                 if shard_idx in remote_info.sharding.shard_indices:
                     shards_to_transfer.append(shard_idx)
+        handled_by_group: set[tuple[int, ...]] = set()
+        if self.merge_contiguous_xfer:
+            handled_by_group = self._post_contiguous_group(
+                "READ", target_agent, target_client, key, tag, shards_to_transfer, local_info, remote_info
+            )
 
         for shard_idx in shards_to_transfer:
+            if shard_idx in handled_by_group:
+                continue
             assert (
                 shard_idx in local_info.sharding.shard_indices and shard_idx in remote_info.sharding.shard_indices
             ), f"Shard {shard_idx} not found in local or remote shards for key {key}"
@@ -2504,7 +2754,7 @@ class NIXLStorageClient:
                 observed.add(remote_version)
 
             # For non-contiguous shards, record the running key and shard idx
-            is_contiguous, running_key, running_shard_idx = True, None, None
+            running_key, running_shard_idx = None, None
             _phase_t0 = time.time()
             # Get local descriptor (check if it's a temporary one)
             local_desc_bytes = local_info.desc_bytes_list[local_pos]
@@ -2514,7 +2764,6 @@ class NIXLStorageClient:
                     f"{local_info.shard_meta_infos[local_pos]} != {remote_info.shard_meta_infos[remote_pos]}"
                 )
             else:
-                is_contiguous = False
                 meta_info = self._temp_meta_mapping[(key, shard_idx)]
                 assert meta_info.can_xfer_to(remote_info.shard_meta_infos[remote_pos]), (
                     f"Temporary shard meta info mismatch for key {key} shard {shard_idx}: "
@@ -2571,10 +2820,6 @@ class NIXLStorageClient:
             _phase_t0 = time.time()
             local_desc, remote_desc = self._align_desc_counts(local_desc, remote_desc)
             self._read_phase_us["align"] += (time.time() - _phase_t0) * 1e6
-            # NOTE(claude): Continue after caching so every shard is processed before return.
-            if merge_and_cache_xfer and is_contiguous:
-                self._cached_xfer_descs.append(("READ", local_desc, remote_desc, target_agent, tag, target_client))
-                continue
             # Real xfer
             _phase_t0 = time.time()
             try:
@@ -2622,10 +2867,6 @@ class NIXLStorageClient:
                     f"{self.client_name} posting client READ transfer to {target_client} failed for "
                     f"key {key} shard {shard_idx}."
                 )
-        # When merging and caching, transfers are deferred to merge_and_finish_cached_xfer.
-        # Return [] so the caller knows there is nothing to wait on immediately.
-        if merge_and_cache_xfer:
-            return []
         return shards_to_transfer
 
     def client_write(
@@ -2635,10 +2876,13 @@ class NIXLStorageClient:
         key: str,
         tag: str,
         comm_plan: NIXLCommPlan | None = None,
-        merge_and_cache_xfer: bool | None = False,
         use_comm_plan: bool = True,
     ) -> list[tuple[int, ...]]:
         """Write to another client, supports shard alignment and communication plan.
+
+        All contiguous shards of the key are posted as a single merged NIXL
+        request. Non-contiguous shards fall back to one request per shard
+        through their temporary buffers.
 
         Args:
             target_agent: NIXL agent name of the remote worker to write to.
@@ -2649,10 +2893,6 @@ class NIXLStorageClient:
             comm_plan: Optional explicit communication plan overriding
                 ``self._comm_plan``. When ``None`` the stored plan is used.
                 A supplied plan takes precedence.
-            merge_and_cache_xfer: When ``True``, accumulate descriptors into an
-                internal cache for later bulk submission via
-                ``merge_and_finish_cached_xfer()`` instead of posting the
-                transfer immediately.
             use_comm_plan: If ``False``, ignore both ``comm_plan`` and the stored
                 ``self._comm_plan`` and fall back to default shard-alignment.
                 Useful when writing to a target that is not covered by the
@@ -2660,6 +2900,7 @@ class NIXLStorageClient:
         """
         plan = (comm_plan or self._comm_plan) if use_comm_plan else None
         self._ensure_client_info_fetched(target_client)
+        self._ensure_full_metadata(target_client)
         # Symmetric with `client_read`: a target that does not hold the key has nothing
         # to receive. Unreachable today, since every push target is a PS worker holding
         # every key -- but leaving the two paths asymmetric is how the read side came to
@@ -2679,7 +2920,15 @@ class NIXLStorageClient:
             for shard_idx in local_info.sharding.shard_indices:
                 if shard_idx in remote_info.sharding.shard_indices:
                     shards_to_transfer.append(shard_idx)
+        handled_by_group: set[tuple[int, ...]] = set()
+        if self.merge_contiguous_xfer:
+            handled_by_group = self._post_contiguous_group(
+                "WRITE", target_agent, target_client, key, tag, shards_to_transfer, local_info, remote_info
+            )
+
         for shard_idx in shards_to_transfer:
+            if shard_idx in handled_by_group:
+                continue
             assert (
                 shard_idx in local_info.sharding.shard_indices and shard_idx in remote_info.sharding.shard_indices
             ), f"Shard {shard_idx} not found in local or remote shards for key {key}"
@@ -2687,7 +2936,6 @@ class NIXLStorageClient:
             remote_pos = remote_info.sharding.shard_indices.index(shard_idx)
 
             # Check if local shard is non-contiguous and needs data copying
-            is_contiguous = True
             local_desc_bytes = local_info.desc_bytes_list[local_pos]
             if local_desc_bytes is not None:
                 assert local_info.shard_meta_infos[local_pos].can_xfer_to(remote_info.shard_meta_infos[remote_pos]), (
@@ -2695,7 +2943,6 @@ class NIXLStorageClient:
                     f"{local_info.shard_meta_infos[local_pos]} != {remote_info.shard_meta_infos[remote_pos]}"
                 )
             else:
-                is_contiguous = False
                 meta_info = self._temp_meta_mapping[(key, shard_idx)]
                 assert meta_info.can_xfer_to(remote_info.shard_meta_infos[remote_pos]), (
                     f"Temporary shard meta info mismatch for key {key} shard {shard_idx}: "
@@ -2768,11 +3015,6 @@ class NIXLStorageClient:
             local_desc = self._deserialize_to_xfer_descs(local_desc_bytes)
             remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
             local_desc, remote_desc = self._align_desc_counts(local_desc, remote_desc)
-            # NOTE(claude): Use continue (not return) here so all shards are processed before returning.
-            # Returning inside the loop would silently skip all remaining shards for this key.
-            if merge_and_cache_xfer and is_contiguous:
-                self._cached_xfer_descs.append(("WRITE", local_desc, remote_desc, target_agent, tag, target_client))
-                continue
             # Real xfer
             try:
                 if (key, shard_idx) in self._write_contiguous_event_cache:
@@ -2806,252 +3048,15 @@ class NIXLStorageClient:
                     f"{self.client_name} posting client WRITE transfer to {target_client} failed for "
                     f"key {key} shard {shard_idx}."
                 )
-        # When merging and caching, transfers are deferred to merge_and_finish_cached_xfer.
-        # Return [] so the caller knows there is nothing to wait on immediately.
-        if merge_and_cache_xfer:
-            return []
         return shards_to_transfer
 
     def clear_intermediate_cached_data(self):
-        """Clear intermediate cached data."""
+        """Clear per-cycle intermediate state and release any leftover handles."""
         self._pinned_slot_running_read_xfer.clear()
         self._pinned_slot_running_write_xfer.clear()
         self._read_contiguous_event_cache.clear()
         self._write_contiguous_event_cache.clear()
-        self.xfer_handles.clear()
-
-    # NOTE(lhy): Merge fragmented transfers into one low level NIXL operation.
-    def merge_and_finish_cached_xfer(self, timeout: float = 1200.0):
-        """Merge, post, and wait for cached transfers.
-
-        Equivalent to ``wait_posted_xfer(post_cached_xfer(), timeout)``. Kept for
-        callers that have nothing to overlap; anything that wants a software pipeline
-        must use the two halves separately, because this one does not return until
-        the last byte has landed.
-        """
-        self.wait_posted_xfer(self.post_cached_xfer(), timeout=timeout)
-
-    def post_cached_xfer(self) -> list[PostedXfer]:
-        """Merge cached descriptors, post the transfers, and return without waiting.
-
-        Splitting post from wait is what makes round-based pipelining possible at
-        all: while these transfers are in flight the caller can cast the next chunk
-        and post it, so RDMA overlaps the cast and format work. The previous combined
-        implementation entered its completion-polling loop before returning, which
-        serialised ``post(i) -> wait(i) -> post(i+1)`` and left the design's depth-2
-        double buffer with nowhere to live (design doc 3.6.4).
-        """
-        posted: list[PostedXfer] = []
-        if not getattr(self, "_cached_xfer_descs", None):
-            self._cached_xfer_descs = []
-            return posted
-
-        # Group by (op_type, target_client, tag) so each group becomes one NIXL op.
-        grouped: dict = {}
-        for (
-            op_type,
-            local_desc,
-            remote_desc,
-            target_agent,
-            tag,
-            target_client,
-        ) in self._cached_xfer_descs:
-            # Both sides must agree in count, which `_align_desc_counts` has already
-            # guaranteed at cache time by splitting whichever side had one descriptor.
-            # The counts themselves may be any size: a strided shard expands to one
-            # descriptor per row (item A2), so 4096-descriptor entries are normal rather
-            # than exceptional.
-            #
-            # This used to assert `descCount() == 1`, which was not a NIXL limit but a
-            # consequence of the accumulation below only ever taking `desc[0]` -- the
-            # assertion existed to stop the other rows being dropped silently. Taking
-            # all of them removes the need for it, and is what lets strided shards reach
-            # the prepped path at all. Without this, a client whose shards are strided
-            # could only submit one read at a time, which the cluster breakdown showed
-            # to be the dominant cost (post_peer 4.1s against wait_peer 0.007s).
-            local_count, remote_count = local_desc.descCount(), remote_desc.descCount()
-            assert local_count == remote_count, (
-                f"Local and remote descriptor counts must match, "
-                f"but found {local_count} and {remote_count} "
-                f"for op type {op_type} target client {target_client} tag {tag}"
-            )
-            bucket = grouped.setdefault(op_type, {}).setdefault(target_client, {})
-            if tag not in bucket:
-                bucket[tag] = [
-                    {
-                        "mem_type": local_desc.getType(),
-                        "descs": [local_desc[i] for i in range(local_count)],
-                    },
-                    {
-                        "mem_type": remote_desc.getType(),
-                        "descs": [remote_desc[i] for i in range(remote_count)],
-                    },
-                    target_agent,
-                ]
-            else:
-                assert (
-                    bucket[tag][0]["mem_type"] == local_desc.getType()
-                    and bucket[tag][1]["mem_type"] == remote_desc.getType()
-                ), (
-                    f"Mem type mismatch for op type {op_type} target client {target_client} tag {tag}: "
-                    f"{bucket[tag][0]['mem_type']} != {local_desc.getType()} or "
-                    f"{bucket[tag][1]['mem_type']} != {remote_desc.getType()}"
-                )
-                bucket[tag][0]["descs"].extend(local_desc[i] for i in range(local_count))
-                bucket[tag][1]["descs"].extend(remote_desc[i] for i in range(remote_count))
-                assert target_agent == bucket[tag][2], (
-                    f"Target agent mismatch for op type {op_type} target client {target_client} tag {tag}: "
-                    f"{target_agent} != {bucket[tag][2]}"
-                )
-
-        for op_type, target_client_dict in grouped.items():
-            for target_client, tag_dict in target_client_dict.items():
-                for tag, (local_meta, remote_meta, target_agent) in tag_dict.items():
-                    handle = self._initialize_merged_xfer(
-                        op_type, local_meta, remote_meta, target_agent, tag, target_client
-                    )
-                    self._post_merged_xfer(handle, op_type, tag, target_client, len(local_meta["descs"]))
-                    posted.append(
-                        PostedXfer(
-                            handle=handle,
-                            op_type=op_type,
-                            tag=tag,
-                            target_client=target_client,
-                            desc_count=len(local_meta["descs"]),
-                            posted_at=time.time(),
-                        )
-                    )
-
-        self._cached_xfer_descs = []
-        return posted
-
-    def _initialize_merged_xfer(self, op_type, local_meta, remote_meta, target_agent, tag, target_client):
-        """Create one NIXL transfer handle for a merged descriptor group.
-
-        Prefers the prepped path, which ships only an index array per submission rather
-        than re-serialising the descriptor list: measured 6-28x cheaper, widening with
-        descriptor count (`tests/nixl/bench_nixl_prepped_xfer.result.json`). Falls back
-        to `initialize_xfer` when prepping is unavailable, so a NIXL build without the
-        ndarray overload still works -- at the old cost.
-        """
-        notif = make_xfer_tag(tag, self.client_name, target_client, f"merged_xfer_for_{tag}")
-        descriptor_count = len(local_meta["descs"])
-
-        # getattr, not direct access: the cache is created in __init__, but clients are
-        # also built via __new__ in tests and in the deprecated workers, and a missing
-        # attribute should degrade to the old path rather than raise.
-        if getattr(self, "_prepped_cache", None) is not None:
-            try:
-                start_time = time.time()
-                handle = self._prepped_cache.make_xfer(
-                    op_type,
-                    target_agent,
-                    local_meta["mem_type"],
-                    local_meta["descs"],
-                    remote_meta["mem_type"],
-                    remote_meta["descs"],
-                    notif,
-                )
-                psrl_logger.debug(
-                    f"{self.client_name} composed prepped {op_type} transfer to {target_client} "
-                    f"for tag {tag} with {descriptor_count} descriptors, "
-                    f"time: {time.time() - start_time}s"
-                )
-                return handle
-            except Exception as e:
-                # Disable rather than retry: if prepping cannot work here it will fail
-                # for every subsequent group too, and silently paying the cost twice per
-                # round would be worse than paying the old cost once.
-                psrl_logger.warning(
-                    f"{self.client_name}: prepped submission unavailable ({type(e).__name__}: {e}); "
-                    f"falling back to initialize_xfer for the rest of this client"
-                )
-                self._prepped_cache.clear()
-                self._prepped_cache = None
-
-        try:
-            merged_local_desc = nixlBind.nixlXferDList(local_meta["mem_type"], local_meta["descs"])
-            merged_remote_desc = nixlBind.nixlXferDList(remote_meta["mem_type"], remote_meta["descs"])
-            start_time = time.time()
-            handle = self.agent.initialize_xfer(
-                op_type,
-                merged_local_desc,
-                merged_remote_desc,
-                target_agent,
-                notif,
-            )
-            psrl_logger.debug(
-                f"{self.client_name} created client {op_type} transfer to {target_client} "
-                f"for tag {tag} with {merged_local_desc.descCount()} merged descriptors, "
-                f"time: {time.time() - start_time}s"
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"{self.client_name} creating client {op_type} transfer to {target_client} failed "
-                f"for tag {tag}: {e}, target agent: {target_agent}"
-            ) from e
-        if not handle:
-            raise RuntimeError(
-                f"{self.client_name} creating client {op_type} transfer to {target_client} failed for tag {tag}."
-            )
-        return handle
-
-    def _post_merged_xfer(self, handle, op_type, tag, target_client, desc_count):
-        """Submit an already-created transfer. Returns as soon as NIXL accepts it."""
-        start_time = time.time()
-        try:
-            state = self.agent.transfer(handle)
-        except Exception as e:
-            raise RuntimeError(
-                f"{self.client_name} posting client {op_type} transfer to {target_client} failed "
-                f"for tag {tag} with {desc_count} merged descriptors: {e}"
-            ) from e
-        if state == "ERR":
-            raise RuntimeError(
-                f"{self.client_name} posting client {op_type} transfer to {target_client} failed "
-                f"for tag {tag} with {desc_count} merged descriptors."
-            )
-        psrl_logger.info(
-            f"{self.client_name} posted client {op_type} transfer to {target_client} for tag {tag} "
-            f"with {desc_count} merged descriptors, time: {time.time() - start_time}s"
-        )
-
-    def wait_posted_xfer(self, posted: list[PostedXfer], timeout: float = 1200.0) -> None:
-        """Block until every transfer in ``posted`` completes.
-
-        Completion is polled with a 1ms backoff, which bounds how small a chunk can
-        usefully be: each round pays up to 1ms, so at 512MB (~10ms of RDMA on a
-        170GB/s node) that is ~10% overhead and below ~256MB it dominates. Design doc
-        3.6.4 records the notification-based alternative that removes this floor.
-        """
-        for entry in posted:
-            start = time.time()
-            while True:
-                try:
-                    state = self.agent.check_xfer_state(entry.handle)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Checking merged transfer state for ({entry.op_type}, {entry.target_client}, "
-                        f"{entry.tag}) from {self.client_name} failed: {e}"
-                    ) from e
-                if state == "ERR":
-                    raise RuntimeError(
-                        f"Merged transfer error for ({entry.op_type}, {entry.target_client}, {entry.tag}) "
-                        f"from {self.client_name}"
-                    )
-                if state == "DONE":
-                    break
-                if time.time() - start > timeout:
-                    raise TimeoutError(
-                        f"Timeout waiting for merged transfer ({entry.op_type}, {entry.target_client}, "
-                        f"{entry.tag}) from {self.client_name}"
-                    )
-                time.sleep(0.001)  # 1ms backoff to avoid CPU starvation at large scale
-            psrl_logger.debug(
-                f"{self.client_name} finished client {entry.op_type} transfer to {entry.target_client} "
-                f"for tag {entry.tag} with {entry.desc_count} merged descriptors, "
-                f"time: {time.time() - start}s"
-            )
+        self._release_all_xfer_handles("clear_intermediate_cached_data")
 
     def wait(
         self,
@@ -3059,67 +3064,36 @@ class NIXLStorageClient:
         tag: str,
         op_type: str,
         target_client: str | None = None,
-        shard_idx: int | None = None,
+        shard_idx: tuple[int, ...] | None = None,
         timeout: float = 1800.0,
     ):
+        """Wait for the transfer(s) of a key and release their handles.
+
+        With ``shard_idx=None`` this waits for the merged contiguous group and
+        every per-shard non-contiguous transfer of the key. With a concrete
+        ``shard_idx`` it waits only for that shard's request (used for pinned
+        temp-buffer slot reuse).
         """
-        Wait for a transfer to be completed.
-        """
-        # Shard tag, wait for all shards
         info = self.local_client_info.get_tensor_info(key)
-        waiting_shard_indices = [shard_idx] if shard_idx is not None else info.sharding.shard_indices
-        for shard_idx in waiting_shard_indices:
-            handle = self.xfer_handles.get(make_xfer_tag(tag, self.client_name, target_client, key, shard_idx))
-            if handle is None:
+        if shard_idx is not None:
+            handle_key = make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
+            if handle_key in self.xfer_handles:
+                self._await_and_release(handle_key, key, tag, op_type, target_client, shard_idx, info, timeout)
+            else:
                 psrl_logger.debug(
                     f"Transfer ({key}, {tag}, {op_type}, shard {shard_idx}) "
                     f"from {self.client_name} to {target_client} not found, continue"
                 )
-                continue  # This shard did not do transfer
-            start = time.time()
-            while True:
-                try:
-                    state = self.agent.check_xfer_state(handle)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Checking transfer state for ({key}, {tag}, {op_type}, shard {shard_idx}) "
-                        f"from {self.client_name} to {target_client} failed: {e}"
-                    ) from e
-                if state == "ERR":
-                    raise RuntimeError(
-                        f"Transfer error for ({key}, {tag}, {op_type}, shard {shard_idx}) "
-                        f"from {self.client_name} to {target_client}"
-                    )
-                elif state == "DONE":
-                    # For non-contiguous shards, sync data back to original tensor after READ
-                    if op_type == "READ":
-                        local_pos = info.sharding.shard_indices.index(shard_idx)
-                        if info.desc_bytes_list[local_pos] is None:
-                            # Non-contiguous shard: copy data from temporary to original
-                            original_tensor = self._get_local_original_tensor(key, shard_idx)
-                            if original_tensor is None:
-                                raise RuntimeError(f"No original tensor mapping found for key {key} shard {shard_idx}")
-                            contiguous_tensor = self._get_local_temp_tensor(key, shard_idx)
-                            if contiguous_tensor is None:
-                                raise RuntimeError(
-                                    f"No temporary tensor mapping found for key {key} shard {shard_idx}"
-                                )
-                            # Copy data from temporary contiguous tensor back to original non-contiguous tensor
-                            self._read_contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
-                            original_tensor.data.copy_(contiguous_tensor)
-                            self._read_contiguous_event_cache[(key, shard_idx)].record()
-                            psrl_logger.debug(
-                                f"Copied data from temporary contiguous tensor to original "
-                                f"non-contiguous tensor for key {key} shard {shard_idx}"
-                            )
-                    self.xfer_handles.pop(make_xfer_tag(tag, self.client_name, target_client, key, shard_idx))
-                    break
-                if time.time() - start > timeout:
-                    raise TimeoutError(
-                        f"Timeout waiting for transfer ({key}, {tag}, {op_type}, shard {shard_idx}) "
-                        f"from {self.client_name} to {target_client}"
-                    )
-                time.sleep(0.001)  # 1ms backoff to avoid CPU starvation on PS nodes at large scale
+            return
+
+        # Whole-key wait: the merged contiguous group first, then any per-shard transfers.
+        group_key = make_xfer_tag(tag, self.client_name, target_client, key)
+        if group_key in self.xfer_handles:
+            self._await_and_release(group_key, key, tag, op_type, target_client, None, info, timeout)
+        for shard in info.sharding.shard_indices:
+            handle_key = make_xfer_tag(tag, self.client_name, target_client, key, shard)
+            if handle_key in self.xfer_handles:
+                self._await_and_release(handle_key, key, tag, op_type, target_client, shard, info, timeout)
 
     def load_state_dict_into_registered_tensors(
         self,
@@ -3274,7 +3248,10 @@ class NIXLStorageClient:
                 )
 
     def shutdown(self):
-        # Release temporary memory first
+        # Release handles before their backing memory is deregistered, so no
+        # stale-generation handle can outlive the remote metadata teardown.
+        self._release_all_xfer_handles("shutdown")
+        self._release_prepared_dlists()
         self._deregister_all_descs()
 
 
@@ -3314,7 +3291,15 @@ class NIXLMultiStorageClients:
         worker_ip = get_worker_info()[0]
         port_scanner = get_port_scanner(worker_ip)
         self.client_port = ray.get(port_scanner.find_free_port.remote())
-        self.agent = nixl_agent(self.agent_name, nixl_agent_config(True, True, self.client_port))
+        self.agent = nixl_agent(
+            self.agent_name,
+            nixl_agent_config(
+                enable_prog_thread=True,
+                enable_listen_thread=True,
+                listen_port=self.client_port,
+                capture_telemetry=bool(nixl_config.get("capture_telemetry", False)),
+            ),
+        )
 
         # Initialize multi clients
         self.multi_clients: list[NIXLStorageClient] = []
@@ -3346,10 +3331,6 @@ class NIXLMultiStorageClients:
             if client.client_name == client_name:
                 return client
         raise ValueError(f"Client {client_name} not found")
-
-    def release_temp_memory(self):
-        for client in self.multi_clients:
-            client.release_temp_memory()
 
     def connect_to_server(self, timeout: float | None = None):
         assert not self._is_connected, "Already connected to server"
@@ -3433,6 +3414,7 @@ class NIXLMultiStorageClients:
                 client._all_client_infos = self.multi_clients[0]._all_client_infos
                 client._comm_plan = self.multi_clients[0]._comm_plan
                 client._all_client_infos_fetched = True
+                client._release_prepared_dlists(side="remote")
 
     def wait_for_server_temp_mappings(self, timeout: float | None = None):
         assert self._is_connected, "Not connected to server"
@@ -3448,6 +3430,7 @@ class NIXLMultiStorageClients:
             for client in self.multi_clients[1:]:
                 client._all_client_infos = self.multi_clients[0]._all_client_infos
                 client._all_temp_mappings = self.multi_clients[0]._all_temp_mappings
+                client._release_prepared_dlists(side="remote")
 
     def broadcast_update_client_infos(self, dst_agent_names: list[str], update_client_names: list[str]):
         assert self._is_connected, "Not connected to server"
@@ -3487,43 +3470,17 @@ class NIXLMultiStorageClients:
         tag: str,
         op_type: str,
         target_client: str | None = None,
+        shard_idx: tuple[int, ...] | None = None,
         timeout: float = 1200.0,
     ):
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)
-        client.wait(key, tag, op_type, target_client, timeout)
+        client.wait(key, tag, op_type, target_client=target_client, shard_idx=shard_idx, timeout=timeout)
 
     def log_shard_info(self, label: str = "", max_elements: int = 8):
         """Call log_shard_info on every sub-client."""
         for client in self.multi_clients:
             client.log_shard_info(label=label, max_elements=max_elements)
-
-    def load_state_dict_into_clients(
-        self,
-        state_dict: dict[str, torch.Tensor],
-        shared: bool = True,
-    ) -> None:
-        """
-        Load *state_dict* weights into all registered sub-clients.
-
-        When *shared* is True (train and gen clients point at the same
-        underlying buffers), write the state dictionary only once into the first
-        client because the other client's
-        ``_original_tensor_mapping`` tensors share the same storage.
-
-        When *shared* is False each client receives an independent copy via
-        its own ``load_state_dict_into_registered_tensors`` call.
-
-        Args:
-            state_dict: ``{param_name: torch.Tensor}`` weights to load.
-            shared: Whether train/gen clients share underlying buffers.
-        """
-        if shared:
-            # Only the first client needs a copy because the others share storage.
-            self.multi_clients[0].load_state_dict_into_registered_tensors(state_dict)
-        else:
-            for client in self.multi_clients:
-                client.load_state_dict_into_registered_tensors(state_dict)
 
     def shutdown(self):
         # TODO(lhy): Avoid duplicate releases when clients share memory.

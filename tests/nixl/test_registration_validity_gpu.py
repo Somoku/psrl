@@ -61,13 +61,11 @@ def _client(agent, name: str):
     client._reg_regions = set()
     client._mtype_to_reg_region_lists = {}
     client._registered_descs = {}
-    client._cached_xfer_descs = []
     # Fields `deregister_local_tensors` touches. It asserts `local_client_info is not
     # None` up front -- deregistering before registration is a caller bug, not a
     # tolerated no-op -- and then clears this set.
     client.local_client_info = {}
     client.enable_tms_for_temp_buffers = True  # skips release_temp_memory()
-    client._prepped_cache = None
     client._pull_engine = None
     return client
 
@@ -255,29 +253,26 @@ class TestAddressChangeIsObserved:
 class TestDeregisterClearsBookkeeping:
     """Deregistration must leave no entry that could later alias live memory."""
 
-    def test_deregister_clears_prepped_cache_first(self, agent_pair):
-        """The prepped cache holds raw pointers, so it must be cleared before deregister.
+    def test_deregister_releases_transfer_and_dlist_handles(self, agent_pair):
+        """Handles embed the addresses they were built from, so they go before the memory.
 
-        Order matters: a prepped descriptor list that outlives its registration is a
-        dangling pointer the NIC would happily dereference.
+        A transfer or prepared dlist that outlives its registration is a dangling
+        pointer the NIC would happily dereference; the release also keeps a long-running
+        client from accumulating handles across steps.
         """
-        from psrl.utils.nixl.prepped_xfer import PreppedXferCache
-
         local, _peer = agent_pair
         client = _client(local, "pytest-local")
-        client._prepped_cache = PreppedXferCache(local, "pytest-local")
-        client._registered_descs = {}
+        client.xfer_handles = {"stale": object()}
+        client._prepared_dlists = {("local", "", "w", 0): (object(), [(0,)])}
 
         client.deregister_local_tensors()
 
-        assert client._prepped_cache is None or not getattr(
-            client._prepped_cache, "_dlists", {}
-        ), "prepped cache still holds dlists after deregistration"
+        assert client.xfer_handles == {}, "transfer handles survived deregistration"
+        assert client._prepared_dlists == {}, "prepared dlists survived deregistration"
 
     def test_deregister_is_idempotent(self, agent_pair):
         """Calling it twice must not raise: shutdown paths may retry."""
         local, _peer = agent_pair
         client = _client(local, "pytest-local")
-        client._prepped_cache = None
         client.deregister_local_tensors()
         client.deregister_local_tensors()

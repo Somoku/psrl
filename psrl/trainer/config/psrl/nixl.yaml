@@ -142,3 +142,16 @@ conflict_wait_budget_ms: 50.0
 # the bound raises, because the instance holds mixed bytes and generating from them is worse
 # than staying out of service for one sync.
 max_pull_attempts: 3
+# Merge all contiguous shards of a key into a single NIXL request per (op, target, key).
+# Disable to fall back to one NIXL request per shard.
+merge_contiguous_xfer: true
+
+# Cache prepared descriptor lists (`prep_xfer_dlist` + `make_prepped_xfer`) to avoid
+# re-preparing unchanged descriptors on every transfer.
+enable_prepared_dlist: true
+
+# Capture NIXL agent telemetry. Requires NIXL_TELEMETRY_ENABLE=true in the environment.
+capture_telemetry: false
+
+# Log per-transfer NIXL telemetry (bytes, post/xfer durations) on completion.
+enable_nixl_telemetry: false

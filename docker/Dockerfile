@@ -21,8 +21,8 @@ ARG INSTALL_FLASH_ATTN_3=1
 # Source revisions are build arguments so downstream releases can update one
 # component without rewriting the installation graph. Patch compatibility must
 # be revalidated whenever one of these defaults changes.
-ARG UCX_REF=v1.20.0
-ARG NIXL_REF=v1.2.0
+ARG UCX_REF=v1.23.x
+ARG NIXL_REF=v1.5.0
 ARG VLLM_REF=v0.30.0
 ARG VERL_REF=3efe38c7
 ARG TRANSFER_QUEUE_REF=434f8c476b4be24bc087e6e95070e64efcc739f9
@@ -251,8 +251,20 @@ ENV GOROOT=/usr/local/go \
 # a revision drifts away from its PSRL patch.
 COPY docker/patch/ ${PSRL_PATCH_DIR}/
 
-# UCX and NIXL provide the PSRL model-transfer data plane. NIXL v1.2.0 follows
-# the upstream CUDA 13 source-packaging flow without the legacy PSRL patch.
+# UCX and NIXL provide the PSRL model-transfer data plane. NIXL v1.5.0 is
+# paired with UCX v1.23.x and built with only the UCX and POSIX plugins, which
+# are the backends PSRL uses.
+#
+# UCX's `--with-gdrcopy` adds the GDRCopy transport path, which needs the
+# `gdrapi.h` header and libgdrapi at configure/link time. GDRCopy is installed
+# first because it is a build-time dependency of UCX; only its userspace
+# library is installed (the kernel module comes from the host driver).
+RUN git clone --depth 1 --branch ${GDRCOPY_REF} \
+        https://github.com/NVIDIA/gdrcopy.git /root/gdrcopy && \
+    make -C /root/gdrcopy -j${MAX_JOBS} prefix=/usr/local lib_install && \
+    ldconfig && \
+    rm -rf /root/gdrcopy
+
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/openucx/ucx.git /root/ucx-source && \
     git -C /root/ucx-source checkout ${UCX_REF} && \
@@ -272,6 +284,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --with-rdmacm \
         --with-mlx5 \
         --with-dm \
+        --with-gdrcopy \
         --enable-mt && \
     make -j${MAX_JOBS} && \
     make -j${MAX_JOBS} install-strip && \
@@ -316,12 +329,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Match vLLM's DeepEP v2 installation path. The helper installs the pinned
 # DeepEP revision and its legacy NVSHMEM backend for workloads that still use it.
-RUN git clone --depth 1 --branch ${GDRCOPY_REF} \
-        https://github.com/NVIDIA/gdrcopy.git /root/gdrcopy && \
-    make -C /root/gdrcopy -j${MAX_JOBS} prefix=/usr/local lib_install && \
-    ldconfig && \
-    rm -rf /root/gdrcopy
-
 RUN --mount=type=cache,target=/root/.cache/uv \
     cd ${PSRL_THIRD_PARTY}/vllm && \
     NVSHMEM_VER=${NVSHMEM_VERSION} \

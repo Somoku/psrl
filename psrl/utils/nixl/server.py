@@ -55,7 +55,14 @@ class NIXLMetaServer:
         # exceeded the 600 s budget and lost ~30 minutes of cluster time to a run that was
         # working.
         self._handshake_timeout = float(getattr(nixl_config, "handshake_timeout_s", 600.0))
-        self.agent = nixl_agent(self.server_name, nixl_agent_config(True, True, self.server_port))
+        self.agent = nixl_agent(
+            self.server_name,
+            nixl_agent_config(
+                enable_prog_thread=True,
+                enable_listen_thread=True,
+                listen_port=self.server_port,
+            ),
+        )
         self.connected_clients: dict[
             str, list[str]
         ] = {}  # agent_name -> [client_name1, client_name2, ...], one agent can bind to multiple clients

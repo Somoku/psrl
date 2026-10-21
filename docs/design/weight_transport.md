@@ -149,9 +149,10 @@ pull 方向是干净的，而且**已经是 pull 模式**：comm plan 的 link p
 
 ### 1.2 热路径是逐张量提交的
 
-`client_read` / `client_write` 对每个 (key, shard) 调一次 `agent.initialize_xfer` + `agent.transfer`
-（`client.py:1173`、`client.py:1353`）。合并路径 `merge_and_cache_xfer` 实现了但**默认关闭且无人调用**，
-所以 pull 结尾的 `merge_and_finish_cached_xfer()` 实际是空操作。
+`client_read` / `client_write` 对同一 `(operation, target, key)` 的**全部连续 shard 只提交
+一个 NIXL 请求**（`merge_contiguous_xfer`，默认开启，`_post_contiguous_group`）；只有非连续
+shard 才逐 shard 经临时缓冲提交。旧的 cached-xfer 队列与 `merge_and_finish_cached_xfer`
+已移除，提交开销因此是 O(#keys) 而不是 O(#shards)。
 
 WeightBridge 在 30B 上实测：逐张量的格式转换 + 控制面开销单项 590ms，超过 `3×T_min`。
 这部分开销与模型大小无关、只与张量数量有关，MoE 下尤其致命。
@@ -2011,10 +2012,11 @@ per-descriptor 开销又加了回来**，而且不会报错。
 
 ##### 前提二：Nx5 strided 需要 NIXL ≥ 1.5.0
 
-`scripts/install_nixl.sh:81` 当前 pin 的是 **v1.2.0**，它的 `prepXferDlist`
-只有两个重载（都接受 `nixlXferDList`，而后者是 Nx3-only）。
-1.5.0 增加了第三个重载 `(agent_name, mem_type, numpy.ndarray, backend)`，
-走 `to_stride_dlist`（`nixl_bindings.cpp:148`）。实测：
+NIXL 在 **v1.5.0** 之前，`prepXferDlist` 只有两个重载（都接受
+`nixlXferDList`，而后者是 Nx3-only）。1.5.0 增加了第三个重载
+`(agent_name, mem_type, numpy.ndarray, backend)`，走 `to_stride_dlist`
+（`nixl_bindings.cpp:148`）。Dockerfile 与 `scripts/install_nixl.sh` 均 pin
+v1.5.0（UCX v1.23.x）。实测：
 
 | | prep | submit |
 |---|---|---|
@@ -2044,8 +2046,8 @@ descriptor 的传输」的耗时——这两件事被混为一谈了。
 与 prep 时间（与 count 无关），**不含提交时间**。
 这不改变做 A2 的理由（元数据扇出是 §3.5.5 的硬阻塞），但要修正收益预期。
 
-**落地要求**：`scripts/install_nixl.sh` 的 `git clone -b v1.2.0` 必须升到 v1.5.0。
-**注意 `nixlXferDList` 在任何版本下都只接受 Nx3**——
+**落地要求**：NIXL 固定为 v1.5.0（Dockerfile 与 install 脚本一致），否则 Nx5
+strided 不可用。**注意 `nixlXferDList` 在任何版本下都只接受 Nx3**——
 strided 只能经由 `prep_xfer_dlist` 使用，这条不对称容易被误判成「功能缺失」。
 
 ##### 一处澄清：WeightBridge 那 590ms 不是提交 API 的开销
@@ -2095,32 +2097,11 @@ while True:
 两者若交叉（即 `M_v / N_min < 256MB`），说明这个规模下靠调 chunk
 已经压不住格式化，必须转向 §3.6.0 推论 3 的「削减格式化本身」。
 
-**更糟的是 `post` 与 `wait` 在同一个调用里串行。**
-`merge_and_finish_cached_xfer`（`client.py:1519-1544`）
-提交之后**紧接着就进轮询循环**，没有返回控制权：
-
-```
-post(chunk i) -> 轮询等 chunk i DONE -> post(chunk i+1) -> ...
-```
-
-**这条路径下「深度 2 双 buffer」根本无法成立**——
-下一个 chunk 的提交被上一个 chunk 的等待挡住了。
-`client_read` 的非 merged 路径好一些（返回 `shards_to_transfer` 由调用方 `wait`），
-但 merged 路径是大 MoE 下唯一可用的那条。
-
-**两条必须做的改动，合入落地项 5：**
-
-1. **`merge_and_finish_cached_xfer` 必须拆成 `post` 与 `wait` 两个调用**，
-   否则 §3.6 的三类重叠在实现层面无处落脚。这是一处真实的接口改动，
-   不是「加个参数」——现有签名没有返回 handle 的位置。
-2. **轮询换成 `get_new_notifs`**。NIXL 的 notification 机制
-   （`agent.send_notif` / `get_new_notifs`，PSRL 握手期已在用，`client.py:850`）
-   可以让发起方在传输完成时收到通知，而不是 1ms 一次地问。
-   这把下界从 256MB 降到由 RTT 决定，**是「chunk 可以调到多小」的真正解法**。
-   若 2 的工作量大，先做 1 并把 chunk 下界写进配置校验。
-
-**这一条此前五轮审核都漏掉了**，因为前几轮把「重叠」当成规划问题，
-而它其实卡在执行层的一个同步调用上。
+**提交与等待在接口层已经分开。** `client_read` / `client_write` 提交一个
+`(target, key)` 的合并请求后立即返回 `shards_to_transfer`，调用方按 key `wait`；
+handle 在 `wait` 中释放，prepared dlist 可复用并在源重注册时失效。不存在一个
+「提交后立刻进入轮询」的全局串行队列，因此 §3.6 的流水重叠可以落在调用方的
+wave 结构上（pull engine 的上游分波与 peer 读重叠）。
 
 #### 3.6.5 通用 cost model：将「应实测」替换为公式
 
@@ -4309,13 +4290,13 @@ train step v 完成
 
 | # | 优化 | 收益 | 独立落地 |
 |---|---|---|---|
-| **0** | **NIXL 新 API 的 micro-benchmark + 升级到 1.5.0** | **已完成**（`tests/nixl/bench_nixl_prepped_xfer.py`）。确认收益成立（5~30×）但有两个前提，见 §3.6.3。**`scripts/install_nixl.sh:81` 的 `-b v1.2.0` 必须升到 v1.5.0**，否则 Nx5 strided 不可用 | 已做 |
+| **0** | **NIXL 新 API 的 micro-benchmark + 升级到 1.5.0** | **已完成**（`tests/nixl/bench_nixl_prepped_xfer.py`）。确认收益成立（5~30×）但有两个前提，见 §3.6.3。Dockerfile 与 install 脚本均 pin **NIXL v1.5.0 + UCX v1.23.x**，否则 Nx5 strided 不可用 | 已做 |
 | 1 | `prep_xfer_dlist` / `make_prepped_xfer` 替代 per-key `initialize_xfer` | **实测 5~30× 加速且随 descriptor 数放大**（16384 条下 0.014ms vs 0.424ms）。**索引必须用 int32 ndarray**，传 Python list 会慢 15× 并抵消全部收益（§3.6.3） | 是 |
 | 2 | colocate 走 CUDA IPC + stage 边界 offload（`discard(("kv_cache",))`） | 切换成本从「全量 PCIe 往返 + 重握手」降到「权重 D2H/H2D + KV cache 重分配」，**且 colocate 路径完全不碰 NIXL 注册**（§3.7.3），省掉大 MoE 下 14 万次 `register_memory` | 是 |
 | 3 | Nx5 strided 描述符 | 删掉非连续 shard 的中转缓冲（**GPU 上，不是 CPU**——见 §3.6 的更正）与槽位串行等待。**槽位串行等待是主要收益**，显存次之 | 是 |
 | 4 | 源头 FP8 wire | 传输字节减半，消掉 train/gen 双缓冲，且量化产物天然就是发布缓冲 | 是 |
 | 5 | 上游分波与 peer 读重叠 | follower 读第 `w` 波时 designate 读第 `w+1` 波，peer 阶段藏到上游后面。cast 不在拉取路径上，发生在发布点（§3.4.2） | 是 |
-| **5b** | **`merge_and_finish_cached_xfer` 拆 post / wait，完成检测改 `get_new_notifs`** | **第 5 项的前置**：现有实现提交后立刻进 1ms 轮询循环（`client.py:1519-1544`），**双 buffer 流水在实现层无处落脚**（§3.6.4）。拆 post/wait 是必需，换 notif 把 chunk 下界从 256MB 降到 RTT 级 | **是**，但 5 依赖它 |
+| **5b** | **按 key 合并连续 shard 的传输** | `client_read`/`client_write` 对同一 (op, target, key) 的全部连续 shard 只提交一个 NIXL 请求（`merge_contiguous_xfer`），替代旧的 cached-xfer 队列；handle 在完成后立即释放，prepared dlist 可复用并在重注册时失效（§3.7.7）。提交开销从 O(#shards) 降到 O(#keys) | 是 |
 | 6 | **canonical MoE 分组**（key 数 14万 → 数百，§3.5.5） | 元数据从 56MB/client 降到几百 KB，**大 MoE 与 1TB 的前置阻塞项** | 是 |
 | 6b | **控制面下热路径**（plan 本地缓存 + 租约按 instance 聚合 + gRPC） | 消除 index 单点，**这是 7/8/9 的前置** | 是 |
 | 6c | `make_xfer_tag` 去 pickle、**chunk 按 `T_fmt/T_rdma` 自适应**（§3.5.6，注意方向与初稿相反）、轮级决策本地化 | 纯 CPU 与 RTT 开销；**本地化是「chunk 可调小」的前提**，而调小是让格式化被流水掩盖的手段 | 是 |

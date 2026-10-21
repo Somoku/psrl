@@ -75,8 +75,19 @@ class NetworkTopology:
         }
 
     def register_client(self, client_name: str, node_ip: str, node_gpu_id: int):
-        """Register client and its node location"""
-        self._client_positions[client_name] = (node_ip, node_gpu_id)
+        """Register client and its node location.
+
+        A cached link is a function of both endpoints' positions, so moving a client
+        invalidates every pair it appears in. Without this a client that re-registers on
+        a different node -- elastic rejoin, or a planner rebuilding its map after a
+        restart -- keeps being planned over the link it had before.
+        """
+        position = (node_ip, node_gpu_id)
+        previous = self._client_positions.get(client_name)
+        self._client_positions[client_name] = position
+        if previous is not None and previous != position:
+            for key in [key for key in self._links if client_name in key]:
+                del self._links[key]
 
     def get_link(self, client1: str, client2: str) -> NetworkLink:
         """Get network connection information between two clients"""

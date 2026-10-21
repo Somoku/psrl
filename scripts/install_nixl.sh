@@ -5,12 +5,17 @@ trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
 CUDA_PATH=${CUDA_PATH:-"/usr/local/cuda"}
 MAX_JOBS=${MAX_JOBS:-32}
-# 1.22.0 is the first release carrying the UCP GPU device API
+# NIXL v1.5.0 is paired with UCX v1.23.x. UCX_REF is the git ref built when the
+# detected UCX is older than REQUIRED_UCX_VERSION.
+#
+# 1.22.0 was the first release carrying the UCP GPU device API
 # (ucp_device_local_mem_list_h and friends) that nixl_ep's kernels compile against, and
 # the first to vendor DOCA GPUNetIO as a submodule instead of requiring a system DOCA
-# whose macro names must happen to match. On 1.20.x the EP build fails to link the
-# device API; against a system DOCA 3.5 it also fails on a renamed volatile-read macro.
-REQUIRED_UCX_VERSION="1.22.0"
+# whose macro names must happen to match. 1.23.x keeps those and is the version the
+# pinned NIXL release is tested against.
+UCX_REF="v1.23.x"
+REQUIRED_UCX_VERSION="1.23.0"
+NIXL_REF="v1.5.0"
 UCX_PREFIX="/usr"
 INSTALL_UCX=true
 
@@ -52,7 +57,7 @@ if $INSTALL_UCX; then
     UCX_PREFIX="$THIRD_PARTY_PATH/ucx"
     mkdir -p $THIRD_PARTY_PATH/ucx_src
     pushd $THIRD_PARTY_PATH/ucx_src
-    git clone -b $REQUIRED_UCX_VERSION https://github.com/openucx/ucx.git
+    git clone -b $UCX_REF https://github.com/openucx/ucx.git
     cd ucx
     # GDAKI (the GPU-initiated RDMA path nixl_ep needs) lives behind HAVE_GPUNETIO, and
     # its headers come from this submodule. Without it, configure reports no GPUNetIO,
@@ -92,7 +97,13 @@ else
     echo "1. Skip UCX installation"
 fi
 
-# Recommend to use gcc 11.x.x, gcc-toolset-13 may have error with nixl
+# NIXL v1.5.0 requires a C++20 compiler (GCC >= 11 or Clang >= 14).
+if ! echo 'int main(){return 0;}' | ${CXX:-g++} -std=c++20 -x c++ - -o /dev/null 2>/dev/null; then
+    echo "[ERROR] NIXL v1.5.0 requires a C++20 compiler (GCC >= 11 or Clang >= 14);" \
+         "${CXX:-g++} does not support -std=c++20." >&2
+    exit 1
+fi
+
 echo "2. Install nixl"
 mkdir -p $THIRD_PARTY_PATH/nixl_src
 pushd $THIRD_PARTY_PATH/nixl_src
@@ -100,13 +111,10 @@ pushd $THIRD_PARTY_PATH/nixl_src
 # array (src/bindings/python/nixl_bindings.cpp to_stride_dlist). PSRL's weight
 # transport relies on it to collapse per-shard descriptors; v1.2.0 silently lacks
 # the overload and falls back to one descriptor per shard.
-git clone -b v1.5.0 https://github.com/ai-dynamo/nixl.git
+git clone -b $NIXL_REF https://github.com/ai-dynamo/nixl.git
 cd nixl
 mkdir -p build
-# Disable obj backend
-sed -i "s/subdir('obj')/# subdir('obj')/" "$THIRD_PARTY_PATH/nixl_src/nixl/src/plugins/meson.build"
-# Disable err handling for ucp (will make NIXL READ slower 10x!)
-echo "Applying nixl patch..."
+# PSRL only uses the UCX backend. Build no other plugins.
 meson setup build \
     --prefix=$THIRD_PARTY_PATH/nixl \
     -Dbuild_docs=false \

@@ -38,6 +38,19 @@ MODEL = {
     "layers.0.down_proj.weight": ((HIDDEN, INTER), 1),
     "layers.0.norm.weight": ((HIDDEN,), None),
 }
+
+def _train_ranks_remote(clients: dict) -> None:
+    """Give train ranks a distinct node when a test exercises diffusion.
+
+    Diffusion now collapses *cross-node* upstream reads only; a same-node upstream is
+    served by a direct device copy and deliberately forms no groups. The loopback
+    transport in these tests does not care where the source lives, but the planner reads
+    node identities, so a same-node fixture would correctly plan no groups at all.
+    """
+    for name, client in clients.items():
+        if name.startswith("NIXLTrainClient"):
+            client.local_client_info.node_ip = "train-node"
+
 CONFIG = OmegaConf.create(
     {
         "server_ip": "127.0.0.1",
@@ -134,6 +147,8 @@ class Cluster:
                 client.set_publish_cast(train_dtype, torch.bfloat16)
             client.register_local_tensors(self.states[name], unified[name])
             self.clients[name] = client
+        if peer_diffusion:
+            _train_ranks_remote(self.clients)
         infos = {name: c.local_client_info for name, c in self.clients.items()}
         plan = CommunicationPlanner(peer_diffusion=peer_diffusion).make_comm_plan(infos)
         for client in self.clients.values():
@@ -497,6 +512,8 @@ def _fp8_cluster(
             client.set_publish_fp8(BLOCK)
         client.register_local_tensors(cluster.states[name], unified[name])
         cluster.clients[name] = client
+    if peer_diffusion:
+        _train_ranks_remote(cluster.clients)
     infos = {name: c.local_client_info for name, c in cluster.clients.items()}
     plan = CommunicationPlanner(peer_diffusion=peer_diffusion).make_comm_plan(infos)
     for client in cluster.clients.values():
@@ -615,6 +632,8 @@ def _replicated_cluster(train_tp, dp, gen_tp, instances, peer_diffusion=False):
         )
         client.register_local_tensors(cluster.states[name], unified[name])
         cluster.clients[name] = client
+    if peer_diffusion:
+        _train_ranks_remote(cluster.clients)
     infos = {name: c.local_client_info for name, c in cluster.clients.items()}
     plan = CommunicationPlanner(peer_diffusion=peer_diffusion).make_comm_plan(infos)
     for client in cluster.clients.values():

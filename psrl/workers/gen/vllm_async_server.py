@@ -59,7 +59,11 @@ from psrl.utils.nixl.pull_engine import WeightRefreshFailed
 from psrl.utils.ps_mode import has_ps_data_plane, uses_nixl
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
-from psrl.workers.gen.smg_adapter import build_worker_registration_payload, cfg_get, is_cache_aware_method
+from psrl.workers.gen.smg_adapter import (
+    build_worker_registration_payload,
+    is_cache_aware_method,
+    resolve_lmcache_event_flags,
+)
 from psrl.workers.gen.stats_collector import DPLBStatCollector
 from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT
 from psrl.workers.gen.zmq_queue import ZMQPushQueue
@@ -190,8 +194,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
     def _get_worker_extension_cls(self) -> str:
         return "psrl.workers.gen.vllm_extension.vLLMWorkerExtension"
 
-    def _build_kv_cache_manager(self) -> KVCacheManager:
-        """Build and configure `KVCacheManager` before vLLM engine initialization."""
+    async def _build_kv_cache_manager(self) -> KVCacheManager:
+        """Build `KVCacheManager` and start this node's LMCache MP server."""
         lmcache_raw = (
             OmegaConf.to_container(
                 self.psrl_config.get("lmcache", OmegaConf.create()),
@@ -200,55 +204,117 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             or {}
         )
 
-        lmcache_instance_id = f"psrl_instance_{self.get_replica_idx()}"
-        if lmcache_raw.get("enable_p2p", False):
-            lmcache_raw.setdefault(
-                "controller_host",
-                str(self.psrl_config.get("ps_manager_ip", "127.0.0.1")),
-            )
-            lmcache_raw["lmcache_instance_id"] = lmcache_instance_id
+        # One MP server per node owns all local KV ranks, so its identity is
+        # node-scoped when a replica spans nodes and replica-scoped otherwise.
+        replica_id = f"psrl_instance_{self.get_replica_idx()}"
+        lmcache_instance_id = replica_id
+        if self.nnodes > 1:
+            lmcache_instance_id = f"{replica_id}_n{self.node_rank}"
+        lmcache_raw["lmcache_instance_id"] = lmcache_instance_id
+        # Registered with the coordinator so a transfer can reach every node of
+        # this replica from either its replica id or a single node id.
+        lmcache_raw["replica_id"] = replica_id
 
-        # Off-GPU cache scoring requires LMCache events in vLLM's KV event stream.
-        lmcache_raw["enable_kv_events"] = bool(
-            lmcache_raw.get("enable", False)
-            and is_cache_aware_method(self.psrl_config.rollout_coordination.routing_strategy.method)
-            and float(
-                cfg_get(
-                    self.psrl_config,
-                    "rollout_coordination.routing_strategy.cache_aware_policy.lmcache_overlap_weight",
-                    0.0,
-                )
+        # One shared resolver decides both flags, so the MP server, the
+        # coordinator launcher and the router agree on when the off-GPU tier is
+        # live.
+        flags = resolve_lmcache_event_flags(self.psrl_config)
+        lmcache_raw["enable_kv_events"] = flags.kv_events
+        lmcache_raw["coordinator_event_reporting"] = flags.coordinator_reporting
+        if lmcache_raw.get("enable_p2p", False) or flags.coordinator_reporting:
+            # MP servers must be reachable in the coordinator registry, both for
+            # P2P discovery and for a router to find the event stream. The YAML
+            # default already points at the PS manager; this fills the host back
+            # in when a config cleared it.
+            lmcache_raw["coordinator_host"] = lmcache_raw.get("coordinator_host") or str(
+                self.psrl_config.get("ps_manager_ip", "127.0.0.1")
             )
-            > 0.0
-        )
 
         lmcache_cfg = LMCacheConfig(**lmcache_raw)
-        if lmcache_cfg.enable_p2p:
-            self._configure_lmcache_p2p_runtime(lmcache_cfg)
-
+        if lmcache_cfg.n_servers > 1:
+            # The connector numbers ranks in node-contiguous blocks, one block
+            # per configured server, and vLLM rejects that alongside DP.
+            assert self.config.data_parallel_size == 1, (
+                f"lmcache.mp_server_urls splits the replica across {lmcache_cfg.n_servers} servers, which "
+                f"LMCacheMPConnector does not support with data_parallel_size="
+                f"{self.config.data_parallel_size}. Leave it empty or disable data parallelism."
+            )
+            assert lmcache_cfg.n_servers == max(1, self.nnodes), (
+                f"lmcache.mp_server_urls lists {lmcache_cfg.n_servers} servers but this replica spans "
+                f"{self.nnodes} node(s). List every node's server, ordered by node rank."
+            )
         kv_cache_manager = KVCacheManager(lmcache_cfg)
-        kv_cache_manager.set_instance_id(self.get_replica_idx())
-        kv_cache_manager.apply_env_vars()
+        if lmcache_cfg.enable:
+            # Per-rank keys follow the connector's own geometry, which is
+            # resolved from the engine config once the engine exists.
+            await self._start_lmcache_mp_runtime(lmcache_cfg, kv_cache_manager)
         return kv_cache_manager
 
-    def _configure_lmcache_p2p_runtime(self, lmcache_cfg: LMCacheConfig) -> None:
-        """Fill runtime-only LMCache P2P fields for this server actor."""
+    def _set_lmcache_geometry(self, vllm_config) -> None:
+        """
+        Derive the KV rank fan-out from the engine config.
+
+        The connector computes its fan-out from this same helper, so taking the
+        value from the engine is what keeps backend pins and cross-instance
+        transfer addressing the keys that were actually stored. Duplicating the
+        formula instead silently mis-addresses multi-node replicas and MLA
+        models, which replicate KV across TP ranks.
+
+        Args:
+            vllm_config: The vLLM config created for this server.
+        """
+        if self.kv_cache_manager is None or not self.kv_cache_manager.enabled:
+            return
+        from lmcache.integration.vllm.lmcache_mp_connector import (
+            build_parallel_strategy_from_vllm_config,
+        )
+
+        n_servers = max(1, self.kv_cache_manager.config.n_servers)
+        strategy = build_parallel_strategy_from_vllm_config(vllm_config, n_servers)
+        self.kv_cache_manager.set_parallel_geometry(self.model_config.path, strategy.kv_world_size)
+
+    async def _start_lmcache_mp_runtime(self, lmcache_cfg: LMCacheConfig, kv_cache_manager: KVCacheManager) -> None:
+        """
+        Allocate runtime ports, start the node-local MP server, and attach it.
+
+        Args:
+            lmcache_cfg (LMCacheConfig): Configuration whose runtime fields are filled here.
+            kv_cache_manager (KVCacheManager): Manager that will own the runtime.
+        """
         from psrl.utils.common.http_utils import get_host_info
+        from psrl.utils.kv_cache.runtime import LMCacheMPRuntime
         from psrl.utils.nixl.port_scanner import get_port_scanner
 
-        # A server actor owns all local vLLM workers for this replica node. In
-        # DP mode, each local DP x TP worker may create an LMCache worker.
-        lmcache_cfg.num_kv_workers = max(1, len(self.workers))
-        _, worker_ip = get_host_info()
-        lmcache_cfg.worker_host = worker_ip
+        _, node_ip = get_host_info()
+        port_scanner = get_port_scanner(node_ip)
+        # Always a message-queue and HTTP port, plus one per enabled feature.
+        wants_events = lmcache_cfg.coordinator_event_reporting
+        # The event stream shares the management HTTP port, and consumers on
+        # other nodes must be able to reach it like a transfer destination.
+        routable_http = lmcache_cfg.enable_p2p or wants_events
+        num_ports = 2 + (1 if lmcache_cfg.enable_p2p else 0)
+        ports = ray.get([port_scanner.find_free_port.remote() for _ in range(num_ports)])
 
-        port_scanner = get_port_scanner(worker_ip)
-        num_ports_needed = lmcache_cfg.num_kv_workers * 3
-        ports = ray.get([port_scanner.find_free_port.remote() for _ in range(num_ports_needed)])
-        n = lmcache_cfg.num_kv_workers
-        lmcache_cfg.allocated_worker_ports = ports[0:n]
-        lmcache_cfg.allocated_p2p_init_ports = ports[n : 2 * n]
-        lmcache_cfg.allocated_p2p_lookup_ports = ports[2 * n : 3 * n]
+        next_port = 0
+        lmcache_cfg.server_host = "127.0.0.1"
+        lmcache_cfg.server_port = ports[next_port]
+        next_port += 1
+        lmcache_cfg.http_port = ports[next_port]
+        next_port += 1
+        if routable_http:
+            lmcache_cfg.http_host = "0.0.0.0"
+            lmcache_cfg.http_advertise_host = node_ip
+        if lmcache_cfg.enable_p2p:
+            lmcache_cfg.p2p_advertise_host = node_ip
+            lmcache_cfg.p2p_transfer_port = ports[next_port]
+
+        log_path = os.path.join(
+            str(self.psrl_config.logging_path),
+            f"lmcache_server_{self.get_replica_idx()}_n{self.node_rank}.log",
+        )
+        runtime = LMCacheMPRuntime(lmcache_cfg)
+        await runtime.start(log_path)
+        kv_cache_manager.attach_runtime(runtime)
 
     def _build_kv_events_args(self) -> dict:
         """
@@ -374,7 +440,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             **engine_kwargs,
         }
 
-        self.kv_cache_manager = self._build_kv_cache_manager()
+        self.kv_cache_manager = await self._build_kv_cache_manager()
         args.update(self.kv_cache_manager.get_engine_kwargs())
 
         # SMG consumes the merged GPU and LMCache event stream through localhost.
@@ -566,6 +632,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             kwargs["stat_loggers"] = [preemption_logger_factory]
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
+
+        # Every node addresses the keys its own workers stored, so the geometry
+        # is resolved here rather than only on the node that serves HTTP.
+        self._set_lmcache_geometry(vllm_config)
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
@@ -767,7 +837,17 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self._asleep_tags -= set(woken)
 
     async def clear_kv_cache(self):
-        await self.engine.reset_prefix_cache(reset_connector=True)
+        # vLLM refuses to reset the prefix cache while any block is referenced,
+        # so drop PSRL's own pins or old-weight KV stays reachable.
+        if self.kv_cache_manager is not None and self.kv_cache_manager.enabled:
+            await self.kv_cache_manager.unpin_all_gpu()
+        reset = await self.engine.reset_prefix_cache(reset_connector=True)
+        if reset is False:
+            psrl_logger.error(
+                "[LMCache] vLLM refused to reset the prefix cache after a weight update, so KV "
+                "produced by the previous weights may still be served. Some blocks are still "
+                "referenced by a live request."
+            )
         await self.engine.reset_mm_cache()
         await self.engine.reset_encoder_cache()
 
@@ -1038,9 +1118,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     def _assert_kv_cache_manager(self) -> KVCacheManager:
         assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
-        assert self.kv_cache_manager.is_attached, (
-            "KVCacheManager engine is not attached. Call launch_server() before KV cache operations."
-        )
         return self.kv_cache_manager
 
     async def kv_pin(self, tokens: list[int], targets: list[str]) -> bool:
@@ -1062,28 +1139,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             f"Invalid targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
         )
         return await kv_cache_manager.unpin(tokens, targets)
-
-    def kv_set_peer_registry(
-        self,
-        registry: dict[str, list[str]],
-        worker_zmq_urls: list[str] | None = None,
-    ) -> None:
-        """Set peer registry for direct LMCache transfer bypass.
-
-        Args:
-            registry: Maps lmcache_instance_id → rank-sorted list of peer_init_url.
-            worker_zmq_urls: This replica's rank-sorted local LMCacheWorker ZMQ URLs.
-        """
-        assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
-        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_urls)
-
-    def set_lmcache_controller_url(self, controller_url: str) -> None:
-        """Receive the shared LMCache Controller URL from `RolloutCoordinator`."""
-        assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
-        from psrl.utils.common.http_utils import init_http_client
-
-        init_http_client(server_concurrency=4, rollout_engine_num=1)
-        self.kv_cache_manager.set_controller_url(controller_url)
 
     def kv_set_current_version(self, version: int) -> None:
         """
@@ -1256,8 +1311,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # Important: the prefix cache needs to be cleared after pulling the model
         await self.clear_kv_cache()
         if self.kv_cache_manager is not None and self.kv_cache_manager.should_clear_on_weight_update:
-            await self.collective_rpc(method="lmcache_clear_all_from_backend")
+            await self.kv_cache_manager.clear()
             psrl_logger.debug("Cleared LMCache backend after model weight update.")
+        if self.kv_cache_manager is not None and self.kv_cache_manager.enabled:
+            # Older-version pins are unreachable now, so they only hold budget.
+            await self.kv_cache_manager.release_pin_groups()
 
     async def nixl_pull_model(
         self,

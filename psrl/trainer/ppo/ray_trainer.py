@@ -136,7 +136,7 @@ from psrl.workers.agent_loop.worker import PSRL_AgentLoopWorker
 from psrl.workers.config.reward_model import resolve_active_managers
 from psrl.workers.gen.rollout_coordination import RolloutCoordinator
 from psrl.workers.gen.rollout_gateway import RolloutGateway
-from psrl.workers.gen.smg_adapter import build_pause_resume_payload
+from psrl.workers.gen.smg_adapter import build_pause_resume_payload, lmcache_coordinator_required
 from psrl.workers.gen.vllm_async_server import GenInterface, PSRL_vLLMReplica
 from psrl.workers.ps import (
     PSClassWithInitArgs,
@@ -1993,10 +1993,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.init_rollout_coordinator()
         # Bind the coordinator before PS transfers so `push_model` can publish new versions.
         ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
-        # Start the LMCache Controller BEFORE init_model() so that LMCache workers
-        # inside EngineCore can register immediately when they start.
-        if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
-            ray.get(self.rollout_coordinator.start_lmcache_controller.remote())
+        # Start the LMCache MP coordinator BEFORE init_model() so that each
+        # node's MP server can register immediately when it starts. It is
+        # needed for P2P discovery and for the off-GPU event stream a
+        # cache-aware router discovers.
+        if lmcache_coordinator_required(self.config.psrl):
+            ray.get(self.rollout_coordinator.start_lmcache_coordinator.remote())
 
         # Rollout uses separate GPUs, so overlap its model loading with PS and actor
         # initialization. When it shares the trainer's GPUs that overlap is a memory

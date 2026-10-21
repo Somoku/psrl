@@ -177,8 +177,8 @@ transfer. Dramatically reduces re-prefill cost in multi-turn agentic RL workload
 bash scripts/install_lmcache.sh
 ```
 
-Required for `psrl.lmcache.enable=True` and cross-instance KV transfer. P2P transfer
-with `p2p_transfer_channel=nixl` also requires NIXL/UCX.
+Required for `psrl.lmcache.enable=True` and cross-instance KV transfer. P2P
+transfer with `p2p_transfer_engine=nixl` also requires NIXL/UCX.
 :::
 
 ::::

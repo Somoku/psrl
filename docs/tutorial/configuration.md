@@ -498,8 +498,8 @@ Controls how generation requests are dispatched across rollout instances.
   | Sub-field | Description |
   |---|---|
   | `enable` | Master switch. **Default:** `False` |
-  | `transfer_mode` | `async` (fire-and-forget), `sync` (await, no pin), `pin_sync` (pin→await→unpin). **Default:** `async` |
-  | `transfer_timeout_ms` | Timeout for `sync`/`pin_sync` modes before falling back to re-prefill. **Default:** `5000` |
+  | `transfer_mode` | `async` (fire-and-forget) or `sync` (await the transfer). `pin_sync` is a deprecated alias for `sync`. **Default:** `async` |
+  | `transfer_timeout_ms` | Timeout for `sync` before falling back to re-prefill. **Default:** `5000` |
   | `stats_log_interval_s` | Interval (s) between periodic KV-transfer stats log lines on each source instance. `0` suppresses stats even when transfer is enabled. **Default:** `30` |
 
 `rollout_coordination.routing_strategy.cost_model_path`
@@ -776,145 +776,148 @@ Megatron training backend.
 
 ### LMCache
 
-KV cache offloading and cross-instance P2P transfer for reducing re-prefill overhead
-in multi-turn workloads.
+KV cache offloading and cross-instance transfer, to cut re-prefill overhead in
+multi-turn workloads. LMCache runs as one multiprocess server per node, and
+`offload_size_gb` is that server's L1 capacity.
 
 `lmcache.enable`
 : Master switch for LMCache KV offloading in vLLM.
   **Default:** `False`
 
-`lmcache.backend`
-: Storage backend for offloaded KV blocks.
-  - `cpu`: host memory (fast, limited by DRAM)
-  - `disk`: filesystem-backed (large capacity, slower)
-  - `remote`: reserved for a remote KV server, not yet implemented
-
-  **Default:** `cpu`
-
 `lmcache.offload_size_gb`
-: Total offload budget in GiB, divided automatically across TP ranks. Do **not**
-  set `LMCACHE_MAX_LOCAL_CPU_SIZE` as an env var, that would apply the full budget
-  to every rank.
+: L1 capacity in GiB for one node's MP server. It covers every local KV rank, so
+  do not divide it by the tensor parallel size.
   **Default:** `100.0`
 
 `lmcache.chunk_size`
 : Token chunk size for hash-based KV indexing (must divide the block size).
   **Default:** `256`
 
+`lmcache.hash_algorithm`
+: Chunk hash algorithm, `blake3` or `sha256`.
+  **Default:** `blake3`
+
+`lmcache.l1_align_bytes`
+: L1 allocation alignment in bytes. Raise it to `65536` when `enable_p2p` is on
+  so RDMA reads stay efficient.
+  **Default:** `4096`
+
+`lmcache.eviction_policy`
+: L1 eviction policy, `LRU`, `IsolatedLRU`, or `noop`.
+  **Default:** `LRU`
+
+`lmcache.l1_use_lazy`
+: Grow the L1 allocation on demand instead of committing all of
+  `offload_size_gb` up front. Turn it off only when the node is expected to fill
+  the whole cap, since the allocation is then committed at startup.
+  **Default:** `True`
+
+`lmcache.l1_init_size_gb`
+: GiB committed at startup when lazy allocation is on. Must not exceed
+  `offload_size_gb`.
+  **Default:** `20`
+
+`lmcache.pin_policy`
+: Which prefixes to hold resident across turns. `off` disables pinning, `all`
+  pins every stored prefix, and `tagged` pins only requests carrying an
+  `lmcache.pin_group` request config. A pin group survives the idle gap between
+  two turns, which LRU cannot guarantee, but pinned bytes cannot be evicted, so
+  enabling it trades cache capacity for hit rate. Measure turn-two hit rate and
+  re-prefill volume before choosing `all`.
+  **Default:** `off`
+
+`lmcache.pin_budget_ratio`
+: Fraction of `offload_size_gb` that pin groups may hold. The least recently
+  pinned groups are released when it is exceeded, and a prefix larger than the
+  whole budget stays unpinned rather than overshooting it.
+  **Default:** `0.25`
+
+`lmcache.pin_ttl_seconds`
+: Idle seconds after which a pin group is released. Pins carry no TTL of their
+  own, so this is the safety net for a client that never releases.
+  **Default:** `600.0`
+
+`lmcache.mp_server_urls`
+: Every MP server backing one replica, ordered by node rank, as `host:port`
+  strings. Empty makes the replica a single-server deployment, which is correct
+  for `rollout_nnodes_per_instance: 1` and also works across nodes, at the cost
+  of each node fetching the other nodes' ranks over P2P when a prefix is warmed.
+  Setting it splits the replica's KV across its nodes, and requires
+  node-contiguous ranks and `data_parallel_size == 1`.
+  **Default:** `[]`
+
+`lmcache.l2_adapters`
+: Extra L2 tiers for the MP server, as JSON objects such as
+  `{type: fs, path: /mnt/kv}`. On top of these, P2P peers act as read-only L2.
+  **Default:** `[]`
+
+`lmcache.l2_store_policy`
+: L2 store policy name.
+
+`lmcache.l2_prefetch_policy`
+: L2 prefetch policy name.
+
 `lmcache.clear_on_weight_update`
-: Evict all cached KV entries after each model weight pull from the PS. This prevents
-  stale-weight KV from being reused in the next generation round, but it is a blunt
-  instrument, it discards every reusable prefix in the offload backend once per
-  weight update. The default is `False` because the
-  shipped configuration relies on `multi_version_kv` instead, which is the
-  finer-grained mechanism and the one P2P requires.
+: Clear the whole server cache after each weight pull from the PS. It discards
+  every reusable prefix once per update, so the shipped configuration relies on
+  `multi_version_kv` instead.
   **Default:** `False`
 
 `lmcache.multi_version_kv`
 : Tag cached KV entries with the model version that produced them, so a request
-  running under version N can never structurally hit an entry produced under version
-  M, instead of clearing the whole cache on every update. Stale entries then age out
-  naturally through ordinary LRU eviction as new-version entries fill the cache. This
-  is the shipped default because under `psrl.staleness > 0` different rollout
-  instances can legitimately sit at different model versions at the same time, so clearing the
-  whole cache on every pull would throw away prefixes that a still-behind instance
-  could still use. Required when `enable_p2p: True` (the shared P2P backend has no
-  clear operation and relies entirely on version tags), in which case
-  `clear_on_weight_update` must be `False`.
+  under version N can never hit an entry from version M. Stale entries age out
+  through ordinary eviction instead of being cleared. Required when
+  `enable_p2p: True`, in which case `clear_on_weight_update` must be `False`.
   **Default:** `True`
 
-`lmcache.reserve_local_cpu_size`
-: GiB of CPU memory to keep free and never use for KV offloading (headroom for other
-  processes on the same node).
-  **Default:** `0.0`
-
-`lmcache.save_decode_cache`
-: Also cache KV from decode steps (not just prefill). Increases memory usage but
-  improves multi-turn prefix reuse.
-  **Default:** `True`
-
-`lmcache.save_unfull_chunk`
-: Persist a chunk even when it is not completely filled, which helps prompts shorter
-  than `chunk_size`.
-  **Default:** `False`. Currently has a known bug, do **not** enable.
-
-`lmcache.cache_policy`
-: Eviction policy: `LRU` or `FIFO`.
-  **Default:** `LRU`
-
-`lmcache.enable_async_loading`
-: Overlap KV cache retrieval with prefill computation to reduce time-to-first-token.
-  **Default:** `False`. Currently has a known bug, do **not** enable.
-
-`lmcache.config_file`
-: Path to a full LMCache YAML config. When set, **overrides all individual fields
-  above**.
-  **Default:** `null`
-
-**Disk backend (when `backend: disk`)**
-
-`lmcache.disk_path`
-: Filesystem path for disk-backed KV storage. Required when `backend: disk`.
-  **Default:** `null`
-
-`lmcache.max_disk_size_gb`
-: Maximum disk usage for KV storage (GiB).
-  **Default:** `1000.0`
-
-**Remote backend (when `backend: remote`)**
-
-`lmcache.remote_url`
-: URL of the remote LMCache server, for example `redis://host:6379`. The remote
-  backend is not implemented yet.
-  **Default:** `null`
+`lmcache.enable_kv_events`
+: Publish the off-GPU tier to routing, so `lmcache_overlap_weight` can score it.
+  Implies `coordinator_event_reporting`.
+  **Default:** `False`
 
 **P2P cross-instance transfer**
 
 `lmcache.enable_p2p`
-: Enable cross-instance KV cache transfer via a shared LMCache Controller process.
-  Required when `routing_strategy.kv_transfer.enable: True`.
+: Enable cross-instance KV transfer. Requires a coordinator, and the transfer
+  itself is a pull by the destination. Required when
+  `routing_strategy.kv_transfer.enable: True`.
   **Default:** `False`
 
-`lmcache.p2p_transfer_channel`
-: Transport for P2P KV transfer.
-  - `nixl`: UCX-based (RDMA on multi-node, shared memory on same node). Recommended.
-  - `tcp`: fallback when UCX is unavailable.
-
+`lmcache.p2p_transfer_engine`
+: Transfer engine for P2P, `nixl` or `mooncake_te`.
   **Default:** `nixl`
 
-`lmcache.controller_host`
-: Host where the LMCache Controller runs.
+`lmcache.coordinator_host`
+: Host where the shared MP coordinator runs. It keeps the instance registry that
+  P2P peer discovery and cross-instance calls rely on.
   **Default:** `${psrl.ps_manager_ip}`
 
-`lmcache.controller_base_port`
-: Base HTTP port for the LMCache Controller's REST API (`/move`, `/lookup`, etc.).
-  The actual port is selected via `find_available_port()` starting here.
-  **Default:** `9000`
+`lmcache.coordinator_port`
+: Coordinator HTTP port.
+  **Default:** `9300`
 
-`lmcache.controller_pull_port`
-: ZMQ PULL port where the Controller listens for worker registrations and heartbeats.
-  **Default:** `8300`
-
-`lmcache.controller_reply_port`
-: ZMQ REPLY port for Controller → worker task dispatch.
-  **Default:** `8400`
-
-`lmcache.controller_health_timeout_s`
-: Seconds to wait for the Controller's HTTP API to become healthy before failing
-  init. The Controller imports torch and vLLM at startup and runs on the busy
-  `ps_manager` node, so under cluster CPU or filesystem contention it can take
-  considerably longer than a standalone launch.
+`lmcache.coordinator_health_timeout_s`
+: Seconds to wait for the coordinator or an MP server to become healthy.
   **Default:** `3000`
 
+`lmcache.coordinator_event_reporting`
+: Stream cache events to the coordinator, which feeds fleet placement tracking
+  and the routing event stream.
+  **Default:** `False`
+
+`lmcache.mq_timeout_s`
+: Timeout in seconds for connector requests to the MP server.
+  **Default:** `300`
+
 `lmcache.gpu_pin_block_budget`
-: Max number of GPU KV blocks PSRL may hold pinned simultaneously, used by
-  `routing_strategy.kv_transfer.transfer_mode == "pin_sync"`. When exceeded, the
-  oldest-pinned trajectory is unpinned (PSRL-side LRU). `0` means no limit.
+: Max number of GPU KV blocks PSRL may hold pinned simultaneously, as asked for
+  by an explicit `PinKv` target of `gpu`. When exceeded, the oldest-pinned
+  trajectory is unpinned (PSRL-side LRU). `0` means no limit.
   **Default:** `0`
 
 ```{seealso}
-{doc}`../design/kv_cache`, KV cache management architecture, LMCache Controller
-process, and cache eviction behavior.
+{doc}`../design/kv_cache`, KV cache management architecture, the MP server, and
+cross-instance transfer.
 ```
 
 ### TMS (torch_memory_saver)

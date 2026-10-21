@@ -26,7 +26,7 @@ ARG NIXL_REF=v1.5.0
 ARG VLLM_REF=v0.30.0
 ARG VERL_REF=3efe38c7
 ARG TRANSFER_QUEUE_REF=434f8c476b4be24bc087e6e95070e64efcc739f9
-ARG LMCACHE_REF=v0.4.6
+ARG LMCACHE_REF=v0.5.5
 ARG MEGATRON_REF=c049020
 ARG MEGATRON_BRIDGE_REF=94d1870
 ARG TMS_REF=d64a6394d1e09c613fab90260054cecc2684586d
@@ -314,9 +314,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         nixl.nixl_agent('psrl-build-check')"
 
 # vLLM is installed from a patched editable checkout. The source patch is kept
-# deliberately narrow: it adds the PSRL scheduler-stats fields and backports
-# upstream sleep-mode NCCL communicator release. All other PSRL behavior lives in
-# the vllm_patches plugin rather than in the vLLM source tree.
+# deliberately narrow: it declares the PSRL scheduler-stats fields and clamps the
+# v1 runner's cached block IDs. All other PSRL behavior lives in the vllm_patches
+# plugin rather than in the vLLM source tree.
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/vllm-project/vllm.git ${PSRL_THIRD_PARTY}/vllm && \
     git -C ${PSRL_THIRD_PARTY}/vllm checkout ${VLLM_REF} && \
@@ -464,7 +464,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git -C ${PSRL_THIRD_PARTY}/LMCache apply ${PSRL_PATCH_DIR}/lm_cache.patch && \
     LMCACHE_CUDA_MAJOR="${CUDA_VERSION%%.*}" \
         uv pip install --no-build-isolation -e ${PSRL_THIRD_PARTY}/LMCache && \
-    python -c "import lmcache"
+    python -c "import lmcache_native, lmcache"
 
 # Build SMG with PSRL routing/state support and install all Python protocol
 # packages plus the native binding.

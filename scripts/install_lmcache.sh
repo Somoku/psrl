@@ -18,14 +18,14 @@ if [ -z "$LMCACHE_PATH" ]; then
     popd
 fi
 pushd $LMCACHE_PATH
-git checkout v0.4.6
+git checkout v0.5.5
 rm -rf ./*.so ./build
 python -m pip uninstall lmcache -y
 python -m pip install --no-cache-dir -e . --no-build-isolation -v
 popd
 
 echo "Check if LMCache is installed correctly"
-python -c "import torch; import lmcache.c_ops as lmc_ops; print('OK')"
+python -c "import torch; import lmcache_native; import lmcache; print('OK')"
 
 echo "2. Apply patch for lmcache"
 bash "$PSRL_PATH/patch/apply_patch.sh" lm_cache

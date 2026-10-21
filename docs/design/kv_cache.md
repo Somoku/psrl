@@ -194,10 +194,16 @@ that score is built from the cache events an MP server publishes. A non-zero
 LMCache weight therefore turns the stream on by itself, and the same switch can
 be set explicitly with `enable_kv_events`. Either way it implies
 `coordinator_event_reporting` and enables the server's event stream at
-`/cache/events/stream`, which emits newline delimited JSON. The stream URL is
-registered with the coordinator, so routers discover it from the instance
-registry instead of being configured per instance, and the coordinator is
-started for the run whenever P2P or event reporting needs it.
+`/cache/events/stream`, which emits newline delimited JSON.
+
+The rollout server bridges each node's stream into the node's gRPC
+`SubscribeKvEvents` stream, so SMG scores the off-GPU tier through the same
+subscription it already uses for GPU events, with no per-instance router
+configuration. Each placement keeps its token position and its model version,
+because the router's index is positional and version-tagged entries must not
+score for a request at another version. The stream URL is also registered with
+the coordinator for external consumers, and the coordinator is started for the
+run whenever P2P or event reporting needs it.
 
 The stream is advisory and lossy by design: a consumer that falls behind drops
 batches instead of stalling the server's observability thread. `GET

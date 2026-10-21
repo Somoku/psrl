@@ -18,6 +18,9 @@ from ray.actor import ActorHandle
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
 from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+
+from psrl.workers.gen.lmcache_kv_events import LMCacheKvEventBridge
+from psrl.workers.gen.lmcache_servicer import PSRLVllmEngineServicer
 from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 from verl.plugin.platform import get_platform
@@ -687,13 +690,30 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         kv_transfer_cfg = self.psrl_config.rollout_coordination.routing_strategy.get("kv_transfer", {})
         kv_transfer_enabled = bool(kv_transfer_cfg.get("enable", False))
         stats_log_interval_s = float(kv_transfer_cfg.get("stats_log_interval_s", 30)) if kv_transfer_enabled else 0.0
-        servicer = VllmEngineServicer(
+
+        # The router scores the off-GPU tier from the LMCache event stream, but
+        # vLLM does not surface connector placements through its own publisher.
+        # Bridge the node's MP-server stream into the same gRPC subscription.
+        lmcache_bridge = None
+        if (
+            self.kv_cache_manager is not None
+            and self.kv_cache_manager.enabled
+            and self.kv_cache_manager.config.enable_kv_events
+            and is_cache_aware_method(self.psrl_config.rollout_coordination.routing_strategy.method)
+        ):
+            lmcache_bridge = LMCacheKvEventBridge(
+                f"http://127.0.0.1:{self.kv_cache_manager.config.http_port}",
+                current_version=lambda: self.kv_cache_manager.current_version,
+            )
+
+        servicer = PSRLVllmEngineServicer(
             engine_client,
             start_time,
             preemption_queue=self.preemption_queue,
             kv_cache_manager=self.kv_cache_manager,
             kv_transfer_stats_log_interval_s=stats_log_interval_s,
             enable_kv_event_replay=self.psrl_config.rollout_gateway.enable_kv_event_replay,
+            lmcache_bridge=lmcache_bridge,
         )
         self.grpc_servicer = servicer
 

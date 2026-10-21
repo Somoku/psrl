@@ -882,9 +882,12 @@ sharding 逐位复核，两轮（第二轮换版本）。不跑完整 RL，因�
 3. **DeepSeek-V3/MLA 的 converter 缺口（真实缺陷，已修）**：
    - vLLM MLA 在 `process_weights_after_loading` 里把 `kv_b_proj.weight` 吸收成
      `W_UK_T`/`W_UV` 参数；它们不是 checkpoint 权重，原 converter 会要求传输。
-     现在 layout 排除这两个 key，并在**每次 pull 落地后**由
-     `vLLMWorkerExtension._refresh_derived_weights` 重新吸收——否则 trainer 更新
-     `kv_b_proj` 后 rollout 的 decode 仍用旧矩阵。
+     现在 layout 排除这两个 key，并在**每次 pull 落地后**在 vLLM 0.30 的
+     `weights_already_processed()` 上下文里调用上游 `process_weights_after_loading`：
+     量化方法跳过张量变换、只恢复运行时 stamp 并重建 kernel；MLA 的 `W_UK_T`/`W_UV`
+     与 MoE kernel 也在这一步重建——否则 trainer 更新 `kv_b_proj` 后 rollout 的 decode
+     仍用旧矩阵。实测一次调用 4.5 ms（dense/FP8）到 8.2 ms（27 层 MLA）；
+     不支持 pre-processed weights 的量化方法会抛错并回退到仅 MLA 的 attribute refresh。
    - Fused experts 模块把 router bias 以 `experts.routed_experts.*` 别名再注册一次，
      converter 会合成一个 trainer 没有的 `experts.routed_gate.*` key。现在排除别名，
      只传 canonical 的 `mlp.gate.e_score_correction_bias`。

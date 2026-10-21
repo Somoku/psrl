@@ -3361,7 +3361,9 @@ sharding 复核，两轮换版本），不跑完整 RL。覆盖与结论：
 两个架构边界（均已写入 FINDINGS §14）：GDN 的 `linear_attn.in_proj_ba` 在 block FP8 下
 必须保持 bf16（64 行 tile 不能被 TP shard 切开），因此 **Qwen3.5 的 FP8-train + FP8-rollout
 组合当前不支持**；DeepSeek-V3/MLA 的 `W_UK_T`/`W_UV` 是 `kv_b_proj` 的运行时吸收结果，
-不参与传输，读者在每次 pull 落地后由 `_refresh_derived_weights` 重新吸收。
+不参与传输；每次 pull 落地后读者在 `weights_already_processed()` 下调用 vLLM 上游
+`process_weights_after_loading`（MLA 吸收、MoE kernel、量化 stamp 一并重建，
+实测 4.5–8.2 ms），不支持的量化方法回退到仅 MLA 的 refresh。
 
 ### 3.8 FP8：贯穿全链路的 wire 格式
 

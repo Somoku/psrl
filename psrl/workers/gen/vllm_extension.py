@@ -321,14 +321,37 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         return PullVerdict(landed=True, versions=frozenset(report.versions), repaired=report.repaired)
 
     def _refresh_derived_weights(self) -> None:
-        """Rebuild parameters vLLM computes from transported ones.
+        """Re-run vLLM's post-load hooks after the pull has rewritten the weights.
 
-        MLA absorbs `kv_b_proj` into `W_UK_T`/`W_UV` after loading, and a pull rewrites
-        `kv_b_proj`, so those views are stale until regenerated. Only modules that expose
-        both attributes are touched; every other architecture pays one attribute check.
+        vLLM derives runtime state from the parameters it loads: MLA absorbs
+        `kv_b_proj` into `W_UK_T`/`W_UV`, fused MoE builds its kernel from the expert
+        tensors, and quant methods keep stamps that are not parameters. A pull replaces
+        the bytes underneath all of those, so the state has to be rebuilt.
+
+        vLLM 0.30 provides the reload path for exactly this: `weights_already_processed()`
+        tells each quant method that the tensors are already in runtime format, so it
+        skips the transforms that would otherwise re-quantise or re-lay-out them, and
+        only restores the non-exported state and rebuilds kernels. Methods that do not
+        declare support raise, which is the signal that the method cannot be reloaded in
+        place; the attribute-based MLA refresh below remains as a fallback so the pull
+        still lands (with a warning naming the method).
         """
         model = self.model_runner.model
-        dtype = getattr(getattr(self.model_runner, "model_config", None), "dtype", None)
+        model_config = getattr(self.model_runner, "model_config", None)
+        if model_config is not None:
+            try:
+                from vllm.model_executor.model_loader.utils import process_weights_after_loading
+                from vllm.model_executor.utils import weights_already_processed
+
+                with weights_already_processed():
+                    process_weights_after_loading(model, model_config, self.device)
+                return
+            except Exception as exc:
+                psrl_logger.warning(
+                    f"{self.nixl_storage_client.client_name}: vLLM's post-load reload hook failed "
+                    f"({exc!r}); falling back to derived-weight refresh only."
+                )
+        dtype = getattr(model_config, "dtype", None)
         for module in model.modules():
             if not (hasattr(module, "W_UK_T") and hasattr(module, "kv_b_proj")):
                 continue

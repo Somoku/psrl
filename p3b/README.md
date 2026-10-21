@@ -27,23 +27,28 @@ target.
 
 ## Quickstart
 
-Validate a configuration before serving it. The exit code is the whole answer,
-which is what a deployment pipeline reads:
+The default deployment is a **control plane over node agents**, and every plane
+runs the Docker backend. `make cluster` starts the example fleet on this host:
+two node agents on ports 9090 and 9091 (with distinct cgroup subtrees), then the
+control plane on port 9000. It preflights all three configs first, so a
+misconfigured node fails before anything is started.
 
 ```bash
-make preflight                        # validates example.json, reaches each backend
-sandboxd -config ${REPO}/p3b/example.json
+make cluster          # nodes first, then the control plane; logs in bin/logs
+make cluster-stop     # stop what it started
 ```
 
 A preflight failure names what it could not reach. `docker daemon at
-/var/run/docker.sock is not answering` means the daemon, not the service.
+/var/run/docker.sock is not answering` means the daemon, not the service. The
+control plane's preflight does not require a local daemon: it declares the
+backend for routing but drives none of it.
 
-Then, from Python:
+Then, from Python, against the control plane:
 
 ```python
 from sandboxd import Resources, SandboxClient, SandboxSpec, Source
 
-async with SandboxClient("unix:///run/sandboxd.sock") as client:
+async with SandboxClient("127.0.0.1:9000") as client:
     async with await client.create(
         SandboxSpec(
             source=Source.image("alpine:latest"),
@@ -53,6 +58,22 @@ async with SandboxClient("unix:///run/sandboxd.sock") as client:
     ) as sandbox:
         print((await sandbox.exec("echo hello")).stdout)
 ```
+
+For a real fleet, install the binary on every machine and start the node agent
+there, then the control plane on its own host:
+
+```bash
+# on each node
+sandboxd -preflight -config node.json
+sandboxd -config node.json
+# on the control host
+sandboxd -preflight -config control.json
+sandboxd -config control.json
+```
+
+`example.json` and `make run-combined` remain the single-process development
+shape. They are not the deployment default: they bypass placement across
+machines and keep one worker's fleet to itself.
 
 ## Layout
 
@@ -119,8 +140,9 @@ nothing running.
 
 ## One control plane over several nodes
 
-The quickstart runs both planes in one process, which serves one machine. A
-fleet splits them: one control process, and one node process per machine.
+The default deployment splits the planes: one control process, and one node
+process per machine. `make cluster` is the single-host example of that shape;
+`run-combined` exists only for development and must not be used for a fleet.
 
 | Field | Role `control` | Role `node` |
 |---|---|---|
@@ -185,43 +207,72 @@ SANDBOXD_BINARY=${PREFIX}/bin/sandboxd pytest ${REPO}/tests/sandbox/test_sdk_liv
 Every live suite skips itself where no Docker socket is present, so the default
 run works on a machine that has none.
 
+Three drivers exercise a deployed service rather than a fake:
+
+```bash
+# placement spread and direct exec on every node
+python verify_cluster.py <control-host:port> 12
+
+# stdout/stderr, missing path, container death, owner silence, episode-shaped load
+python tests/sandbox/fault_injection.py --endpoint <control-host:port> \
+    --node-ssh 'node-a=root@host-a,node-b=root@host-b' --image alpine:latest
+
+# node process outage and out-of-band container removal
+python tests/sandbox/fleet_faults.py --endpoint <control-host:port> \
+    --nodes 'node-a=root@host-a,node-b=root@host-b' --target node-b \
+    --image alpine:latest --restart-cmd '<binary> -config <node-config> > /tmp/node.log 2>&1 & sleep 3'
+
+# a held load that samples live sandboxes, renewal failures, fds, and containers
+python tests/sandbox/soak.py --endpoint <control-host:port> \
+    --nodes 'node-a=root@host-a,node-b=root@host-b' --image alpine:latest \
+    --seconds 900 --concurrency 128
+```
+
+The fleet drivers SSH to the nodes to kill a container or a node process; the
+addresses are arguments, never configuration in the repository.
+
 ## Using it from PSRL
 
 PSRL reaches the service through the `p3b` backend, which is a client and
 nothing more: placement, admission, and reclamation stay here. Two steps.
 
-1. Start a service where the sandboxes should run. One combined process per
-   node is the simplest shape; a fleet runs one control plane over several node
-   processes instead. `listen` is what the worker reaches.
-2. Point the rollout at it, in
-   `psrl/trainer/config/rollout/psrl_rollout.yaml`:
+1. Start the default deployment: one control plane and one node agent per
+   machine, both on the Docker backend. `listen` is what the worker reaches.
+2. Point the workers at the control plane. The shipped rollout config already
+   selects `p3b` and names a placeholder control host; override it per
+   deployment (or set `PSRL_P3B_ENDPOINT`):
 
 ```yaml
 sandbox:
-  default_backend: p3b          # was: docker
+  default_backend: p3b
   backends:
     p3b:
-      endpoint: unix:///run/sandboxd.sock
+      endpoint: ${oc.env:PSRL_P3B_ENDPOINT,p3b-control:9000}
       resource_class: rollout   # must name a class this service declares
 ```
 
 The `resource_class` has to exist in this service's own `classes` block, or
 every create is refused for a class it was never given a share of.
 
-Choose `p3b` over the in-process `docker` backend when more than one worker
-shares a fleet: the service holds one quota ledger across every node and
-backend it drives, so a class guarantee bounds the whole run rather than each
-worker's own node. A single-worker deployment gains nothing from the hop.
+The default is `p3b` because the deployment is a control plane over node agents:
+one quota ledger and one placement view span every worker and machine. The
+in-process `docker` backend remains for single-worker development and for
+ablations that must hold the backend fixed.
 
 The service must be listening before a worker starts. The backend connects on
-its first create, and a missing socket is a startup error rather than something
-it retries.
+its first create, and a missing endpoint is a startup error rather than
+something it retries.
 
 ## Gotchas
 
 - **A node refusal is not a failure.** The control plane asks placement for
   another node. A fleet with one node turns the refusal into an error, which is
   why a single-node deployment reads `node_pressure` as a hard stop.
+- **A stopped container and a missing file are different 404s.** The node asks
+  the runtime which one it got: `runtime gone` releases the sandbox and its
+  charge, `path not found` leaves a healthy sandbox usable. A caller that sees
+  `SandboxTransportError` for an exec on a dead node is seeing a stale node, not
+  a task result; the node's own prober will release the charge when it returns.
 - **`fleet.memory_mb` is what the service may admit in total, not the sum of
   your nodes' declared envelopes.** State the sum of what the nodes *will
   grant* — each node's declared envelope times its `overcommit` — or the ledger
@@ -235,3 +286,13 @@ it retries.
   already in use`. Check for a second `sandboxd` before assuming a bug.
 - **Commands do not go through the control plane.** If `exec` fails while
   `create` works, the fault is on the node or in the sandbox, not in placement.
+- **Renewals target the nodes that hold the owner's sandboxes, not every node
+  that ever reported.** A node that missed its reports is stale, and a heartbeat
+  that paid its timeout would turn one dead machine into a permanent beat
+  delay. `client.diagnostics()` reports renewal failures and the last fan-out
+  duration; `client.contract()` reports the timing spans a client should derive
+  its cadence from.
+- **The quota ledger follows the node's inventory.** A sandbox removed out of
+  band is released from the node in one probe interval and from the control
+  plane's ledger in two eligible reports; `owner_lease` is only the backstop for
+  a partitioned node.

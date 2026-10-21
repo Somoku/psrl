@@ -16,7 +16,12 @@ DESTDIR ?=
 BINDIR   = $(DESTDIR)$(PREFIX)/bin
 
 BINARY  = bin/sandboxd
-CONFIG  ?= example.json
+# The default deployment is a control plane over node agents. `example.json` is
+# the single-process development shape and is reached through `run-combined`.
+CONFIG        ?= example_control.json
+NODE_CONFIG   ?= example_node.json
+CLUSTER_NODES ?= example_node.json example_node_b.json
+LOGDIR        ?= bin/logs
 
 # Trim the symbol table and DWARF. A sandbox node runs this, it does not debug
 # it, and the stripped binary is roughly a third smaller to ship.
@@ -32,7 +37,12 @@ help:
 	@echo "  install       install the binary to $(PREFIX)/bin (override PREFIX, DESTDIR)"
 	@echo "  uninstall     remove it again"
 	@echo "  preflight     validate CONFIG=$(CONFIG) and exit, without serving"
-	@echo "  run           build, then serve CONFIG=$(CONFIG) in the foreground"
+	@echo "  preflight-node validate NODE_CONFIG=$(NODE_CONFIG)"
+	@echo "  run           build, then serve the control plane CONFIG=$(CONFIG)"
+	@echo "  run-node      build, then serve one node agent NODE_CONFIG=$(NODE_CONFIG)"
+	@echo "  run-combined  build, then serve example.json (single-process dev shape)"
+	@echo "  cluster       start $(CLUSTER_NODES) then the control plane, logs in $(LOGDIR)"
+	@echo "  cluster-stop  stop the processes started by cluster"
 	@echo ""
 	@echo "Python SDK:"
 	@echo "  sdk-install   pip install -e sdk  (the surface a caller imports)"
@@ -67,9 +77,49 @@ uninstall:
 preflight: build
 	./$(BINARY) -preflight -config $(CONFIG)
 
+.PHONY: preflight-node
+preflight-node: build
+	./$(BINARY) -preflight -config $(NODE_CONFIG)
+
 .PHONY: run
 run: build
 	./$(BINARY) -config $(CONFIG)
+
+.PHONY: run-node
+run-node: build
+	./$(BINARY) -config $(NODE_CONFIG)
+
+.PHONY: run-combined
+run-combined: build
+	./$(BINARY) -config example.json
+
+# The default deployment: one control plane over node agents. The example
+# configs run both agents and the control plane on this host, on distinct ports
+# and cgroup subtrees, so the two-plane path can be exercised without a second
+# machine. A real fleet runs `run-node` on each machine and `run` on the control.
+.PHONY: cluster
+cluster: build
+	@mkdir -p $(LOGDIR)
+	@for cfg in $(CLUSTER_NODES); do ./$(BINARY) -preflight -config $$cfg || exit 1; done
+	@./$(BINARY) -preflight -config $(CONFIG)
+	@for cfg in $(CLUSTER_NODES); do \
+		name=$$(basename $$cfg .json); \
+		nohup ./$(BINARY) -config $$cfg > $(LOGDIR)/$$name.log 2>&1 & \
+		echo $$! > $(LOGDIR)/$$name.pid; \
+	done
+	@sleep 2
+	@nohup ./$(BINARY) -config $(CONFIG) > $(LOGDIR)/control.log 2>&1 & \
+		echo $$! > $(LOGDIR)/control.pid
+	@sleep 2
+	@echo "cluster started: control on 127.0.0.1:9000, nodes $(CLUSTER_NODES); logs in $(LOGDIR)"
+
+.PHONY: cluster-stop
+cluster-stop:
+	@for f in $(LOGDIR)/*.pid; do \
+		[ -f "$$f" ] && kill $$(cat $$f) 2>/dev/null || true; \
+		rm -f "$$f"; \
+	done
+	@echo "cluster stopped"
 
 # Editable, because the SDK is developed alongside the service it speaks to and
 # a copied install would hide a wire-format change until the next reinstall.

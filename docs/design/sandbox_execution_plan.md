@@ -143,21 +143,24 @@ mode a target owner.
 Steps 2.1 to 2.3 and 2.5 are wired: the trainer creates the placement service and one
 node agent per node in `gen_actor_rollout_ref.rollout.agent.node_ips` (every alive node
 when that list is empty), each worker builds its backend over those handles, and the plane
-is exercised on a real cluster by
-`python -m tests.sandbox.smoke_ray_plane`.
+is exercised by `p3b/verify_cluster.py` against a real multi-node fleet.
 
-Two exit criteria are not met yet, so the steps that carry them stay open:
+Step 2.4 is satisfied for the Go service: `p3b/tests/rollout/remote_rollout_test.go`
+drives a control plane and real node processes against a real daemon, and
+`p3b/verify_cluster.py` plus `p3b/tests/sandbox/fleet_faults.py` exercise a three-node
+fleet (placement spread, direct exec on every node, node outage and restart adoption).
+The Python/Ray variant of the same criterion is tracked separately.
 
-- **2.4** asks that `harness_agent_loop` and the MiniSWE runner be unchanged while running
-  against a remote node. They are unchanged, but no run has been made against a remote
-  node: the smoke script covers the plane, not a rollout. A remote rollout needs a Docker
-  daemon on a second host.
+One exit criterion remains open:
+
 - **2.6** asks for colocated and dedicated placement policies. `required_label` pins a
   request to a labelled node, which is the mechanism, but there is no policy that keeps a
   sandbox off a trainer node beyond naming the fleet in `node_ips`.
 
 Step 2.7's diagnostics surface exists on the node agent, and 2.8's metrics family reaches
-the trainer's per-step hook, so both are done.
+the trainer's per-step hook, so both are done. This revision adds the control plane's own
+`diagnostics` and `contract` calls, so renewal failures and the mechanism's timing spans
+are observable from the SDK rather than only from worker logs.
 
 ### One node stays the degenerate case
 

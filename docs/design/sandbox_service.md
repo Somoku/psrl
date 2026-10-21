@@ -5,6 +5,11 @@ inside a Ray worker: one control plane for the fleet, one agent per node, a Pyth
 SDK for callers, and the sandbox runtimes supplied by existing open-source projects
 rather than reimplemented here.
 
+The cluster/node split is the **default deployment**, and the Docker backend is
+its default runtime. The single-process mode (`role` absent, `example.json`) is a
+development shape: it bypasses cross-machine placement and keeps one worker's
+fleet to itself, so it is not what a fleet deployment starts.
+
 It supersedes the deployment shape in {doc}`sandbox_refactor`, which assumed the
 module lives in-process. The capability model stays where it is: this page adds no
 feature table and cites {doc}`sandbox_backend_integration` for every capability
@@ -172,6 +177,35 @@ the sandbox is for, so it states the sandbox's whole life -- agent work, the gra
 follows it, and a margin for provisioning and teardown -- and the node reclaims a caller
 that died or forgot without a second deadline carrying the same meaning.
 
+### The ledger follows the runtime, not the other way around
+
+The sweep answers "should this record still exist?" from ownership and lifetime. It does
+not answer "is the container still running?", and for a while nothing did: a container
+that exited stayed charged, and every command against it got a Docker 409 that the wire
+reported as a transport fault.
+
+A second loop answers that question. Every `runtime_probe_interval` the node asks the
+runtime for the status of each resident sandbox whose command count is zero, concurrently
+and with a per-call timeout. Only `exited`, `oom`, and `terminated` are decisions; a
+failed probe, `paused`, and any state the probe does not recognize leave the sandbox
+alone. The re-check happens under the allocation lock, because a command may have started
+while the probe was in flight. The decision goes through the same cleanup queue as the
+sweep and the charge is returned only after the runtime confirms the removal.
+
+An exec that discovers the container is gone does not wait for the probe: it marks the
+record lost, attributes the exit reason (OOM when the runtime says so), and returns a lost
+session to the caller. That is the difference between a sandbox that is *unhealthy* and
+one that is *gone* -- `ErrSessionLost` (a persistent shell died, the container may still be
+healthy) does not release the record, while `ErrRuntimeGone` does.
+
+The control plane's quota ledger converges the same way. Each node report carries an
+inventory sequence and the sandbox ids it holds; a grant whose sandbox is absent from two
+consecutive reports generated after the grant was recorded is released. The guards are
+the point: an older node that sends no inventory is skipped, a truncated inventory is
+skipped, a report generated before the grant was recorded cannot count as a miss, a
+sequence regression (a node restart) re-arms instead of comparing, and `owner_lease`
+remains the backstop for a node that is partitioned rather than gone.
+
 ---
 
 ## Timing: how fast the fleet notices
@@ -191,9 +225,27 @@ timing:
 | Constant | Value | Why |
 |---|---|---|
 | `load_report_interval` | `node_ttl` / 4 | several missed reports fit inside one TTL |
-| `owner_lease` | 4h | a dead owner's grant outlives any sandbox lifetime; the node reclaims the sandbox by its own lifetime |
+| `owner_heartbeat_interval` | 30s | how often a caller renews the sandboxes it holds |
+| `owner_silence_ttl` | 90s | three missed beats: a node treats the owner as gone and reclaims |
+| `owner_lease` | 4h | the control plane's quota backstop for a partitioned node; the node reclaims on silence, and a node's inventory releases a vanished grant within two reports |
 | `reservation_ttl` | 60s | a placement reservation outlives the gap to the node's next report, and a slow create renews it |
 | `sweep_interval` | 15s | a sweep enforces a TTL, so it must be faster |
+| `runtime_probe_interval` | 30s | how often a node asks the runtime whether a resident container is still alive |
+
+The two owner clocks are deliberately different and must not be conflated. The
+**node** reclaims on `owner_silence_ttl`, because it is the component that can see
+whether a container is still there. The **control plane** keeps its quota grant
+for `owner_lease`, because a partitioned node may still be running the sandbox;
+the grant is released earlier when the node's own inventory reports the sandbox
+gone (two consecutive eligible reports, after a two-sequence arming delay).
+
+A renewal is fanned out **concurrently, to the nodes that actually hold the
+owner's sandboxes**, with a per-node bound of 3s and a batch bound of 5s. The
+client's own deadline is 10s. A stale node is not in the live fleet and is not
+targeted; if a control plane restarted with no records, it falls back to the
+live fleet. The node also treats any command or touch it serves as evidence the
+owner is alive, so a delayed heartbeat cannot reclaim a sandbox that is actively
+running work.
 
 Placement asserts the one ordering it depends on -- the reservation TTL is shorter than the
 node TTL -- and the rest are constants whose orderings are fixed where they are defined.
@@ -224,6 +276,8 @@ class SandboxClient:
 
     async def fleet(self) -> FleetReport: ...      # what Monitor sees, for metrics
     async def quota(self) -> QuotaReport: ...      # per-class ledger, for metrics
+    async def diagnostics(self) -> dict: ...       # renewal/health counters, for operators
+    async def contract(self) -> dict: ...          # timing spans a client derives from
     async def close(self) -> None: ...
 
 
@@ -335,11 +389,23 @@ an infrastructure fault must never be recorded as a model or harness failure.
 |---|---|---|
 | `SandboxCapacityTimeout` | never admitted; no sandbox existed | capacity planning, retry later |
 | `SandboxCapabilityError` | no backend satisfies the spec | fix the spec or the deployment |
-| `SandboxSessionLostError` | the sandbox stopped unasked | replace the rollout, do not blame the harness |
-| `SandboxOomError` | the kernel killed it for memory | resource fault, raise the request |
+| `SandboxSessionLostError` | the sandbox stopped unasked; `exit_reason` is `released`, `reaped_lifetime`, `reclaimed_orphan`, `exited`, `runtime_gone`, or `oom` | replace the rollout, do not blame the harness |
+| `SandboxOomError` | a resource fault carried as an OOM attribution | raise the request |
+| `SandboxPathNotFound` | a file operation addressed a path the sandbox does not have | handle the path; the sandbox is still usable |
 | `SandboxCommandTimeout` | a command exceeded its deadline; `sandbox_preserved` says whether the sandbox survived | continue with a fresh shell, or replace |
 | `SandboxSetupError` | the task's preparation failed | task fault, nothing was captured |
-| `SandboxTransportError` | the control channel failed | says nothing about the workload |
+| `SandboxTransportError` | the control channel or a node did not answer | says nothing about the workload |
+
+A lost session and a missing path are both 404s from the container runtime, and
+the wire keeps them apart with an explicit `path_not_found` class. That class is
+carried across the node→control hop as a string beside the gRPC code, so
+`classify` can prefer the error's own classification over the coarse status
+code. A bare gRPC `NotFound` still means a lost session for callers that speak
+the proto directly.
+
+`exec` returns stdout and stderr separately, plus `truncated` when the engine's
+frame stream ended mid-write. The service never merges the streams and never
+reports an empty stderr for output it actually received.
 
 ---
 

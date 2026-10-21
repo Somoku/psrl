@@ -385,6 +385,48 @@ number a price that has not measured anything will let through.
   resident byte-seconds during model waits -- are not measured here. They need an A/B of
   full training steps, not these microbenchmarks.
 
+## 5. Fleet validation: liveness, reconciliation, and error taxonomy
+
+A control plane and three node planes (384 cores and 2.2 TB each, Docker 26,
+`alpine:latest`, `max_create_concurrency=64` per node) were driven by
+`tests/sandbox/fault_injection.py`, `tests/sandbox/fleet_faults.py`, and
+`verify_cluster.py`. The numbers below are what a reader can act on; each is
+reproduced by the command named beside it.
+
+| Case | Measurement | Reading |
+|---|---|---|
+| stdout/stderr | exit 7 with `stdout="out\n"`, `stderr="err\n"` | the Engine's stream byte is honored; the old `stderr=""` was a producer-side loss |
+| missing path | `SandboxPathNotFound`, later exec succeeds | a missing file no longer destroys a healthy sandbox |
+| container killed | `session_lost(exit_reason=exited)` in 0.001–0.002 s, charge released | the exec path attributes the runtime's 409 instead of calling it transport |
+| owner stops renewing | reclaimed at 100.1 s | 90 s silence + 15 s sweep, inside the [90, 105] s bound |
+| container removed out of band | node charge released at 30.0 s, control quota at 60.1 s | one probe interval, then two inventory reports |
+| node process killed | renewal batch 0.001 s (max 0.006 s), stale after 125 s, 0/9 new placements on it | the heartbeat no longer pays a dead node's timeout |
+| node blackholed (accepts, never replies) | renewal batch 3.002 s, one node failure recorded, data plane `SandboxTransportError`, recovery after unblock | the per-node 3 s budget bounds a stall instead of the old 60 s serial fan-out |
+| node restarted | the sandbox's container was adopted and the same handle executed again | containers outlive the node process; startup reconciliation owns them |
+
+Held load: 128 concurrent episode workers for one hour against the three-node
+fleet completed 36,945 episodes. Six failed (0.016%), all during the final
+drain (a cancelled release leaves its grant to the inventory; the control's
+ledger released those grants in two reports, which is the convergence path
+working rather than a leak). At the end the fleet reported zero live sandboxes,
+zero containers, and file-descriptor counts flat between 39 and 72 across the
+hour.
+
+Load, measured as create + four short execs + a file read + release per episode:
+
+| Fleet | Concurrency | Episodes | Failures | p50 | p99 | Throughput |
+|---|---|---|---|---|---|---|
+| 1 node | 64 | 256 | 0 | 6.22 s | 10.94 s | 7.21/s |
+| 3 nodes | 64 | 256 | 0 | 1.58 s | 4.65 s | 21.91/s |
+| 3 nodes | 256 | 1024 | 0 | 8.16 s | 18.88 s | 14.67/s |
+
+Three nodes at equal per-node concurrency scale almost exactly linearly (21.9/s
+against 7.2/s). Pushing the fleet to 256 concurrent episodes *lowers* throughput
+(14.7/s) while raising p99: each node's create gate is 64, so the extra
+concurrency queues behind the gate instead of doing work. Size the caller's
+in-flight episodes to the fleet's create gate, not to the number of episodes a
+step needs.
+
 ## Reproducing
 
 ```
@@ -396,4 +438,18 @@ go test -tags integration ./internal/cgroup/ ./internal/pressure/
 
 # a node with a warm_pool block configured, then
 python tests/sandbox/bench_warm_pool.py <control-endpoint> --batches 16 --pool-size 8
+
+# the single-node failure matrix and an episode-shaped burst
+python tests/sandbox/fault_injection.py --endpoint <control-endpoint> \
+    --node-ssh root@<node-host> --image alpine:latest --concurrency 64
+
+# a fleet: node outage with restart, and out-of-band container removal
+python tests/sandbox/fleet_faults.py --endpoint <control-endpoint> \
+    --nodes 'node-a=root@<host-a>,node-b=root@<host-b>' --target node-b \
+    --image alpine:latest --restart-cmd '<binary> -config <node-config> > /tmp/node.log 2>&1 & sleep 3'
+
+# held load; one JSON sample per cadence, and a final leak check
+python tests/sandbox/soak.py --endpoint <control-endpoint> \
+    --nodes 'node-a=root@<host-a>,node-b=root@<host-b>' \
+    --image alpine:latest --seconds 900 --concurrency 128
 ```

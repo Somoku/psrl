@@ -172,7 +172,7 @@ agent:
     # runtime objects such as Docker clients and metrics locks never enter `RolloutConfig`.
     _recursive_: false
 
-    default_backend: docker
+    default_backend: p3b
 
     # How long one create waits for room before it is reported as a capacity fault. The
     # refused request is the one that made a sandbox share full, and a share clears as its
@@ -221,29 +221,24 @@ agent:
 
     backends:
 
-      # The p3b sandbox service. Switch to it with `default_backend: p3b`.
-      #
-      # Choose it over `docker` when more than one worker shares a fleet: the
-      # service holds one quota ledger across every node and backend it drives,
-      # so a class guarantee bounds the whole run rather than each worker's own
-      # node. A single-worker deployment gains nothing from the hop and should
-      # stay on `docker`.
+      # The p3b sandbox service. It is the default backend: the service's
+      # control plane owns placement, admission, and reclamation across its
+      # node agents, so every worker shares one ledger instead of each worker
+      # bounding only its own machine.
       #
       # The service must already be listening before a worker starts — the
-      # backend connects on its first create and a missing socket is a startup
+      # backend connects on its first create and a missing endpoint is a startup
       # error, not a retry. `p3b/README.md` carries the deployment steps.
       p3b:
         _target_: psrl.sandbox.backends.P3bBackend
 
-        # Where the SDK reaches the service. A service per node uses this unix
-        # socket; one shared control plane over several nodes is reached by
-        # host:port instead, and that is the deployment which makes this backend
-        # worth the hop — every worker charges one ledger and placement compares
-        # every node rather than each worker seeing only its own.
-        #
-        # Override per deployment rather than editing this default:
+        # Where the SDK reaches the control plane. The default names a control
+        # host the deployment supplies; override it per deployment rather than
+        # editing this value:
         #   actor_rollout_ref.rollout.sandbox.backends.p3b.endpoint=<host>:9000
-        endpoint: unix:///run/sandboxd.sock
+        # The environment variable is the deployment-wide form of the same
+        # override.
+        endpoint: ${oc.env:PSRL_P3B_ENDPOINT,p3b-control:9000}
 
         # The class a sandbox is charged to when its spec names none. The
         # service's own `classes` block has to declare this same name, or every

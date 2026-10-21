@@ -58,7 +58,7 @@ p3b 服务于长程 Agentic RL。这个场景的成本结构与短 FaaS 不同�
 
 两件与决策相关的事实：
 
-- **部署里实际运行的只有 Docker backend。** `p3b/deploy.json`、`deploy_direct.json`、`deploy_node_250.json`、`deploy_control.json`、`deploy_node.json` 以及各 `example*.json` 全部声明 `type: docker`，没有任何 provider 配置。这是修订 D2 的依据。
+- **默认部署以 Docker backend 为主，但契约同时支持 provider。** `deploy.json`、`deploy_node_250.json`、`deploy_control.json` 等声明 Docker；`deploy_direct.json` 默认 OpenSandbox，`agentenv` 与 `cubesandbox` 的 adapter 也在树内。D2 的依据是「Docker 是默认交付路径」，不是「只有 Docker」。
 - **按需加载对同类容器路径不可用。** `image_on_demand` 与 `image_block_delivery` 只在各 backend 的 `Capabilities()` 里出现，仅被 capability 匹配消费。OpenSandbox 的核实结论见 8.1：Docker runtime 完整拉取镜像，按需加载只存在于 fast-sandbox 路径。
 
 **范围决定（已修订）。** D2 与 S8 已按下述结论修订：Docker backend 是默认部署 backend，同时保持契约完整，需要无外部服务，但不追求 provider 级密度。允许一个**能力门控的节点内 snapshotter** 作为可选项，理由是它属于节点部署成分而非外部服务，且是唯一能在不依赖外部平台的前提下端到端验证 lazy 的地方。DSec 式内核级页共享与 microVM 路径仍排除在 Docker backend 之外。
@@ -71,18 +71,20 @@ p3b 服务于长程 Agentic RL。这个场景的成本结构与短 FaaS 不同�
 | --- | --- | --- |
 | `p3b/internal/node/lifecycle.go` | 显式 Release 已按先销毁再归还处理（`Release` 在 `backend.Release` 失败时保留 grant） | 保留该顺序，消除旁路 |
 | `p3b/internal/node/lifecycle.go` | **已修**：独立 TTL 路径已删除，`Sweep` 不再无条件 `admission.Expire()`，预算只在销毁确认后归还 | 已收敛到同一状态机 |
-| `p3b/internal/node/lifecycle.go` | idle pause 与 idle reap 已移除，停滞判定只余 owner 存活与 lifetime。pause 只走控制面，无 generation 协调 | 生命周期动作按 generation 串行确认 |
-| `p3b/internal/node/admission.go` | **已修**：`Renew` 经 `control.RenewOwner` 到 `Node.RenewOwner`。`SetDraining` 现由 `cleanup_failed` 置位与清除，有生产调用链 | 保留 |
+| `p3b/internal/node/lifecycle.go` | idle pause 与 idle reap 已移除，停滞判定只余 owner 存活与 lifetime。**本轮新增**：`ProbeRuntime` 每 30s 向 runtime 询问 resident sandbox 的状态，只对 `exited/oom/terminated` 决策；失败/`paused`/未知状态不回收；决策前在锁内二次校验 `inFlight`。`MarkLost` 让 exec 发现容器已死时立即归因并归还 charge | 生命周期动作按 generation 串行确认 |
+| `p3b/internal/node/admission.go` | **已修**：`Renew` 经 `control.RenewOwner` 到 `Node.RenewOwner`。`SetDraining` 现由 `cleanup_failed` 置位与清除，有生产调用链。**本轮新增**：`Exec/Touch/ReadBytes/WriteBytes` 在 node 侧直接 `admission.Renew(owner)`，数据面活动本身即活性证据 | 保留 |
 | `p3b/internal/node/admission.go` | owner 存活检查**已修**：`main.go` 在生产路径安装 `gate.OwnerAlive` | 保留，补齐死亡检测与重启对账 |
-| `p3b/internal/pressure/` | 读的是外层部署 cgroup 而非 sandbox 子树（5.2 有实测）。读失败在 `Read()` 里静默返回零，而 `effectiveEnvelopeLocked` 把零当「未超售」 | 采样域与 sandbox 子域对齐，失效值不得当作空闲 |
-| `p3b/internal/server/nodeserver.go` | `view()` 重复采样（两次 `pressure()`），`ImageDigests`/`ImageReferences` 写成空 map，`localityScore` 永远为 0 | 单一采样器发布带时间戳快照，补齐镜像与准备制品库存 |
-| `p3b/internal/backend/dockerbackend/docker.go` | 创建设置静态内存和 CPU 限额，未设置 `CgroupParent`。镜像准备发生在 create 并发控制之前 | 补齐资源域，分开限制拉取、创建、执行和清理 |
-| `p3b/internal/backend/dockerbackend/docker.go` | `Backend.Sweep` **已修**：改为可选接口 `backend.Reconciler`，节点启动时按标签重建账本。仍缺拉取请求合并，`callRaw` 仍整块缓冲响应 | 请求合并与有界输出仍待做 |
-| `p3b/internal/backend/dockerbackend/warmpool.go` | 预热匹配只比 image、memory、cpu，不含 env、workdir、runtime、network。接管不更新实际限额。补充仅受数量约束，销毁失败被吞 | 规格正确、实际资源可核对、压力感知的预热池 |
-| `p3b/internal/placement/` | 已有镜像局部性评分，但库存输入为空。控制面重试不排除已拒绝节点 | 可解释的库存评分、拒绝节点排除和退避 |
+| `p3b/internal/pressure/` | **已修**：采样域是配置的 sandbox 子树；域不可读是错误而不是零，admission 不会把失效读数当成空闲（`pressure.go` + `domain_test.go`） | 保留 |
+| `p3b/internal/server/nodeserver.go` | **已修**：`view()` 每次报告只采样一次。仍存在的缺口是 `ImageDigests`/`ImageReferences` 为空，`localityScore` 因此没有输入 | 补齐镜像与准备制品库存 |
+| `p3b/internal/server/control.go` | **本轮新增**：`RenewOwner` 只发给持有该 owner 记录的节点（无记录时回退到 live fleet），并发 fan-out，单节点 3s、整批 5s，错误聚合为计数与一条批次日志；`dialNode` 用 `DialContext`，ctx 真正约束拨号 | 保留；续租不再串行走历史节点 |
+| `p3b/internal/server/jsonrpc.go` | **本轮新增**：`classify` 先看 `WireCode()`，`path_not_found` 与 `session_lost` 跨 node→control→SDK 三跳保真；`preserveSessionLost` 不再把带类型的错误压成 transport | 保留 |
+| `p3b/internal/quota/` + `control.go` | **本轮新增**：节点报告携带 inventory 序号与 live sandbox ids；控制面连续两次 eligible report 缺失后释放 grant，带两序号 arming、截断/旧节点跳过、序号回退重置。实测一次容器被外部删除后 quota 在 60.1s 内归零 | 保留；`owner_lease` 只做分区兜底 |
+| `p3b/internal/backend/dockerbackend/docker.go` | 创建设置静态内存和 CPU 限额，且 **已设置 `CgroupParent`**；启动对账拒绝子树外的容器。**本轮新增**：409/404 按 body 区分 `ErrRuntimeGone` 与 `ErrPathNotFound`；`Status` 区分 `oom`/`exited`/`paused`；Docker 帧按 stream 字节分流 stdout/stderr；`Reconciled` 携带 OOMKilled/ExitCode。仍缺拉取请求合并，`callRaw` 仍整块缓冲响应 | 请求合并与有界输出仍待做 |
+| `p3b/internal/backend/dockerbackend/warmpool.go` | **已修**：匹配包含 env、workdir、class、exec_mode、lifetime、mounts、GPU；runtime/network 仍不是模板字段。接管不更新实际限额的问题仍在 | 规格正确、实际资源可核对、压力感知的预热池 |
+| `p3b/internal/placement/` | **已修**：`ExcludeNodes` 已用于排除被拒绝的节点；本轮把「节点未应答 admission」也加入排除并尝试下一候选。镜像局部性仍无库存输入 | 可解释的库存评分与退避 |
 | `p3b/internal/server/convert.go` 与 `p3b/internal/quota/` | fleet 与节点预算均由同一静态规格转换，等待依赖轮询 | 拆分租户公平性与物理准入，支持有界事件唤醒 |
-| Python p3b adapter 与 SDK | **已修**：`_to_service_spec` 现转发 workdir、exec_mode、required_features、required_resume_level 与 backend pin，并把全部 PSRL 字段登记为转发、拒绝或明确不转发（新增字段会被用例挡住）。拒绝集不变 | 保留：新增字段必须在此边界做决定，禁止静默忽略 |
-| `p3b/sdk/sandboxd/` | 连接池默认大小 32，池槽等待在请求超时之外 | 总截止时间覆盖连接池排队 |
+| Python p3b adapter 与 SDK | **已修**：`_to_service_spec` 现转发 workdir、exec_mode、required_features、required_resume_level 与 backend pin，并把全部 PSRL 字段登记为转发、拒绝或明确不转发（新增字段会被用例挡住）。拒绝集不变。**本轮新增**：`SandboxPathNotFound` 贯通、续租使用独立连接池并从 `contract` 推导节奏、`Transport.call` 取消时关闭连接、`fleet_report` 的 `backends` 修正 | 保留：新增字段必须在此边界做决定，禁止静默忽略 |
+| `p3b/sdk/sandboxd/` | 连接池默认大小 32，池槽等待在请求超时之外。**本轮新增**：续租使用独立 client/pool；create 仍以 `timeout_s=None` 占槽，这是下一步应拆分的控制面生命周期调用 | 总截止时间覆盖连接池排队 |
 | 所有 backend 的 `image_on_demand` | 能力字符串，仅用于路由匹配。OpenSandbox 已核实：Docker runtime 完整拉取，无按需路径 | opensandbox backend 不声明该能力，其交付为块级。AgentEnv 与 CubeSandbox 待核实后再定 |
 
 现有 overcommit 主要扩展基于观测值的内存准入包络，不构成 CPU 与内存联合弹性控制器。CPU 请求总和仍可先成为瓶颈。不得把一个更大的 overcommit 系数当成 P2。

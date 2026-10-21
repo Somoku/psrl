@@ -50,8 +50,15 @@ def sample(reply: dict, ts: float) -> list[tuple]:
         env = n.get("envelope") or {}
         mem_env = _num(env, "memory_mb", "memory")
         cpu_env = _num(env, "cpu_millis", "cpu")
-        mem_head = _num(env, "memory_headroom_mb", default=mem_env)
-        cpu_head = _num(env, "cpu_headroom_millis", default=cpu_env)
+        # Headroom is what the envelope has left after the node's promises. The
+        # envelope object carries the total, not the remainder: reading a
+        # `memory_headroom_mb` key that does not exist silently reported the
+        # envelope as headroom, which made a full node look idle.
+        granted = n.get("granted") or {}
+        mem_granted = _num(granted, "memory_mb", "memory")
+        cpu_granted = _num(granted, "cpu_millis", "cpu")
+        mem_head = max(mem_env - mem_granted, 0.0)
+        cpu_head = max(cpu_env - cpu_granted, 0.0)
         class_head = n.get("class_headroom") or {}
         for cls, hr in class_head.items():
             rows.append((ts, nid, f"class:{cls}",

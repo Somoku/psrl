@@ -259,6 +259,10 @@ func writeNodeConfig(t *testing.T, workDir, nodeID, address string, overcommit f
 			"local_mem_ceiling":  0.95,
 			"overcommit":         overcommit,
 			"utilization_target": 0.85,
+			// A subtree of its own: a test that shared the deployment's default
+			// subtree would rewrite the limit of a service already running on
+			// the same host.
+			"cgroup_parent": "psrl-rollout-" + nodeID,
 		},
 		"classes": map[string]any{
 			"default": map[string]any{"guaranteed_share": 0.5, "max_share": 1.0},
@@ -278,9 +282,11 @@ func writeNodeConfig(t *testing.T, workDir, nodeID, address string, overcommit f
 	}
 	if overcommit <= 1 {
 		// An unset target with overcommit off is valid, and leaving the target in
-		// would not be exercising the off path.
+		// would not be exercising the off path. Overcommit itself is still
+		// stated as exactly 1: zero is not "off", it is a subtree smaller than
+		// the envelope, which the domain refuses.
+		config["node"].(map[string]any)["overcommit"] = 1.0
 		delete(config["node"].(map[string]any), "utilization_target")
-		delete(config["node"].(map[string]any), "overcommit")
 	}
 
 	configPath := filepath.Join(workDir, nodeID+".json")

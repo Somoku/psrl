@@ -127,6 +127,10 @@ sandbox_placement:
   # when it names one and every alive node otherwise, which shares nodes with the trainer:
   # each node still admits against its own envelope, so name the fleet to keep sandboxes
   # off the GPU nodes.
+  # Off: p3b's control plane owns placement and admission across its node agents,
+  # so the rollout must not run a second scheduler over the same machines. On: the
+  # Python/Ray placement plane, for a deployment that drives the in-process
+  # backends without p3b.
   enabled: False
 
   # The backend the fleet runs, which is also the placement filter and the name a task asks

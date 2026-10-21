@@ -87,11 +87,12 @@ async def main() -> int:
     argv = [arg for arg in sys.argv[1:] if arg != "--lifecycle"]
     lifecycle = "--lifecycle" in sys.argv
     endpoint = argv[0] if argv else "127.0.0.1:9000"
-    count = int(argv[1]) if len(argv) > 1 else 4
+    count_arg = int(argv[1]) if len(argv) > 1 else None
 
     async with SandboxClient(endpoint) as client:
         report = await client.fleet()
         nodes = report.nodes
+        count = count_arg if count_arg is not None else max(2, len(nodes) * 2)
         print(f"fleet: {len(nodes)} node(s)")
         for node in nodes:
             print(

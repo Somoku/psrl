@@ -28,6 +28,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -178,10 +179,10 @@ func newShellSession(ctx context.Context, b *Backend, sandboxID string) (*shellS
 	startCtx, cancel := context.WithTimeout(ctx, defaultShellStartupTimeout)
 	defer cancel()
 	probe := fmt.Sprintf("echo %s $$", readinessMarker)
-	out, _, err := s.runInner(startCtx, probe, "", nil)
-	if err != nil || !strings.Contains(out, readinessMarker) {
+	res, err := s.runInner(startCtx, probe, "", nil)
+	if err != nil || !strings.Contains(res.Stdout, readinessMarker) {
 		s.close()
-		return nil, fmt.Errorf("persistent shell did not become ready: %v (output: %q)", err, out)
+		return nil, fmt.Errorf("persistent shell did not become ready: %v (output: %q)", err, res.Stdout)
 	}
 	// Install the exit shim once, so that for the life of this session `exit N`
 	// ends the command rather than the shell.
@@ -192,7 +193,7 @@ func newShellSession(ctx context.Context, b *Backend, sandboxID string) (*shellS
 	// directory and every exported variable it had built, and would never be told.
 	// The shim returns instead, so the sentinel still carries the status. A
 	// caller that redefines exit itself overrides this, which is its own choice.
-	if _, _, err := s.runInner(startCtx, exitShim, "", nil); err != nil {
+	if _, err := s.runInner(startCtx, exitShim, "", nil); err != nil {
 		s.close()
 		return nil, fmt.Errorf("persistent shell could not install its exit handling: %w", err)
 	}
@@ -230,29 +231,44 @@ func (s *shellSession) run(
 	ctx context.Context,
 	command, workdir string,
 	env map[string]string,
-) (stdout string, exitCode int, err error) {
+) (backend.ExecResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return "", 1, fmt.Errorf("persistent shell is closed")
+		return backend.ExecResult{ExitCode: 1}, fmt.Errorf("persistent shell is closed")
 	}
 	return s.runInner(ctx, command, workdir, env)
 }
 
 // runInner executes one command. Must be called with s.mu held.
+//
+// The hijacked stream carries the Engine's multiplexing frames, so output is
+// decoded as it arrives instead of searching the raw bytes for the sentinel: a
+// frame header could otherwise match the sentinel, and the two streams could not
+// be reported separately. A partial frame is kept until the rest of it arrives.
 func (s *shellSession) runInner(
 	ctx context.Context,
 	command, workdir string,
 	env map[string]string,
-) (string, int, error) {
+) (backend.ExecResult, error) {
 	wrapped := s.wrap(command, workdir, env)
 	if _, err := fmt.Fprintf(s.conn, "%s\n", wrapped); err != nil {
 		s.closed = true
-		return "", 1, fmt.Errorf("persistent shell write: %w", err)
+		return backend.ExecResult{ExitCode: 1}, fmt.Errorf("persistent shell write: %w", err)
 	}
 
-	// Read until the sentinel appears.
-	var buf bytes.Buffer
+	var stdout, stderr, pending bytes.Buffer
+	unframed := false
+	truncated := false
+	fail := func(code int, message string) (backend.ExecResult, error) {
+		return backend.ExecResult{
+			ExitCode:  code,
+			Stdout:    stdout.String(),
+			Stderr:    stderr.String(),
+			Truncated: truncated || pending.Len() > 0,
+		}, errors.New(message)
+	}
+
 	deadline := time.Time{}
 	if t, ok := ctx.Deadline(); ok {
 		deadline = t
@@ -264,7 +280,7 @@ func (s *shellSession) runInner(
 			now := time.Now()
 			if now.After(deadline) {
 				s.closed = true
-				return buf.String(), 1, fmt.Errorf("persistent shell command exceeded deadline")
+				return fail(1, "persistent shell command exceeded deadline")
 			}
 			nextSilence := silenceDeadline
 			if deadline.Before(nextSilence) {
@@ -277,20 +293,36 @@ func (s *shellSession) runInner(
 
 		n, readErr := s.reader.Read(raw)
 		if n > 0 {
-			buf.Write(raw[:n])
+			pending.Write(raw[:n])
 			silenceDeadline = time.Now().Add(defaultSilenceTimeout)
-			// Check if the sentinel has arrived.
-			output := buf.String()
-			exitCode, remaining, found := parseSentinel(output, s.sentinel)
-			if found {
-				return remaining, exitCode, nil
+			if !unframed && pending.Len() >= 8 && pending.Bytes()[0] > 2 {
+				// Not the Engine's framing: keep the bytes as stdout rather than
+				// dropping an output stream that is already plain text.
+				unframed = true
+			}
+			if unframed {
+				stdout.Write(pending.Bytes())
+				pending.Reset()
+			} else {
+				consumed := decodeFrames(pending.Bytes(), &stdout, &stderr)
+				pending.Next(consumed)
+			}
+			if exitCode, remaining, found := parseSentinel(stdout.String(), s.sentinel); found {
+				stdout.Reset()
+				stdout.WriteString(remaining)
+				return backend.ExecResult{
+					ExitCode:  exitCode,
+					Stdout:    stdout.String(),
+					Stderr:    stderr.String(),
+					Truncated: truncated || pending.Len() > 0,
+				}, nil
 			}
 		}
 		if readErr != nil {
 			if os.IsTimeout(readErr) {
 				if time.Now().After(silenceDeadline) {
 					s.closed = true
-					return buf.String(), 1, fmt.Errorf("persistent shell silence timeout exceeded")
+					return fail(1, "persistent shell silence timeout exceeded")
 				}
 				continue
 			}
@@ -299,12 +331,38 @@ func (s *shellSession) runInner(
 				// The stream ended, which for this session means the shell is gone.
 				// That is a fact about the caller's session rather than a fault of
 				// the runtime, so it is marked as one.
-				return buf.String(), 1, fmt.Errorf(
+				result, _ := fail(1, "")
+				return result, fmt.Errorf(
 					"persistent shell exited before the command finished: %w", backend.ErrSessionLost)
 			}
-			return buf.String(), 1, fmt.Errorf("persistent shell read: %w", readErr)
+			return fail(1, "persistent shell read: "+readErr.Error())
 		}
 	}
+}
+
+// decodeFrames consumes the complete Engine frames in buf and writes each
+// payload to its stream. It returns how many bytes it consumed; an incomplete
+// trailing frame is left for the next read.
+func decodeFrames(buf []byte, stdout, stderr *bytes.Buffer) int {
+	consumed := 0
+	for len(buf)-consumed >= 8 {
+		stream := buf[consumed]
+		if stream > 2 {
+			return consumed
+		}
+		size := int(binary.BigEndian.Uint32(buf[consumed+4 : consumed+8]))
+		if size < 0 || len(buf)-consumed-8 < size {
+			break
+		}
+		payload := buf[consumed+8 : consumed+8+size]
+		if stream == 2 {
+			stderr.Write(payload)
+		} else {
+			stdout.Write(payload)
+		}
+		consumed += 8 + size
+	}
+	return consumed
 }
 
 // wrap builds the text written to stdin for one command.
@@ -491,12 +549,12 @@ func (b *Backend) execPersistent(
 	handle backend.Handle,
 	command, workdir string,
 	env map[string]string,
-) (int, string, error) {
+) (backend.ExecResult, error) {
 	s, err := b.shells.acquire(ctx, b, handle.SandboxID)
 	if err != nil {
-		return 1, "", fmt.Errorf("persistent shell: %w", err)
+		return backend.ExecResult{ExitCode: 1}, fmt.Errorf("persistent shell: %w", err)
 	}
-	stdout, code, err := s.run(ctx, command, workdir, env)
+	result, err := s.run(ctx, command, workdir, env)
 	if errors.Is(err, backend.ErrSessionLost) {
 		// The shell exited while this command was running, so the session is gone
 		// and part of the command may already have run.
@@ -508,11 +566,9 @@ func (b *Backend) execPersistent(
 		// command gets a new one, and the caller is told: it is the only one that
 		// knows whether re-running duplicates work.
 		b.shells.drop(handle.SandboxID)
-		return code, demultiplex([]byte(stdout)), fmt.Errorf(
+		return result, fmt.Errorf(
 			"the persistent shell exited while this command was running, so the session was replaced "+
 				"and any state built in it is gone: %w", err)
 	}
-	// Strip the frame headers the Engine multiplexer adds: the persistent shell
-	// stream uses the same framing as the one-shot exec.
-	return code, demultiplex([]byte(stdout)), err
+	return result, err
 }

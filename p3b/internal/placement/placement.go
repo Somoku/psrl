@@ -126,6 +126,25 @@ type NodeView struct {
 	// call may want and uses a fraction of one between calls, so charging the declaration
 	// caps the fleet at a number that has nothing to do with the load on it.
 	ClassReserveCPUMillis map[string]int64
+
+	// Inventory is the node's own list of sandboxes it currently holds, with
+	// the sequence number the snapshot was taken under. The control plane
+	// reconciles its quota grants against this: a grant whose sandbox is absent
+	// from two consecutive eligible reports is charged for a runtime the node
+	// no longer has.
+	//
+	// InventoryReported distinguishes "this node holds nothing" from "this node
+	// is an older build that never sent an inventory". A zero value must not be
+	// read as an empty node, or a rolling upgrade releases every grant on it.
+	ReportSeq          uint64
+	InventoryReported  bool
+	InventoryTruncated bool
+	LiveSandboxIDs     []string
+
+	// Diagnostics are the node's own counters, carried beside the scheduling
+	// view so an operator can see why a node is refusing or reaping without
+	// reading its logs. They are not inputs to placement.
+	Diagnostics map[string]float64
 }
 
 // Request is what a caller needs from a node.

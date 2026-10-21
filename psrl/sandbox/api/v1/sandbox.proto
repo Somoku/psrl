@@ -373,6 +373,10 @@ enum ExitReason {
   OOM = 4;
   RECLAIMED_ORPHAN = 5;
   FAILED = 6;
+  // The container stopped for a reason other than OOM.
+  CONTAINER_EXITED = 7;
+  // The runtime no longer has the container at all.
+  CONTAINER_RUNTIME_GONE = 8;
 }
 
 message DiagnosticsResponse {

@@ -148,6 +148,27 @@ func (m *Monitor) Fleet() []placement.NodeView {
 	return m.view
 }
 
+// LiveFleet returns the nodes whose report is still inside the TTL.
+//
+// Fleet is the historical view -- it keeps a node that once reported so the
+// fleet report can explain a drain. Any caller that acts on a node (a renewal,
+// a probe, a control fan-out) must use this instead: acting on a stale entry
+// means paying that node's timeout on every pass, and a single unreachable node
+// then becomes a permanent tax on a mechanism that has nothing to do with it.
+func (m *Monitor) LiveFleet() []placement.NodeView {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	now := m.now()
+	live := make([]placement.NodeView, 0, len(m.view))
+	for _, view := range m.view {
+		if m.nodeTTL > 0 && now.Sub(view.SeenAt) > m.nodeTTL {
+			continue
+		}
+		live = append(live, view)
+	}
+	return live
+}
+
 // Version changes whenever the fleet does, so a reader can skip an unchanged pull.
 func (m *Monitor) Version() uint64 { return m.version.Load() }
 

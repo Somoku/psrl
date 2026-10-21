@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -621,10 +622,17 @@ func (b *Backend) Status(ctx context.Context, handle backend.Handle) (string, er
 	case inspected.State.Paused:
 		return "paused", nil
 	case inspected.State.Running:
+		// Running wins over OOMKilled: a container that was restarted after an
+		// OOM reports the historical flag while its process is healthy, and
+		// reading that as "oom" would reap a live sandbox.
 		return "running", nil
+	case inspected.State.OOMKill:
+		return "oom", nil
 	case inspected.State.Status == "exited" || inspected.State.Status == "dead":
 		return "exited", nil
 	default:
+		// "created" and "restarting" are transitional; a caller that read them
+		// as gone would destroy a sandbox the daemon is bringing back.
 		return "unknown", nil
 	}
 }
@@ -680,7 +688,17 @@ func (b *Backend) ReadFile(ctx context.Context, handle backend.Handle, path stri
 	raw, err := b.callRaw(ctx, http.MethodGet,
 		"/containers/"+handle.SandboxID+"/archive?path="+urlEncodePath(path), nil)
 	if err != nil {
-		return nil, fmt.Errorf("docker archive get %q: %w", path, err)
+		// The Engine answers 404 both for "this path is not in the container"
+		// and for "this container does not exist". They are different facts to
+		// the caller: one leaves the sandbox usable, the other does not.
+		switch {
+		case isContainerGone(err):
+			return nil, fmt.Errorf("docker archive get %q: %w (docker: %v)", path, backend.ErrRuntimeGone, err)
+		case isArchiveFileMissing(err):
+			return nil, fmt.Errorf("docker archive get %q: %w (docker: %v)", path, backend.ErrPathNotFound, err)
+		default:
+			return nil, fmt.Errorf("docker archive get %q: %w", path, err)
+		}
 	}
 	return extractTarSingle(raw)
 }
@@ -704,12 +722,12 @@ func (b *Backend) WriteFile(ctx context.Context, handle backend.Handle, path str
 	// Charging it to the request timeout makes a daemon too busy to start a process
 	// report a stalled mkdir as a dead write, which is a fault in the wrong place.
 	mkdirCmd := "mkdir -p " + shellescape(dir)
-	code, out, execErr := b.execOneShot(ctx, handle, mkdirCmd, "", nil)
+	result, execErr := b.execOneShot(ctx, handle, mkdirCmd, "", nil)
 	if execErr != nil {
 		return fmt.Errorf("docker archive put %q: mkdir: %w", path, execErr)
 	}
-	if code != 0 {
-		return fmt.Errorf("docker archive put %q: mkdir exited %d: %s", path, code, out)
+	if result.ExitCode != 0 {
+		return fmt.Errorf("docker archive put %q: mkdir exited %d: %s", path, result.ExitCode, result.Stderr)
 	}
 	putCtx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
@@ -825,16 +843,11 @@ func (b *Backend) DeleteSnapshot(ctx context.Context, snapshotID string) error {
 	return nil
 }
 
-// Exec runs one command in a sandbox and returns its result.
+// Exec runs one command in a sandbox under the strategy the spec asked for.
 //
 // This is here because a container has no in-sandbox agent to talk to. It is
 // reached through the node agent rather than the control plane, so command
 // traffic still stays node-local.
-func (b *Backend) Exec(ctx context.Context, handle backend.Handle, command string, workdir string, env map[string]string) (int, string, error) {
-	return b.execOneShot(ctx, handle, command, workdir, env)
-}
-
-// ExecWithMode runs a command under the strategy the spec asked for.
 //
 // A persistent shell keeps working directory, exported variables, and an
 // activated environment alive between calls, which is what a multi-turn harness
@@ -842,9 +855,9 @@ func (b *Backend) Exec(ctx context.Context, handle backend.Handle, command strin
 // for a grader step that runs exactly once. The strategy is a property of the
 // workload rather than of the backend, so it travels on the spec and the node
 // passes it here.
-func (b *Backend) ExecWithMode(
+func (b *Backend) Exec(
 	ctx context.Context, handle backend.Handle, execMode, command, workdir string, env map[string]string,
-) (int, string, error) {
+) (backend.ExecResult, error) {
 	if execMode == "persistent" {
 		return b.execPersistent(ctx, handle, command, workdir, env)
 	}
@@ -852,7 +865,7 @@ func (b *Backend) ExecWithMode(
 }
 
 // execOneShot starts a new process per command, holding no state between calls.
-func (b *Backend) execOneShot(ctx context.Context, handle backend.Handle, command string, workdir string, env map[string]string) (int, string, error) {
+func (b *Backend) execOneShot(ctx context.Context, handle backend.Handle, command string, workdir string, env map[string]string) (backend.ExecResult, error) {
 	envList := make([]string, 0, len(env))
 	for key, value := range env {
 		envList = append(envList, key+"="+value)
@@ -873,44 +886,77 @@ func (b *Backend) execOneShot(ctx context.Context, handle backend.Handle, comman
 		ID string `json:"Id"`
 	}
 	if err := b.call(ctx, http.MethodPost, "/containers/"+handle.SandboxID+"/exec", create, &created); err != nil {
-		return 0, "", fmt.Errorf("docker exec create: %w", err)
+		return backend.ExecResult{}, commandError("docker exec create", err)
 	}
 	output, err := b.callRaw(ctx, http.MethodPost, "/exec/"+created.ID+"/start", map[string]any{"Detach": false, "Tty": false})
 	if err != nil {
-		return 0, "", fmt.Errorf("docker exec start: %w", err)
+		return backend.ExecResult{}, commandError("docker exec start", err)
 	}
 	var inspected struct {
 		ExitCode int  `json:"ExitCode"`
 		Running  bool `json:"Running"`
 	}
 	if err := b.call(ctx, http.MethodGet, "/exec/"+created.ID+"/json", nil, &inspected); err != nil {
-		return 0, "", fmt.Errorf("docker exec inspect: %w", err)
+		return backend.ExecResult{}, commandError("docker exec inspect", err)
 	}
-	return inspected.ExitCode, demultiplex(output), nil
+	stdout, stderr, truncated := demultiplexStreams(output)
+	return backend.ExecResult{
+		ExitCode:  inspected.ExitCode,
+		Stdout:    stdout,
+		Stderr:    stderr,
+		Truncated: truncated,
+	}, nil
 }
 
-// demultiplex strips the Engine's stream framing.
+// commandError classifies a failed Engine call.
 //
-// An attached exec without a TTY returns a framed stream: an eight-byte header
-// per chunk, with the payload length in the last four bytes. Returning the raw
-// bytes would put binary headers into a command's output.
-func demultiplex(raw []byte) string {
-	var out bytes.Buffer
+// A container that is not running or no longer exists is a fact about the
+// runtime, not a transport fault. The caller must replace the sandbox and the
+// node must stop charging it, so it is reported as ErrRuntimeGone rather than
+// as an indistinguishable "the daemon did not answer".
+func commandError(op string, err error) error {
+	if isContainerGone(err) {
+		return fmt.Errorf("%s: %w (docker: %v)", op, backend.ErrRuntimeGone, err)
+	}
+	return fmt.Errorf("%s: %w", op, err)
+}
+
+// demultiplexStreams separates the Engine's stdout and stderr frames.
+//
+// An attached exec without a TTY returns one framed stream carrying both
+// streams: an eight-byte header per chunk whose first byte names the stream
+// (1 stdout, 2 stderr) and whose last four bytes are the payload length. The
+// order within each stream is preserved; interleaving between them is not
+// recoverable from two separate strings, which is why the result keeps them
+// apart instead of concatenating them.
+func demultiplexStreams(raw []byte) (stdout, stderr string, truncated bool) {
+	var out, errOut bytes.Buffer
+	sawFrame := false
 	for len(raw) >= 8 {
-		size := int(raw[4])<<24 | int(raw[5])<<16 | int(raw[6])<<8 | int(raw[7])
+		sawFrame = true
+		stream := raw[0]
+		size := int(binary.BigEndian.Uint32(raw[4:8]))
 		raw = raw[8:]
 		if size > len(raw) {
+			// A short frame means the stream ended mid-write. Keep what arrived
+			// and tell the caller its output is incomplete rather than silently
+			// returning a truncated answer as if it were whole.
 			size = len(raw)
+			truncated = true
 		}
-		out.Write(raw[:size])
+		if stream == 2 {
+			errOut.Write(raw[:size])
+		} else {
+			out.Write(raw[:size])
+		}
 		raw = raw[size:]
 	}
-	// A daemon that returned unframed bytes is older than the framing; keep them
-	// rather than dropping a command's output.
-	if out.Len() == 0 {
-		return string(raw)
+	if !sawFrame {
+		// A daemon that returned unframed bytes is older than the framing; keep
+		// them rather than dropping a command's output.
+		out.Write(raw)
 	}
-	return out.String()
+	return out.String(), errOut.String(), truncated
 }
 
 // Reconcile returns every sandbox this service owns on this node, with the facts
@@ -1055,7 +1101,10 @@ func (b *Backend) inspectOne(ctx context.Context, id string) (backend.Reconciled
 		Name    string `json:"Name"`
 		Created string `json:"Created"`
 		State   struct {
-			Running bool `json:"Running"`
+			Running   bool   `json:"Running"`
+			OOMKilled bool   `json:"OOMKilled"`
+			ExitCode  int    `json:"ExitCode"`
+			Status    string `json:"Status"`
 		} `json:"State"`
 		Config struct {
 			Labels map[string]string `json:"Labels"`
@@ -1081,6 +1130,11 @@ func (b *Backend) inspectOne(ctx context.Context, id string) (backend.Reconciled
 		Class:         labels[labelClass],
 		ExecMode:      labels[labelExecMode],
 		Running:       inspected.State.Running,
+		// The daemon's attribution for a container that is no longer running.
+		// A node that adopts by restart must be able to say why a stopped
+		// container is being reclaimed, not just that it is.
+		OOMKilled: inspected.State.OOMKilled && !inspected.State.Running,
+		ExitCode:  inspected.State.ExitCode,
 		Resources: backend.Resources{
 			MemoryMB: inspected.HostConfig.Memory / (1024 * 1024),
 		},
@@ -1382,6 +1436,48 @@ func isNotFound(err error) bool {
 		return apiErr.status == http.StatusNotFound
 	}
 	return false
+}
+
+// apiErrorDetail returns the Engine status and body behind a wrapped error.
+func apiErrorDetail(err error) (status int, body string, ok bool) {
+	var apiErr *apiError
+	if !asAPIError(err, &apiErr) {
+		return 0, "", false
+	}
+	return apiErr.status, apiErr.body, true
+}
+
+// isContainerGone reports whether the Engine said the container is stopped or
+// no longer exists.
+//
+// Both are 409 or 404 bodies rather than distinct status codes, so the message
+// is the only signal. The two phrases are Docker's own stable wording:
+// "Container <id> is not running" for a stopped container and "No such
+// container" for a removed one. A paused container also answers 409, and is
+// deliberately not included: it can be resumed, so it is not gone.
+func isContainerGone(err error) bool {
+	status, body, ok := apiErrorDetail(err)
+	if !ok {
+		return false
+	}
+	lowered := strings.ToLower(body)
+	switch status {
+	case http.StatusConflict:
+		return strings.Contains(lowered, "is not running")
+	case http.StatusNotFound:
+		return strings.Contains(lowered, "no such container")
+	}
+	return false
+}
+
+// isArchiveFileMissing reports whether an archive read failed because the path
+// is absent from a container that does exist.
+func isArchiveFileMissing(err error) bool {
+	status, body, ok := apiErrorDetail(err)
+	if !ok || status != http.StatusNotFound {
+		return false
+	}
+	return strings.Contains(strings.ToLower(body), "could not find the file")
 }
 
 func asAPIError(err error, target **apiError) bool {

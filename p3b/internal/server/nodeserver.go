@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"time"
 
@@ -367,7 +369,8 @@ func (n *Node) LedgerAudit() (granted node.Resources, envelope node.Resources, a
 // works at: a scheduler given the envelope remainder sends work this node will
 // refuse, and the mismatch shows up only as sandboxes that never start.
 func (n *Node) Report(context.Context, *v1.Empty) (*v1.NodeView, error) {
-	return n.view(), nil
+	view, _ := n.view()
+	return view, nil
 }
 
 // throttledPct is the share of the last interval the sandboxes spent stopped for
@@ -385,7 +388,7 @@ func (n *Node) throttledPct() float64 {
 	return n.elastic.lastThrottledPct
 }
 
-func (n *Node) view() *v1.NodeView {
+func (n *Node) view() (*v1.NodeView, node.LifecycleReport) {
 	// One sample per report, used for both admission and the wire fields. Calling it
 	// twice made the reported CPU figure a rate over the microseconds between two
 	// RPC-internal calls, which is noise, and it disagreed with what admission stored.
@@ -430,13 +433,13 @@ func (n *Node) view() *v1.NodeView {
 		}
 		out.Backends = append(out.Backends, hosted)
 	}
-	return out
+	return out, life
 }
 
 // View returns this node's state as placement reads it, for an in-process
 // deployment where the monitor and the node share a process.
 func (n *Node) View() placement.NodeView {
-	proto := n.view()
+	proto, life := n.view()
 	view := placement.NodeView{
 		NodeID:                proto.GetNodeId(),
 		SeenAt:                time.Now(),
@@ -452,6 +455,28 @@ func (n *Node) View() placement.NodeView {
 		ClassReserveMB:        n.classMemoryReservesMB(),
 		ClassReserveCPUMillis: n.classCPUReservesMillis(),
 	}
+	// The inventory travels with the sequence it was taken under, so the
+	// control plane can tell a report generated before a grant existed from one
+	// generated after it.
+	view.ReportSeq = life.ReportSeq
+	view.InventoryReported = life.InventoryReported
+	view.InventoryTruncated = life.InventoryTruncated
+	view.LiveSandboxIDs = life.LiveSandboxIDs
+	view.Diagnostics = map[string]float64{
+		"lifecycle/resident":       float64(life.Resident),
+		"lifecycle/busy":           float64(life.Busy),
+		"lifecycle/destroying":     float64(life.Destroying),
+		"lifecycle/cleanup_failed": float64(life.CleanupFailed),
+		"lifecycle/failures":       float64(life.Failures),
+	}
+	for reason, count := range life.Exits {
+		view.Diagnostics["lifecycle/exit/"+string(reason)] = float64(count)
+	}
+	checks, gone, probesFailed, probeErrors := n.lifecycle.ProbeCounters()
+	view.Diagnostics["probe/checks"] = float64(checks)
+	view.Diagnostics["probe/gone"] = float64(gone)
+	view.Diagnostics["probe/failures"] = float64(probesFailed)
+	view.Diagnostics["probe/errors"] = float64(probeErrors)
 	if envelope := proto.GetEnvelope(); envelope != nil {
 		view.Envelope = placement.Headroom{
 			MemoryMB: envelope.GetMemoryMb(), CPUMillis: envelope.GetCpuMillis(),
@@ -535,7 +560,36 @@ func (e *sessionGoneError) Error() string {
 // having to type-switch on this package's concrete error.
 func (e *sessionGoneError) ExitReason() string { return e.reason }
 
+// WireCode names the caller-facing classification. It is checked before the
+// gRPC status so a lost session stays a lost session across every hop.
+func (e *sessionGoneError) WireCode() string { return "session_lost" }
+
 func (e *sessionGoneError) GRPCStatus() *status.Status {
+	return status.New(codes.NotFound, e.Error())
+}
+
+// pathNotFoundError is a file operation against a path that is not present in a
+// sandbox this node still holds.
+//
+// It exists because a missing file is not a missing sandbox. Both are Docker
+// 404s, and the old code mapped both to a lost session, which made a failed
+// harness report say the sandbox had died when the real problem was a file the
+// agent removed.
+type pathNotFoundError struct {
+	path string
+	err  error
+}
+
+func (e *pathNotFoundError) Error() string {
+	return fmt.Sprintf("path %q is not present in the sandbox: %v", e.path, e.err)
+}
+
+func (e *pathNotFoundError) Unwrap() error { return e.err }
+
+// WireCode names the caller-facing classification, checked before the status.
+func (e *pathNotFoundError) WireCode() string { return "path_not_found" }
+
+func (e *pathNotFoundError) GRPCStatus() *status.Status {
 	return status.New(codes.NotFound, e.Error())
 }
 
@@ -547,40 +601,173 @@ func (e *sessionGoneError) GRPCStatus() *status.Status {
 // starts a fresh process per call, which is cheaper and correct for a grader.
 // The strategy is chosen at sandbox creation time and stored on the lifecycle
 // resident so this path cannot diverge from what the spec asked for.
-func (n *Node) Exec(ctx context.Context, handle backend.Handle, command, workdir string, env map[string]string) (int, string, error) {
+func (n *Node) Exec(ctx context.Context, handle backend.Handle, command, workdir string, env map[string]string) (backend.ExecResult, error) {
 	_, held, owned := n.lifecycle.Lookup(handle.SandboxID)
 	if !owned {
 		// The sandbox is gone. Report why it left when the lifecycle still
-		// remembers, so the caller can tell a reaped-idle sandbox from one that
-		// was never here -- and gets a lost-session rather than a transport
-		// fault.
+		// remembers, so the caller can tell a reaped sandbox from one that was
+		// never here -- and gets a lost-session rather than a transport fault.
 		reason, _ := n.lifecycle.ExitReasonOf(handle.SandboxID)
-		return 0, "", &sessionGoneError{
+		return backend.ExecResult{}, &sessionGoneError{
 			sandboxID: handle.SandboxID,
 			nodeID:    n.nodeID,
 			reason:    string(reason),
 		}
 	}
-	// A backend whose sandboxes run their own in-sandbox agent is never reached
-	// here — the SDK contacts the agent directly.
-	type execModer interface {
-		ExecWithMode(context.Context, backend.Handle, string, string, string, map[string]string) (int, string, error)
-	}
 	// Mark the sandbox busy for the whole command, so the reclamation sweep
 	// cannot read a long command as idle and pause a running test suite.
 	done := n.lifecycle.Begin(handle.SandboxID)
 	defer done()
-	if moded, ok := held.(execModer); ok {
-		execMode := n.lifecycle.ExecMode(handle.SandboxID)
-		return moded.ExecWithMode(ctx, handle, execMode, command, workdir, env)
-	}
-	runner, canRun := held.(interface {
-		Exec(context.Context, backend.Handle, string, string, map[string]string) (int, string, error)
-	})
+	// Data-plane traffic is the strongest liveness evidence the node has: it
+	// observes the command itself. Refreshing the owner here is what keeps a
+	// sandbox alive when the control plane's heartbeat is delayed by another
+	// node, without adding a second protocol.
+	n.renewOwnerOf(handle.SandboxID)
+
+	executor, canRun := held.(backend.Executor)
 	if !canRun {
-		return 0, "", fmt.Errorf("backend %q runs commands through its own in-sandbox agent", held.Name())
+		// A backend whose sandboxes run their own in-sandbox agent is never
+		// reached here; the SDK contacts the agent directly.
+		return backend.ExecResult{}, fmt.Errorf("backend %q runs commands through its own in-sandbox agent", held.Name())
 	}
-	return runner.Exec(ctx, handle, command, workdir, env)
+	execMode := n.lifecycle.ExecMode(handle.SandboxID)
+	result, err := executor.Exec(ctx, handle, execMode, command, workdir, env)
+	if err == nil {
+		return result, nil
+	}
+	return result, n.classifyRuntimeFailure(ctx, held, handle, err)
+}
+
+// classifyRuntimeFailure turns a backend command error into the attribution the
+// caller acts on, and updates the node's ledger when the runtime is gone.
+func (n *Node) classifyRuntimeFailure(
+	ctx context.Context, held backend.Backend, handle backend.Handle, err error,
+) error {
+	switch {
+	case errors.Is(err, backend.ErrRuntimeGone):
+		reason := n.runtimeGoneReason(ctx, held, handle)
+		n.lifecycle.MarkLost(handle.SandboxID, reason)
+		return &sessionGoneError{sandboxID: handle.SandboxID, nodeID: n.nodeID, reason: string(reason)}
+	case errors.Is(err, backend.ErrSessionLost):
+		// The command session is gone, but the container may still be healthy.
+		// The caller replaces the sandbox; the node does not release a runtime
+		// it has no evidence is dead.
+		return &sessionGoneError{sandboxID: handle.SandboxID, nodeID: n.nodeID}
+	case errors.Is(err, backend.ErrPathNotFound):
+		return &pathNotFoundError{path: "", err: err}
+	default:
+		return err
+	}
+}
+
+// runtimeGoneReason asks the runtime why it is gone, with a short budget. A
+// failed or slow probe answers "exited": the caller still needs the sandbox
+// replaced, and an unknown cause is not a reason to leave the charge in place.
+func (n *Node) runtimeGoneReason(ctx context.Context, held backend.Backend, handle backend.Handle) node.ExitReason {
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	status, err := held.Status(probeCtx, handle)
+	if err != nil {
+		return node.ExitExited
+	}
+	switch status {
+	case "oom":
+		return node.ExitOOM
+	case "terminated":
+		return node.ExitRuntimeGone
+	default:
+		return node.ExitExited
+	}
+}
+
+// renewOwnerOf refreshes the owner's liveness on this node. An owner this node
+// never admitted is ignored by the admission gate, so a stale sandbox id is
+// harmless.
+func (n *Node) renewOwnerOf(sandboxID string) {
+	if owner, ok := n.lifecycle.OwnerOf(sandboxID); ok {
+		n.admission.Renew(owner)
+	}
+}
+
+// ReadBytes reads one file from a sandbox this node holds, preserving the
+// distinction between a missing file and a missing sandbox.
+func (n *Node) ReadBytes(ctx context.Context, handle backend.Handle, path string) ([]byte, error) {
+	_, held, owned := n.lifecycle.Lookup(handle.SandboxID)
+	if !owned {
+		reason, _ := n.lifecycle.ExitReasonOf(handle.SandboxID)
+		return nil, &sessionGoneError{sandboxID: handle.SandboxID, nodeID: n.nodeID, reason: string(reason)}
+	}
+	n.renewOwnerOf(handle.SandboxID)
+	if files, ok := held.(backend.FileHandler); ok {
+		data, err := files.ReadFile(ctx, handle, path)
+		if err == nil {
+			return data, nil
+		}
+		switch {
+		case errors.Is(err, backend.ErrPathNotFound):
+			return nil, &pathNotFoundError{path: path, err: err}
+		case errors.Is(err, backend.ErrRuntimeGone):
+			return nil, n.classifyRuntimeFailure(ctx, held, handle, err)
+		case errors.Is(err, backend.ErrSessionLost):
+			return nil, n.classifyRuntimeFailure(ctx, held, handle, err)
+		default:
+			return nil, err
+		}
+	}
+	// Shell fallback for a backend with no file API. A non-zero exit is the
+	// only signal a shell can give, and for a read it means the path did not
+	// exist or could not be read; both are path-level facts.
+	executor, ok := held.(backend.Executor)
+	if !ok {
+		return nil, fmt.Errorf("backend %q has neither a file API nor a command executor", held.Name())
+	}
+	done := n.lifecycle.Begin(handle.SandboxID)
+	defer done()
+	result, err := executor.Exec(ctx, handle, n.lifecycle.ExecMode(handle.SandboxID),
+		fmt.Sprintf("base64 %q", path), "", nil)
+	if err != nil {
+		return nil, n.classifyRuntimeFailure(ctx, held, handle, err)
+	}
+	if result.ExitCode != 0 {
+		return nil, &pathNotFoundError{path: path, err: fmt.Errorf("command exited %d: %s", result.ExitCode, result.Stderr)}
+	}
+	decoded, err := base64.StdEncoding.DecodeString(compactBase64(result.Stdout))
+	if err != nil {
+		return nil, fmt.Errorf("reading %q: the shell fallback produced invalid base64: %w", path, err)
+	}
+	return decoded, nil
+}
+
+// WriteBytes writes one file into a sandbox this node holds.
+func (n *Node) WriteBytes(ctx context.Context, handle backend.Handle, path string, data []byte) error {
+	_, held, owned := n.lifecycle.Lookup(handle.SandboxID)
+	if !owned {
+		reason, _ := n.lifecycle.ExitReasonOf(handle.SandboxID)
+		return &sessionGoneError{sandboxID: handle.SandboxID, nodeID: n.nodeID, reason: string(reason)}
+	}
+	n.renewOwnerOf(handle.SandboxID)
+	if files, ok := held.(backend.FileHandler); ok {
+		if err := files.WriteFile(ctx, handle, path, data); err != nil {
+			return n.classifyRuntimeFailure(ctx, held, handle, err)
+		}
+		return nil
+	}
+	executor, ok := held.(backend.Executor)
+	if !ok {
+		return fmt.Errorf("backend %q has neither a file API nor a command executor", held.Name())
+	}
+	done := n.lifecycle.Begin(handle.SandboxID)
+	defer done()
+	command := fmt.Sprintf("mkdir -p \"$(dirname %q)\" && printf %%s %q | base64 -d > %q",
+		path, base64.StdEncoding.EncodeToString(data), path)
+	result, err := executor.Exec(ctx, handle, n.lifecycle.ExecMode(handle.SandboxID), command, "", nil)
+	if err != nil {
+		return n.classifyRuntimeFailure(ctx, held, handle, err)
+	}
+	if result.ExitCode != 0 {
+		return status.Errorf(codes.FailedPrecondition, "writing %q exited %d: %s", path, result.ExitCode, result.Stderr)
+	}
+	return nil
 }
 
 // Touch records activity on a sandbox this node holds.
@@ -590,6 +777,7 @@ func (n *Node) Exec(ctx context.Context, handle backend.Handle, command, workdir
 // that sandbox idle from creation and pause it mid-episode.
 func (n *Node) Touch(handle backend.Handle) {
 	n.lifecycle.Touch(handle.SandboxID)
+	n.renewOwnerOf(handle.SandboxID)
 }
 
 // RenewOwner records that an owner is still using this node's sandboxes.

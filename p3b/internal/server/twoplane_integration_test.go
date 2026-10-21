@@ -76,8 +76,8 @@ func (f *fakeExecBackend) Status(_ context.Context, handle backend.Handle) (stri
 	}
 	return "terminated", nil
 }
-func (f *fakeExecBackend) Exec(_ context.Context, _ backend.Handle, command, _ string, _ map[string]string) (int, string, error) {
-	return 0, "hello-from-" + f.name, nil
+func (f *fakeExecBackend) Exec(_ context.Context, _ backend.Handle, _, command, _ string, _ map[string]string) (backend.ExecResult, error) {
+	return backend.ExecResult{Stdout: "hello-from-" + f.name}, nil
 }
 
 // buildNodeForTest builds a real Node backed by the fake backend, returning it
@@ -182,15 +182,15 @@ func TestTwoPlaneCreateExecRelease(t *testing.T) {
 
 	// Step 4: exec — the node proxies for a backend whose sandboxes have no
 	// in-sandbox agent, which is exactly what the docker backend does.
-	code, stdout, err := fleet.ExecOn(ctx, created.Handle, "echo hello", "", nil)
+	result, err := fleet.ExecOn(ctx, created.Handle, "echo hello", "", nil)
 	if err != nil {
 		t.Fatalf("exec_on: %v", err)
 	}
-	if code != 0 {
-		t.Errorf("exec exit code: got %d, want 0", code)
+	if result.ExitCode != 0 {
+		t.Errorf("exec exit code: got %d, want 0", result.ExitCode)
 	}
-	if !strings.Contains(stdout, "hello-from-fake") {
-		t.Errorf("exec stdout: got %q, want it to contain hello-from-fake", stdout)
+	if !strings.Contains(result.Stdout, "hello-from-fake") {
+		t.Errorf("exec stdout: got %q, want it to contain hello-from-fake", result.Stdout)
 	}
 
 	// Step 5: release
@@ -245,12 +245,12 @@ func TestTwoPlaneMultiNodeRouting(t *testing.T) {
 	}
 
 	// Exec must reach node-b's backend, not node-a's.
-	_, stdout, err := fleet.ExecOn(ctx, created.Handle, "echo hello", "", nil)
+	result, err := fleet.ExecOn(ctx, created.Handle, "echo hello", "", nil)
 	if err != nil {
 		t.Fatalf("exec_on: %v", err)
 	}
-	if !strings.Contains(stdout, "hello-from-fake2") {
-		t.Errorf("exec reached wrong node: got stdout %q, want hello-from-fake2", stdout)
+	if !strings.Contains(result.Stdout, "hello-from-fake2") {
+		t.Errorf("exec reached wrong node: got stdout %q, want hello-from-fake2", result.Stdout)
 	}
 
 	// node-a must not have seen the sandbox.
@@ -266,7 +266,7 @@ func TestTwoPlaneExecOnUnknownNodeReturnsError(t *testing.T) {
 		"node-a": server.NewRemoteNodeClient("127.0.0.1:1", 1*time.Second, 1*time.Second),
 	})
 	handle := backend.Handle{Backend: "fake", SandboxID: "sb-1", NodeID: "node-missing"}
-	_, _, err := fleet.ExecOn(context.Background(), handle, "echo hi", "", nil)
+	_, err := fleet.ExecOn(context.Background(), handle, "echo hi", "", nil)
 	if err == nil {
 		t.Fatal("expected error for sandbox on an unknown node, got nil")
 	}

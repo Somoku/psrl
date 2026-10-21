@@ -17,6 +17,16 @@ import (
 // caller could still be asking about.
 const exitRecordTTL = 10 * time.Minute
 
+// The runtime prober is the node's continuous reconciliation with the daemon.
+// A record is not evidence that a container is alive; it is only evidence that
+// the node once asked for one. These spans are how fast that claim is checked
+// again, not how long a sandbox runs.
+const (
+	DefaultRuntimeProbeInterval = 30 * time.Second
+	DefaultRuntimeProbeTimeout  = 5 * time.Second
+	DefaultRuntimeProbeWorkers  = 8
+)
+
 // DefaultLifetime is the lifetime a sandbox gets when its create states none.
 // It is a fallback, not the design: the caller states how long its sandbox may
 // live, and this only keeps a caller that omits the field from creating an
@@ -47,6 +57,14 @@ const (
 	// trajectory that produced a wrong answer, it is one that never ran, and training on
 	// it teaches the policy something about a task it never saw. The caller resamples.
 	ExitOOM ExitReason = "oom"
+	// ExitExited is a sandbox whose container stopped for a reason other than OOM:
+	// its entry process exited, or the runtime reported it dead. The container's
+	// filesystem -- and everything the caller built in it -- is gone with it.
+	ExitExited ExitReason = "exited"
+	// ExitRuntimeGone is a container the runtime no longer has at all. It is
+	// distinct from ExitExited because the runtime could not even report an exit:
+	// a removed container is a stronger statement than a stopped one.
+	ExitRuntimeGone ExitReason = "runtime_gone"
 )
 
 // exitRecord attributes a sandbox that is no longer held.
@@ -89,6 +107,23 @@ type Lifecycle struct {
 	counters map[ExitReason]int64
 	failures int64
 
+	// Runtime probing: the continuous check that a resident record still has a
+	// live container. It runs on its own goroutine and its own clock, because a
+	// slow daemon must not stretch the sweep that enforces owner silence.
+	probeInterval time.Duration
+	probeTimeout  time.Duration
+	probeWorkers  int
+	probeStop     chan struct{}
+	probeStopped  sync.WaitGroup
+	probeChecks   int64
+	probeGone     int64
+	probeErrors   int64
+	probeFailures int64
+
+	// reportSeq advances with every inventory snapshot, so the control plane can
+	// tell a report generated before a grant existed from one generated after it.
+	reportSeq uint64
+
 	// lastExit remembers why each sandbox left, so a caller that reaches for it
 	// after it is gone gets an attribution instead of silence.
 	lastExit map[string]exitRecord
@@ -118,6 +153,10 @@ func NewLifecycleWithCleanup(
 		cleanupCfg:  cleanupCfg.validated(),
 		counters:    map[ExitReason]int64{},
 		lastExit:    map[string]exitRecord{},
+
+		probeInterval: DefaultRuntimeProbeInterval,
+		probeTimeout:  DefaultRuntimeProbeTimeout,
+		probeWorkers:  DefaultRuntimeProbeWorkers,
 	}
 	life.cleanup = newCleanup(life, life.cleanupCfg)
 	return life, nil
@@ -136,6 +175,26 @@ func (l *Lifecycle) SetOwnerLiveness(alive func(owner string) bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.ownerAlive = alive
+}
+
+// SetRuntimeProbeConfig overrides the prober's cadence and bounds.
+//
+// A non-positive interval or timeout keeps the default, so a deployment cannot
+// accidentally configure a probe that runs continuously or waits forever. It is
+// mostly for tests: a test that drives the probe directly calls ProbeRuntime and
+// does not need the loop at all.
+func (l *Lifecycle) SetRuntimeProbeConfig(interval, timeout time.Duration, workers int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if interval > 0 {
+		l.probeInterval = interval
+	}
+	if timeout > 0 {
+		l.probeTimeout = timeout
+	}
+	if workers > 0 {
+		l.probeWorkers = workers
+	}
 }
 
 // Reserve records a grant whose runtime object does not exist yet.
@@ -337,8 +396,67 @@ func (l *Lifecycle) removeLocked(held *allocation, reason ExitReason) {
 func (l *Lifecycle) ExitReasonOf(sandboxID string) (ExitReason, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	rec, ok := l.lastExit[sandboxID]
-	return rec.reason, ok
+	if rec, ok := l.lastExit[sandboxID]; ok {
+		return rec.reason, true
+	}
+	// A record that is already being destroyed has a decided reason but has not
+	// reached removeLocked yet. Reporting it now is what lets the command that
+	// discovered the loss name the cause instead of waiting a cleanup round.
+	if held, ok := l.bySandbox[sandboxID]; ok && held.pendingReason != "" {
+		return held.pendingReason, true
+	}
+	return "", false
+}
+
+// MarkLost decides that a resident sandbox's runtime is gone and hands its
+// removal to the cleanup workers.
+//
+// It is the synchronous half of reconciliation: an exec that discovered the
+// container is dead must not wait for the next probe to stop charging it, and
+// the caller needs an attribution before it returns. The transition is decided
+// under the lock and the enqueue happens outside it, exactly as Sweep does, so
+// a full cleanup queue restores the record rather than losing it.
+func (l *Lifecycle) MarkLost(sandboxID string, reason ExitReason) bool {
+	if reason == "" {
+		reason = ExitExited
+	}
+	l.mu.Lock()
+	held, ok := l.bySandbox[sandboxID]
+	if !ok || held.state != allocResident {
+		l.mu.Unlock()
+		return false
+	}
+	held.state = allocDestroying
+	held.pendingReason = reason
+	leaseID := held.leaseID
+	l.mu.Unlock()
+
+	if !l.cleanup.enqueue(leaseID) {
+		l.mu.Lock()
+		if current, still := l.allocations[leaseID]; still && current.state == allocDestroying {
+			current.state = allocResident
+			current.pendingReason = ""
+		}
+		l.failures++
+		l.mu.Unlock()
+		return false
+	}
+	return true
+}
+
+// OwnerOf reports the owner a node holds a sandbox for.
+//
+// Data-plane traffic uses it to refresh the owner's liveness on the node that
+// actually observes the work, which is a stronger signal than a heartbeat that
+// may be travelling through a control plane with other nodes in its path.
+func (l *Lifecycle) OwnerOf(sandboxID string) (string, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	held, ok := l.bySandbox[sandboxID]
+	if !ok {
+		return "", false
+	}
+	return held.owner, held.owner != ""
 }
 
 // Touch records activity on a sandbox this node holds.
@@ -530,8 +648,191 @@ func (l *Lifecycle) retainOwners() {
 	l.admission.RetainOwners(live)
 }
 
+// ProbeReport is what one runtime-reconciliation pass saw.
+type ProbeReport struct {
+	Checked  int
+	Gone     int
+	OOM      int
+	Errors   int
+	Failures int
+}
+
+type probeCandidate struct {
+	leaseID   string
+	sandboxID string
+	handle    backend.Handle
+	backend   backend.Backend
+}
+
+// ProbeRuntime asks the runtime about every resident sandbox and reclaims the
+// ones that are provably gone.
+//
+// "Provably" is the whole design. A paused container is healthy, a transitional
+// one is unknown, and a probe that failed says nothing about the sandbox. Only
+// an explicit exited/oom/terminated answer is acted on. Reading a failed probe
+// as death would turn one slow daemon into a fleet-wide loss of live work.
+func (l *Lifecycle) ProbeRuntime(ctx context.Context) ProbeReport {
+	l.mu.Lock()
+	timeout := l.probeTimeout
+	workers := l.probeWorkers
+	candidates := make([]probeCandidate, 0, len(l.bySandbox))
+	for _, held := range l.bySandbox {
+		if held.state != allocResident || held.inFlight > 0 || held.backend == nil || held.sandboxID == "" {
+			continue
+		}
+		candidates = append(candidates, probeCandidate{
+			leaseID:   held.leaseID,
+			sandboxID: held.sandboxID,
+			handle:    held.handle,
+			backend:   held.backend,
+		})
+	}
+	l.mu.Unlock()
+
+	report := ProbeReport{Checked: len(candidates)}
+	if len(candidates) == 0 {
+		return report
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	type outcome struct {
+		candidate probeCandidate
+		status    string
+		err       error
+	}
+	results := make(chan outcome, len(candidates))
+	jobs := make(chan probeCandidate)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for candidate := range jobs {
+				probeCtx, cancel := context.WithTimeout(ctx, timeout)
+				status, err := candidate.backend.Status(probeCtx, candidate.handle)
+				cancel()
+				results <- outcome{candidate: candidate, status: status, err: err}
+			}
+		}()
+	}
+	go func() {
+		for _, candidate := range candidates {
+			jobs <- candidate
+		}
+		close(jobs)
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for result := range results {
+		if result.err != nil {
+			report.Errors++
+			continue
+		}
+		var reason ExitReason
+		switch result.status {
+		case "oom":
+			reason = ExitOOM
+		case "exited":
+			reason = ExitExited
+		case "terminated":
+			reason = ExitRuntimeGone
+		default:
+			// "running", "paused", "unknown" and anything a future backend adds:
+			// a state this probe does not recognize is not permission to destroy.
+			continue
+		}
+		gone, failed := l.markProbedGone(result.candidate, reason)
+		if gone {
+			report.Gone++
+			if reason == ExitOOM {
+				report.OOM++
+			}
+		}
+		if failed {
+			report.Failures++
+		}
+	}
+
+	l.mu.Lock()
+	l.probeChecks += int64(report.Checked)
+	l.probeGone += int64(report.Gone)
+	l.probeErrors += int64(report.Errors)
+	l.probeFailures += int64(report.Failures)
+	l.mu.Unlock()
+	return report
+}
+
+// markProbedGone transitions one record after the probe, re-checking under the
+// lock that a command did not begin while the probe was in flight. A command
+// that started mid-probe means the container is alive enough to serve it; the
+// next pass will look again.
+func (l *Lifecycle) markProbedGone(candidate probeCandidate, reason ExitReason) (gone, failed bool) {
+	l.mu.Lock()
+	held, ok := l.bySandbox[candidate.sandboxID]
+	if !ok || held.leaseID != candidate.leaseID || held.state != allocResident || held.inFlight > 0 {
+		l.mu.Unlock()
+		return false, false
+	}
+	held.state = allocDestroying
+	held.pendingReason = reason
+	l.mu.Unlock()
+
+	if !l.cleanup.enqueue(candidate.leaseID) {
+		l.mu.Lock()
+		if current, still := l.allocations[candidate.leaseID]; still && current.state == allocDestroying {
+			current.state = allocResident
+			current.pendingReason = ""
+		}
+		l.failures++
+		l.mu.Unlock()
+		return false, true
+	}
+	return true, false
+}
+
+// ProbeCounters returns the prober's cumulative accounting.
+func (l *Lifecycle) ProbeCounters() (checks, gone, failures, errors int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.probeChecks, l.probeGone, l.probeFailures, l.probeErrors
+}
+
+// startProber runs ProbeRuntime on its own cadence until the stop channel is
+// closed. It is separate from the sweep's goroutine so a daemon that answers
+// slowly delays reconciliation, not owner-silence enforcement.
+func (l *Lifecycle) startProber(ctx context.Context) {
+	l.mu.Lock()
+	l.probeStop = make(chan struct{})
+	stop := l.probeStop
+	interval := l.probeInterval
+	l.mu.Unlock()
+
+	l.probeStopped.Add(1)
+	go func() {
+		defer l.probeStopped.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				l.ProbeRuntime(ctx)
+			}
+		}
+	}()
+}
+
 // Start runs the sweep on its own cadence until Stop, with the cleanup workers
-// that carry out what it decides.
+// that carry out what it decides, and the runtime prober that keeps the ledger
+// converged with the daemon.
 func (l *Lifecycle) Start(ctx context.Context) {
 	l.mu.Lock()
 	if l.stop != nil {
@@ -543,6 +844,7 @@ func (l *Lifecycle) Start(ctx context.Context) {
 	l.mu.Unlock()
 
 	l.cleanup.Start(ctx)
+	l.startProber(ctx)
 	l.stopped.Add(1)
 	go func() {
 		defer l.stopped.Done()
@@ -567,7 +869,13 @@ func (l *Lifecycle) Stop() {
 	l.mu.Lock()
 	stop := l.stop
 	l.stop = nil
+	probeStop := l.probeStop
+	l.probeStop = nil
 	l.mu.Unlock()
+	if probeStop != nil {
+		close(probeStop)
+		l.probeStopped.Wait()
+	}
 	if stop != nil {
 		close(stop)
 		l.stopped.Wait()
@@ -608,7 +916,19 @@ type LifecycleReport struct {
 	Draining      bool
 	Exits         map[ExitReason]int64
 	Failures      int64
+	// Inventory is what the control plane reconciles quota against. The sequence
+	// is generated under the same lock as the list, so a report can never claim
+	// a newer sequence than the inventory it carries.
+	ReportSeq          uint64
+	InventoryReported  bool
+	InventoryTruncated bool
+	LiveSandboxIDs     []string
 }
+
+// maxReportedInventory bounds the sandbox list one report carries. A report
+// that would exceed it is marked truncated and the control skips reconciliation
+// for that node rather than reading an incomplete list as "these are gone".
+const maxReportedInventory = 16384
 
 // Snapshot returns what this node holds. The planes report and never log.
 func (l *Lifecycle) Snapshot() LifecycleReport {
@@ -632,9 +952,29 @@ func (l *Lifecycle) Snapshot() LifecycleReport {
 	for reason, count := range l.counters {
 		exits[reason] = count
 	}
+	l.reportSeq++
+	live := make([]string, 0, len(l.bySandbox))
+	for sandboxID, held := range l.bySandbox {
+		if sandboxID == "" {
+			continue
+		}
+		switch held.state {
+		case allocResident, allocDestroying, allocCleanupFailed:
+			live = append(live, sandboxID)
+		}
+		if len(live) > maxReportedInventory {
+			break
+		}
+	}
+	truncated := len(live) > maxReportedInventory
+	if truncated {
+		live = live[:maxReportedInventory]
+	}
 	return LifecycleReport{
 		Resident: len(l.bySandbox), Busy: busy,
 		Destroying: destroying, CleanupFailed: failed, Draining: l.draining,
 		Exits: exits, Failures: l.failures,
+		ReportSeq: l.reportSeq, InventoryReported: true,
+		InventoryTruncated: truncated, LiveSandboxIDs: live,
 	}
 }

@@ -30,6 +30,45 @@ import (
 // "my session is gone and an infrastructure retry will not bring it back".
 var ErrSessionLost = errors.New("sandbox session lost")
 
+// ErrRuntimeGone marks a failure where the sandbox's runtime object is gone:
+// the container stopped or no longer exists. It is deliberately distinct from
+// ErrSessionLost, whose meaning is narrower: the state a caller built inside a
+// command session is gone (a persistent shell exited), while the container may
+// still be alive and able to serve a fresh command.
+//
+// The two need different answers. A runtime-gone sandbox must be charged back
+// and replaced; a lost shell only costs the caller its working directory and
+// exported variables, and destroying the sandbox would throw away a healthy
+// runtime.
+var ErrRuntimeGone = errors.New("sandbox runtime gone")
+
+// ErrPathNotFound marks a file request that failed because the path does not
+// exist inside a sandbox that is otherwise healthy. It exists because a missing
+// file and a missing sandbox are both Docker 404s, and collapsing them made a
+// harness report an absent diagnostics file as a lost session.
+var ErrPathNotFound = errors.New("path not found in sandbox")
+
+// ExecResult is one completed command: its output streams kept separate, its
+// exit code, and whether the backend stopped retaining output at its budget.
+type ExecResult struct {
+	ExitCode  int
+	Stdout    string
+	Stderr    string
+	Truncated bool
+}
+
+// Executor is implemented by a backend that can run a command inside a
+// sandbox. It is optional and separate from Backend because a backend whose
+// sandboxes run their own in-agent command server never reaches this path.
+//
+// execMode is "persistent" or "one_shot"; an empty value takes the backend's
+// default. The result carries stdout and stderr separately: a caller diagnosing
+// a failed command needs to know which stream said what, and a backend that
+// merged them cannot answer that.
+type Executor interface {
+	Exec(ctx context.Context, handle Handle, execMode, command, workdir string, env map[string]string) (ExecResult, error)
+}
+
 // SchedulingMode says who chooses the node a sandbox lands on.
 //
 // It is a deployment property rather than a backend capability: the same backend
@@ -295,6 +334,11 @@ type Reconciled struct {
 	Lifetime   time.Duration
 	CreatedAt  time.Time
 	Running    bool
+	// OOMKilled and ExitCode are the daemon's attribution for a container that
+	// stopped. They are what lets a restarted node report *why* an adoption was
+	// refused instead of a bare "not running".
+	OOMKilled bool
+	ExitCode  int
 	// Name is the runtime's name for the object, when it has one. It is what
 	// distinguishes unclaimed warm-pool inventory from a sandbox: a label written at
 	// create cannot be removed when an entry is claimed, but a name can be changed.

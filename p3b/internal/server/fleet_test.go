@@ -206,12 +206,12 @@ func TestRemoteNodeClientExecOn(t *testing.T) {
 	addr := startFakeJSONNodeServer(t)
 	client := NewRemoteNodeClient(addr, 5*time.Second, 5*time.Second)
 	handle := backend.Handle{Backend: "docker", SandboxID: "sb-1", NodeID: "n1"}
-	code, output, err := client.execOn(context.Background(), handle, "echo hello", "", nil)
+	result, err := client.execOn(context.Background(), handle, "echo hello", "", nil)
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
-	if code != 0 || output != "hello" {
-		t.Errorf("exec: got code=%d output=%q, want 0/hello", code, output)
+	if result.ExitCode != 0 || result.Stdout != "hello" {
+		t.Errorf("exec: got code=%d output=%q, want 0/hello", result.ExitCode, result.Stdout)
 	}
 }
 
@@ -302,7 +302,7 @@ func TestPollFleetPublishesNodeViews(t *testing.T) {
 	m := monitor.New(60 * time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go fleet.PollFleet(ctx, m, 20*time.Millisecond)
+	go fleet.PollFleet(ctx, m, 20*time.Millisecond, nil)
 
 	deadline := time.Now().Add(2 * time.Second)
 	var views []placement.NodeView

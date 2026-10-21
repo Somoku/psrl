@@ -99,15 +99,15 @@ func TestACreatedSandboxIsRunningAndRunsACommand(t *testing.T) {
 		t.Fatalf("status is %q, want running", status)
 	}
 
-	code, output, err := b.Exec(ctx, created.Handle, "echo hello-sandbox", "", nil)
+	result, err := b.Exec(ctx, created.Handle, "", "echo hello-sandbox", "", nil)
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
-	if code != 0 {
-		t.Fatalf("exit code %d, want 0 (output %q)", code, output)
+	if result.ExitCode != 0 {
+		t.Fatalf("exit code %d, want 0 (output %q)", result.ExitCode, result.Stdout)
 	}
-	if !strings.Contains(output, "hello-sandbox") {
-		t.Fatalf("output %q does not carry the command's stdout", output)
+	if !strings.Contains(result.Stdout, "hello-sandbox") {
+		t.Fatalf("output %q does not carry the command's stdout", result.Stdout)
 	}
 }
 
@@ -117,13 +117,13 @@ func TestExecReportsANonZeroExitRatherThanAnError(t *testing.T) {
 	b := liveBackend(t)
 	created := createOne(t, b)
 
-	code, _, err := b.Exec(context.Background(), created.Handle, "exit 42", "", nil)
+	result, err := b.Exec(context.Background(), created.Handle, "", "exit 42", "", nil)
 
 	if err != nil {
 		t.Fatalf("a non-zero exit must not be an error: %v", err)
 	}
-	if code != 42 {
-		t.Fatalf("exit code %d, want 42", code)
+	if result.ExitCode != 42 {
+		t.Fatalf("exit code %d, want 42", result.ExitCode)
 	}
 }
 
@@ -131,14 +131,14 @@ func TestExecCarriesTheWorkingDirectoryAndEnvironment(t *testing.T) {
 	b := liveBackend(t)
 	created := createOne(t, b)
 
-	_, output, err := b.Exec(context.Background(), created.Handle, "pwd && echo $SANDBOX_MARK", "/tmp",
+	result, err := b.Exec(context.Background(), created.Handle, "", "pwd && echo $SANDBOX_MARK", "/tmp",
 		map[string]string{"SANDBOX_MARK": "carried"})
 
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
-	if !strings.Contains(output, "/tmp") || !strings.Contains(output, "carried") {
-		t.Fatalf("output %q is missing the working directory or the environment", output)
+	if !strings.Contains(result.Stdout, "/tmp") || !strings.Contains(result.Stdout, "carried") {
+		t.Fatalf("output %q is missing the working directory or the environment", result.Stdout)
 	}
 }
 
@@ -148,13 +148,13 @@ func TestOutputIsDemultiplexedRatherThanFramed(t *testing.T) {
 	b := liveBackend(t)
 	created := createOne(t, b)
 
-	_, output, err := b.Exec(context.Background(), created.Handle, "printf 'clean'", "", nil)
+	result, err := b.Exec(context.Background(), created.Handle, "", "printf 'clean'", "", nil)
 
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
-	if output != "clean" {
-		t.Fatalf("output is %q, want exactly \"clean\"", output)
+	if result.Stdout != "clean" {
+		t.Fatalf("output is %q, want exactly \"clean\"", result.Stdout)
 	}
 }
 
@@ -177,8 +177,8 @@ func TestAFreezeKeepsTheSandboxResidentAndResumable(t *testing.T) {
 	if err := b.Resume(ctx, created.Handle); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	if code, _, err := b.Exec(ctx, created.Handle, "true", "", nil); err != nil || code != 0 {
-		t.Fatalf("a resumed sandbox must run commands: code=%d err=%v", code, err)
+	if result, err := b.Exec(ctx, created.Handle, "", "true", "", nil); err != nil || result.ExitCode != 0 {
+		t.Fatalf("a resumed sandbox must run commands: code=%d err=%v", result.ExitCode, err)
 	}
 }
 
@@ -197,8 +197,8 @@ func TestASnapshotCommitsTheFilesystemAndCanBeDeleted(t *testing.T) {
 	b := liveBackend(t)
 	created := createOne(t, b)
 	ctx := context.Background()
-	if code, _, err := b.Exec(ctx, created.Handle, "echo marked > /tmp/mark", "", nil); err != nil || code != 0 {
-		t.Fatalf("writing the marker: code=%d err=%v", code, err)
+	if result, err := b.Exec(ctx, created.Handle, "", "echo marked > /tmp/mark", "", nil); err != nil || result.ExitCode != 0 {
+		t.Fatalf("writing the marker: code=%d err=%v", result.ExitCode, err)
 	}
 
 	snapshotID, err := b.Snapshot(ctx, created.Handle, "filesystem")
@@ -389,15 +389,15 @@ func TestTheMemoryLimitIsAppliedToTheContainer(t *testing.T) {
 	b := liveBackend(t)
 	created := createOne(t, b)
 
-	_, output, err := b.Exec(context.Background(), created.Handle,
+	result, err := b.Exec(context.Background(), created.Handle, "",
 		"cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes", "", nil)
 
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
 	// 64MB was requested; the cgroup must report that rather than the host total.
-	if !strings.Contains(output, "67108864") {
-		t.Fatalf("cgroup reports %q, want the 64MB limit (67108864)", strings.TrimSpace(output))
+	if !strings.Contains(result.Stdout, "67108864") {
+		t.Fatalf("cgroup reports %q, want the 64MB limit (67108864)", strings.TrimSpace(result.Stdout))
 	}
 }
 
@@ -424,8 +424,8 @@ func TestConcurrentCreatesAndReleasesAllSucceed(t *testing.T) {
 				errs <- fmt.Errorf("create: %w", err)
 				return
 			}
-			if code, _, err := b.Exec(ctx, created.Handle, "true", "", nil); err != nil || code != 0 {
-				errs <- fmt.Errorf("exec: code=%d err=%w", code, err)
+			if result, err := b.Exec(ctx, created.Handle, "", "true", "", nil); err != nil || result.ExitCode != 0 {
+				errs <- fmt.Errorf("exec: code=%d err=%w", result.ExitCode, err)
 			}
 			if err := b.Release(ctx, created.Handle); err != nil {
 				errs <- fmt.Errorf("release: %w", err)
@@ -478,36 +478,36 @@ func persistentOne(t *testing.T, b *Backend) backend.Created {
 	return created
 }
 
-func execIn(t *testing.T, b *Backend, handle backend.Handle, command string) (int, string, error) {
+func execIn(t *testing.T, b *Backend, handle backend.Handle, command string) (backend.ExecResult, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	return b.ExecWithMode(ctx, handle, "persistent", command, "", nil)
+	return b.Exec(ctx, handle, "persistent", command, "", nil)
 }
 
 // setUpSessionState builds the state whose loss these tests are about.
 func setUpSessionState(t *testing.T, b *Backend, handle backend.Handle) {
 	t.Helper()
-	if code, out, err := execIn(t, b, handle, "cd /tmp && export PSRL_MARK=kept"); err != nil || code != 0 {
-		t.Fatalf("setting session state failed: code=%d err=%v out=%q", code, err, out)
+	if result, err := execIn(t, b, handle, "cd /tmp && export PSRL_MARK=kept"); err != nil || result.ExitCode != 0 {
+		t.Fatalf("setting session state failed: code=%d err=%v out=%q", result.ExitCode, err, result.Stdout)
 	}
 }
 
 func assertSessionSurvived(t *testing.T, b *Backend, handle backend.Handle) {
 	t.Helper()
-	code, out, err := execIn(t, b, handle, "pwd")
-	if err != nil || code != 0 {
-		t.Fatalf("pwd after the command failed: code=%d err=%v", code, err)
+	result, err := execIn(t, b, handle, "pwd")
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("pwd after the command failed: code=%d err=%v", result.ExitCode, err)
 	}
-	if strings.TrimSpace(out) != "/tmp" {
-		t.Errorf("the working directory is %q, so the session was replaced", strings.TrimSpace(out))
+	if strings.TrimSpace(result.Stdout) != "/tmp" {
+		t.Errorf("the working directory is %q, so the session was replaced", strings.TrimSpace(result.Stdout))
 	}
-	code, out, err = execIn(t, b, handle, "echo $PSRL_MARK")
-	if err != nil || code != 0 {
-		t.Fatalf("reading the exported variable failed: code=%d err=%v", code, err)
+	result, err = execIn(t, b, handle, "echo $PSRL_MARK")
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("reading the exported variable failed: code=%d err=%v", result.ExitCode, err)
 	}
-	if strings.TrimSpace(out) != "kept" {
-		t.Errorf("the exported variable is %q, so the session was replaced", strings.TrimSpace(out))
+	if strings.TrimSpace(result.Stdout) != "kept" {
+		t.Errorf("the exported variable is %q, so the session was replaced", strings.TrimSpace(result.Stdout))
 	}
 }
 
@@ -519,12 +519,12 @@ func TestAnExitCommandReportsItsOwnStatusAndTheShellSurvives(t *testing.T) {
 	created := persistentOne(t, b)
 	setUpSessionState(t, b, created.Handle)
 
-	code, _, err := execIn(t, b, created.Handle, "exit 3")
+	result, err := execIn(t, b, created.Handle, "exit 3")
 	if err != nil {
 		t.Fatalf("exit 3 was reported as a failure rather than as a status: %v", err)
 	}
-	if code != 3 {
-		t.Fatalf("exit 3 reported %d, want 3", code)
+	if result.ExitCode != 3 {
+		t.Fatalf("exit 3 reported %d, want 3", result.ExitCode)
 	}
 	assertSessionSurvived(t, b, created.Handle)
 }
@@ -538,15 +538,15 @@ func TestACallerErrexitDoesNotReplaceTheSession(t *testing.T) {
 	created := persistentOne(t, b)
 	setUpSessionState(t, b, created.Handle)
 
-	if code, _, err := execIn(t, b, created.Handle, "set -e"); err != nil || code != 0 {
-		t.Fatalf("set -e failed: code=%d err=%v", code, err)
+	if result, err := execIn(t, b, created.Handle, "set -e"); err != nil || result.ExitCode != 0 {
+		t.Fatalf("set -e failed: code=%d err=%v", result.ExitCode, err)
 	}
-	code, _, err := execIn(t, b, created.Handle, "false")
+	result, err := execIn(t, b, created.Handle, "false")
 	if err != nil {
 		t.Fatalf("a failing command under errexit reported an error: %v", err)
 	}
-	if code != 1 {
-		t.Fatalf("false under errexit reported %d, want 1", code)
+	if result.ExitCode != 1 {
+		t.Fatalf("false under errexit reported %d, want 1", result.ExitCode)
 	}
 	assertSessionSurvived(t, b, created.Handle)
 }
@@ -561,7 +561,7 @@ func TestADeadShellIsReportedAndItsCommandIsNotRepeated(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if _, _, err := b.ExecWithMode(ctx, created.Handle, "persistent",
+	if _, err := b.Exec(ctx, created.Handle, "persistent",
 		"echo ran >> /tmp/psrl-attempts && kill -9 $$", "", nil); err == nil {
 		t.Fatal("a command that killed its shell must be reported as a failure")
 	} else if !errors.Is(err, backend.ErrSessionLost) {
@@ -579,8 +579,8 @@ func TestADeadShellIsReportedAndItsCommandIsNotRepeated(t *testing.T) {
 
 	// The dead session is replaced rather than left poisoned, so the next command
 	// works -- in a new shell, which is what "the state is gone" means.
-	if code, out, err := execIn(t, b, created.Handle, "echo after"); err != nil || code != 0 ||
-		!strings.Contains(out, "after") {
-		t.Fatalf("the session was not replaced: code=%d err=%v out=%q", code, err, out)
+	if result, err := execIn(t, b, created.Handle, "echo after"); err != nil || result.ExitCode != 0 ||
+		!strings.Contains(result.Stdout, "after") {
+		t.Fatalf("the session was not replaced: code=%d err=%v out=%q", result.ExitCode, err, result.Stdout)
 	}
 }

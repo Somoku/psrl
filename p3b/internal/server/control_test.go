@@ -66,8 +66,8 @@ func (s *stubNodes) RenewOwnerOn(_ context.Context, _, owner string) error {
 	s.renewed = append(s.renewed, owner)
 	return nil
 }
-func (s *stubNodes) ExecOn(context.Context, backend.Handle, string, string, map[string]string) (int, string, error) {
-	return 0, "", nil
+func (s *stubNodes) ExecOn(context.Context, backend.Handle, string, string, map[string]string) (backend.ExecResult, error) {
+	return backend.ExecResult{}, nil
 }
 func (s *stubNodes) ReadBytesOn(context.Context, backend.Handle, string) (string, error) {
 	return "", nil

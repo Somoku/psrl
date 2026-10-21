@@ -20,6 +20,17 @@ type fakeEngine struct {
 	execStartDelay time.Duration
 	createDelay    time.Duration
 
+	// Optional canned failure responses, so a test can state the Engine's own
+	// wording for a stopped container or a missing path. Zero means the happy
+	// path the other tests use.
+	execCreateStatus int
+	execCreateBody   string
+	execStartStatus  int
+	execStartBody    string
+	archiveStatus    int
+	archiveBody      string
+	inspectBody      string
+
 	mu          sync.Mutex
 	inFlight    int
 	maxInFlight int
@@ -64,14 +75,35 @@ func (f *fakeEngine) leaveCreate() {
 func (f *fakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasSuffix(r.URL.Path, "/exec"):
+		if f.execCreateStatus != 0 {
+			w.WriteHeader(f.execCreateStatus)
+			writeBody(w, f.execCreateBody)
+			return
+		}
 		writeBody(w, `{"Id":"exec-1"}`)
 	case strings.Contains(r.URL.Path, "/exec/exec-1/start"):
 		time.Sleep(f.execStartDelay)
+		if f.execStartStatus != 0 {
+			w.WriteHeader(f.execStartStatus)
+			writeBody(w, f.execStartBody)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	case strings.Contains(r.URL.Path, "/exec/exec-1/json"):
 		writeBody(w, `{"ExitCode":0,"Running":false}`)
 	case strings.Contains(r.URL.Path, "/archive"):
+		if f.archiveStatus != 0 {
+			w.WriteHeader(f.archiveStatus)
+			writeBody(w, f.archiveBody)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
+	case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+		if f.inspectBody != "" {
+			writeBody(w, f.inspectBody)
+			return
+		}
+		writeBody(w, `{"State":{"Status":"running","Running":true}}`)
 	case strings.Contains(r.URL.Path, "/images/"):
 		// The image is present, so no pull is attempted.
 		writeBody(w, `{}`)

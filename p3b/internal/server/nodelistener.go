@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -17,7 +16,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	v1 "psrl.dev/sandboxd/api/v1"
-	"psrl.dev/sandboxd/internal/backend"
 	"psrl.dev/sandboxd/internal/placement"
 )
 
@@ -265,11 +263,16 @@ func (n *NodeListener) exec(ctx context.Context, raw json.RawMessage) (any, erro
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, err
 	}
-	code, output, err := n.node.Exec(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
+	result, err := n.node.Exec(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
 	if err != nil {
 		return nil, preserveSessionLost(err)
 	}
-	return map[string]any{"exit_code": code, "stdout": output, "stderr": "", "truncated": false}, nil
+	return map[string]any{
+		"exit_code": result.ExitCode,
+		"stdout":    result.Stdout,
+		"stderr":    result.Stderr,
+		"truncated": result.Truncated,
+	}, nil
 }
 
 // readBytes fetches one file out of a sandbox.
@@ -287,23 +290,11 @@ func (n *NodeListener) readBytes(ctx context.Context, raw json.RawMessage) (any,
 		return nil, err
 	}
 	handle := payload.handle()
-	if hosted, hosts := n.node.hosted(handle.Backend); hosts {
-		if files, ok := hosted.(backend.FileHandler); ok {
-			data, err := files.ReadFile(ctx, handle, payload.Path)
-			if err != nil {
-				return nil, status.Errorf(codes.NotFound, "reading %q: %v", payload.Path, err)
-			}
-			return map[string]any{"data": base64.StdEncoding.EncodeToString(data)}, nil
-		}
-	}
-	code, output, err := n.node.Exec(ctx, handle, fmt.Sprintf("base64 %q", payload.Path), "", nil)
+	data, err := n.node.ReadBytes(ctx, handle, payload.Path)
 	if err != nil {
 		return nil, preserveSessionLost(err)
 	}
-	if code != 0 {
-		return nil, status.Errorf(codes.NotFound, "reading %q exited %d", payload.Path, code)
-	}
-	return map[string]any{"data": compactBase64(output)}, nil
+	return map[string]any{"data": base64.StdEncoding.EncodeToString(data)}, nil
 }
 
 // writeBytes puts one file into a sandbox.
@@ -321,26 +312,12 @@ func (n *NodeListener) writeBytes(ctx context.Context, raw json.RawMessage) (any
 		return nil, err
 	}
 	handle := payload.handle()
-	if hosted, hosts := n.node.hosted(handle.Backend); hosts {
-		if files, ok := hosted.(backend.FileHandler); ok {
-			decoded, err := base64.StdEncoding.DecodeString(payload.Data)
-			if err != nil {
-				return nil, status.Errorf(codes.InvalidArgument, "writing %q: %v", payload.Path, err)
-			}
-			if err := files.WriteFile(ctx, handle, payload.Path, decoded); err != nil {
-				return nil, status.Errorf(codes.FailedPrecondition, "writing %q: %v", payload.Path, err)
-			}
-			return map[string]any{}, nil
-		}
-	}
-	command := fmt.Sprintf("mkdir -p \"$(dirname %q)\" && printf %%s %q | base64 -d > %q",
-		payload.Path, payload.Data, payload.Path)
-	code, output, err := n.node.Exec(ctx, handle, command, "", nil)
+	decoded, err := base64.StdEncoding.DecodeString(payload.Data)
 	if err != nil {
-		return nil, preserveSessionLost(err)
+		return nil, status.Errorf(codes.InvalidArgument, "writing %q: %v", payload.Path, err)
 	}
-	if code != 0 {
-		return nil, status.Errorf(codes.FailedPrecondition, "writing %q exited %d: %s", payload.Path, code, output)
+	if err := n.node.WriteBytes(ctx, handle, payload.Path, decoded); err != nil {
+		return nil, preserveSessionLost(err)
 	}
 	return map[string]any{}, nil
 }
@@ -377,6 +354,15 @@ type nodeViewWire struct {
 	ImageDigests    []string     `json:"image_digests"`
 	ImageReferences []string     `json:"image_references"`
 	Labels          []string     `json:"labels"`
+
+	// Inventory is the node's own sandbox list for quota reconciliation. An
+	// older node omits it, and InventoryReported is then false: a zero value
+	// must never be read as "this node holds nothing".
+	ReportSeq          uint64             `json:"report_seq"`
+	InventoryReported  bool               `json:"inventory_reported"`
+	InventoryTruncated bool               `json:"inventory_truncated"`
+	LiveSandboxIDs     []string           `json:"live_sandbox_ids"`
+	Diagnostics        map[string]float64 `json:"diagnostics"`
 }
 
 type backendCapWire struct {
@@ -412,7 +398,12 @@ func nodeViewToWire(view placement.NodeView) nodeViewWire {
 			GPUCount: view.Granted.GPUCount, DiskMB: view.Granted.DiskMB},
 		Observed: headroomWire{MemoryMB: view.Observed.MemoryMB, CPUMillis: view.Observed.CPUMillis,
 			GPUCount: view.Observed.GPUCount, DiskMB: view.Observed.DiskMB},
-		ThrottledPct: view.ThrottledPct,
+		ThrottledPct:       view.ThrottledPct,
+		ReportSeq:          view.ReportSeq,
+		InventoryReported:  view.InventoryReported,
+		InventoryTruncated: view.InventoryTruncated,
+		LiveSandboxIDs:     view.LiveSandboxIDs,
+		Diagnostics:        view.Diagnostics,
 	}
 	for class, h := range view.ClassHeadroom {
 		w.ClassHeadroom[class] = headroomWire{
@@ -454,10 +445,15 @@ func nodeViewFromWire(w nodeViewWire) placement.NodeView {
 			GPUCount: w.Granted.GPUCount, DiskMB: w.Granted.DiskMB},
 		Observed: placement.Headroom{MemoryMB: w.Observed.MemoryMB, CPUMillis: w.Observed.CPUMillis,
 			GPUCount: w.Observed.GPUCount, DiskMB: w.Observed.DiskMB},
-		ThrottledPct:    w.ThrottledPct,
-		ImageDigests:    make(map[string]struct{}, len(w.ImageDigests)),
-		ImageReferences: make(map[string]struct{}, len(w.ImageReferences)),
-		Labels:          make(map[string]struct{}, len(w.Labels)),
+		ThrottledPct:       w.ThrottledPct,
+		ImageDigests:       make(map[string]struct{}, len(w.ImageDigests)),
+		ImageReferences:    make(map[string]struct{}, len(w.ImageReferences)),
+		Labels:             make(map[string]struct{}, len(w.Labels)),
+		ReportSeq:          w.ReportSeq,
+		InventoryReported:  w.InventoryReported,
+		InventoryTruncated: w.InventoryTruncated,
+		LiveSandboxIDs:     w.LiveSandboxIDs,
+		Diagnostics:        w.Diagnostics,
 		Envelope: placement.Headroom{
 			MemoryMB: w.Envelope.MemoryMB, CPUMillis: w.Envelope.CPUMillis,
 			GPUCount: w.Envelope.GPUCount, DiskMB: w.Envelope.DiskMB,

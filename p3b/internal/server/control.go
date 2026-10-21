@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -38,7 +40,7 @@ type NodeClient interface {
 	// the node that holds the sandbox. In a single-process deployment they call
 	// the node directly; in a fleet they reach the right machine over the
 	// node-plane protocol so the control plane never proxies data traffic.
-	ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (int, string, error)
+	ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (backend.ExecResult, error)
 	ReadBytesOn(ctx context.Context, handle backend.Handle, path string) (string, error)
 	WriteBytesOn(ctx context.Context, handle backend.Handle, path, data string) error
 }
@@ -73,6 +75,10 @@ type Control struct {
 
 	mu      sync.Mutex
 	sandbox map[string]sandboxRecord
+	// lastSeq is the newest inventory report applied per node. A report is only
+	// evidence about grants that existed before it was generated, so a grant is
+	// armed two sequences past the last applied one.
+	lastSeq map[string]uint64
 	// provisions is what a create with an idempotency key is doing, so a caller
 	// that has no response yet can tell "still working" from "lost the request".
 	provisions map[string]*provisionRecord
@@ -80,6 +86,14 @@ type Control struct {
 	// price moves is stated once instead of once per request.
 	pricing map[string]int64
 	log     *slog.Logger
+
+	// Owner renewal is a liveness signal, and its own health is reported beside
+	// the fleet's: a heartbeat that never reaches a node is invisible from the
+	// node side, which is exactly the failure this accounting exists to expose.
+	renewAttempts  atomic.Int64
+	renewFailures  atomic.Int64
+	renewNodes     atomic.Int64
+	renewLastNanos atomic.Int64
 }
 
 // provisionRecord is what a create with an idempotency key is doing.
@@ -104,6 +118,15 @@ type sandboxRecord struct {
 	grantID       string
 	reservationID string
 	class         string
+	// owner is the caller identity the node keys liveness on. Renewal targets
+	// the nodes that hold this owner's sandboxes, not every node the fleet has
+	// ever heard from.
+	owner     string
+	createdAt time.Time
+	// Reconciliation state: a grant is released only after two inventory
+	// reports that were generated after it was recorded both fail to list it.
+	misses        int
+	armedAfterSeq uint64
 	// charged is what this sandbox cost the fleet when it was admitted, and declared is
 	// the maximum its caller asked for. Both are kept so the grant can be repriced: the
 	// class's price is a measurement that moves, and a fleet still charging the
@@ -159,6 +182,7 @@ func NewControl(cfg ControlConfig) (*Control, error) {
 		sandbox:                  map[string]sandboxRecord{},
 		provisions:               map[string]*provisionRecord{},
 		pricing:                  map[string]int64{},
+		lastSeq:                  map[string]uint64{},
 		log:                      cfg.Logger,
 	}, nil
 }
@@ -213,6 +237,7 @@ func (c *Control) create(ctx context.Context, req *v1.CreateRequest) (*v1.Create
 	c.remember(created.handle.SandboxID, sandboxRecord{
 		handle: created.handle, backend: selected,
 		grantID: grantID, reservationID: created.reservationID, class: spec.ResourceClass,
+		owner: owner, createdAt: time.Now(),
 		// What it costs now, and what its caller declared: the first is what the fleet
 		// charges until the class's price moves, and the second is the ceiling a reprice
 		// may never exceed.
@@ -385,6 +410,8 @@ func (c *Control) place(
 	}
 
 	var lastRefusal string
+	var lastTransportErr error
+	transportFailures := 0
 	// refused carries the nodes that already said no into the next attempt. Placement
 	// ranks on a reported headroom that can be seconds old, while a refusal is that
 	// node's own ledger speaking about now; re-asking the same node the same question is
@@ -413,8 +440,19 @@ func (c *Control) place(
 		}
 		leaseID, gpus, refusal, err := c.nodes.Admit(ctx, decision.NodeID, spec)
 		if err != nil {
+			// A node that did not answer is not a full fleet. Excluding it and
+			// trying the next candidate keeps one unreachable machine from
+			// failing every create; only when every attempt was a transport
+			// failure is the fleet itself unreachable.
 			c.placement.Cancel(decision.ReservationID)
-			return placed{}, status.Errorf(codes.Unavailable, "node %s did not answer: %v", decision.NodeID, err)
+			lastTransportErr = err
+			transportFailures++
+			refused = append(refused, decision.NodeID)
+			if c.log != nil {
+				c.log.Warn("a node did not answer admission, trying the next candidate",
+					"node", decision.NodeID, "error", err)
+			}
+			continue
 		}
 		if refusal != "" {
 			// Try elsewhere. The reservation is withdrawn so the node is not held for
@@ -442,6 +480,10 @@ func (c *Control) place(
 			return placed{}, status.Errorf(codes.Unavailable, "node %s could not create: %v", decision.NodeID, err)
 		}
 		return placed{created: created, handle: created.Handle, reservationID: decision.ReservationID}, nil
+	}
+	if transportFailures > 0 && transportFailures == attempts && lastTransportErr != nil {
+		return placed{}, status.Errorf(codes.Unavailable,
+			"no node answered admission after %d attempt(s): %v", attempts, lastTransportErr)
 	}
 	if c.log != nil {
 		// A refusal is the one thing the caller cannot see through: it arrives as a
@@ -699,7 +741,87 @@ func (c *Control) Quota(context.Context, *v1.Empty) (*v1.QuotaReport, error) {
 func (c *Control) remember(id string, record sandboxRecord) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A report generated before this grant was recorded cannot be evidence that
+	// its sandbox is absent. Two sequences of grace make sure the first eligible
+	// report was generated after the create returned.
+	record.armedAfterSeq = c.lastSeq[record.handle.NodeID] + 2
 	c.sandbox[id] = record
+}
+
+// ReconcileGrants releases grants whose sandbox has vanished from the node that
+// was holding it.
+//
+// The quest the ledger answered at create time is "what did the fleet promise",
+// and only the node can answer whether that promise still has a runtime behind
+// it. A node that crashed, a container that was removed out of band, or a
+// release whose response was lost all leave a grant charged for nothing; this
+// is where the ledger converges back to the node's truth.
+//
+// The guards are the whole safety argument:
+//   - an older node that sends no inventory is skipped, so a rolling upgrade
+//     cannot read "no inventory" as "holds nothing";
+//   - a truncated inventory is skipped, because a partial list is not evidence
+//     of absence;
+//   - a report generated before the grant was recorded is skipped, so a create
+//     in flight is never mistaken for a vanished sandbox;
+//   - two consecutive eligible misses are required, so one lost report is not a
+//     release;
+//   - a sequence regression means the node restarted and its report belongs to
+//     a new epoch, so everything is re-armed rather than compared.
+func (c *Control) ReconcileGrants(view placement.NodeView) {
+	if view.NodeID == "" || !view.InventoryReported || view.InventoryTruncated {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	last := c.lastSeq[view.NodeID]
+	if view.ReportSeq < last {
+		c.lastSeq[view.NodeID] = view.ReportSeq
+		for id, record := range c.sandbox {
+			if record.handle.NodeID != view.NodeID {
+				continue
+			}
+			record.misses = 0
+			record.armedAfterSeq = view.ReportSeq + 2
+			c.sandbox[id] = record
+		}
+		return
+	}
+	if view.ReportSeq == last {
+		return
+	}
+	c.lastSeq[view.NodeID] = view.ReportSeq
+
+	live := make(map[string]struct{}, len(view.LiveSandboxIDs))
+	for _, sandboxID := range view.LiveSandboxIDs {
+		live[sandboxID] = struct{}{}
+	}
+	for id, record := range c.sandbox {
+		if record.handle.NodeID != view.NodeID {
+			continue
+		}
+		if view.ReportSeq < record.armedAfterSeq {
+			continue
+		}
+		if _, present := live[record.handle.SandboxID]; present {
+			record.misses = 0
+			c.sandbox[id] = record
+			continue
+		}
+		record.misses++
+		if record.misses < 2 {
+			c.sandbox[id] = record
+			continue
+		}
+		c.ledger.Release(record.grantID)
+		delete(c.sandbox, id)
+		if c.log != nil {
+			c.log.Warn("released a grant whose sandbox the node no longer holds",
+				"node", view.NodeID, "sandbox_id", record.handle.SandboxID,
+				"grant", record.grantID, "reports_missed", record.misses)
+		}
+	}
 }
 
 // RepriceGrants brings the fleet's ledger back in line with what the nodes measure.
@@ -834,20 +956,139 @@ func (c *Control) ProvisionState(ticket string) (ProvisionState, bool) {
 	}, true
 }
 
-// RenewOwner keeps one caller's grants alive and tells every live node the owner
-// is still there, so a node reclaims that owner's sandboxes only once the caller
-// has really stopped renewing.
+// The two budgets a renewal has to fit inside the caller's own deadline. The
+// client waits ten seconds; a batch that used a node's full RPC budget would
+// never answer inside that, so the whole fan-out is bounded well below it.
+const (
+	renewNodeTimeout = 3 * time.Second
+	renewBatchBudget = 5 * time.Second
+)
+
+// RenewOwner keeps one caller's grants alive and tells every node that actually
+// holds its sandboxes that the caller is still there.
 //
-// The fan-out is best effort: a node that is briefly unreachable must not fail
-// the renewal for the nodes that answered. The next heartbeat retries, and the
-// node's own silence TTL is several beats long precisely so one missed renewal
-// is not a reclamation.
+// The fan-out targets the nodes named by this owner's records, not every node in
+// the fleet. A node that once reported and then went dark is still in the
+// monitor's historical view, and renewing it would make every heartbeat pay a
+// dead node's timeout -- the failure this path used to have. A control plane
+// that has just restarted has no records, so it falls back to the live fleet.
+//
+// The fan-out is concurrent and bounded: one stalled node delays its own
+// goroutine, never the nodes that would answer.
 func (c *Control) RenewOwner(ctx context.Context, owner string) {
 	c.ledger.Renew(owner)
 	if c.nodes == nil {
 		return
 	}
-	for _, node := range c.monitor.Fleet() {
-		_ = c.nodes.RenewOwnerOn(ctx, node.NodeID, owner)
+	nodes := c.renewalNodes(owner)
+	c.renewAttempts.Add(1)
+	c.renewNodes.Add(int64(len(nodes)))
+	if len(nodes) == 0 {
+		return
+	}
+
+	started := time.Now()
+	batchCtx, cancel := context.WithTimeout(ctx, renewBatchBudget)
+	defer cancel()
+
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		failed []string
+	)
+	for _, nodeID := range nodes {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			nodeCtx, nodeCancel := context.WithTimeout(batchCtx, renewNodeTimeout)
+			defer nodeCancel()
+			if err := c.nodes.RenewOwnerOn(nodeCtx, id, owner); err != nil {
+				mu.Lock()
+				failed = append(failed, id)
+				mu.Unlock()
+			}
+		}(nodeID)
+	}
+	wg.Wait()
+
+	c.renewLastNanos.Store(int64(time.Since(started)))
+	if len(failed) > 0 {
+		c.renewFailures.Add(int64(len(failed)))
+		if c.log != nil {
+			// One line per batch, not one per node per beat: the failure is a
+			// property of the fleet, and a log that repeats it every thirty
+			// seconds is a log an operator stops reading.
+			c.log.Warn("owner renewal did not reach every node holding this owner's sandboxes",
+				"owner", owner, "failed_nodes", failed, "targeted", len(nodes))
+		}
+	}
+}
+
+// renewalNodes returns the nodes that hold this owner's sandboxes, or the live
+// fleet when the control has no record of the owner.
+func (c *Control) renewalNodes(owner string) []string {
+	seen := map[string]struct{}{}
+	c.mu.Lock()
+	for _, record := range c.sandbox {
+		if record.owner == owner && record.handle.NodeID != "" {
+			seen[record.handle.NodeID] = struct{}{}
+		}
+	}
+	c.mu.Unlock()
+	if len(seen) == 0 {
+		for _, view := range c.monitor.LiveFleet() {
+			seen[view.NodeID] = struct{}{}
+		}
+	}
+	nodes := make([]string, 0, len(seen))
+	for id := range seen {
+		nodes = append(nodes, id)
+	}
+	sort.Strings(nodes)
+	return nodes
+}
+
+// RenewStats reports the renewal path's own health, for the diagnostics surface.
+func (c *Control) RenewStats() (attempts, failures, targeted int64, last time.Duration) {
+	return c.renewAttempts.Load(), c.renewFailures.Load(), c.renewNodes.Load(),
+		time.Duration(c.renewLastNanos.Load())
+}
+
+// Diagnostics reports the control plane's own counters and every node's, in the
+// shape the SDK's diagnostics call returns.
+//
+// These are the facts that used to exist only as log lines: how many renewals
+// failed, how long the last fan-out took, and how many nodes are stale. A
+// service that reports only what it schedules is a service an operator has to
+// guess about exactly when it is misbehaving.
+func (c *Control) Diagnostics() map[string]any {
+	attempts, failures, targeted, last := c.RenewStats()
+	fleet := c.monitor.Fleet()
+	live := c.monitor.LiveFleet()
+	c.mu.Lock()
+	records := len(c.sandbox)
+	c.mu.Unlock()
+	nodes := make(map[string]any, len(fleet))
+	for _, view := range fleet {
+		nodes[view.NodeID] = map[string]any{
+			"live_sandboxes":    view.LiveSandboxes,
+			"last_report_age_s": time.Since(view.SeenAt).Seconds(),
+			"draining":          view.Draining,
+			"diagnostics":       view.Diagnostics,
+		}
+	}
+	return map[string]any{
+		"renew": map[string]any{
+			"attempts":         attempts,
+			"failures":         failures,
+			"nodes_targeted":   targeted,
+			"last_duration_ms": float64(last.Microseconds()) / 1000.0,
+		},
+		"fleet": map[string]any{
+			"live_nodes":  len(live),
+			"stale_nodes": len(fleet) - len(live),
+			"records":     records,
+		},
+		"nodes": nodes,
 	}
 }

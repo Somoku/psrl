@@ -324,8 +324,11 @@ func preflight(configPath string, log *slog.Logger) error {
 	log.Info("timing contract resolved", "spans", spans.Spans())
 
 	// buildBackends preflights each one as it is built, which is the expensive
-	// part of the check and the part that reaches the node.
-	backends, err := buildBackends(cfg, log)
+	// part of the check and the part that reaches the node. A control-only process
+	// declares backends for routing but drives none of them, so it builds them
+	// without reaching a local runtime: requiring a Docker daemon on the control
+	// host would make the cluster topology impossible to validate there.
+	backends, err := buildBackends(cfg, log, cfg.Role != "control")
 	if err != nil {
 		return err
 	}
@@ -341,6 +344,22 @@ func preflight(configPath string, log *slog.Logger) error {
 		LeaseTTL: timing.OwnerLease,
 	}); err != nil {
 		return err
+	}
+	if cfg.Role == "control" {
+		if cfg.Listen == "" {
+			return fmt.Errorf("role \"control\" requires listen to be set")
+		}
+		if len(cfg.FleetNodes) == 0 {
+			return fmt.Errorf("role \"control\" requires fleet_nodes: a control plane with no nodes serves nothing")
+		}
+		for _, fleetNode := range cfg.FleetNodes {
+			if fleetNode.NodeID == "" || fleetNode.Address == "" {
+				return fmt.Errorf("each fleet_nodes entry needs both node_id and address")
+			}
+		}
+		log.Info("control plane is servable",
+			"listen", cfg.Listen, "fleet_nodes", len(cfg.FleetNodes), "backends", backendNames(backends))
+		return nil
 	}
 	// The node envelope and its windows are only meaningful where a runtime is
 	// installed here, which is the same condition run uses to build the agent.
@@ -439,7 +458,7 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 	if cfg.NodeListen == "" {
 		return fmt.Errorf("role \"node\" requires node_listen to be set")
 	}
-	backends, err := buildBackends(cfg, log)
+	backends, err := buildBackends(cfg, log, true)
 	if err != nil {
 		return err
 	}
@@ -546,7 +565,7 @@ func runControl(ctx context.Context, cfg Config, spans timing.Contract, log *slo
 	// Control-only processes carry no local backends — they route to fleet nodes.
 	// The registry may be empty if all backends are on the remote nodes, but quota
 	// and placement still need to be wired.
-	backends, err := buildBackends(cfg, log)
+	backends, err := buildBackends(cfg, log, true)
 	if err != nil && len(cfg.Backends) > 0 {
 		// If backends are declared they must build. If none are declared, this is fine.
 		return err
@@ -574,7 +593,6 @@ func runControl(ctx context.Context, cfg Config, spans timing.Contract, log *slo
 		log.Info("fleet node registered", "node", n.NodeID, "address", n.Address)
 	}
 	fleetClient := server.NewFleetNodeClient(remotes)
-	go fleetClient.PollFleet(ctx, fleet, spans.LoadReportInterval())
 
 	ledger, err := quota.New(quota.Config{
 		Total: quota.Amount{
@@ -604,6 +622,11 @@ func runControl(ctx context.Context, cfg Config, spans timing.Contract, log *slo
 	}
 
 	go sweepReservations(ctx, place, timing.SweepInterval)
+	// Polling feeds two consumers: placement's view and the ledger's
+	// reconciliation. A grant whose sandbox the node no longer holds is released
+	// from the node's own inventory, which is the only authority on whether the
+	// runtime still exists.
+	go fleetClient.PollFleet(ctx, fleet, spans.LoadReportInterval(), control.ReconcileGrants)
 	// The fleet's grants are repriced between reports, because that is when the nodes'
 	// published prices move. Doing it on the admission path would put a walk of every
 	// live grant in front of the request that is waiting for it.
@@ -625,7 +648,7 @@ func runControl(ctx context.Context, cfg Config, spans timing.Contract, log *slo
 // runCombined is the original single-process shape: control and node in one
 // binary, reachable over one socket.
 func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *slog.Logger) error {
-	backends, err := buildBackends(cfg, log)
+	backends, err := buildBackends(cfg, log, true)
 	if err != nil {
 		return err
 	}
@@ -743,7 +766,7 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 		// The bounds half runs on its own, much shorter cadence: it is the one a burst
 		// has to be visible to.
 		go limitLoop(ctx, agent, seconds(cfg.Node.Elastic.LimitSampleIntervalS), log)
-		go republish(ctx, agent, fleet, spans.LoadReportInterval())
+		go republish(ctx, agent, fleet, spans.LoadReportInterval(), control.ReconcileGrants)
 
 		// If node_listen is set in combined mode, also serve the node-plane
 		// protocol so that a second control process (e.g. a dedicated gateway) can
@@ -771,7 +794,10 @@ func runCombined(ctx context.Context, cfg Config, spans timing.Contract, log *sl
 	return server.NewJSONListener(control, agent, log).Serve(ctx, listener)
 }
 
-func republish(ctx context.Context, agent *server.Node, fleet *monitor.Monitor, every time.Duration) {
+func republish(
+	ctx context.Context, agent *server.Node, fleet *monitor.Monitor, every time.Duration,
+	reconcile func(placement.NodeView),
+) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
@@ -779,7 +805,11 @@ func republish(ctx context.Context, agent *server.Node, fleet *monitor.Monitor, 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			fleet.Report(agent.View())
+			view := agent.View()
+			fleet.Report(view)
+			if reconcile != nil {
+				reconcile(view)
+			}
 		}
 	}
 }
@@ -797,7 +827,7 @@ func sweepReservations(ctx context.Context, place *placement.Service, every time
 	}
 }
 
-func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
+func buildBackends(cfg Config, log *slog.Logger, check bool) ([]backend.Backend, error) {
 	if len(cfg.Backends) == 0 {
 		return nil, fmt.Errorf("a sandbox service needs at least one backend")
 	}
@@ -815,9 +845,12 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 		// Provisioned before built, because a backend whose service is absent
 		// fails to construct with the runtime's own error, and that error names a
 		// socket or a status code rather than the thing an operator has to install.
-		// This check names it.
-		if result := provisionCheck(declared, mode); result.Err != nil {
-			return nil, result.Err
+		// This check names it. A routing-only build skips it: the control plane
+		// does not drive these runtimes.
+		if check {
+			if result := provisionCheck(declared, mode); result.Err != nil {
+				return nil, result.Err
+			}
 		}
 		var (
 			b   backend.Backend
@@ -911,9 +944,12 @@ func buildBackends(cfg Config, log *slog.Logger) ([]backend.Backend, error) {
 		// added later cannot be wired in without its refusal. At startup rather
 		// than at the first rollout: a daemon that is not answering is a
 		// configuration error, and discovering it inside an episode costs a sample.
-		if checker, can := b.(backend.Preflighter); can {
-			if err := checker.Preflight(context.Background()); err != nil {
-				return nil, fmt.Errorf("backend %q preflight: %w", declared.Type, err)
+		// A routing-only build (the control plane) does not reach the runtime.
+		if check {
+			if checker, can := b.(backend.Preflighter); can {
+				if err := checker.Preflight(context.Background()); err != nil {
+					return nil, fmt.Errorf("backend %q preflight: %w", declared.Type, err)
+				}
 			}
 		}
 		log.Info("sandbox backend ready", "type", declared.Type, "mode", mode,

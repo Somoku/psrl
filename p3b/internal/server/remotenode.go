@@ -16,6 +16,7 @@ import (
 
 	"psrl.dev/sandboxd/internal/backend"
 	"psrl.dev/sandboxd/internal/monitor"
+	"psrl.dev/sandboxd/internal/placement"
 )
 
 // Ensure FleetNodeClient satisfies the NodeClient interface at compile time.
@@ -62,7 +63,7 @@ func (r *RemoteNodeClient) budgetFor(method string) time.Duration {
 
 // call dials the node, sends one request, reads one reply, and closes.
 func (r *RemoteNodeClient) call(ctx context.Context, method string, payload any) (json.RawMessage, error) {
-	conn, err := dialNode(r.address, r.timeout)
+	conn, err := dialNode(ctx, r.address, r.timeout)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "node at %s: %v", r.address, err)
 	}
@@ -179,22 +180,29 @@ func (r *RemoteNodeClient) renewOwnerOn(ctx context.Context, owner string) error
 	return err
 }
 
-func (r *RemoteNodeClient) execOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (int, string, error) {
+func (r *RemoteNodeClient) execOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (backend.ExecResult, error) {
 	raw, err := r.call(ctx, "exec", map[string]any{
 		"backend": handle.Backend, "sandbox_id": handle.SandboxID, "node_id": handle.NodeID,
 		"command": command, "cwd": cwd, "env": env,
 	})
 	if err != nil {
-		return 0, "", err
+		return backend.ExecResult{}, err
 	}
 	var out struct {
-		ExitCode int    `json:"exit_code"`
-		Stdout   string `json:"stdout"`
+		ExitCode  int    `json:"exit_code"`
+		Stdout    string `json:"stdout"`
+		Stderr    string `json:"stderr"`
+		Truncated bool   `json:"truncated"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return 0, "", fmt.Errorf("exec reply: %w", err)
+		return backend.ExecResult{}, fmt.Errorf("exec reply: %w", err)
 	}
-	return out.ExitCode, out.Stdout, nil
+	return backend.ExecResult{
+		ExitCode:  out.ExitCode,
+		Stdout:    out.Stdout,
+		Stderr:    out.Stderr,
+		Truncated: out.Truncated,
+	}, nil
 }
 
 func (r *RemoteNodeClient) readBytesOn(ctx context.Context, handle backend.Handle, path string) (string, error) {
@@ -331,10 +339,10 @@ func (f *FleetNodeClient) RenewOwnerOn(ctx context.Context, nodeID, owner string
 }
 
 // ExecOn runs one command in a sandbox on the node that holds it.
-func (f *FleetNodeClient) ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (int, string, error) {
+func (f *FleetNodeClient) ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (backend.ExecResult, error) {
 	n, err := f.node(handle.NodeID)
 	if err != nil {
-		return 0, "", err
+		return backend.ExecResult{}, err
 	}
 	return n.execOn(ctx, handle, command, cwd, env)
 }
@@ -363,7 +371,9 @@ func (f *FleetNodeClient) WriteBytesOn(ctx context.Context, handle backend.Handl
 // interval governs how often each node is polled. A node that does not answer
 // within its own timeout is skipped for that round and its view ages out
 // naturally through the monitor's TTL.
-func (f *FleetNodeClient) PollFleet(ctx context.Context, fleet *monitor.Monitor, interval time.Duration) {
+func (f *FleetNodeClient) PollFleet(
+	ctx context.Context, fleet *monitor.Monitor, interval time.Duration, onView func(placement.NodeView),
+) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -389,7 +399,11 @@ func (f *FleetNodeClient) PollFleet(ctx context.Context, fleet *monitor.Monitor,
 						// network blip should not cause a mass placement failure.
 						return
 					}
-					fleet.Report(nodeViewFromWire(wire))
+					view := nodeViewFromWire(wire)
+					fleet.Report(view)
+					if onView != nil {
+						onView(view)
+					}
 				}(n)
 			}
 		}
@@ -398,11 +412,16 @@ func (f *FleetNodeClient) PollFleet(ctx context.Context, fleet *monitor.Monitor,
 
 // -- helpers -------------------------------------------------------------------
 
-func dialNode(address string, timeout time.Duration) (net.Conn, error) {
+func dialNode(ctx context.Context, address string, timeout time.Duration) (net.Conn, error) {
+	// DialContext, not DialTimeout: a caller that has already bounded the call
+	// (a renewal with a three-second budget, say) must not then block for the
+	// client's full sixty-second dial timeout on a node whose port is a
+	// black hole.
+	dialer := &net.Dialer{Timeout: timeout}
 	if path, found := cutPrefix(address, "unix://"); found {
-		return net.DialTimeout("unix", path, timeout)
+		return dialer.DialContext(ctx, "unix", path)
 	}
-	return net.DialTimeout("tcp", address, timeout)
+	return dialer.DialContext(ctx, "tcp", address)
 }
 
 func cutPrefix(s, prefix string) (string, bool) {
@@ -413,17 +432,21 @@ func cutPrefix(s, prefix string) (string, bool) {
 }
 
 func wireErrorToStatus(e *wireError) error {
-	return &nodeFailure{code: wireErrorCode(e.Code), message: e.Message, exitReason: e.ExitReason}
+	return &nodeFailure{code: wireErrorCode(e.Code), class: e.Code, message: e.Message, exitReason: e.ExitReason}
 }
 
 // wireErrorCode maps a wire classification onto the gRPC code a caller reads.
+//
+// path_not_found shares codes.NotFound with session_lost because gRPC has no
+// better slot for it, but the class travels beside the code: classify prefers
+// the class, so the two are not conflated where the caller reads them.
 func wireErrorCode(class string) codes.Code {
 	switch class {
 	case "capability":
 		return codes.FailedPrecondition
 	case "capacity_timeout":
 		return codes.ResourceExhausted
-	case "session_lost":
+	case "session_lost", "path_not_found":
 		return codes.NotFound
 	case "transport":
 		return codes.Unavailable
@@ -445,11 +468,17 @@ func wireErrorCode(class string) codes.Code {
 // this process.
 type nodeFailure struct {
 	code       codes.Code
+	class      string
 	message    string
 	exitReason string
 }
 
 func (e *nodeFailure) Error() string { return e.message }
+
+// WireCode keeps the node's own classification across the control hop. Without
+// it a path_not_found would be re-read as session_lost from its gRPC status
+// alone, which is exactly the conflation this class exists to prevent.
+func (e *nodeFailure) WireCode() string { return e.class }
 
 func (e *nodeFailure) GRPCStatus() *status.Status { return status.New(e.code, e.message) }
 

@@ -81,59 +81,30 @@ func (l *LocalNodeClient) RenewOwnerOn(_ context.Context, _ string, owner string
 }
 
 // ExecOn runs one command in a sandbox the node holds.
-func (l *LocalNodeClient) ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (int, string, error) {
+func (l *LocalNodeClient) ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (backend.ExecResult, error) {
 	return l.node.Exec(ctx, handle, command, cwd, env)
 }
 
 // ReadBytesOn reads a file from a sandbox the node holds.
 //
-// Uses the Engine archive API when the backend implements FileHandler, which
-// avoids the ARG_MAX limit that breaks shell-based base64 for files over ~96 KiB.
+// The node owns the distinction between a missing file and a missing sandbox;
+// returning its typed error lets the control plane preserve that classification
+// across the JSON boundary instead of flattening both into "internal".
 func (l *LocalNodeClient) ReadBytesOn(ctx context.Context, handle backend.Handle, path string) (string, error) {
-	if b, ok := l.node.hosted(handle.Backend); ok {
-		if fh, ok := b.(backend.FileHandler); ok {
-			data, err := fh.ReadFile(ctx, handle, path)
-			if err != nil {
-				return "", fmt.Errorf("reading %q: %w", path, err)
-			}
-			return base64.StdEncoding.EncodeToString(data), nil
-		}
-	}
-	// Fallback for backends that don't implement FileHandler.
-	code, output, err := l.node.Exec(ctx, handle, fmt.Sprintf("base64 %q", path), "", nil)
+	data, err := l.node.ReadBytes(ctx, handle, path)
 	if err != nil {
 		return "", err
 	}
-	if code != 0 {
-		return "", fmt.Errorf("reading %q exited %d", path, code)
-	}
-	return compactBase64(output), nil
+	return base64.StdEncoding.EncodeToString(data), nil
 }
 
 // WriteBytesOn writes a file into a sandbox the node holds.
-//
-// Uses the Engine archive API when the backend implements FileHandler, which
-// avoids the ARG_MAX limit that breaks shell-based base64 for files over ~96 KiB.
 func (l *LocalNodeClient) WriteBytesOn(ctx context.Context, handle backend.Handle, path, data string) error {
-	if b, ok := l.node.hosted(handle.Backend); ok {
-		if fh, ok := b.(backend.FileHandler); ok {
-			decoded, err := base64.StdEncoding.DecodeString(data)
-			if err != nil {
-				return fmt.Errorf("writing %q: decode: %w", path, err)
-			}
-			return fh.WriteFile(ctx, handle, path, decoded)
-		}
-	}
-	// Fallback for backends that don't implement FileHandler.
-	command := fmt.Sprintf("mkdir -p \"$(dirname %q)\" && printf %%s %q | base64 -d > %q", path, data, path)
-	code, output, err := l.node.Exec(ctx, handle, command, "", nil)
+	decoded, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
-		return err
+		return fmt.Errorf("writing %q: decode: %w", path, err)
 	}
-	if code != 0 {
-		return fmt.Errorf("writing %q exited %d: %s", path, code, output)
-	}
-	return nil
+	return l.node.WriteBytes(ctx, handle, path, decoded)
 }
 
 // specToProto renders a spec for the node, which speaks the proto contract even

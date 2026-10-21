@@ -16,7 +16,9 @@ import (
 
 	v1 "psrl.dev/sandboxd/api/v1"
 	"psrl.dev/sandboxd/internal/backend"
+	"psrl.dev/sandboxd/internal/node"
 	"psrl.dev/sandboxd/internal/placement"
+	"psrl.dev/sandboxd/internal/timing"
 )
 
 // JSONListener serves the SDK's wire format: a four-byte length then a JSON
@@ -176,22 +178,30 @@ func (j *JSONListener) write(conn net.Conn, out reply) {
 
 // classify maps a failure onto the attribution the caller acts on.
 func classify(err error) *wireError {
-	code := "internal"
-	switch status.Code(err) {
-	case codes.FailedPrecondition:
-		code = "capability"
-	case codes.ResourceExhausted:
-		code = "capacity_timeout"
-	case codes.OutOfRange:
-		// The request can never fit its class, so retrying cannot help. Distinct
-		// from capacity_timeout, which clears as sandboxes are released.
-		code = "cannot_admit"
-	case codes.NotFound:
-		code = "session_lost"
-	case codes.Unavailable:
-		code = "transport"
-	case codes.DeadlineExceeded:
-		code = "command_timeout"
+	var code string
+	if wireCode, ok := wireCodeOf(err); ok {
+		// An error's own classification wins over the status code it happens to
+		// carry, because the status vocabulary is too coarse to express the
+		// difference between a missing file and a missing sandbox.
+		code = wireCode
+	} else {
+		code = "internal"
+		switch status.Code(err) {
+		case codes.FailedPrecondition:
+			code = "capability"
+		case codes.ResourceExhausted:
+			code = "capacity_timeout"
+		case codes.OutOfRange:
+			// The request can never fit its class, so retrying cannot help. Distinct
+			// from capacity_timeout, which clears as sandboxes are released.
+			code = "cannot_admit"
+		case codes.NotFound:
+			code = "session_lost"
+		case codes.Unavailable:
+			code = "transport"
+		case codes.DeadlineExceeded:
+			code = "command_timeout"
+		}
 	}
 	return &wireError{Code: code, Message: err.Error(), ExitReason: exitReasonOf(err)}
 }
@@ -208,7 +218,16 @@ func classify(err error) *wireError {
 // with it, so an infrastructure retry cannot bring it back and the caller has to
 // decide what to do. Only the second carries an attribution, so this passes that
 // one through untouched and covers everything else.
+// preserveSessionLost keeps a typed classification intact across the wire.
+//
+// A lost session and a missing path are different answers: the first replaces
+// the sandbox, the second leaves it usable. Anything that carries its own wire
+// code is passed through untouched; a bare ErrSessionLost is promoted to the
+// lost-session status, and everything else is the transport fault it reads as.
 func preserveSessionLost(err error) error {
+	if _, ok := wireCodeOf(err); ok {
+		return err
+	}
 	switch {
 	case status.Code(err) == codes.NotFound:
 		// Already carries the code and the attribution the wire layer reports.
@@ -220,8 +239,22 @@ func preserveSessionLost(err error) error {
 	}
 }
 
+// wireCodeOf reports the caller-facing classification an error carries, if any.
+// It is checked before the gRPC status so an error's own semantics survive
+// every hop, including hops that only preserve a status code.
+func wireCodeOf(err error) (string, bool) {
+	var coded interface{ WireCode() string }
+	if errors.As(err, &coded) {
+		if code := coded.WireCode(); code != "" {
+			return code, true
+		}
+	}
+	return "", false
+}
+
 func exitReasonOf(err error) string {
-	if attributed, ok := err.(interface{ ExitReason() string }); ok {
+	var attributed interface{ ExitReason() string }
+	if errors.As(err, &attributed) {
 		return attributed.ExitReason()
 	}
 	return ""
@@ -261,6 +294,10 @@ func (j *JSONListener) dispatch(ctx context.Context, req request) (any, error) {
 		return j.fleet(ctx)
 	case "quota":
 		return j.quota(ctx)
+	case "diagnostics":
+		return j.diagnostics(ctx)
+	case "contract":
+		return j.contract(ctx)
 	default:
 		return nil, status.Errorf(codes.Unimplemented, "the sandbox service has no method %q", req.Method)
 	}
@@ -583,11 +620,16 @@ func (j *JSONListener) exec(ctx context.Context, raw json.RawMessage) (any, erro
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, err
 	}
-	code, output, err := j.control.nodes.ExecOn(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
+	result, err := j.control.nodes.ExecOn(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
 	if err != nil {
 		return nil, preserveSessionLost(err)
 	}
-	return map[string]any{"exit_code": code, "stdout": output, "stderr": "", "truncated": false}, nil
+	return map[string]any{
+		"exit_code": result.ExitCode,
+		"stdout":    result.Stdout,
+		"stderr":    result.Stderr,
+		"truncated": result.Truncated,
+	}, nil
 }
 
 // touch refreshes a held sandbox's activity.
@@ -767,6 +809,38 @@ func (j *JSONListener) quota(ctx context.Context) (any, error) {
 		}
 	}
 	return map[string]any{"classes": classes}, nil
+}
+
+// diagnostics returns the control plane's own counters and every node's.
+//
+// It exists because the facts an operator needs when the service misbehaves --
+// renewal failures, fan-out latency, stale nodes, runtime-probe outcomes -- were
+// previously only log lines. A plane that reports what it schedules but not
+// whether its own liveness machinery is working is a plane that has to be
+// guessed about exactly when guessing is most expensive.
+func (j *JSONListener) diagnostics(_ context.Context) (any, error) {
+	if j.control == nil {
+		return nil, status.Error(codes.Unimplemented,
+			"no control plane is configured; this process has no fleet diagnostics")
+	}
+	return j.control.Diagnostics(), nil
+}
+
+// contract publishes the mechanism's own timing spans.
+//
+// The SDK used to hardcode a heartbeat interval and a timeout that had to agree
+// with these values; when they drifted, the client reported "the node reclaims
+// after three beats" while the node used a different clock. A client derives its
+// cadence from this instead of restating it.
+func (j *JSONListener) contract(_ context.Context) (any, error) {
+	return map[string]any{
+		"owner_heartbeat_interval_s": timing.OwnerHeartbeatInterval.Seconds(),
+		"owner_silence_ttl_s":        timing.OwnerSilenceTTL.Seconds(),
+		"owner_lease_s":              timing.OwnerLease.Seconds(),
+		"sweep_interval_s":           timing.SweepInterval.Seconds(),
+		"reservation_ttl_s":          timing.ReservationTTL.Seconds(),
+		"runtime_probe_interval_s":   node.DefaultRuntimeProbeInterval.Seconds(),
+	}, nil
 }
 
 // Enum values the SDK sends as names, mapped back explicitly so an unknown one

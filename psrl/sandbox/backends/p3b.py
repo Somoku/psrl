@@ -75,6 +75,7 @@ from psrl.sandbox.core import (
     SandboxExitReason,
     SandboxFeature,
     SandboxOomError,
+    SandboxPathNotFoundError,
     SandboxRef,
     SandboxSession,
     SandboxSessionLostError,
@@ -127,6 +128,10 @@ def _translate(exc: service_errors.SandboxError) -> BaseException:
         return SandboxOomError(str(exc))
     if isinstance(exc, service_errors.SandboxCommandTimeout):
         return SandboxCommandTimeout(str(exc), sandbox_preserved=getattr(exc, "sandbox_preserved", False))
+    if isinstance(exc, service_errors.SandboxPathNotFound):
+        # A path-level fact, not a lost sandbox: the sandbox stays usable and a
+        # caller that reads this as infrastructure loss replaces a healthy one.
+        return SandboxPathNotFoundError(str(exc))
     if isinstance(exc, service_errors.SandboxTransportError):
         return SandboxTransportError(str(exc))
     return SandboxSetupError(str(exc))
@@ -363,9 +368,26 @@ class P3bBackend(SandboxBackend):
         # the service bounds its own work. The client keeps only its internal
         # liveness for calls expected to answer promptly.
         self._client = SandboxClient(endpoint)
+        # The renewal gets its own connection pool. A create holds a control
+        # connection for its whole duration (it has no client deadline), so a
+        # burst of creates can occupy every slot in the shared pool; a heartbeat
+        # that then waits on a slot reports a missed beat while the service is
+        # answering every request promptly.
+        self._renew_client: SandboxClient | None = None
         self._owner_id = ""
         self._closed = False
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._contract_loaded = False
+        self._heartbeat_interval_s = OWNER_HEARTBEAT_INTERVAL_S
+        self._silence_ttl_s = OWNER_HEARTBEAT_INTERVAL_S * _OWNER_SILENCE_BEATS
+        self._renew_timeout_s = OWNER_RENEW_TIMEOUT_S
+        # Renewal health, exposed as metrics beside the fleet report: the
+        # caller's own timeouts are the only signal that a renewal is not
+        # reaching a node, and they must not exist only as log lines.
+        self._renew_attempts = 0
+        self._renew_failures = 0
+        self._renew_consecutive_misses = 0
+        self._renew_last_duration_s = 0.0
 
     @property
     def name(self) -> str:
@@ -426,6 +448,34 @@ class P3bBackend(SandboxBackend):
         if not self._owner_id:
             self._owner_id = owner_id
 
+    async def _load_contract(self) -> None:
+        """Read the service's timing spans once, so this client stops guessing.
+
+        A failure here is not a create failure: the client keeps a conservative
+        default and says once that it did. The values it would have read govern
+        a liveness probe, not the sandbox the caller is asking for.
+        """
+        if self._contract_loaded:
+            return
+        self._contract_loaded = True
+        try:
+            contract = await self._client.contract()
+        except Exception as exc:  # noqa: BLE001 - a liveness detail must not fail a create
+            psrl_logger.warning(
+                "Could not read the sandbox service's timing contract; using the client defaults: %r",
+                exc,
+            )
+            return
+        heartbeat = float(contract.get("owner_heartbeat_interval_s") or self._heartbeat_interval_s)
+        silence = float(contract.get("owner_silence_ttl_s") or self._silence_ttl_s)
+        if heartbeat > 0 and silence > 0:
+            self._heartbeat_interval_s = heartbeat
+            self._silence_ttl_s = silence
+            # Never wait longer than a third of the silence budget: a renewal
+            # allowed to run that long cannot be told apart from a loop that has
+            # stopped, and the next beat would carry the loss.
+            self._renew_timeout_s = min(OWNER_RENEW_TIMEOUT_S, max(1.0, silence / 3.0))
+
     def _ensure_owner_heartbeat(self) -> None:
         """Start renewing this worker's ownership of the sandboxes it holds.
 
@@ -436,6 +486,8 @@ class P3bBackend(SandboxBackend):
         every sandbox this worker starts keeps the same single loop.
         """
         if self._owner_id and (self._heartbeat_task is None or self._heartbeat_task.done()):
+            if self._renew_client is None:
+                self._renew_client = SandboxClient(self._endpoint, pool_size=4)
             self._heartbeat_task = asyncio.create_task(self._renew_owner_loop())
 
     async def _renew_owner_loop(self) -> None:
@@ -455,9 +507,11 @@ class P3bBackend(SandboxBackend):
         missed = 0
         while not self._closed:
             started = time.monotonic()
+            client = self._renew_client or self._client
+            self._renew_attempts += 1
             try:
-                async with asyncio.timeout(OWNER_RENEW_TIMEOUT_S):
-                    await self._client.renew_owner(self._owner_id)
+                async with asyncio.timeout(self._renew_timeout_s):
+                    await client.renew_owner(self._owner_id)
                 if missed:
                     psrl_logger.info(
                         "Sandbox owner renewal recovered for owner %r after %d missed beat(s).",
@@ -465,27 +519,34 @@ class P3bBackend(SandboxBackend):
                         missed,
                     )
                 missed = 0
+                self._renew_consecutive_misses = 0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 missed += 1
+                self._renew_failures += 1
+                self._renew_consecutive_misses = missed
                 # One missed beat costs nothing; the second means one more will cost every
                 # sandbox this worker holds. Say so at the level that gets read.
                 log = psrl_logger.error if missed >= _RENEWAL_MISSES_BEFORE_ALARM else psrl_logger.warning
+                beats = max(1, int(round(self._silence_ttl_s / max(self._heartbeat_interval_s, 0.001))))
                 log(
                     "Sandbox owner renewal failed for owner %r (%d consecutive miss(es), "
                     "the node reclaims after %d): %r. Every sandbox this worker holds is at risk.",
                     self._owner_id,
                     missed,
-                    _OWNER_SILENCE_BEATS,
+                    beats,
                     exc,
                 )
-            remaining = OWNER_HEARTBEAT_INTERVAL_S - (time.monotonic() - started)
+            finally:
+                self._renew_last_duration_s = time.monotonic() - started
+            remaining = self._heartbeat_interval_s - (time.monotonic() - started)
             if remaining > 0:
                 await asyncio.sleep(remaining)
 
     async def create(self, spec: SandboxSpec) -> SandboxSession:
         self._require_open()
+        await self._load_contract()
         self._ensure_owner_heartbeat()
         sandbox = await _service_call(
             self._client.create(_to_service_spec(spec, self._owner_id, self._resource_class))
@@ -505,6 +566,7 @@ class P3bBackend(SandboxBackend):
 
     async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> SandboxSession:
         self._require_open()
+        await self._load_contract()
         self._ensure_owner_heartbeat()
         service_spec = _to_service_spec(spec, self._owner_id, self._resource_class) if spec is not None else None
         sandbox = await _service_call(
@@ -543,6 +605,9 @@ class P3bBackend(SandboxBackend):
             self._heartbeat_task.cancel()
             await asyncio.gather(self._heartbeat_task, return_exceptions=True)
             self._heartbeat_task = None
+        if self._renew_client is not None:
+            await self._renew_client.close()
+            self._renew_client = None
         await self._client.close()
 
     # -- Metric passthroughs ---------------------------------------------------
@@ -561,7 +626,10 @@ class P3bBackend(SandboxBackend):
         result["nodes"] = [
             {
                 "node_id": n.node_id,
-                "backend": n.backend,
+                # NodeReport carries every runtime the node hosts, not one: a
+                # machine can serve a spec through its container daemon and
+                # another through a microVM, and naming one would hide the other.
+                "backends": list(n.backends),
                 "live_sandboxes": n.live_sandboxes,
                 "cpu_used_pct": n.cpu_used_pct,
                 "mem_used_pct": n.mem_used_pct,
@@ -570,6 +638,27 @@ class P3bBackend(SandboxBackend):
             for n in (report.nodes or [])
         ]
         return result
+
+    async def diagnostics(self) -> dict[str, Any]:
+        """Return the service's own health counters, for PSRL's metric hooks."""
+        self._require_open()
+        return await _service_call(self._client.diagnostics())
+
+    def heartbeat_report(self) -> dict[str, float]:
+        """Return this backend's renewal health as flat metrics.
+
+        Renewal failures are otherwise only visible as repeated log lines on the
+        worker; a metric makes "this run's heartbeats never reached a node" a
+        number beside the fleet's, instead of a paragraph someone has to notice.
+        """
+        return {
+            "sandbox/p3b/renew/attempts": float(self._renew_attempts),
+            "sandbox/p3b/renew/failures": float(self._renew_failures),
+            "sandbox/p3b/renew/consecutive_misses": float(self._renew_consecutive_misses),
+            "sandbox/p3b/renew/last_duration_s": self._renew_last_duration_s,
+            "sandbox/p3b/renew/interval_s": self._heartbeat_interval_s,
+            "sandbox/p3b/renew/silence_ttl_s": self._silence_ttl_s,
+        }
 
     async def quota_report(self) -> dict[str, Any]:
         """Return the service's quota view for PSRL's metric hooks.

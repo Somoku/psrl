@@ -79,6 +79,16 @@ class SandboxSetupError(SandboxError):
     """
 
 
+class SandboxPathNotFound(SandboxError):
+    """A file operation addressed a path the sandbox does not have.
+
+    The sandbox itself is healthy and stays usable. This is deliberately not a
+    lost session: a missing diagnostics file and a dead container are both 404s
+    from the runtime, and reading the first as the second made a harness report
+    say the sandbox had died when the real problem was a file that was gone.
+    """
+
+
 class SandboxTransportError(SandboxError):
     """The control channel failed rather than the command.
 

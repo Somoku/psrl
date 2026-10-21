@@ -108,6 +108,40 @@ class SandboxSetupError(RuntimeError):
     """
 
 
+class SandboxPathNotFoundError(RuntimeError):
+    """
+    Raised when a file operation addressed a path the sandbox does not have.
+
+    The sandbox is healthy and stays usable. Deliberately not a
+    `SandboxSessionLostError`: a missing diagnostics file and a dead container are
+    both runtime 404s, and reading the first as the second makes an episode look
+    like an infrastructure loss when nothing was lost.
+    """
+
+
+class SandboxCollectorError(RuntimeError):
+    """
+    Raised when a harness's artifact collector could not run in the sandbox.
+
+    This is an environment fault (a missing tool, a broken shell, a filesystem
+    that is not writable), not a model or task result and not necessarily a lost
+    session: the container may still be running. It carries the collector's exit
+    code and whatever diagnostics could be read, because the failure is exactly
+    the moment the sandbox's own diagnostic file may be unavailable.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_code: int | None = None,
+        diagnostics: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.diagnostics = diagnostics
+
+
 class SandboxProvisionError(RuntimeError):
     """
     Transfer ownership of a partially provisioned sandbox to its caller.
@@ -315,6 +349,11 @@ class SandboxExitReason(str, Enum):
     OOM = "oom"
     # A node reclaimer found it with no live owner.
     RECLAIMED_ORPHAN = "reclaimed_orphan"
+    # Its container stopped for a reason other than OOM: the entry process
+    # exited, or the runtime reported it dead.
+    CONTAINER_EXITED = "exited"
+    # The runtime no longer has the container at all.
+    CONTAINER_RUNTIME_GONE = "runtime_gone"
     # It failed on its own.
     FAILED = "failed"
     # It is gone and no local record explains why.

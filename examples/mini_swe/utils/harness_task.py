@@ -4,7 +4,14 @@ import logging
 import shlex
 from pathlib import PurePosixPath
 
-from psrl.sandbox import SandboxSession, SandboxSessionLostError
+from psrl.sandbox import (
+    SandboxCollectorError,
+    SandboxExitReason,
+    SandboxPathNotFoundError,
+    SandboxSession,
+    SandboxSessionLostError,
+    SandboxStatus,
+)
 
 psrl_logger = logging.getLogger(__file__)
 
@@ -14,9 +21,10 @@ psrl_logger = logging.getLogger(__file__)
 # incomplete solution and report the result as if it were measured.
 _HARNESS_PATCH_NAME = "psrl-harness.patch"
 # Collection diagnostics, written by the script and read back through the file API.
-# The sandbox exec channel does not carry stderr on every backend (the p3b node agent
-# returns an empty stderr), so a failing collection would otherwise report only an
-# exit code with no way to tell which step failed.
+# The sandbox exec channel now carries stderr on the p3b backend, but the
+# self-report also names which tool or directory was missing at each step, which
+# a stderr tail does not, and it survives on backends whose exec channel still
+# carries no stderr.
 _HARNESS_DIAG_NAME = "psrl-harness-collect.diag"
 # A repository read by git, not an interactive command, so one generous call is enough
 # and every retry cost is the agent's work being wasted.
@@ -157,12 +165,42 @@ async def collect_git_patch(
         )
         raise
     if result.exit_code != 0:
-        diagnostics = await _read_collector_diagnostics(session, diag_path)
-        raise RuntimeError(
+        diagnostics, unavailable = await _read_collector_diagnostics(session, diag_path)
+        detail = (
             f"Could not collect harness patch (exit {result.exit_code}, cwd={workdir!r}): "
             f"{result.stderr.strip() or '<backend reported no stderr>'}\n"
             f"collector diagnostics:\n{diagnostics}"
         )
+        # The collector's exit code and its own diagnostics are the only evidence
+        # available for telling these apart, and they lead to different caller
+        # responses:
+        #
+        # - 137 is SIGKILL. If the sandbox is no longer running, the kernel killed
+        #   it for memory and the episode is a resource loss; if it is still
+        #   running, a child was killed and the sandbox is usable.
+        # - 126/127 mean the shell could not execute the collector's tools. The
+        #   sandbox's execution environment is not what the harness needs.
+        # - A diagnostics file that cannot be read at all, after a non-137 exit,
+        #   means the collector's filesystem or shell never worked. Reporting the
+        #   episode as a collector error would blame the harness for a broken
+        #   sandbox.
+        if result.exit_code == 137:
+            if not await _sandbox_is_running(session):
+                raise SandboxSessionLostError(
+                    detail,
+                    exit_reason=SandboxExitReason.OOM,
+                )
+            raise SandboxCollectorError(detail, exit_code=137, diagnostics=diagnostics)
+        if unavailable:
+            raise SandboxSessionLostError(
+                f"Harness patch collection could not run in the sandbox: {detail}",
+                exit_reason=SandboxExitReason.CONTAINER_EXITED,
+            )
+        if result.exit_code in (126, 127):
+            raise SandboxCollectorError(
+                detail, exit_code=result.exit_code, diagnostics=diagnostics
+            )
+        raise RuntimeError(detail)
     try:
         payload = await session.read_bytes(patch_path)
     except Exception as exc:
@@ -177,16 +215,43 @@ async def collect_git_patch(
     return payload.decode(errors="replace")
 
 
-async def _read_collector_diagnostics(session: SandboxSession, diag_path: str) -> str:
+async def _sandbox_is_running(session: SandboxSession) -> bool:
+    """Report whether the sandbox survived a collector that was SIGKILLed.
+
+    A 137 exit can be the sandbox dying or a child process being killed for
+    memory inside a healthy one. The distinction decides whether the episode is
+    a resource loss or a collector fault, so it is asked rather than guessed. A
+    status call that fails is treated as "not running": the caller then replaces
+    the sandbox, which is the safe direction when its state cannot be read.
+    """
+    try:
+        return await session.status() == SandboxStatus.RUNNING
+    except Exception:  # noqa: BLE001 - an unreadable status is not evidence of health
+        return False
+
+
+async def _read_collector_diagnostics(
+    session: SandboxSession, diag_path: str
+) -> tuple[str, bool]:
     """Read the collector's self-report after a non-zero exit.
 
-    Read as a file rather than from the exec response because the sandbox exec channel
-    does not carry stderr on every backend. Failure to read is itself diagnostic, so it
-    is reported inline instead of masking the collection error.
+    Returns the text and whether the report was *unavailable* rather than simply
+    empty. The second value is what lets a caller distinguish "the collector ran
+    and said why it failed" from "the sandbox could not produce the file at
+    all" -- two failures that used to be the same string, and the second of which
+    points at the sandbox rather than at the collector.
+
+    Read as a file rather than from the exec response because the sandbox exec
+    channel does not carry stderr on every backend. Failure to read is itself
+    diagnostic, so it is reported inline instead of masking the collection error.
     """
     try:
         payload = await session.read_bytes(diag_path)
-    except Exception as exc:
+    except SandboxPathNotFoundError as exc:
+        # A missing file in a live sandbox. The collector creates this file in
+        # its first lines, so its absence means the script never got that far.
+        return f"<missing: the collector never created its diagnostics file: {exc!r}>", True
+    except Exception as exc:  # noqa: BLE001 - any read failure is diagnostic here
         # The file is the only record of which tool the sandbox was missing, so losing it
         # loses the diagnosis. `read_bytes` is one way to reach it and not the only one:
         # fall back to the exec channel, which survives on backends whose file reads do
@@ -195,8 +260,10 @@ async def _read_collector_diagnostics(session: SandboxSession, diag_path: str) -
         try:
             shown = await session.exec(f"cat {shlex.quote(diag_path)}", timeout_s=30)
         except Exception as exec_exc:
-            return f"<unavailable: {read_error}; cat failed: {exec_exc!r}>"
+            return f"<unavailable: {read_error}; cat failed: {exec_exc!r}>", True
         if shown.exit_code != 0:
-            return f"<unavailable: {read_error}; cat exited {shown.exit_code}>"
-        return (shown.stdout or "").strip() or f"<empty; {read_error}>"
-    return payload.decode(errors="replace").strip() or "<empty>"
+            return f"<unavailable: {read_error}; cat exited {shown.exit_code}>", True
+        text = (shown.stdout or "").strip()
+        return (text or f"<empty; {read_error}>"), not bool(text)
+    text = payload.decode(errors="replace").strip()
+    return (text or "<empty>"), not bool(text)

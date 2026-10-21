@@ -16,6 +16,7 @@ import asyncio
 import dataclasses
 
 import pytest
+from psrl.sandbox import SandboxPathNotFoundError
 from psrl.sandbox.backends import p3b as p3b_backend
 from psrl.sandbox.backends.p3b import P3bBackend, _to_service_spec
 from psrl.sandbox.core import (
@@ -25,10 +26,12 @@ from psrl.sandbox.core import (
     MountSpec,
     ResourceSpec,
     ResumeLevel,
+    SandboxExitReason,
     SandboxFeature,
     SandboxSource,
     SandboxSpec,
 )
+from sandboxd import errors as service_errors
 
 _OWNER = "worker-1"
 _CLASS = "rollout"
@@ -252,10 +255,12 @@ class TestItRenewsOwnershipWhileItHoldsSandboxes:
     """
 
     async def test_it_renews_the_owner_on_a_timer(self, monkeypatch):
-        monkeypatch.setattr(p3b_backend, "OWNER_HEARTBEAT_INTERVAL_S", 0.01)
         backend = make_backend()
         client = _RecordingClient()
         backend._client = client
+        backend._renew_client = client
+        backend._heartbeat_interval_s = 0.01
+        backend._renew_timeout_s = 0.1
         backend.adopt_owner_id(_OWNER)
 
         backend._ensure_owner_heartbeat()
@@ -265,10 +270,31 @@ class TestItRenewsOwnershipWhileItHoldsSandboxes:
         assert client.renewals, "a worker holding sandboxes must renew its ownership"
         assert set(client.renewals) == {_OWNER}
 
+    async def test_renewal_uses_its_own_pool(self):
+        # A create holds a control connection for its whole duration, so a burst
+        # of creates can occupy every slot. The heartbeat must not wait behind
+        # them: a missed beat is then reported while the service is healthy.
+        backend = make_backend()
+        main, renew = _RecordingClient(), _RecordingClient()
+        backend._client = main
+        backend._renew_client = renew
+        backend._heartbeat_interval_s = 0.01
+        backend._renew_timeout_s = 0.1
+        backend.adopt_owner_id(_OWNER)
+
+        backend._ensure_owner_heartbeat()
+        await asyncio.sleep(0.05)
+        await backend.shutdown()
+
+        assert renew.renewals, "the renewal must use its dedicated client"
+        assert not main.renewals, "the data/control pool must not carry the heartbeat"
+
     async def test_starting_it_more_than_once_keeps_one_loop(self, monkeypatch):
-        monkeypatch.setattr(p3b_backend, "OWNER_HEARTBEAT_INTERVAL_S", 0.01)
         backend = make_backend()
         backend._client = _RecordingClient()
+        backend._renew_client = _RecordingClient()
+        backend._heartbeat_interval_s = 0.01
+        backend._renew_timeout_s = 0.1
         backend.adopt_owner_id(_OWNER)
 
         backend._ensure_owner_heartbeat()
@@ -279,10 +305,12 @@ class TestItRenewsOwnershipWhileItHoldsSandboxes:
         await backend.shutdown()
 
     async def test_it_stops_renewing_when_it_shuts_down(self, monkeypatch):
-        monkeypatch.setattr(p3b_backend, "OWNER_HEARTBEAT_INTERVAL_S", 0.01)
         backend = make_backend()
         client = _RecordingClient()
         backend._client = client
+        backend._renew_client = client
+        backend._heartbeat_interval_s = 0.01
+        backend._renew_timeout_s = 0.1
         backend.adopt_owner_id(_OWNER)
 
         backend._ensure_owner_heartbeat()
@@ -308,3 +336,20 @@ class TestItRenewsOwnershipWhileItHoldsSandboxes:
         await backend.shutdown()
 
         assert not client.renewals
+
+
+class TestFailuresKeepTheirAttribution:
+    """A failure's type is what a caller acts on, so the translation must not flatten it."""
+
+    def test_a_missing_path_is_not_a_lost_session(self):
+        translated = p3b_backend._translate(service_errors.SandboxPathNotFound("missing"))
+
+        assert isinstance(translated, SandboxPathNotFoundError)
+        assert not isinstance(translated, p3b_backend.SandboxSessionLostError)
+
+    def test_a_lost_session_keeps_its_exit_reason(self):
+        translated = p3b_backend._translate(
+            service_errors.SandboxSessionLost("gone", sandbox_id="sb-1", exit_reason="oom")
+        )
+
+        assert translated.exit_reason is SandboxExitReason.OOM

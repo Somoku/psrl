@@ -28,6 +28,7 @@ from sandboxd.errors import (
     SandboxCapacityTimeout,
     SandboxCommandTimeout,
     SandboxError,
+    SandboxPathNotFound,
     SandboxSessionLost,
     SandboxTransportError,
 )
@@ -165,29 +166,39 @@ class Transport:
                 raise SandboxTransportError(
                     f"The sandbox service at {self.endpoint!r} could not be reached for {method!r}: {exc}"
                 ) from exc
+            # A connection is reusable only when its reply was read in full. Every
+            # other exit -- a timeout, a transport fault, or the caller cancelling
+            # the task (which is a BaseException and matches no except below) --
+            # leaves an unread reply or a dead socket, so the finally closes it
+            # instead of pooling it. Without the finally, a cancelled heartbeat
+            # leaked its connection and the service kept the mirror of it open.
+            reusable = False
             try:
                 roundtrip = self._roundtrip(reader, writer, method, payload)
                 if timeout_s is None:
                     result = await roundtrip
                 else:
                     result = await asyncio.wait_for(roundtrip, timeout=timeout_s)
+                reusable = True
+                return result
             except asyncio.TimeoutError as exc:
                 # The service may still be acting on it, so this connection is
                 # dropped rather than pooled with an unread reply in the pipe.
-                writer.close()
                 raise SandboxTransportError(
                     f"The sandbox service did not answer {method!r} within {timeout_s:g}s."
                 ) from exc
             except (ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
-                writer.close()
                 raise SandboxTransportError(f"The sandbox service connection failed during {method!r}: {exc}") from exc
             except SandboxError:
                 # A typed service error leaves the connection clean: the reply was
                 # read in full, so the connection is still reusable.
-                self._release(reader, writer)
+                reusable = True
                 raise
-            self._release(reader, writer)
-            return result
+            finally:
+                if reusable:
+                    self._release(reader, writer)
+                else:
+                    writer.close()
 
     async def _roundtrip(
         self,
@@ -243,6 +254,7 @@ def _error_for(
         "cannot_admit": SandboxCapacityTimeout,
         "capability": SandboxCapabilityError,
         "command_timeout": SandboxCommandTimeout,
+        "path_not_found": SandboxPathNotFound,
         "transport": SandboxTransportError,
     }.get(code, SandboxError)(message)
 
@@ -504,6 +516,26 @@ class SandboxClient:
         deciding which of those fields are worth carrying.
         """
         return await self._call("fleet", {})
+
+    async def diagnostics(self) -> dict:
+        """Return the service's own health counters.
+
+        Renewal failures and fan-out latency are facts only the control plane
+        has: a node that stopped answering is invisible from the node side, and
+        the heartbeat's caller only sees its own timeout. Report them beside the
+        fleet so an operator can tell a quiet fleet from a broken liveness path.
+        """
+        return await self._call("diagnostics", {})
+
+    async def contract(self) -> dict:
+        """Return the mechanism's own timing spans.
+
+        A client derives its heartbeat cadence and timeout from this instead of
+        restating values that live in the service; the two drifting apart is how
+        a client reported "the node reclaims after three beats" while the node
+        used a different clock.
+        """
+        return await self._call("contract", {})
 
     async def provision_status(self, ticket: str) -> ProvisionStatus:
         """Return how a create with this ticket is progressing.

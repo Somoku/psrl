@@ -23,7 +23,7 @@ from verl.utils.tokenizer import (
 )
 from verl.workers.config.model import HFModelConfig
 
-from psrl.sandbox import SandboxCapacityTimeout, SandboxSessionLostError
+from psrl.sandbox import SandboxCapacityTimeout, SandboxCollectorError, SandboxSessionLostError
 from psrl.sandbox.config import build_sandbox_manager, placement_manager_config
 from psrl.sandbox.ray_plane import SandboxPlaneHandle
 from psrl.utils.common.chat_template import resolve_chat_template_value
@@ -80,6 +80,8 @@ def _classify_rollout_failure(exc: BaseException) -> TerminateReason:
             return TerminateReason.SANDBOX_CAPACITY_TIMEOUT
         if isinstance(current, SandboxSessionLostError):
             return TerminateReason.CONTAINER_LOST
+        if isinstance(current, SandboxCollectorError):
+            return TerminateReason.SANDBOX_COLLECT_FAILED
         if type(current).__name__ in _CANCELLATION_ERROR_NAMES:
             return TerminateReason.ROLLOUT_CANCELLED
     return TerminateReason.ROLLOUT_ERROR

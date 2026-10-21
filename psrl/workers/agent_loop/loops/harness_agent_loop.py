@@ -38,6 +38,17 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
+def _request_id_of(request: Mapping[str, Any]) -> str:
+    """Return the id of the plain dict `run()` receives.
+
+    `run_with_termination_handling` unpacks the TensorDict before calling `run`,
+    so the request here is a dict. An attribute access on the abort path fails
+    exactly when it is needed, turning a deliberate gateway abort into a
+    rollout error that refills the whole group.
+    """
+    return str(request.get("uid", "N/A"))
+
+
 def _raise_if_episode_is_over(lease: SandboxLease | None) -> None:
     """Stop the episode before it collects artifacts it can no longer keep or store.
 
@@ -505,7 +516,7 @@ class HarnessAgentLoop(SessionAgentLoop):
                         "reporting the episode as aborted rather than failed."
                     )
                     raise RequestAbortedByGatewayError(
-                        request_id=str(request.request_id),
+                        request_id=_request_id_of(request),
                         message="gateway aborted the episode's model requests during a turn",
                     )
 

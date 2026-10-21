@@ -24,8 +24,12 @@ from psrl.sandbox import (
     MountSpec,
     ResourceSpec,
     SandboxCapabilities,
+    SandboxCollectorError,
+    SandboxExitReason,
+    SandboxPathNotFoundError,
     SandboxRef,
     SandboxSession,
+    SandboxSessionLostError,
     SandboxSource,
     SandboxSpec,
     SandboxStatePolicy,
@@ -66,11 +70,18 @@ class FakeSandbox(SandboxSession):
         block_cli: bool = False,
         cli_exit_code: int = 0,
         collect_exit_code: int = 0,
+        diag_missing: bool = False,
+        status_value: SandboxStatus = SandboxStatus.RUNNING,
     ) -> None:
         self.runtime_available = runtime_available
         self.block_cli = block_cli
         self.cli_exit_code = cli_exit_code
         self.collect_exit_code = collect_exit_code
+        # A missing diagnostics file in a live sandbox is the case that used to be
+        # reported as a lost session; the status is scripted separately so a 137
+        # can be attributed to OOM or to a killed child.
+        self.diag_missing = diag_missing
+        self.status_value = status_value
         self.commands: list[tuple[str, str | None, Mapping[str, str] | None]] = []
         self.writes: dict[str, bytes] = {}
         self.cli_started = asyncio.Event()
@@ -112,13 +123,15 @@ class FakeSandbox(SandboxSession):
         return ExecResult(0, "", "")
 
     async def read_bytes(self, path: str) -> bytes:
+        if path not in self.writes:
+            raise SandboxPathNotFoundError(f"{path!r} is not present in the sandbox")
         return self.writes[path]
 
     async def write_bytes(self, path: str, data: bytes) -> None:
         self.writes[path] = data
 
     async def status(self) -> SandboxStatus:
-        return SandboxStatus.RUNNING
+        return self.status_value
 
     async def terminate(self) -> None:
         return None
@@ -397,6 +410,60 @@ async def test_patch_collection_failure_surfaces_collector_diagnostics() -> None
     assert "exit 127" in message
     assert "cwd='/testbed'" in message
     assert "wc=MISSING" in message
+
+
+@pytest.mark.asyncio
+async def test_a_sigkill_after_the_sandbox_died_is_an_oom_loss() -> None:
+    """137 plus a sandbox that is no longer running is the kernel killing the sandbox."""
+    sandbox = FakeSandbox(
+        collect_exit_code=137,
+        diag_missing=True,
+        status_value=SandboxStatus.TERMINATED,
+    )
+
+    with pytest.raises(SandboxSessionLostError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.exit_reason is SandboxExitReason.OOM
+
+
+@pytest.mark.asyncio
+async def test_a_sigkill_inside_a_live_sandbox_is_a_collector_fault() -> None:
+    """A killed child is not a lost sandbox: the container is still running and usable."""
+    sandbox = FakeSandbox(
+        collect_exit_code=137,
+        diag_missing=True,
+        status_value=SandboxStatus.RUNNING,
+    )
+
+    with pytest.raises(SandboxCollectorError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.exit_code == 137
+
+
+@pytest.mark.asyncio
+async def test_a_missing_diagnostics_file_after_a_non_sigkill_is_a_lost_environment() -> None:
+    """The collector creates the file first, so its absence means the script never ran."""
+    sandbox = FakeSandbox(collect_exit_code=128, diag_missing=True)
+
+    with pytest.raises(SandboxSessionLostError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.exit_reason is SandboxExitReason.CONTAINER_EXITED
+
+
+@pytest.mark.asyncio
+async def test_missing_tools_are_a_collector_fault_with_diagnostics() -> None:
+    """126/127 mean the sandbox could not execute the collector's tools."""
+    sandbox = FakeSandbox(collect_exit_code=127)
+    sandbox.writes[_DIAG_PATH] = b"git=MISSING\nwc=MISSING\n"
+
+    with pytest.raises(SandboxCollectorError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.exit_code == 127
+    assert "git=MISSING" in str(excinfo.value)
 
 
 @pytest.mark.asyncio
@@ -685,3 +752,17 @@ def test_docker_session_translates_loopback_callback_through_policy() -> None:
     assert session.resolve_callback_url("https://router.internal/sessions/s1") == (
         "https://router.internal/sessions/s1"
     )
+
+
+def test_the_abort_path_can_name_a_dict_request() -> None:
+    """The loop's request is a dict, and the abort path used to require an attribute.
+
+    `run_with_termination_handling` unpacks the TensorDict before calling `run`,
+    so `request.request_id` raised exactly when the gateway had already aborted
+    the episode -- turning a deliberate abort into a rollout error that refilled
+    the whole group.
+    """
+    from psrl.workers.agent_loop.loops.harness_agent_loop import _request_id_of
+
+    assert _request_id_of({"uid": 7}) == "7"
+    assert _request_id_of({}) == "N/A"

@@ -16,7 +16,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
 from verl.utils.tokenizer.chat_template import apply_chat_template, initialize_system_prompt
 
-from psrl.sandbox import SandboxCapacityTimeout, SandboxSessionLostError
+from psrl.sandbox import SandboxCapacityTimeout, SandboxCollectorError, SandboxSessionLostError
 from psrl.utils.common.http_io_thread import get_http_io_thread
 from psrl.utils.common.http_utils import (
     RequestAbortedByGatewayError,
@@ -825,6 +825,21 @@ class AgentLoopBase(ABC):
                 self.last_error_traceback,
             )
             return None, TerminateReason.CONTAINER_LOST
+        except SandboxCollectorError as exc:
+            # The episode ran, but the sandbox's own execution environment could
+            # not run the artifact collector (a missing tool, a shell that never
+            # started). Nothing about the model or the harness is implicated, so
+            # this is a coordination fault: the group is replaced, not the run.
+            self._record_error(exc)
+            psrl_logger.error(
+                "Harness artifact collection failed inside the sandbox for request %s "
+                "(exit_code=%s).\nCollector diagnostics:\n%s\nUnderlying failure:\n%s",
+                request_ids,
+                exc.exit_code,
+                exc.diagnostics or "<none>",
+                self.last_error_traceback,
+            )
+            return None, TerminateReason.SANDBOX_COLLECT_FAILED
         except asyncio.TimeoutError as exc:
             # A call inside the episode timed out, which is an infrastructure fault
             # rather than the configured episode budget. Record its traceback first.

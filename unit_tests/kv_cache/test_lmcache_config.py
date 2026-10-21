@@ -92,6 +92,7 @@ class TestLMCacheConfig:
         argv = _runtime_config().to_server_argv()
         assert argv[argv.index("--l1-size-gb") + 1] == "20.0"
         assert argv[argv.index("--port") + 1] == "5555"
+        assert argv[argv.index("--supported-transfer-mode") + 1] == "engine_driven"
         assert argv[argv.index("--http-port") + 1] == "8080"
         assert argv[argv.index("--chunk-size") + 1] == "128"
 

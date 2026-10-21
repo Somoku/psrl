@@ -318,6 +318,9 @@ class LMCacheConfig:
         assert self.pin_policy in SUPPORTED_PIN_POLICIES, (
             f"pin_policy must be one of {SUPPORTED_PIN_POLICIES}, got {self.pin_policy!r}."
         )
+        assert self.mp_transfer_mode in SUPPORTED_MP_TRANSFER_MODES, (
+            f"mp_transfer_mode must be one of {SUPPORTED_MP_TRANSFER_MODES}, got {self.mp_transfer_mode!r}."
+        )
         assert 0.0 <= self.pin_budget_ratio <= 1.0, (
             f"pin_budget_ratio must be within [0.0, 1.0], got {self.pin_budget_ratio}."
         )
@@ -369,6 +372,11 @@ class LMCacheConfig:
             str(self.pin_budget_ratio),
             "--l1-pin-ttl-seconds",
             str(self.pin_ttl_seconds),
+            # The server registers handlers for exactly this path. It defaults
+            # to the handle-based one, so the copy path is unreachable unless
+            # declared here.
+            "--supported-transfer-mode",
+            self.mp_transfer_mode,
         ]
 
         if self.lmcache_instance_id:

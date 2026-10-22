@@ -453,3 +453,40 @@ python tests/sandbox/soak.py --endpoint <control-endpoint> \
     --nodes 'node-a=root@<host-a>,node-b=root@<host-b>' \
     --image alpine:latest --seconds 900 --concurrency 128
 ```
+
+## Member refill, bounded collection, and command-start bursts
+
+Measured on a three-node CPU fleet with cgroup v1 and Docker: each node declared
+200000 MB and 64000 millicores, `overcommit` 1.0, elastic on with a 512 MB class
+reserve, `command_burst_mb: 2048`, and a 200000 MB sandbox subtree.
+
+| Scenario | Result |
+| --- | --- |
+| create+exec+release, 8 / 16 / 32 / 64 concurrent | 8/8, 16/16, 32/32, 64/64; at 64: 8.59/s, p50 1832 ms, p95 3555 ms |
+| 120 s soak, 64 concurrent, one command per sandbox | 828 completed, 1 transient failure (0.12%), 0 renewal failures, 0 stale nodes; fleet records returned to 0 |
+| command-start burst | a memory-less sandbox's live cgroup limit was 2048 MB while a command ran, from a 512 MB class-reserve start |
+| collector caps (local git repository) | an untracked file above the per-file cap is skipped and named in the diagnostics; a patch above the total cap exits 3 with `patch_capped=1` and leaves the sandbox running |
+
+The 64-level create latency is dominated by Docker container start; the fleet
+spread (4/4/4 over three nodes) and the zero-leak final check are the properties
+this run is testing, not single-node create speed.
+
+Reproduce:
+
+```bash
+# member refill manager behavior and the readmit primitive
+pytest tests/agent_loop/test_manager_refill_breaker.py \
+    tests/agent_loop/test_manager_validation_recovery.py \
+    tests/agent_loop/test_member_refill_status.py
+
+# collector size bounds, including a real shell run against a temporary repo
+pytest tests/agent_loop/test_harness.py -k collector
+
+# fleet create+exec+release under increasing concurrency
+PSRL_BENCH_ENDPOINT=<control-endpoint> python tests/sandbox/bench_p3b_concurrency.py
+
+# held load with live inventory, renewal and leak checks
+python tests/sandbox/soak.py --endpoint <control-endpoint> \
+    --nodes 'node-a=root@<host-a>,node-b=root@<host-b>,node-c=root@<host-c>' \
+    --image alpine:latest --seconds 120 --concurrency 64
+```

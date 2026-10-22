@@ -239,8 +239,18 @@ class TestEveryHarnessConfigHasATopLevelNixlSection:
     """
 
     @pytest.mark.parametrize("path", sorted(CONFIG_DIR.glob("nixl_e2e*.yaml")), ids=lambda p: p.name)
-    def test_nixl_options_live_under_nixl(self, path):
-        cfg = OmegaConf.load(path)
+    def test_nixl_options_live_under_nixl(self, path, monkeypatch):
+        # Resolve the defaults chain: leaf configs inherit `nixl:` from their base,
+        # and reading the raw YAML would flag every correctly-inheriting config.
+        from hydra import compose, initialize_config_dir
+
+        repo = Path(__file__).resolve().parents[2]
+        monkeypatch.setenv("PSRL_REPO", str(repo))
+        monkeypatch.setenv("PSRL_WORKSPACE", str(repo))
+        monkeypatch.setenv("PSRL_MATRIX_MODELS", str(repo / "tests/nixl/models"))
+        monkeypatch.setenv("LOCAL_IP", "127.0.0.1")
+        with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+            cfg = compose(config_name=path.stem)
         assert "nixl" in cfg, f"{path.name} has no top level nixl section."
         assert "server_mode" in cfg.nixl, f"{path.name} is missing nixl.server_mode."
         stray = {"handshake_timeout_s", "server_mode", "peer_diffusion"} & set(cfg.get("network", {}))

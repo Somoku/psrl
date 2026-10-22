@@ -83,7 +83,16 @@ multi-turn agent loops described in the design.
   rollout check on Qwen3.5-4B. Initial pull 0.719 s, round-2 pull 0.201 s,
   24.48 GB trainer egress, 523 of 538 keys judged per client (the rest are the
   intentionally bf16 layers), 3869 descriptors, 520 MiB staged, no fallbacks.
+- `tests/nixl/test_nixl_e2e.py --config-name nixl_e2e_colocate_qwen35_4b`:
+  colocate on the same eight GPUs. Round-2 pull 0.010 s, 38.73 GB moved over
+  CUDA IPC at 625-647 GB/s, 523/538 keys judged per client, 0 descriptors and
+  0 fallbacks.
 - `unit_tests/kv_cache` and `tests/gen_dplb`: 91 passed.
+- `tests/nixl`: 1382 passed, 23 skipped. The remaining failures are stale
+  source-text assertions and GPU/PCIe environment tests, all reproducible on
+  the pre-merge commit; the registration fixture and the config-matrix
+  default-resolution check were repaired so the suite reflects the current
+  client and harness configs.
 
 The LMCache merge leaves the NIXL client, transfer planner, and weight-sync
 paths unchanged; the regression above is the guard on that claim.

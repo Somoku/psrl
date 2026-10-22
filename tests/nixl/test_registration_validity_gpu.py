@@ -61,6 +61,15 @@ def _client(agent, name: str):
     client._reg_regions = set()
     client._mtype_to_reg_region_lists = {}
     client._registered_descs = {}
+    # Registration bookkeeping added by segment/export-aware registration.
+    client._storage_bases = set()
+    client._ipc_regions = {}
+    client._ipc_export_errors = []
+    client._segment_extents = []
+    client._segment_registration = False
+    # Transfer-handle caches cleared by teardown.
+    client.xfer_handles = {}
+    client._prepared_dlists = {}
     # Fields `deregister_local_tensors` touches. It asserts `local_client_info is not
     # None` up front -- deregistering before registration is a caller bug, not a
     # tolerated no-op -- and then clears this set.

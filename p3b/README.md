@@ -289,12 +289,15 @@ something it retries.
   already in use`. Check for a second `sandboxd` before assuming a bug.
 - **Commands do not go through the control plane.** If `exec` fails while
   `create` works, the fault is on the node or in the sandbox, not in placement.
-- **Renewals target the nodes that hold the owner's sandboxes, not every node
-  that ever reported.** A node that missed its reports is stale, and a heartbeat
-  that paid its timeout would turn one dead machine into a permanent beat
-  delay. `client.diagnostics()` reports renewal failures and the last fan-out
-  duration; `client.contract()` reports the timing spans a client should derive
-  its cadence from.
+- **Renewals target the nodes that hold the owner's sandboxes.** The set is the
+  control plane's create records unioned with each node's own `LiveOwners`
+  report, so a record lost to a restart or a lost release response does not let
+  a live node's owner lease expire and reclaim sandboxes that are still in use.
+  A node that missed its reports is stale, and a heartbeat that paid its timeout
+  would turn one dead machine into a permanent beat delay.
+  `client.diagnostics()` reports renewal failures and the last fan-out duration;
+  `client.contract()` reports the timing spans a client should derive its
+  cadence from.
 - **The quota ledger follows the node's inventory.** A sandbox removed out of
   band is released from the node in one probe interval and from the control
   plane's ledger in two eligible reports; `owner_lease` is only the backstop for

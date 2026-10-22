@@ -270,9 +270,12 @@ something it retries.
   why a single-node deployment reads `node_pressure` as a hard stop.
 - **A stopped container and a missing file are different 404s.** The node asks
   the runtime which one it got: `runtime gone` releases the sandbox and its
-  charge, `path not found` leaves a healthy sandbox usable. A caller that sees
+  charge, `path not found` leaves a healthy sandbox usable. A lost session also
+  carries the runtime's `exit_code` and `finished_at`, so a post mortem can line
+  the stop up with the node's cgroup and kernel events; a caller that sees
   `SandboxTransportError` for an exec on a dead node is seeing a stale node, not
-  a task result; the node's own prober will release the charge when it returns.
+  a task result, and the node's own prober will release the charge when it
+  returns.
 - **`fleet.memory_mb` is what the service may admit in total, not the sum of
   your nodes' declared envelopes.** State the sum of what the nodes *will
   grant* — each node's declared envelope times its `overcommit` — or the ledger

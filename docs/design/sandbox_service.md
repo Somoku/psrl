@@ -389,9 +389,10 @@ an infrastructure fault must never be recorded as a model or harness failure.
 |---|---|---|
 | `SandboxCapacityTimeout` | never admitted; no sandbox existed | capacity planning, retry later |
 | `SandboxCapabilityError` | no backend satisfies the spec | fix the spec or the deployment |
-| `SandboxSessionLostError` | the sandbox stopped unasked; `exit_reason` is `released`, `reaped_lifetime`, `reclaimed_orphan`, `exited`, `runtime_gone`, or `oom` | replace the rollout, do not blame the harness |
+| `SandboxSessionLostError` | the sandbox stopped unasked; `exit_reason` is `released`, `reaped_lifetime`, `reclaimed_orphan`, `exited`, `runtime_gone`, or `oom`, and `exit_code`/`finished_at` carry the runtime's own evidence when it reported any | replace the rollout, do not blame the harness |
 | `SandboxOomError` | a resource fault carried as an OOM attribution | raise the request |
 | `SandboxPathNotFound` | a file operation addressed a path the sandbox does not have | handle the path; the sandbox is still usable |
+| `SandboxCollectorError` | the harness's artifact collector could not run; the sandbox may still be running | report the sandbox's execution environment, keep the episode's evidence |
 | `SandboxCommandTimeout` | a command exceeded its deadline; `sandbox_preserved` says whether the sandbox survived | continue with a fresh shell, or replace |
 | `SandboxSetupError` | the task's preparation failed | task fault, nothing was captured |
 | `SandboxTransportError` | the control channel or a node did not answer | says nothing about the workload |
@@ -402,6 +403,15 @@ carried across the node→control hop as a string beside the gRPC code, so
 `classify` can prefer the error's own classification over the coarse status
 code. A bare gRPC `NotFound` still means a lost session for callers that speak
 the proto directly.
+
+The same rule applies one layer up: a collector failure is not a lost session.
+The harness asks the sandbox for its status and only a non-running answer is a
+loss. A live sandbox whose diagnostics file was never created is a collector or
+environment fault, and its error carries the sandbox id, the node, the status,
+the tails of stdout and stderr, and one probe of the environment's `PATH`,
+tools, directories, free space, cgroup limits, and host memory. A missing
+diagnostics file is a fact about the collector's first write, not about the
+sandbox's existence.
 
 `exec` returns stdout and stderr separately, plus `truncated` when the engine's
 frame stream ended mid-write. The service never merges the streams and never

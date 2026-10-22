@@ -77,13 +77,14 @@ p3b 服务于长程 Agentic RL。这个场景的成本结构与短 FaaS 不同�
 | `p3b/internal/pressure/` | **已修**：采样域是配置的 sandbox 子树；域不可读是错误而不是零，admission 不会把失效读数当成空闲（`pressure.go` + `domain_test.go`） | 保留 |
 | `p3b/internal/server/nodeserver.go` | **已修**：`view()` 每次报告只采样一次。仍存在的缺口是 `ImageDigests`/`ImageReferences` 为空，`localityScore` 因此没有输入 | 补齐镜像与准备制品库存 |
 | `p3b/internal/server/control.go` | **本轮新增**：`RenewOwner` 只发给持有该 owner 记录的节点（无记录时回退到 live fleet），并发 fan-out，单节点 3s、整批 5s，错误聚合为计数与一条批次日志；`dialNode` 用 `DialContext`，ctx 真正约束拨号 | 保留；续租不再串行走历史节点 |
-| `p3b/internal/server/jsonrpc.go` | **本轮新增**：`classify` 先看 `WireCode()`，`path_not_found` 与 `session_lost` 跨 node→control→SDK 三跳保真；`preserveSessionLost` 不再把带类型的错误压成 transport | 保留 |
+| `p3b/internal/server/jsonrpc.go` | **本轮新增**：`classify` 先看 `WireCode()`，`path_not_found` 与 `session_lost` 跨 node→control→SDK 三跳保真；`preserveSessionLost` 不再把带类型的错误压成 transport。**本轮补充**：`session_lost` 同时携带 `exit_code` 与 `finished_at`，让训练日志能直接把沙箱退出码和节点 cgroup/内核事件对齐 | 保留 |
 | `p3b/internal/quota/` + `control.go` | **本轮新增**：节点报告携带 inventory 序号与 live sandbox ids；控制面连续两次 eligible report 缺失后释放 grant，带两序号 arming、截断/旧节点跳过、序号回退重置。实测一次容器被外部删除后 quota 在 60.1s 内归零 | 保留；`owner_lease` 只做分区兜底 |
-| `p3b/internal/backend/dockerbackend/docker.go` | 创建设置静态内存和 CPU 限额，且 **已设置 `CgroupParent`**；启动对账拒绝子树外的容器。**本轮新增**：409/404 按 body 区分 `ErrRuntimeGone` 与 `ErrPathNotFound`；`Status` 区分 `oom`/`exited`/`paused`；Docker 帧按 stream 字节分流 stdout/stderr；`Reconciled` 携带 OOMKilled/ExitCode。仍缺拉取请求合并，`callRaw` 仍整块缓冲响应 | 请求合并与有界输出仍待做 |
+| `p3b/internal/backend/dockerbackend/docker.go` | 创建设置静态内存和 CPU 限额，且 **已设置 `CgroupParent`**；启动对账拒绝子树外的容器。**本轮新增**：409/404 按 body 区分 `ErrRuntimeGone` 与 `ErrPathNotFound`；`Status` 区分 `oom`/`exited`/`paused`；Docker 帧按 stream 字节分流 stdout/stderr；`Reconciled` 携带 OOMKilled/ExitCode/FinishedAt；新增 `ExitDetail`/`ExitDetailer`，节点在 exec 发现容器已死时直接取 daemon 的退出码与停止时间。仍缺拉取请求合并，`callRaw` 仍整块缓冲响应 | 请求合并与有界输出仍待做 |
 | `p3b/internal/backend/dockerbackend/warmpool.go` | **已修**：匹配包含 env、workdir、class、exec_mode、lifetime、mounts、GPU；runtime/network 仍不是模板字段。接管不更新实际限额的问题仍在 | 规格正确、实际资源可核对、压力感知的预热池 |
 | `p3b/internal/placement/` | **已修**：`ExcludeNodes` 已用于排除被拒绝的节点；本轮把「节点未应答 admission」也加入排除并尝试下一候选。镜像局部性仍无库存输入 | 可解释的库存评分与退避 |
 | `p3b/internal/server/convert.go` 与 `p3b/internal/quota/` | fleet 与节点预算均由同一静态规格转换，等待依赖轮询 | 拆分租户公平性与物理准入，支持有界事件唤醒 |
 | Python p3b adapter 与 SDK | **已修**：`_to_service_spec` 现转发 workdir、exec_mode、required_features、required_resume_level 与 backend pin，并把全部 PSRL 字段登记为转发、拒绝或明确不转发（新增字段会被用例挡住）。拒绝集不变。**本轮新增**：`SandboxPathNotFound` 贯通、续租使用独立连接池并从 `contract` 推导节奏、`Transport.call` 取消时关闭连接、`fleet_report` 的 `backends` 修正 | 保留：新增字段必须在此边界做决定，禁止静默忽略 |
+| `examples/mini_swe/utils/harness_task.py` | **本轮新增**：采集失败由 `status()` 判活，不再把「诊断文件不存在」当成沙箱丢失；live sandbox 的 126/127/128/137 一律 `SandboxCollectorError`，只有 state 非 running 才 `SandboxSessionLostError`。错误携带 sandbox/node/status、stdout/stderr 尾部、诊断文件，以及一次环境探针（PATH、工具、目录、df、cgroup、`/proc/meminfo`）。组失败时兄弟请求仍按组作废（GRPO 组是完成单元），重复的组失败报告降为 debug | 成员级重试是下一步的独立设计；当前先保证归因正确、单次故障只留一条根因 |
 | `p3b/sdk/sandboxd/` | 连接池默认大小 32，池槽等待在请求超时之外。**本轮新增**：续租使用独立 client/pool；create 仍以 `timeout_s=None` 占槽，这是下一步应拆分的控制面生命周期调用 | 总截止时间覆盖连接池排队 |
 | 所有 backend 的 `image_on_demand` | 能力字符串，仅用于路由匹配。OpenSandbox 已核实：Docker runtime 完整拉取，无按需路径 | opensandbox backend 不声明该能力，其交付为块级。AgentEnv 与 CubeSandbox 待核实后再定 |
 

@@ -34,6 +34,7 @@
       "shrink_step": 0.25,
       "growth_horizon_s": 60,
       "start_limit_mb": 12288,
+      "command_burst_mb": 4096,
       "limit_sample_interval_s": 0.2,
       "reap_foreign": false
     },

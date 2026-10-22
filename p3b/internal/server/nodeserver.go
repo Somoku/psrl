@@ -113,6 +113,8 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 			maxCPUMillisBySandbox: map[string]int64{},
 			startMBBySandbox:      map[string]int64{},
 			lowSince:              map[string]time.Time{},
+			commandBusy:           map[string]bool{},
+			forcedBurst:           map[string]int64{},
 			failCountBySandbox:    map[string]int64{},
 			oomCountBySandbox:     map[string]int64{},
 			exhausted:             map[string]bool{},
@@ -663,6 +665,11 @@ func (n *Node) Exec(ctx context.Context, handle backend.Handle, command, workdir
 		return backend.ExecResult{}, fmt.Errorf("backend %q runs commands through its own in-sandbox agent", held.Name())
 	}
 	execMode := n.lifecycle.ExecMode(handle.SandboxID)
+	// A command start is the earliest evidence of a burst. Reserve the burst limit
+	// before the command runs; the usage sampler is already too late by the time a
+	// `git diff` or a compiler reaches the bound.
+	n.PrepareForCommand(ctx, handle.SandboxID)
+	defer n.FinishCommand(handle.SandboxID)
 	result, err := executor.Exec(ctx, handle, execMode, command, workdir, env)
 	if err == nil {
 		return result, nil

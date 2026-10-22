@@ -107,6 +107,10 @@ type ElasticConfig struct {
 	// maximum the sandbox declared. Either way the ceiling is protection, not entitlement:
 	// growth stops there, and a sandbox that OOMs there has no tier left to raise.
 	CeilingLimitMB int64
+	// CommandBurstMB is the limit a sandbox is raised to when a command starts, before
+	// the usage sample can see the burst. Zero disables the reservation; the command is
+	// still marked busy, so the slow shrink waits for it.
+	CommandBurstMB int64
 	// GrowAbove is the fraction of its current limit a sandbox's measured usage reaches
 	// before the limit is raised. It is deliberately well below one: by the time usage is
 	// at the limit the kernel is already refusing allocations, and on a host with no
@@ -463,6 +467,26 @@ func (n *Node) ElasticLimitsTick(ctx context.Context) LimitReport {
 	next := 0
 	for i := range tracked {
 		e := &tracked[i]
+		if target, forced := n.elastic.forcedBurst[e.id]; forced {
+			// A command start is positive evidence of a burst. Apply its target
+			// through the same budget and loans as ordinary growth, then let the
+			// command's own usage decide whether it needs more.
+			delete(n.elastic.forcedBurst, e.id)
+			delete(n.elastic.lowSince, e.id)
+			if e.limit < target {
+				if grew := n.raise(e, target, &spare, loans, &next); grew {
+					report.Grown = append(report.Grown, e.id)
+				}
+			}
+			continue
+		}
+		if n.elastic.commandBusy[e.id] {
+			// A command is in flight. The start already raised the bound; do not
+			// shrink under the work, and do not let the dwell clock run while it
+			// is busy.
+			delete(n.elastic.lowSince, e.id)
+			continue
+		}
 		switch {
 		case e.oomKnown && e.oomDelta > 0:
 			// The kernel killed something in this sandbox. It is the emergency signal: the
@@ -539,6 +563,43 @@ func (n *Node) ElasticLimitsTick(ctx context.Context) LimitReport {
 	return report
 }
 
+// PrepareForCommand marks a sandbox busy and queues the command burst before the
+// command runs.
+//
+// The usage loop reacts after a sample, and a `git diff` or a compile can cross
+// the whole burst between two samples. The command start is the one signal that
+// is always early: it is emitted by the same path that is about to run the work.
+// The target is applied by the next limit tick (the 200ms loop), which is where
+// the subtree budget and preemptible loans live; doing a full tick per command
+// would turn a tool-call stream into an O(sandboxes) scan per call.
+func (n *Node) PrepareForCommand(ctx context.Context, sandboxID string) {
+	if n.elastic == nil || !n.elastic.cfg.Enabled || sandboxID == "" {
+		return
+	}
+	burst := n.elastic.cfg.CommandBurstMB
+	n.elastic.mu.Lock()
+	n.elastic.commandBusy[sandboxID] = true
+	if burst > 0 {
+		n.elastic.forcedBurst[sandboxID] = burst * mib
+	}
+	n.elastic.mu.Unlock()
+}
+
+// FinishCommand ends the busy window.
+//
+// The next shrink measurement starts from here rather than from the command's
+// first idle-looking sample, so a short command followed by another does not get
+// its bound lowered in the gap.
+func (n *Node) FinishCommand(sandboxID string) {
+	if n.elastic == nil || !n.elastic.cfg.Enabled || sandboxID == "" {
+		return
+	}
+	n.elastic.mu.Lock()
+	delete(n.elastic.commandBusy, sandboxID)
+	delete(n.elastic.lowSince, sandboxID)
+	n.elastic.mu.Unlock()
+}
+
 // boundState is one sandbox's bounds, as this tick sees them.
 //
 // It is a working copy rather than the reading itself because a tick makes writes, and a
@@ -597,6 +658,12 @@ func (n *Node) failDeltaLocked(child cgroup.Child) (int64, bool) {
 // capped by what the node will allow any one sandbox to hold.
 func (n *Node) ceilingLocked(sandboxID string) int64 {
 	ceiling := n.elastic.maxMemoryMBBySandbox[sandboxID] * mib
+	if ceiling <= 0 {
+		// The caller declared no maximum. The sandbox subtree the node sells is
+		// the only honest ceiling left; the tick's budget and loans still decide
+		// how much of it can be granted at once.
+		ceiling = n.elasticBudgetMB() * mib
+	}
 	if cap := n.elastic.cfg.CeilingLimitMB * mib; cap > 0 && (ceiling <= 0 || ceiling > cap) {
 		ceiling = cap
 	}
@@ -699,7 +766,13 @@ func (n *Node) applyStartLimit(spec backend.Spec) backend.Spec {
 	n.elastic.mu.Lock()
 	start := n.startLimitLocked(spec)
 	n.elastic.mu.Unlock()
-	if start <= 0 || start >= spec.Resources.MemoryMB {
+	if start <= 0 {
+		return spec
+	}
+	// A declared maximum at or below the start needs no lowering. A caller that
+	// declared none has no maximum to compare against: the class reserve is the
+	// bound the node is prepared to back, so it is the one to create under.
+	if spec.Resources.MemoryMB > 0 && start >= spec.Resources.MemoryMB {
 		return spec
 	}
 	out := spec
@@ -717,7 +790,18 @@ func (n *Node) applyStartLimit(spec backend.Spec) backend.Spec {
 func (n *Node) startLimitLocked(spec backend.Spec) int64 {
 	cfg := n.elastic.cfg
 	declared := spec.Resources.MemoryMB
-	if declared <= 0 || cfg.StartLimitMB <= 0 {
+	if declared <= 0 {
+		// The caller named no maximum. Starting at zero would create the
+		// container with no bound and leave the controller with no guarantee to
+		// protect; the class reserve is what admission charges this sandbox, so
+		// it is the smallest bound the node can honestly back.
+		reserve := n.memoryFootprintForLocked(spec.ResourceClass).Reserve()
+		if reserve < cfg.MinLimitMB {
+			reserve = cfg.MinLimitMB
+		}
+		return reserve
+	}
+	if cfg.StartLimitMB <= 0 {
 		return declared
 	}
 	start := cfg.StartLimitMB
@@ -896,6 +980,14 @@ type elastic struct {
 	// lowSince is when each sandbox's usage first fell under ShrinkBelow, which is what
 	// the dwell is measured from. Absent means the clock is not running.
 	lowSince map[string]time.Time
+	// commandBusy marks sandboxes with a command in flight. A command start is
+	// positive evidence of a burst, so the limit is raised before the work rather
+	// than after a usage sample catches it, and the slow shrink does not run
+	// while it is in flight.
+	commandBusy map[string]bool
+	// forcedBurst carries the command-start target to the next limit tick, which
+	// applies it through the same budget and loan machinery as ordinary growth.
+	forcedBurst map[string]int64
 	// failCount and oomCount are the previous readings of each sandbox's memory.failcnt
 	// and oom_kill counters. Both are cumulative, so the counter is not the signal -- the
 	// delta is. An OOM that happened before the sandbox was admitted is not the
@@ -1353,10 +1445,10 @@ func (n *Node) elasticCharge(spec backend.Spec) node.Resources {
 	}
 	n.elastic.mu.Lock()
 	defer n.elastic.mu.Unlock()
-	if reserve := n.memoryFootprintForLocked(spec.ResourceClass).Reserve(); reserve > 0 && reserve < charge.MemoryMB {
+	if reserve := n.memoryFootprintForLocked(spec.ResourceClass).Reserve(); reserve > 0 && (charge.MemoryMB <= 0 || reserve < charge.MemoryMB) {
 		charge.MemoryMB = reserve
 	}
-	if reserve := n.cpuFootprintForLocked(spec.ResourceClass).Reserve(); reserve > 0 && reserve < charge.CPUMillis {
+	if reserve := n.cpuFootprintForLocked(spec.ResourceClass).Reserve(); reserve > 0 && (charge.CPUMillis <= 0 || reserve < charge.CPUMillis) {
 		charge.CPUMillis = reserve
 	}
 	return charge
@@ -1459,6 +1551,8 @@ func (n *Node) elasticAudit() {
 		delete(n.elastic.classBySandbox, sandboxID)
 		delete(n.elastic.startMBBySandbox, sandboxID)
 		delete(n.elastic.lowSince, sandboxID)
+		delete(n.elastic.commandBusy, sandboxID)
+		delete(n.elastic.forcedBurst, sandboxID)
 		delete(n.elastic.failCountBySandbox, sandboxID)
 		delete(n.elastic.oomCountBySandbox, sandboxID)
 		delete(n.elastic.exhausted, sandboxID)

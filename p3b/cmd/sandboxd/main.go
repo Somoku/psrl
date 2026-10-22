@@ -151,6 +151,9 @@ type Config struct {
 			// CeilingLimitMB is the highest a sandbox's bound may be raised to. Zero uses
 			// what the sandbox declared.
 			CeilingLimitMB int64 `json:"ceiling_limit_mb"`
+			// CommandBurstMB is the limit a sandbox is raised to when a command
+			// starts, before usage can be sampled. Zero disables it.
+			CommandBurstMB int64 `json:"command_burst_mb"`
 			// GrowAbove is the fraction of its bound a sandbox reaches before the bound is
 			// raised, GrowFactor by how much, and EmergencyGrowFactor by how much on an
 			// OOM. ShrinkBelow is the fraction it must fall under, ShrinkDwellS for how
@@ -514,6 +517,7 @@ func runNode(ctx context.Context, cfg Config, spans timing.Contract, log *slog.L
 			// at its declared maximum has nowhere to grow, and a cadence that is not
 			// sub-second cannot see the burst that kills it.
 			"start_limit_mb", cfg.Node.Elastic.StartLimitMB,
+			"command_burst_mb", cfg.Node.Elastic.CommandBurstMB,
 			"limit_sample_interval_s", cfg.Node.Elastic.LimitSampleIntervalS)
 	}
 	agent, err := server.NewNode(server.NodeConfig{
@@ -1121,6 +1125,7 @@ func elasticConfig(cfg Config) server.ElasticConfig {
 		GrowthHorizonS:         declared.GrowthHorizonS,
 		StartLimitMB:           declared.StartLimitMB,
 		CeilingLimitMB:         declared.CeilingLimitMB,
+		CommandBurstMB:         declared.CommandBurstMB,
 		GrowAbove:              declared.GrowAbove,
 		GrowFactor:             declared.GrowFactor,
 		EmergencyGrowFactor:    declared.EmergencyGrowFactor,

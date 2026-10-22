@@ -263,13 +263,13 @@ func (c *Control) charged(spec backend.Spec) backend.Spec {
 	}
 	charged := spec
 	if reserve, published := c.monitor.ClassReserveMB(spec.ResourceClass); published &&
-		spec.Resources.MemoryMB > 0 && reserve > 0 && reserve < spec.Resources.MemoryMB {
+		reserve > 0 && (spec.Resources.MemoryMB <= 0 || reserve < spec.Resources.MemoryMB) {
 		charged.Resources.MemoryMB = reserve
 		c.notePricing(spec.ResourceClass, "memory_mb", spec.Resources.MemoryMB, reserve)
 	}
 	requestedCPU := int64(spec.Resources.CPUCount * 1000)
 	if reserve, published := c.monitor.ClassReserveCPUMillis(spec.ResourceClass); published &&
-		requestedCPU > 0 && reserve > 0 && reserve < requestedCPU {
+		reserve > 0 && (requestedCPU <= 0 || reserve < requestedCPU) {
 		charged.Resources.CPUCount = float64(reserve) / 1000
 		c.notePricing(spec.ResourceClass, "cpu_millis", requestedCPU, reserve)
 	}

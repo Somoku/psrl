@@ -110,6 +110,88 @@ func limitOf(t *testing.T, memoryDir, parent, id string) int64 {
 	return value / mib
 }
 
+func TestAMemoryLessSandboxIsCreatedAtItsClassReserve(t *testing.T) {
+	const parent = "psrl-test-sandboxes"
+	domain, _, _ := fakeDomain(t, parent)
+	agent := limitsNode(t, domain, parent, 100000, 100000, ElasticConfig{
+		Enabled: true, MinLimitMB: 256,
+	})
+
+	out := agent.applyStartLimit(backend.Spec{ResourceClass: "rollout"})
+	if out.Resources.MemoryMB != 512 {
+		t.Fatalf("created memory bound = %d MB, want the 512 MB class reserve", out.Resources.MemoryMB)
+	}
+}
+
+func TestAMemoryLessSandboxIsChargedTheClassReserve(t *testing.T) {
+	// Admission must not read "no declared maximum" as "free": the node still
+	// grants the class reserve, and the fleet ledger has to see it.
+	const parent = "psrl-test-sandboxes"
+	domain, _, _ := fakeDomain(t, parent)
+	agent := limitsNode(t, domain, parent, 100000, 100000, ElasticConfig{
+		Enabled: true, MinLimitMB: 256,
+	})
+
+	charge := agent.elasticCharge(backend.Spec{ResourceClass: "rollout"})
+	if charge.MemoryMB != 512 {
+		t.Fatalf("memory-less charge = %d MB, want the 512 MB class reserve", charge.MemoryMB)
+	}
+}
+
+func TestAMemoryLessSandboxStartsAtItsClassReserve(t *testing.T) {
+	// PSRL often sends no memory request at all. Starting such a sandbox at zero
+	// would create it without a bound and leave the controller with no guarantee
+	// to protect; the class reserve is what admission charges, so it is the floor.
+	const parent = "psrl-test-sandboxes"
+	domain, _, _ := fakeDomain(t, parent)
+	agent := limitsNode(t, domain, parent, 100000, 100000, ElasticConfig{
+		Enabled: true, MinLimitMB: 256,
+	})
+	spec := backend.Spec{ResourceClass: "rollout"}
+
+	if start := agent.startLimitLocked(spec); start != 512 {
+		t.Fatalf("start limit %d MB, want the 512 MB class reserve", start)
+	}
+	if ceiling := agent.ceilingLocked("sb-1") / mib; ceiling != 100000 {
+		t.Fatalf("ceiling %d MB, want the 100000 MB subtree budget", ceiling)
+	}
+}
+
+func TestACommandStartRaisesTheBoundBeforeTheBurst(t *testing.T) {
+	const parent = "psrl-test-sandboxes"
+	domain, memoryDir, cpuDir := fakeDomain(t, parent)
+	sandbox(t, memoryDir, cpuDir, parent, "sb-1", 100*mib, 512*mib)
+	agent := limitsNode(t, domain, parent, 100000, 100000, ElasticConfig{
+		Enabled: true, StartLimitMB: 512, CommandBurstMB: 2048, MinLimitMB: 256,
+	})
+	agent.elasticRemember("sb-1", backend.Spec{
+		ResourceClass: "rollout",
+		Resources:     backend.Resources{MemoryMB: 8192},
+	})
+
+	agent.PrepareForCommand(context.Background(), "sb-1")
+	// The 200ms limit loop applies the queued target.
+	agent.ElasticLimitsTick(context.Background())
+	if got := limitOf(t, memoryDir, parent, "sb-1"); got != 2048 {
+		t.Fatalf("limit after command start = %d MB, want the 2048 MB burst", got)
+	}
+
+	// While the command is in flight, a low-usage sample must not shrink it.
+	agent.ElasticLimitsTick(context.Background())
+	if got := limitOf(t, memoryDir, parent, "sb-1"); got != 2048 {
+		t.Fatalf("a busy sandbox was shrunk to %d MB", got)
+	}
+
+	agent.FinishCommand("sb-1")
+	// The tick after the command starts the dwell; backdate it to make the
+	// shrink eligible without sleeping through the production dwell.
+	agent.elastic.lowSince["sb-1"] = time.Now().Add(-2 * time.Minute)
+	agent.ElasticLimitsTick(context.Background())
+	if got := limitOf(t, memoryDir, parent, "sb-1"); got >= 2048 {
+		t.Fatalf("limit after the command and dwell = %d MB, want it below the burst", got)
+	}
+}
+
 // A sandbox is born under its guarantee, not under its declared maximum, and the maximum
 // stays as the ceiling growth may reach.
 func TestASandboxIsCreatedUnderItsGuaranteeNotItsMaximum(t *testing.T) {

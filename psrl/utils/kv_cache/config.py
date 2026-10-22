@@ -1,6 +1,8 @@
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 _logger = logging.getLogger(__file__)
 
@@ -167,8 +169,24 @@ class LMCacheConfig:
     # deployment whose KV memory is exportable.
     mp_transfer_mode: str = "engine_driven"
 
+    # Defer stores and submit finished requests in batches, so the GPU-to-L1
+    # copy does not sit on the request path. `request_finished` still returns
+    # immediately; the store is submitted on a later non-empty scheduling step.
+    lazy_offload: bool = False
+
+    # Number of finished requests that makes a lazy batch eligible.
+    lazy_offload_threshold: int = 100
+
+    # Maximum requests selected per lazy batch.
+    lazy_offload_select_count: int = 10
+
     # Submit the LMCache lookup as soon as a request is scheduled.
     eager_prefetch: bool = False
+
+    # Report per-step GPU block allocation deltas to the MP server. Only the
+    # optional L0 observability view consumes them, and PSRL reads the KV event
+    # stream instead, so the per-step record building is off by default.
+    report_block_allocations: bool = False
 
     # --- Cache behaviour ---
 
@@ -181,6 +199,16 @@ class LMCacheConfig:
 
     # Publish KV cache events so routing can score the off-GPU cache tier.
     enable_kv_events: bool = False
+
+    # Let validation instances offload KV. Validation prompts are single-turn,
+    # unique within a run, and version-fenced after a weight update, so stores
+    # there are pure overhead. Reward/teacher models are never offloaded.
+    enable_validation: bool = False
+
+    # Let a single-turn rollout (generate-only agent) offload KV. Such a pool
+    # has no within-trajectory reuse, and cross-step reuse is fenced by the
+    # model version, so stores there are pure overhead too.
+    enable_single_turn: bool = False
 
     # --- GPU pin budget (PSRL-side) ---
 
@@ -255,6 +283,13 @@ class LMCacheConfig:
         assert self.mp_transfer_mode in SUPPORTED_MP_TRANSFER_MODES, (
             f"mp_transfer_mode must be one of {SUPPORTED_MP_TRANSFER_MODES}, got {self.mp_transfer_mode!r}."
         )
+        if self.lazy_offload:
+            assert self.lazy_offload_threshold >= 1, (
+                f"lazy_offload_threshold must be >= 1, got {self.lazy_offload_threshold}."
+            )
+            assert self.lazy_offload_select_count >= 1, (
+                f"lazy_offload_select_count must be >= 1, got {self.lazy_offload_select_count}."
+            )
         extra = {
             "lmcache.mp.host": self.server_host,
             "lmcache.mp.port": self.server_port,
@@ -262,7 +297,16 @@ class LMCacheConfig:
             "lmcache.mp.heartbeat_interval": self.heartbeat_interval_s,
             "lmcache.mp.eager_prefetch": self.eager_prefetch,
             "lmcache.mp.mp_transfer_mode": self.mp_transfer_mode,
+            "lmcache.mp.report_block_allocations": self.report_block_allocations,
         }
+        if self.lazy_offload:
+            extra.update(
+                {
+                    "lmcache.mp.lazy_offload": True,
+                    "lmcache.mp.lazy_offload_threshold": self.lazy_offload_threshold,
+                    "lmcache.mp.lazy_offload_select_count": self.lazy_offload_select_count,
+                }
+            )
         if self.mp_server_urls:
             # The connector prefers `server_urls` over `host`/`port`, and
             # derives `n_servers` from its length.
@@ -452,3 +496,41 @@ def _to_json(value) -> str:
         str: JSON text.
     """
     return value if isinstance(value, str) else json.dumps(value)
+
+
+def enable_for_pool(
+    lmcache_raw: Mapping[str, Any],
+    tag: str,
+    *,
+    is_reward_model: bool = False,
+    is_teacher_model: bool = False,
+    is_single_turn: bool = False,
+) -> bool:
+    """
+    Whether a rollout pool should offload KV for this server.
+
+    Validation is single-turn, unique within a run, and fenced by the model
+    version after every weight update, so its stores can never be read back.
+    Reward and teacher models produce no reusable generation KV at all. A
+    generate-only rollout pool has the same problem: one request per trajectory
+    and a new version every step. All of them would pay the copy for nothing.
+
+    Args:
+        lmcache_raw: The resolved `psrl.lmcache` config node.
+        tag: Server role, for example `rollout` or `validate`.
+        is_reward_model: Whether this server serves a reward model.
+        is_teacher_model: Whether this server serves a teacher model.
+        is_single_turn: Whether this pool runs the generate-only agent loop.
+
+    Returns:
+        bool: True when the server should build and start LMCache.
+    """
+    if not lmcache_raw.get("enable", False):
+        return False
+    if is_reward_model or is_teacher_model:
+        return False
+    if tag == "validate" and not lmcache_raw.get("enable_validation", False):
+        return False
+    if is_single_turn and not lmcache_raw.get("enable_single_turn", False):
+        return False
+    return True

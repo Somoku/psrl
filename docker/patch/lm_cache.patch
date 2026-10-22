@@ -50,6 +50,66 @@ index dfc98fe..51187fa 100644
  L2 Policies
  -----------
  
+diff --git a/lmcache/integration/vllm/lazy_offload_policy/fifo.py b/lmcache/integration/vllm/lazy_offload_policy/fifo.py
+index 9ca40a4..7237b4b 100644
+--- a/lmcache/integration/vllm/lazy_offload_policy/fifo.py
++++ b/lmcache/integration/vllm/lazy_offload_policy/fifo.py
+@@ -60,19 +60,20 @@ class FIFOOffloadPolicy(OffloadPolicy):
+     def mark_req_finished(self, req_id: str) -> None:
+         """Mark a queued request as ready for FIFO offload.
+ 
++        A request that never queued a block -- for example one served entirely
++        from vLLM's own prefix cache, or aborted before any store metadata was
++        recorded -- has nothing to offload. Finishing it is a no-op rather than
++        an error, because the engine must be able to retire every request.
++
+         Args:
+             req_id: Identifier of the request that has completed.
+-
+-        Raises:
+-            ValueError: If ``req_id`` has no queued cache blocks.
+         """
+-        if req_id in self._pending_items:
+-            self._pending_items[req_id].is_finished = True
+-            self._finished_requests_count += 1
+-        else:
+-            raise ValueError(
+-                f"mark req finished failed: req_id: {req_id} not in pending_items"
+-            )
++        item = self._pending_items.get(req_id)
++        if item is None:
++            logger.debug("lazy offload: request %s finished with no queued blocks", req_id)
++            return
++        item.is_finished = True
++        self._finished_requests_count += 1
+ 
+     def pop_items_for_offload(self, count: int) -> list[PendingStoreItem]:
+         """Return up to ``count`` finished requests in insertion order.
+diff --git a/lmcache/integration/vllm/lmcache_mp_connector.py b/lmcache/integration/vllm/lmcache_mp_connector.py
+index 8a58699..7c49b34 100644
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -580,6 +580,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         self.lazy_offload = vllm_config.kv_transfer_config.get_from_extra_config(
+             "lmcache.mp.lazy_offload", False
+         )
++        # The L0 allocation report feeds optional observability. Deployments
++        # that do not consume it can skip the per-step record building and RPC.
++        self.report_block_allocations = vllm_config.kv_transfer_config.get_from_extra_config(
++            "lmcache.mp.report_block_allocations", True
++        )
+ 
+         if self.role == KVConnectorRole.SCHEDULER:
+             # Banner from the scheduler role only, so tensor-parallel
+@@ -1526,6 +1531,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         For cached requests: only newly appended block_ids and token_ids.
+         The L0 allocation telemetry is flat today, so HMA reports engine group 0.
+         """
++        if not self.report_block_allocations:
++            return
+         records: list[RequestAllocationRecord] = []
+ 
+         # New requests: send all tokens covering all allocated blocks so
 diff --git a/lmcache/v1/distributed/api.py b/lmcache/v1/distributed/api.py
 index ab8876c..ba67d96 100644
 --- a/lmcache/v1/distributed/api.py

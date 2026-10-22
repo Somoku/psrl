@@ -29,7 +29,7 @@ from psrl.utils.kv_cache.config import LMCacheConfig
 from psrl.utils.kv_cache.runtime import LMCacheMPRuntime, start_coordinator
 
 REPO = Path(__file__).resolve().parents[2]
-MODEL = os.environ.get("PSRL_LMCACHE_TEST_MODEL", str(REPO / "tests/nixl/models/Qwen2.5-0.5B-Instruct"))
+MODEL = os.environ.get("PSRL_LMCACHE_TEST_MODEL", str(REPO / "models/Qwen2.5-0.5B-Instruct"))
 
 
 def free_port() -> int:

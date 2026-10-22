@@ -28,8 +28,8 @@ l1_use_lazy: True
 l1_init_size_gb: 20
 
 # Which prefixes to hold resident across turns: "off", "all", or "tagged".
-# Pinning trades cache capacity for hit rate, so measure before enabling it.
-pin_policy: off
+# Quote "off": unquoted it is a YAML boolean, not the policy name.
+pin_policy: "off"
 
 # Fraction of L1 the pin groups may hold.
 pin_budget_ratio: 0.25
@@ -107,8 +107,22 @@ heartbeat_interval_s: 10
 # CUDA IPC and needs exportable KV memory; "auto" lets LMCache choose.
 mp_transfer_mode: engine_driven
 
+# Defer stores and submit finished requests in batches. Store work then leaves
+# the request path, which matters for single-turn batches where the KV is
+# unlikely to be reused.
+lazy_offload: False
+
+# Finished requests required to make a lazy batch eligible, and the maximum
+# number selected per batch.
+lazy_offload_threshold: 100
+lazy_offload_select_count: 10
+
 # Submit the LMCache lookup as soon as a request is scheduled.
 eager_prefetch: False
+
+# Report per-step GPU block allocation deltas. Only LMCache's optional L0
+# observability consumes them; PSRL reads the KV event stream instead.
+report_block_allocations: False
 
 # --- Cache behaviour ---
 
@@ -121,6 +135,15 @@ multi_version_kv: True
 
 # Publish KV cache events so routing can score the off-GPU cache tier.
 enable_kv_events: False
+
+# Offload validation instances. Validation is single-turn and its entries are
+# version-fenced after every weight update, so stores there only cost time.
+# Reward and teacher models are never offloaded.
+enable_validation: False
+
+# Offload a generate-only rollout pool. It has one request per trajectory and
+# a new model version every step, so its stores cannot be reused either.
+enable_single_turn: False
 
 # --- GPU pin budget ---
 

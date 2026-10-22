@@ -67,6 +67,12 @@ sequenceDiagram
 | `l2_prefetch_policy` | str | `default` | L2 prefetch policy name |
 | `clear_on_weight_update` | bool | `False` | Clear the server cache after a weight sync |
 | `multi_version_kv` | bool | `True` | Tag entries with the model version |
+| `enable_validation` | bool | `False` | Offload validation instances (single-turn, version-fenced) |
+| `enable_single_turn` | bool | `False` | Offload a generate-only rollout pool (no within-trajectory reuse) |
+| `lazy_offload` | bool | `False` | Defer and batch stores behind finished requests |
+| `lazy_offload_threshold` | int | `100` | Finished requests that make a lazy batch eligible |
+| `lazy_offload_select_count` | int | `10` | Requests selected per lazy batch |
+| `report_block_allocations` | bool | `False` | Report per-step GPU block deltas to the L0 view |
 | `enable_p2p` | bool | `False` | Enable cross-instance KV transfer |
 | `p2p_transfer_engine` | str | `nixl` | Transfer engine, `nixl` or `mooncake_te` |
 | `mp_transfer_mode` | str | `engine_driven` | Worker-to-server path: `engine_driven` (compatible with sleep-mode allocations), `lmcache_driven` (zero-copy CUDA IPC), or `auto` |
@@ -126,6 +132,25 @@ The factor of four covers key plus value in fp16. For a 7B model with 32 layers,
 The cap is not committed up front. L1 grows lazily from `l1_init_size_gb` as it
 fills, so a generous `offload_size_gb` costs nothing until the cache is actually
 used. Set `l1_use_lazy: false` only to pre-commit the whole cap.
+
+### Which pools offload
+
+A store only pays off if the same prefix is requested again at the same model
+version. PSRL therefore starts LMCache only for a rollout pool running a
+multi-turn agent loop. Validation is single-turn and version-fenced after every
+weight update; a generate-only rollout has one request per trajectory; reward
+and teacher models produce no reusable generation KV. Those pools skip the
+server unless `enable_validation` or `enable_single_turn` is set.
+
+When stores are enabled for a mixed workload, set `lazy_offload: true`: stores
+are batched behind finished requests instead of competing with the next
+generation step. `report_block_allocations` is off because only LMCache's L0
+observability view consumes it.
+
+On a batch with no reuse, the cost is measurable: the connector alone is about
+10%, eager stores make it 18-23%, and lazy stores about 9%. With reuse, a
+1k-token cached prefill is 1.8x faster through the worker-copy path and 3.05x
+through zero-copy, which pays the overhead back on the first reused turn.
 
 ## Cross-instance transfer
 

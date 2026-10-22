@@ -1,10 +1,12 @@
 import json
 
 import pytest
+from omegaconf import OmegaConf
 from psrl.utils.kv_cache.config import (
     MP_CONNECTOR_MODULE,
     MP_CONNECTOR_NAME,
     LMCacheConfig,
+    enable_for_pool,
 )
 from psrl.utils.kv_cache.manager import KVCacheManager
 
@@ -56,6 +58,33 @@ class TestLMCacheConfig:
 
     def test_engine_kwargs_reject_an_unknown_transfer_mode(self):
         config = LMCacheConfig(enable=True, server_port=5555, mp_transfer_mode="copy")
+        with pytest.raises(AssertionError):
+            config.to_engine_kwargs()
+
+    def test_lazy_offload_is_off_by_default(self):
+        config = LMCacheConfig(enable=True, server_port=5555)
+        extra = config.to_connector_extra_config()
+        assert "lmcache.mp.lazy_offload" not in extra
+        assert config.enable_validation is False
+        assert config.enable_single_turn is False
+        # PSRL does not consume LMCache's L0 allocation reports.
+        assert extra["lmcache.mp.report_block_allocations"] is False
+
+    def test_lazy_offload_forwards_its_batch_controls(self):
+        config = LMCacheConfig(
+            enable=True,
+            server_port=5555,
+            lazy_offload=True,
+            lazy_offload_threshold=8,
+            lazy_offload_select_count=4,
+        )
+        extra = config.to_connector_extra_config()
+        assert extra["lmcache.mp.lazy_offload"] is True
+        assert extra["lmcache.mp.lazy_offload_threshold"] == 8
+        assert extra["lmcache.mp.lazy_offload_select_count"] == 4
+
+    def test_lazy_offload_rejects_empty_batches(self):
+        config = LMCacheConfig(enable=True, server_port=5555, lazy_offload=True, lazy_offload_threshold=0)
         with pytest.raises(AssertionError):
             config.to_engine_kwargs()
 
@@ -166,6 +195,12 @@ class TestLMCacheConfig:
             if line.strip() and not line.strip().startswith("#") and ":" in line
         }
         assert named <= known, f"lmcache.yaml names unknown fields: {sorted(named - known)}"
+        # YAML 1.1 parses bare `off` as a boolean, which the server validates as
+        # an invalid eviction policy rather than the policy named "off".
+        cfg = OmegaConf.load(yaml_path)
+        assert cfg.pin_policy == "off"
+        assert isinstance(cfg.pin_policy, str)
+        assert isinstance(cfg.l1_init_size_gb, int)
 
     def test_coordinator_metadata_carries_replica(self):
         config = _runtime_config(
@@ -458,3 +493,26 @@ class TestKVCacheManager:
             _runtime_config(pin_budget_ratio=1.5).to_server_argv()
         with pytest.raises(AssertionError):
             _runtime_config(pin_ttl_seconds=0).to_server_argv()
+
+
+class TestEnableForPool:
+    """Which pools should pay for offload at all."""
+
+    def test_rollout_offloads_when_enabled(self):
+        assert enable_for_pool({"enable": True}, "rollout")
+
+    def test_validation_is_skipped_by_default(self):
+        assert not enable_for_pool({"enable": True}, "validate")
+        assert enable_for_pool({"enable": True, "enable_validation": True}, "validate")
+
+    def test_reward_and_teacher_models_never_offload(self):
+        assert not enable_for_pool({"enable": True}, "reward_model_r0", is_reward_model=True)
+        assert not enable_for_pool({"enable": True}, "teacher_r0", is_teacher_model=True)
+
+    def test_single_turn_rollout_is_skipped_by_default(self):
+        assert not enable_for_pool({"enable": True}, "rollout", is_single_turn=True)
+        assert enable_for_pool({"enable": True, "enable_single_turn": True}, "rollout", is_single_turn=True)
+        assert enable_for_pool({"enable": True}, "rollout", is_single_turn=False)
+
+    def test_disabled_globally_stays_disabled(self):
+        assert not enable_for_pool({"enable": False}, "rollout")

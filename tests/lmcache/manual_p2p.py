@@ -30,7 +30,7 @@ from psrl.utils.kv_cache.manager import KVCacheManager
 from psrl.utils.kv_cache.runtime import LMCacheMPRuntime, start_coordinator
 
 REPO = Path(__file__).resolve().parents[2]
-MODEL = os.environ.get("PSRL_LMCACHE_TEST_MODEL", str(REPO / "tests/nixl/models/Qwen2.5-0.5B-Instruct"))
+MODEL = os.environ.get("PSRL_LMCACHE_TEST_MODEL", str(REPO / "models/Qwen2.5-0.5B-Instruct"))
 _DEVICES = [int(part) for part in os.environ.get("PSRL_LMCACHE_TEST_GPUS", "0,1").split(",")]
 _USED_PORTS: set[int] = set()
 

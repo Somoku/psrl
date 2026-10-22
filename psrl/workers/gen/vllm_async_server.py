@@ -51,7 +51,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 import grpc
 from psrl.sandbox.config import SandboxManagerConfig
-from psrl.utils.kv_cache import KVCacheManager, LMCacheConfig
+from psrl.utils.kv_cache import KVCacheManager, LMCacheConfig, enable_for_pool
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -114,6 +114,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         nnodes: int,
         cuda_visible_devices: str,
         gen_interface: GenInterface,
+        tag: str = "rollout",
     ):
         super().__init__(
             config,
@@ -132,6 +133,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         self.psrl_config = psrl_config
         self.gen_interface = gen_interface
+        #: Role of this server ("rollout", "validate", "reward_model_*",
+        #: "teacher_*"); LMCache uses it to skip pools that cannot reuse KV.
+        self.tag = tag
         self.status_queue = None
 
         self.stat_collector = None
@@ -206,6 +210,27 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             )
             or {}
         )
+
+        # A validation run is single-turn, its prompts are unique within the
+        # run, and a weight update fences every earlier entry by version. Its
+        # stores can never be read back, so the copy is pure overhead. Reward
+        # and teacher models produce no reusable generation KV either, and a
+        # generate-only agent pool has no within-trajectory reuse.
+        agent_loop = str(getattr(self.config.agent, "default_agent_loop", ""))
+        if not enable_for_pool(
+            lmcache_raw,
+            self.tag,
+            is_reward_model=getattr(self, "is_reward_model", False),
+            is_teacher_model=getattr(self, "is_teacher_model", False),
+            is_single_turn=agent_loop == "generate_only_agent",
+        ):
+            if lmcache_raw.get("enable", False):
+                psrl_logger.info(
+                    "[LMCache] Disabled for %s server %s: this pool cannot reuse KV.",
+                    self.tag,
+                    self.get_replica_idx(),
+                )
+            lmcache_raw["enable"] = False
 
         # One MP server per node owns all local KV ranks, so its identity is
         # node-scoped when a replica spans nodes and replica-scoped otherwise.
@@ -1728,6 +1753,7 @@ class PSRL_vLLMReplica(vLLMReplica):
                 nnodes=nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
                 gen_interface=self.gen_interface,
+                tag=self.tag,
             )
             self.servers.append(server)
 

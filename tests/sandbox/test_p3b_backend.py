@@ -30,8 +30,10 @@ from psrl.sandbox.core import (
     SandboxFeature,
     SandboxSource,
     SandboxSpec,
+    SandboxStatus,
 )
 from sandboxd import errors as service_errors
+from sandboxd.types import SandboxStatus as ServiceStatus
 
 _OWNER = "worker-1"
 _CLASS = "rollout"
@@ -336,6 +338,38 @@ class TestItRenewsOwnershipWhileItHoldsSandboxes:
         await backend.shutdown()
 
         assert not client.renewals
+
+
+class _StatusOnlySandbox:
+    """The service-side sandbox a P3bSession.status call needs, and nothing else."""
+
+    sandbox_id = "sb-status"
+
+    def __init__(self, status: ServiceStatus) -> None:
+        self._status = status
+
+    async def status(self) -> ServiceStatus:
+        return self._status
+
+
+class TestStatusKeepsTheWireValue:
+    """The SDK's status enum must not be stringified back through the constructor."""
+
+    @pytest.mark.asyncio
+    async def test_a_running_service_status_is_running(self):
+        session = p3b_backend.P3bSession.__new__(p3b_backend.P3bSession)
+        session._sandbox = _StatusOnlySandbox(ServiceStatus.RUNNING)
+        session._terminated = False
+
+        assert await session.status() is SandboxStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_service_status_is_unknown(self):
+        session = p3b_backend.P3bSession.__new__(p3b_backend.P3bSession)
+        session._sandbox = _StatusOnlySandbox(ServiceStatus.UNKNOWN)
+        session._terminated = False
+
+        assert await session.status() is SandboxStatus.UNKNOWN
 
 
 class TestFailuresKeepTheirAttribution:

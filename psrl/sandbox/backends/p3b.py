@@ -263,7 +263,11 @@ class P3bSession(SandboxSession):
         if self._terminated:
             return SandboxStatus.TERMINATED
         raw = await _service_call(self._sandbox.status())
-        return SandboxStatus(str(raw))
+        # The SDK returns its own `SandboxStatus` enum. `str()` on a `str, Enum`
+        # member yields "SandboxStatus.RUNNING" in Python 3.12, not "running",
+        # so converting it back through the constructor raises and made every
+        # status call read as unreadable. Take the wire value instead.
+        return SandboxStatus(getattr(raw, "value", raw))
 
     async def terminate(self) -> None:
         """Release the sandbox back to the service.
@@ -490,7 +494,27 @@ class P3bBackend(SandboxBackend):
         if self._owner_id and (self._heartbeat_task is None or self._heartbeat_task.done()):
             if self._renew_client is None:
                 self._renew_client = SandboxClient(self._endpoint, pool_size=4)
-            self._heartbeat_task = asyncio.create_task(self._renew_owner_loop())
+            task = asyncio.create_task(self._renew_owner_loop())
+            task.add_done_callback(self._heartbeat_done)
+            self._heartbeat_task = task
+
+    def _heartbeat_done(self, task: asyncio.Task[None]) -> None:
+        """Report a renewal loop that stopped without being asked to.
+
+        A loop that dies silently is indistinguishable from a control plane
+        that is not answering: both end with the node reclaiming every sandbox
+        this worker holds, and neither leaves a line saying which one it was.
+        """
+        if self._closed or task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            psrl_logger.error(
+                "Sandbox owner renewal loop stopped unexpectedly; the node will "
+                "reclaim every sandbox this worker holds after %.0fs: %r",
+                self._silence_ttl_s,
+                exc,
+            )
 
     async def _renew_owner_loop(self) -> None:
         # Three properties this loop has to have, each of which it did not:

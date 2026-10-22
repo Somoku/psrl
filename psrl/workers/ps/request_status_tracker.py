@@ -317,13 +317,25 @@ class RequestStatusTracker:
             self._status_to_request_ids[status[i]].add(req_id)
 
     @_state_locked
+    def is_request_aborted(self, request_id: int) -> bool:
+        """Report whether a request is marked for abortion.
+
+        A member-level refill keeps the same request id, so the manager has to
+        distinguish "this attempt failed and its worker aborted it" from "a
+        refill of it is already in flight"; the abort record is exactly that
+        distinction, and `readmit_requests` is what clears it.
+        """
+        return request_id in self._abort_request_ids
+
+    @_state_locked
     def readmit_requests(self, request_ids: list[int] | int, is_validate: bool = False) -> None:
         """Clear an abort record so the same request ids may be dispatched again.
 
         Aborting a group marks every child id, and a marked id is rejected on its next
-        status update. Re-running the same prompt therefore needs its ids released first,
-        which only the validation retry path wants: it re-runs the identical task to keep
-        the evaluation set fixed, where a training refill takes a fresh prompt and fresh ids.
+        status update. Re-running the same task therefore needs its ids released first.
+        Validation uses it to keep the evaluation set fixed; a training member refill
+        uses it to keep the failed child's id, and with it the group's expected id set
+        intact, while the siblings and their completed work stay in place.
 
         Done in one locked step rather than as a remove followed by an add, because in
         between the two the ids exist in neither map and a concurrent status update would

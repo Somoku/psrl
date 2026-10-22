@@ -97,6 +97,11 @@ class FakeManager:
         self.val_retry_limit = 1
         self._val_attempts: dict[int, int] = {}
         self._val_round_prompts: dict = {}
+        # Member-level refill state. Empty retained prompts mean these tests
+        # exercise the whole-group fallback; member tests populate the row.
+        self._train_round_prompts: dict = {}
+        self._train_member_attempts: dict[int, int] = {}
+        self.train_member_retry_limit = 3
 
         self.running_loop = None
         self._request_counter = 0
@@ -108,6 +113,9 @@ class FakeManager:
         self.ps_manager_handle.release.remote = AsyncMock(return_value=None)
         self.ps_manager_handle.abort_requests.remote = AsyncMock(return_value=None)
         self.ps_manager_handle.ensure_train_buffer_exists.remote = AsyncMock(return_value=None)
+        self.ps_manager_handle.readmit_requests.remote = AsyncMock(return_value=None)
+        # A failed child reaches the manager already aborted by its worker.
+        self.ps_manager_handle.is_request_aborted.remote = AsyncMock(return_value=True)
 
         # Refills return nothing by default, which is the broken-invariant case.
         self.data_processor = MagicMock()
@@ -126,6 +134,10 @@ class FakeManager:
         self._refill_failed_group = PSRL_AgentLoopManager._refill_failed_group.__get__(self)
         self._retry_validation_group = PSRL_AgentLoopManager._retry_validation_group.__get__(self)
         self._forget_validation_group = PSRL_AgentLoopManager._forget_validation_group.__get__(self)
+        self._refill_member = PSRL_AgentLoopManager._refill_member.__get__(self)
+        self._member_prompt_row = PSRL_AgentLoopManager._member_prompt_row.__get__(self)
+        self._active_rollout_n = PSRL_AgentLoopManager._active_rollout_n.__get__(self)
+        self._retain_train_round_prompts = PSRL_AgentLoopManager._retain_train_round_prompts.__get__(self)
         self._refill_breaker_error = PSRL_AgentLoopManager._refill_breaker_error.__get__(self)
         self._raise_if_refill_breaker_tripped = PSRL_AgentLoopManager._raise_if_refill_breaker_tripped.__get__(self)
         self._await_buffer_future = PSRL_AgentLoopManager._await_buffer_future.__get__(self)
@@ -136,9 +148,92 @@ class FakeManager:
         """Stand in for the TQ payload purge, which needs a live TransferQueue."""
         return self.rollout_request_tracker.pop(parent_id, [])
 
-    async def _inner_dispatch_data(self, data, is_validate):
+    async def _inner_dispatch_data(self, data, is_validate, *, retain_prompts: bool = True):
         """Record dispatches instead of sending them to rollout workers."""
         self.dispatched_batches.append(data)
+        return len(data)
+
+
+class TestMemberRefill:
+    """A failed child is rerun in place; its siblings keep their work."""
+
+    @staticmethod
+    def _group_batch(parent_id: int = 7, rollout_n: int = 2):
+        import torch
+        from tensordict import TensorDict
+        from verl.utils import tensordict_utils as tu
+
+        batch = TensorDict(
+            {"input_ids": torch.zeros(rollout_n, 2)}, batch_size=[rollout_n]
+        )
+        tu.assign_non_tensor_stack(
+            batch, "uid", [parent_id * rollout_n + i for i in range(rollout_n)]
+        )
+        tu.assign_non_tensor_stack(batch, "parent_id", [parent_id] * rollout_n)
+        tu.assign_non_tensor_stack(batch, "version_tag", [0] * rollout_n)
+        return batch
+
+    def test_only_the_failed_child_is_redispatched(self):
+        async def _run():
+            manager = FakeManager(threshold=1000, rollout_n=2)
+            manager.running_loop = asyncio.get_running_loop()
+            manager._train_round_prompts[7] = self._group_batch()
+            manager.data_processor.sample_train_prompts.remote = AsyncMock(
+                return_value=_stub_prompt_batch()
+            )
+
+            await manager.notify_group_failed(
+                parent_id=7,
+                failed_uid=14,
+                is_validate=False,
+                terminate_reason=TerminateReason.CONTAINER_LOST,
+            )
+
+            manager.ps_manager_handle.readmit_requests.remote.assert_awaited_once_with(
+                [14], is_validate=False
+            )
+            # The group is still alive: no sibling was aborted and it was not
+            # recorded as a failed group.
+            manager.ps_manager_handle.abort_requests.remote.assert_not_awaited()
+            assert 7 not in manager._failed_train_group_ids
+            assert manager._train_member_attempts[14] == 1
+            assert len(manager.dispatched_batches) == 1
+            dispatched = manager.dispatched_batches[0]
+            from verl.utils import tensordict_utils as tu
+
+            assert list(tu.get(dispatched, "uid")) == [14]
+            assert list(tu.get(dispatched, "parent_id")) == [7]
+            assert 7 in manager._train_round_prompts
+
+        asyncio.run(_run())
+
+    def test_an_exhausted_member_falls_back_to_the_group(self):
+        async def _run():
+            manager = FakeManager(threshold=1000, rollout_n=2)
+            manager.running_loop = asyncio.get_running_loop()
+            manager.train_member_retry_limit = 1
+            manager._train_member_attempts[14] = 1
+            manager._train_round_prompts[7] = self._group_batch()
+            manager.data_processor.sample_train_prompts.remote = AsyncMock(
+                return_value=_stub_prompt_batch()
+            )
+
+            await manager.notify_group_failed(
+                parent_id=7,
+                failed_uid=14,
+                is_validate=False,
+                terminate_reason=TerminateReason.CONTAINER_LOST,
+            )
+
+            assert 7 in manager._failed_train_group_ids
+            # The fallback aborts every child, including the failed one that a
+            # prior readmit may have left PENDING.
+            manager.ps_manager_handle.abort_requests.remote.assert_awaited_once()
+            aborted = manager.ps_manager_handle.abort_requests.remote.await_args.args[0]
+            assert aborted == [14, 15]
+            assert 7 not in manager._train_round_prompts
+
+        asyncio.run(_run())
 
 
 class TestZeroRefill:

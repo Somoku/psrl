@@ -6,9 +6,15 @@ batch_agg_mode: trajectory
 # fork, `longest_traj` the deepest, `multi_thinking` keeps CoT inline, `disable_thinking` off.
 thinking_template: multi_traj
 
-# Consecutive rollout groups that may fail with no success before training aborts. Each failure
-# is refilled with a fresh prompt, and any success resets the count.
+# Consecutive rollout groups that may fail with no success before training aborts. A member
+# failure is first repaired in place; only a member whose retries are exhausted replaces its
+# whole group with a fresh prompt, and any success resets the count.
 refill_failure_threshold: 32
+
+# In-place retries a single failed training child gets before its group is replaced. The refill
+# keeps the same parent and child id, so the siblings keep their completed work and their
+# sandboxes; a task that kills every sandbox it runs in still falls back to a fresh group.
+train_member_retry_limit: 3
 
 # Consecutive groups that may be lost to node capacity admission before training aborts. Each
 # attempt waits for capacity until the sandbox service refuses it, and its replacement waits

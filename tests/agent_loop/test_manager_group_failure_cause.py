@@ -44,7 +44,15 @@ def _manager(rollout_n: int = 4):
     mgr.ps_manager_handle.acquire.remote = AsyncMock(return_value=True)
     mgr.ps_manager_handle.release.remote = AsyncMock(return_value=None)
     mgr.ps_manager_handle.abort_requests.remote = AsyncMock(return_value=None)
+    mgr.ps_manager_handle.is_request_aborted.remote = AsyncMock(return_value=True)
+    mgr._train_round_prompts = {}
+    mgr._train_member_attempts = {}
+    mgr.train_member_retry_limit = 3
+    mgr.val_retry_limit = 1
     mgr.notify_group_failed = PSRL_AgentLoopManager.notify_group_failed.__get__(mgr)
+    mgr._refill_member = PSRL_AgentLoopManager._refill_member.__get__(mgr)
+    mgr._member_prompt_row = PSRL_AgentLoopManager._member_prompt_row.__get__(mgr)
+    mgr._active_rollout_n = PSRL_AgentLoopManager._active_rollout_n.__get__(mgr)
     mgr._purge_tracker_group = AsyncMock(return_value=None)
     # The real accounting, so the group actually lands in the failed set and the second
     # child is recognised as a duplicate rather than recorded again.

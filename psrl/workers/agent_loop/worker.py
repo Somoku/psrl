@@ -556,6 +556,16 @@ class PSRL_AgentLoopWorker:
                     )
                     output = None
 
+                # Release the failed child's record before asking the manager to
+                # recover it. A member-level refill keeps the same child id, so an
+                # abort issued after `notify_group_failed` would abort the refill
+                # the manager had just dispatched.
+                if output is None and terminate_reason != TerminateReason.ABORTED:
+                    psrl_logger.warning(
+                        f"Aborting failed generation: request_ids={request_ids!r}, reason={terminate_reason.value!r}."
+                    )
+                    await self.ps_manager_handle.abort_requests.remote(request_ids)
+
                 # Only the manager can purge the partial group and dispatch a replacement
                 # prompt, and it owns the breaker that ends a deterministically failing run.
                 if terminate_reason.needs_manager_retry():
@@ -623,15 +633,7 @@ class PSRL_AgentLoopWorker:
                         terminate_reason.value,
                         prompt_index,
                     )
-            elif terminate_reason != TerminateReason.ABORTED:
-                # Abort the reserved inventory entry after an unreported generation
-                # failure so the buffer can progress.
-                psrl_logger.warning(
-                    f"Aborting failed generation: request_ids={request_ids!r}, reason={terminate_reason.value!r}."
-                )
-                await self.ps_manager_handle.abort_requests.remote(request_ids)
-
-            # After ALL cleanup is complete (notify_group_failed + abort_requests),
+            # After ALL cleanup is complete (abort_requests + notify_group_failed),
             # re-raise the original error so it propagates to the task callback.
             if raised_error is not None:
                 raise raised_error

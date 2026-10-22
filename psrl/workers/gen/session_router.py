@@ -16,6 +16,7 @@ from psrl.utils.common.http_utils import (
     request_raw,
 )
 from psrl.utils.rollout.turn_output_writer import TurnOutputWriter
+from psrl.utils.sampler_distribution import SamplerCapture, configure_capture
 from psrl.workers.gen.harness.protocol import (
     anthropic_error_body,
     anthropic_error_response,
@@ -100,6 +101,7 @@ class SessionRouter:
         client_concurrency: int = 1024,
         trajectory_id_strategy: str = "manual",
         turn_output_writer: TurnOutputWriter | None = None,
+        sampler_capture: SamplerCapture | None = None,
     ):
         trajectory_id_strategy = trajectory_id_strategy.lower()
         if trajectory_id_strategy not in TRAJECTORY_ID_STRATEGIES:
@@ -111,6 +113,9 @@ class SessionRouter:
         self.client_concurrency = client_concurrency
         self.trajectory_id_strategy = trajectory_id_strategy
         self.turn_output_writer = turn_output_writer
+        # Resolve eagerly so a bad mode or budget fails at construction, not on the first request.
+        self.sampler_capture = sampler_capture or SamplerCapture()
+        _ = self.sampler_capture.width
         self.states: dict[str, SessionState] = {}
         self.states_lock = asyncio.Lock()
         self.setup_routes()
@@ -179,7 +184,7 @@ class SessionRouter:
 
     async def session_chat_completions(self, sid: str, request: Request) -> Response:
         """Handle Chat Completions, synthesizing SSE after a completed turn."""
-        prepared = await self.prepare_protocol_request(request, "chat")
+        prepared = await self.prepare_protocol_request(request, "chat", sid)
         if isinstance(prepared, Response):
             return prepared
         content, stream = prepared
@@ -201,7 +206,7 @@ class SessionRouter:
 
     async def session_responses(self, sid: str, request: Request) -> Response:
         """Proxy Codex Responses natively, buffering one complete training turn."""
-        prepared = await self.prepare_protocol_request(request, "responses")
+        prepared = await self.prepare_protocol_request(request, "responses", sid)
         if isinstance(prepared, Response):
             return prepared
         content, stream = prepared
@@ -227,7 +232,7 @@ class SessionRouter:
 
     async def session_messages(self, sid: str, request: Request) -> Response:
         """Proxy Anthropic Messages natively, buffering one complete training turn."""
-        prepared = await self.prepare_protocol_request(request, "messages")
+        prepared = await self.prepare_protocol_request(request, "messages", sid)
         if isinstance(prepared, Response):
             return prepared
         content, stream = prepared
@@ -249,10 +254,11 @@ class SessionRouter:
             return anthropic_stream_response(response_body, headers=result.headers)
         return self.build_response(result)
 
-    @staticmethod
     async def prepare_protocol_request(
+        self,
         request: Request,
         protocol: str,
+        sid: str,
     ) -> tuple[bytes, bool] | Response:
         """Buffer one JSON request and force a completed upstream turn."""
         try:
@@ -277,9 +283,19 @@ class SessionRouter:
 
         stream = body.get("stream") is True
         body["stream"] = False
-        if protocol == "chat":
-            body["logprobs"] = True
-            body["top_logprobs"] = 1
+        state = await self._ensure_state(sid)
+        # Validation runs never capture, so they use a disabled capture regardless of config.
+        capture = SamplerCapture() if state.headers.get("x-is-validate") == "true" else self.sampler_capture
+        try:
+            # Always apply the capture contract: a disabled capture still sets the OpenAI logprob
+            # fields TITO needs, while Anthropic Messages only carries sampler_top_logprobs.
+            configure_capture(
+                body,
+                capture,
+                set_response_fields=protocol in ("chat", "responses"),
+            )
+        except (ValueError, TypeError) as error:
+            return JSONResponse(status_code=400, content={"error": str(error)})
         content = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
         return content, stream
 

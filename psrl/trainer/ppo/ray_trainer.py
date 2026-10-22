@@ -1921,9 +1921,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         placement_config = self.config.psrl.deployment.get("sandbox_placement", None)
         placement_enabled = bool(placement_config and placement_config.get("enabled", False))
         if placement_enabled:
-            # A plane places every sandbox, so each node owns its own envelope and this worker
-            # holds no local backend. Keeping both would charge a node for containers another
-            # node runs.
+            # A plane places every sandbox, so each node owns its own envelope and this worker holds
+            # no local backend. Keeping both would charge a node for containers another node runs.
             use_node_capacity = False
             capacity_config = None
             hard_affinity = bool(allowed_ips)
@@ -3598,9 +3597,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             policy_loss_config = self.config.train_actor_rollout_ref.actor.policy_loss
             with open_dict(policy_loss_config):
-                # Pass rollout_correction config to actor for loss computation and metrics
+                # Kept for parity with the decoupled path. The worker already sees these from the
+                # static mirror written in validate_config, which runs before init_model.
                 policy_loss_config["rollout_correction"] = rollout_corr_config
-                # Always use bypass_mode loss function which handles both loss_types
                 policy_loss_config["loss_mode"] = "bypass_mode"
             return batch
 
@@ -3712,10 +3711,21 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        # Score centering is only active in the bypass REINFORCE path. The engine reads this
+        # micro-batch flag to attach the logits processor (upstream FSDP and the Megatron branch).
+        rollout_correction = self.config.algorithm.get("rollout_correction", None) or {}
+        score_centering = bool(rollout_correction.get("score_centering", False))
+        # Support (exact top_p<1) mode renormalizes the trainer over the recorded support. The engine
+        # passes this flag to the score-centering logits processor.
+        sampler_support = (
+            self.config.gen_actor_rollout_ref.rollout.get("sampler_distribution", "disabled") == "support"
+        )
         base_extra_info = {
             "calculate_entropy": calculate_entropy,
             "multi_turn": self.config.gen_actor_rollout_ref.rollout.multi_turn.enable,
             "distillation_use_topk": distillation_use_topk,
+            "score_centering": score_centering,
+            "sampler_support": sampler_support,
             "compute_loss": True,
         }
         actor_metrics = self._run_scheduled_update(

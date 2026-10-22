@@ -60,7 +60,7 @@ class TestTitoLengthInvariant:
         output = [10, 11, 12]
         records = [{"prompt_token_count": len(prompt), "output_logprobs": None, "finish_reason": "stop"}]
 
-        with pytest.raises(ValueError, match="carries no output_logprobs"):
+        with pytest.raises(ValueError, match="Missing output_logprobs"):
             build_training_data(accumulated_token_ids=prompt + output, records=records)
 
     def test_twenty_five_turns_stays_aligned(self):

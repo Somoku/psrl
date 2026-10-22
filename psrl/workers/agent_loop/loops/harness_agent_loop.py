@@ -623,6 +623,8 @@ class HarnessAgentLoop(SessionAgentLoop):
         response_length = remaining_response_tokens
         output.response_ids = output.response_ids[:response_length]
         output.response_mask = output.response_mask[:response_length]
+        if output.sampler_distribution is not None:
+            output.sampler_distribution = output.sampler_distribution.prefix(len(output.response_ids))
         if output.response_log_probs is not None:
             output.response_log_probs = output.response_log_probs[:response_length]
         if output.routed_experts is not None:

@@ -123,6 +123,15 @@ class RolloutConfig(_VeRLRolloutConfig):
     # The SMG router uses this template to render TITO session prompts.
     chat_template: str | None = None
 
+    sampler_distribution: str = "disabled"
+    sampler_max_tokens: int = 32
+    # Per-row capture validation (duplicate ids, probability mass, sampled-token agreement) sorts each
+    # row and is expensive over long responses, so normal training skips it. Enable for CI runs.
+    sampler_strict_validation: bool = False
+    # Support mode only: ship per-row support lengths + flat support ids instead of a dense id head.
+    # A smaller transport for a per-micro-batch GPU reconstruction, and now allowed with context parallel.
+    sampler_compact_support: bool = True
+
 
 __all__ = [
     "SamplingConfig",

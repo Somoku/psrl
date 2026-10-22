@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 import pytest
+from psrl.utils.sampler_distribution import SamplerCapture
 from psrl.workers.agent_loop.loops.session_agent_loop import SessionAgentLoop, SessionAgentResult
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 
@@ -21,6 +22,7 @@ async def test_session_agent_loop_owns_external_agent_lifecycle():
     loop.trajectory_id_strategy = "manual"
     loop.rollout_budget = 65536
     loop.session_snapshot = None
+    loop.sampler_capture = SamplerCapture()
 
     @asynccontextmanager
     async def session_scope(request):
@@ -71,6 +73,7 @@ async def test_auto_session_agent_loop_returns_all_resolved_trajectories():
     loop.trajectory_id_strategy = "auto"
     loop.rollout_budget = 65536
     loop.session_snapshot = None
+    loop.sampler_capture = SamplerCapture()
 
     @asynccontextmanager
     async def session_scope(request):

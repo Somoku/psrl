@@ -152,7 +152,8 @@ async def test_chat_completions_buffers_body_with_logprobs(client):
         "messages": [],
         "logprobs": True,
         "stream": False,
-        "top_logprobs": 1,
+        "top_logprobs": 0,
+        "sampler_top_logprobs": 0,
     }
 
 

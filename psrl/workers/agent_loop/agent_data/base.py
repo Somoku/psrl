@@ -13,6 +13,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.ray_utils import get_event_loop
 
 from psrl.environments.base import ConversationType, Environment
+from psrl.utils.sampler_distribution import SamplerCapture, SamplerDistribution
 from psrl.workers.gen.utils import RolloutInstanceId, TokenOutput, rollout_token_budget
 
 psrl_logger = logging.getLogger(__name__)
@@ -113,6 +114,7 @@ class Trajectory:
     response_mask: list[int] = field(default_factory=list)
     response_logprobs: list[float] = field(default_factory=list)
     routed_experts: np.ndarray | torch.Tensor | None = None
+    sampler_distribution: SamplerDistribution | None = None
 
     # Per-turn reward signals
     # Rewards collected from tool execution at each user turn.
@@ -226,6 +228,8 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         self.gamma = self.config.gen_actor_rollout_ref.rollout.agent.gamma
         # Coefficient for reward shaping (default: 0.0)
         self.reward_bonus_coeff = self.config.gen_actor_rollout_ref.rollout.agent.reward_bonus_coeff
+        # Resolved sampler capture config, shared with the trainer padding and TITO validation.
+        self.sampler_capture = SamplerCapture.from_rollout_config(self.config.gen_actor_rollout_ref.rollout)
 
     @classmethod
     def init_class(cls, config: DictConfig, **kwargs):
@@ -643,6 +647,12 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                 response_mask=trajectory.response_mask,
                 response_log_probs=(trajectory.response_logprobs if len(trajectory.response_logprobs) > 0 else None),
                 routed_experts=routed_experts,
+                sampler_distribution=(
+                    trajectory.sampler_distribution.prefix(len(trajectory.response_ids))
+                    if trajectory.sampler_distribution is not None
+                    else None
+                ),
+                sampler_capture=self.sampler_capture,
                 multi_modal_data=multi_modal_data,
                 # TODO(linsh): Check whether to use the global turn count.
                 num_turns=self.session_data.assistant_turns + self.session_data.user_turns + 1,

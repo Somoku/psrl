@@ -9,6 +9,7 @@ from omegaconf import DictConfig
 from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import DualOutputHandler
 from psrl.utils.rollout.turn_output_writer import TurnOutputWriter
+from psrl.utils.sampler_distribution import SamplerCapture
 from psrl.workers.gen.smg_adapter import build_rollout_router_args, get_trajectory_id_strategy
 
 psrl_logger = logging.getLogger(__file__)
@@ -156,6 +157,7 @@ class RolloutGateway:
             trajectory_id_strategy,
             logging_path,
             turn_output_kwargs,
+            sampler_capture,
         ):
             import uvicorn
 
@@ -180,6 +182,7 @@ class RolloutGateway:
                 client_concurrency=client_concurrency,
                 trajectory_id_strategy=trajectory_id_strategy,
                 turn_output_writer=turn_output_writer,
+                sampler_capture=sampler_capture,
             )
             uvicorn.run(router.app, host=host, port=port, log_level="warning")
 
@@ -198,6 +201,7 @@ class RolloutGateway:
                     "output_dir": turn_output_writer_template.output_dir,
                     "include_response": turn_output_writer_template.include_response,
                 },
+                SamplerCapture.from_rollout_config(self.config.gen_actor_rollout_ref.rollout),
             ),
         )
         self.session_router_process.daemon = True

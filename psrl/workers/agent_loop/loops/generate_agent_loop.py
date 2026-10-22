@@ -32,6 +32,8 @@ class GenerateAgentLoop(AgentLoopBase):
         output.response_mask = output.response_mask[: self.response_length]
         if output.response_log_probs is not None:
             output.response_log_probs = output.response_log_probs[: self.response_length]
+        if output.sampler_distribution is not None:
+            output.sampler_distribution = output.sampler_distribution.prefix(len(output.response_ids))
         if output.routed_experts is not None:
             expected_rows = len(output.prompt_ids) + len(output.response_ids) - 1
             if output.routed_experts.shape[0] < expected_rows:

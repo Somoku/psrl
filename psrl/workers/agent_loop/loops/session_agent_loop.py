@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from psrl.utils.common.http_utils import delete, get, post
 from psrl.utils.rollout.vision_utils import normalize_messages
+from psrl.utils.sampler_distribution import SamplerCapture, configure_capture
 from psrl.utils.tito.training_data import build_training_data
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.context import AgentLoopContext
@@ -38,6 +39,7 @@ class SessionAgentLoop(AgentLoopBase):
         self.trajectory_id_strategy = get_trajectory_id_strategy(context.config)
         self.max_turns = context.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
         self.session_snapshot = None  # TITO session snapshot for offline analysis
+        self._capture_sessions: set[str] = set()
 
     def get_generate_fields(self) -> list[str]:
         fields = super().get_generate_fields()
@@ -76,11 +78,17 @@ class SessionAgentLoop(AgentLoopBase):
             headers=headers,
         )
         session_id = response["session_id"]
+        if (
+            not request.get("validate", False)
+            and self.rollout_config.get("sampler_distribution", "disabled") != "disabled"
+        ):
+            self._capture_sessions.add(session_id)
         psrl_logger.debug("Created TITO session %r.", session_id)
         return session_id
 
     async def delete_session(self, session_id: str) -> None:
         """Delete one TITO session after its requests have drained."""
+        self._capture_sessions.discard(session_id)
         response = await delete(f"{self.session_router_url}/sessions/{session_id}")
         psrl_logger.debug("Deleted TITO session %r with status %r.", session_id, response.status)
 
@@ -183,6 +191,8 @@ class SessionAgentLoop(AgentLoopBase):
         }
         if request.get("seed") is not None:
             params["seed"] = int(request["seed"])
+        capture = SamplerCapture() if request.get("validate", False) else self.sampler_capture
+        configure_capture(params, capture)
         return params
 
     async def chat_completion(
@@ -234,7 +244,14 @@ class SessionAgentLoop(AgentLoopBase):
             raise RuntimeError(
                 f"TITO session {session_id!r} returned an invalid snapshot: expected a trajectories list."
             )
-        return [self.build_training_data_from_trajectory(trajectory, session_data) for trajectory in trajectories]
+        training_data = [
+            self.build_training_data_from_trajectory(trajectory, session_data) for trajectory in trajectories
+        ]
+        if session_id in self._capture_sessions and any(
+            item["response_ids"] and item.get("sampler_distribution") is None for item in training_data
+        ):
+            raise ValueError("Sampler capture was requested but TITO returned no distribution.")
+        return training_data
 
     async def get_primary_training_data(self, session_id: str) -> dict:
         """Collect the single linear trajectory expected by native session loops."""
@@ -259,7 +276,11 @@ class SessionAgentLoop(AgentLoopBase):
             trajectory.get("accumulated_token_ids", []),
             records,
             max_trim_tokens=session_data.get("max_trim_tokens", 0),
+            strict_validation=self.rollout_config.get("sampler_strict_validation", False),
         )
+        distribution = training_data.get("sampler_distribution")
+        if distribution is not None:
+            distribution.validate_capture(self.sampler_capture, training_data["response_mask"])
         training_data["trajectory_id"] = trajectory["trajectory_id"]
         header_info = session_data.get("header_info", {})
         if header_info.get("base_worker_id") is not None and header_info.get("target_dp_rank") is not None:
@@ -292,12 +313,18 @@ class SessionAgentLoop(AgentLoopBase):
 
         trajectory_fields = dict(extra_fields or {})
         trajectory_fields["trajectory_id"] = training_data["trajectory_id"]
+        distribution = training_data.get("sampler_distribution")
+        if distribution is not None:
+            distribution = distribution.prefix(len(response_ids))
+            distribution.validate_capture(self.sampler_capture, response_mask)
         return TokenOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
             response_mask=response_mask,
             response_log_probs=response_log_probs,
             routed_experts=routed_experts,
+            sampler_distribution=distribution,
+            sampler_capture=self.sampler_capture,
             stop_reason=training_data.get("finish_reason"),
             num_turns=training_data["num_turns"],
             rollout_instance_id=training_data.get("rollout_instance_id"),
@@ -317,6 +344,7 @@ class SessionAgentLoop(AgentLoopBase):
         trajectory.response_ids = training_data["response_ids"]
         trajectory.response_mask = training_data["response_mask"]
         trajectory.response_logprobs = training_data["logprobs"]
+        trajectory.sampler_distribution = training_data.get("sampler_distribution")
         trajectory.response_length = len(trajectory.response_ids)
         if update_turn_counts:
             trajectory.assistant_turns = training_data["num_turns"]

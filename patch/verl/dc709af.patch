@@ -1,0 +1,2466 @@
+diff --git a/tests/trainer/ppo/test_score_centering_alignment_on_cpu.py b/tests/trainer/ppo/test_score_centering_alignment_on_cpu.py
+deleted file mode 100644
+index d9a67248..00000000
+--- a/tests/trainer/ppo/test_score_centering_alignment_on_cpu.py
++++ /dev/null
+@@ -1,100 +0,0 @@
+-# Copyright 2026 Bytedance Ltd. and/or its affiliates
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-"""Dense gradient oracles for automatic score-centering alignment and its tail proxy."""
+-
+-import pytest
+-import torch
+-
+-from verl.trainer.ppo.score_centering import (
+-    score_centering_auto_correction,
+-    score_centering_correction,
+-    score_centering_weight_fn,
+-)
+-
+-
+-@pytest.mark.parametrize("rule,threshold", [(None, 2.0), ("token", 2.0), ("token", "0.5_5.0")])
+-def test_mixed_alignment_matches_dense_score_gradient(rule, threshold):
+-    # Row 0 has complete recorded support. Row 1 records only part of the sampler.
+-    # Both rows are off-policy so this checks clipping and the normalizer, not a zero gradient.
+-    initial = torch.tensor([[1.0, 0.2, -0.3, 0.7, -0.4], [0.3, -0.2, 0.8, -0.7, 0.1]])
+-    ids = torch.tensor([[0, 1, 2], [0, 1, 2]])
+-    q_head = torch.tensor([[0.65, 0.35, 0.0], [0.10, 0.20, 0.35]])
+-    complete = torch.tensor([True, False])
+-    weight = score_centering_weight_fn(rule, threshold)
+-    logits = initial.clone().requires_grad_()
+-    lp = logits.log_softmax(-1)
+-    correction, shift, q_mass, p_mass = score_centering_auto_correction(
+-        lp.gather(-1, ids), q_head.log(), weight, complete
+-    )
+-    actual_grad = torch.autograd.grad(correction.sum(), logits)[0]
+-
+-    oracle_logits = initial.clone().requires_grad_()
+-    oracle_lp = oracle_logits.log_softmax(-1)
+-    # Explicit dense sampler proxy. The complete row uses the actual support;
+-    # the incomplete row retains head q and distributes residual mass over the trainer tail.
+-    support_lp = oracle_logits[0, :2].log_softmax(-1)
+-    with torch.no_grad():
+-        aligned_weights = weight((support_lp - q_head[0, :2].log()).exp())
+-        p = oracle_lp[1].exp()
+-        q_proxy = torch.cat([q_head[1], (1 - q_head[1].sum()) * p[3:] / p[3:].sum()])
+-        proxy_weights = weight((oracle_lp[1] - q_proxy.log()).exp())
+-    oracle = (q_head[0, :2] * aligned_weights * support_lp).sum()
+-    oracle += (q_proxy * proxy_weights * oracle_lp[1]).sum()
+-    oracle_grad = torch.autograd.grad(oracle, oracle_logits)[0]
+-    torch.testing.assert_close(actual_grad, oracle_grad, atol=1e-6, rtol=1e-5)
+-    torch.testing.assert_close(shift[0], lp[0, :2].logsumexp(-1))
+-    assert shift[1] == 0
+-    torch.testing.assert_close(q_mass, q_head.sum(-1))
+-    torch.testing.assert_close(p_mass, torch.stack([lp[0, :2].exp().sum(), lp[1, :3].exp().sum()]))
+-
+-
+-def test_unit_head_mass_without_receipt_does_not_align():
+-    logits = torch.tensor([[2.0, 0.8, 0.2, -1.0]], requires_grad=True)
+-    head = logits.log_softmax(-1)[:, :2]
+-    q = torch.tensor([[0.7, 0.3]]).log()
+-    weight = score_centering_weight_fn(None, 2.0)
+-    correction, shift, _, _ = score_centering_auto_correction(head, q, weight, torch.tensor([False]))
+-    reference, _, _ = score_centering_correction(head, q, weight)
+-    torch.testing.assert_close(correction, reference)
+-    assert shift.item() == 0
+-    assert torch.isfinite(torch.autograd.grad(correction.sum(), logits)[0]).all()
+-
+-
+-def test_equal_configured_k_with_cutoff_ties_uses_partial_tail_proxy():
+-    logits = torch.tensor([[2.0, 1.0, 1.0, 0.0]], requires_grad=True)
+-    # Sampling top-k=2 retains the tied third token; the recording budget is still two.
+-    q = torch.tensor([[2.0, 1.0, 1.0, -torch.inf]]).log_softmax(-1)
+-    head = logits.log_softmax(-1)[:, :2]
+-    correction, shift, q_mass, _ = score_centering_auto_correction(
+-        head, q[:, :2], score_centering_weight_fn("token", 2.0), torch.tensor([False])
+-    )
+-    assert q_mass.item() == pytest.approx(0.7880584)
+-    assert shift.item() == 0
+-    assert torch.isfinite(torch.autograd.grad(correction.sum(), logits)[0]).all()
+-
+-
+-@pytest.mark.parametrize("rule,threshold", [(None, 2.0), ("token", 2.0), ("token", "0.5_5.0")])
+-def test_sampled_token_outside_head_keeps_actual_probability(rule, threshold):
+-    logits = torch.tensor([[1.2, 0.4, -0.1, 0.3]], requires_grad=True)
+-    lp = logits.log_softmax(-1)
+-    q_head = torch.tensor([[0.45, 0.25]])
+-    q_sample = torch.tensor([0.20])
+-    weight = score_centering_weight_fn(rule, threshold)
+-    correction, shift, _, _ = score_centering_auto_correction(lp[:, :2], q_head.log(), weight, torch.tensor([False]))
+-    sampled = lp[:, 2] - shift
+-    actual_sampled_weight = weight((sampled.detach() - q_sample.log()).exp())
+-    loss = -(actual_sampled_weight * sampled - correction).mean()
+-    assert shift.item() == 0
+-    assert torch.equal(q_sample, torch.tensor([0.20]))
+-    assert torch.isfinite(torch.autograd.grad(loss, logits)[0]).all()
+diff --git a/tests/trainer/ppo/test_score_centering_compact_on_cpu.py b/tests/trainer/ppo/test_score_centering_compact_on_cpu.py
+new file mode 100644
+index 00000000..1abe7ac5
+--- /dev/null
++++ b/tests/trainer/ppo/test_score_centering_compact_on_cpu.py
+@@ -0,0 +1,168 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""PSRL compact transport and shared sampled-token scoring for score centering."""
++
++import math
++
++import pytest
++import torch
++from tensordict import TensorDict
++from verl.trainer.ppo.score_centering import HEAD_PADDING_ID, score_centering_logits_processor
++from verl.trainer.config.algorithm import RolloutCorrectionConfig
++from verl.workers.config import ActorConfig, PolicyLossConfig
++
++
++def _actor_config(rollout_correction):
++    config = ActorConfig(
++        strategy="fsdp",
++        rollout_n=1,
++        ppo_micro_batch_size_per_gpu=1,
++        policy_loss=PolicyLossConfig(loss_mode="bypass_mode", rollout_correction=rollout_correction),
++        loss_agg_mode="token-mean",
++    )
++    config.global_batch_info.update(dp_size=1, batch_num_tokens=None, global_batch_size=None, loss_scale_factor=None)
++    return config
++
++
++def _topk_config():
++    return RolloutCorrectionConfig(
++        bypass_mode=True,
++        loss_type="reinforce",
++        rollout_is=None,
++        score_centering=True,
++    )
++
++
++def _support_config():
++    return RolloutCorrectionConfig(
++        bypass_mode=True,
++        loss_type="reinforce",
++        rollout_is=None,
++        score_centering=True,
++    )
++
++
++def _dense_topk(lengths, k, vocab, seed=0):
++    torch.manual_seed(seed)
++    rows = [torch.log_softmax(torch.randn(n, vocab) * 2, dim=-1) for n in lengths]
++    ids = [torch.randint(0, vocab, (n, k), dtype=torch.int32) for n in lengths]
++    log_probs = [row.gather(-1, i.long()) for row, i in zip(rows, ids, strict=True)]
++    return TensorDict(
++        {
++            "rollout_topk_ids": torch.nested.as_nested_tensor(ids, layout=torch.jagged),
++            "rollout_topk_log_probs": torch.nested.as_nested_tensor(log_probs, layout=torch.jagged),
++        },
++        batch_size=[len(lengths)],
++    )
++
++
++def _dense_support(lengths, k, vocab, seed=0):
++    torch.manual_seed(seed)
++    ids_rows, logp_rows, complete = [], [], []
++    for n in lengths:
++        row = torch.log_softmax(torch.randn(n, vocab) * 2, dim=-1)
++        # A nested support with a few finite entries per row, -inf padding to the budget.
++        count = min(k - 1, max(1, k // 2))
++        ids = torch.stack([torch.randperm(vocab)[:count] for _ in range(n)]).to(torch.int32)
++        logp = torch.full((n, k), -math.inf)
++        for r in range(n):
++            logp[r, :count] = row[r].gather(-1, ids[r].long())
++        ids_rows.append(ids)
++        logp_rows.append(logp)
++        complete.append(torch.ones(n, dtype=torch.bool))
++    ids_rows = [torch.cat([i, torch.full((n, k - i.shape[1]), HEAD_PADDING_ID, dtype=torch.int32)], 1) if i.shape[1] < k else i for i, n in zip(ids_rows, lengths, strict=True)]
++    data = TensorDict(
++        {
++            "rollout_topk_ids": torch.nested.as_nested_tensor(ids_rows, layout=torch.jagged),
++            "rollout_topk_log_probs": torch.nested.as_nested_tensor(logp_rows, layout=torch.jagged),
++            "rollout_support_complete": torch.nested.as_nested_tensor(complete, layout=torch.jagged),
++        },
++        batch_size=[len(lengths)],
++    )
++    return data
++
++
++def _compact(data, lengths):
++    """Convert full-sequence dense heads into PSRL's full-sequence compact triple."""
++    ids = data["rollout_topk_ids"].values()
++    logp = data["rollout_topk_log_probs"].values()
++    finite = logp.isfinite()
++    counts = finite.sum(-1).to(torch.int32)
++    flat_ids = ids[finite].to(torch.int32)
++    flat_logp = logp[finite].to(torch.float32)
++    receipt = (
++        _flatten_receipt(data["rollout_support_complete"])
++        if "rollout_support_complete" in data.keys()
++        else torch.zeros(ids.shape[0], dtype=torch.bool)
++    )
++    return TensorDict(
++        {
++            "rollout_topk_lengths": counts,
++            "rollout_support_ids": flat_ids,
++            "rollout_support_log_probs": flat_logp,
++            "rollout_support_complete": receipt,
++        },
++        batch_size=[],
++    )
++
++
++def _flatten_receipt(receipt):
++    if isinstance(receipt, torch.Tensor) and receipt.is_nested:
++        return receipt.values()
++    return torch.as_tensor(receipt)
++
++
++def test_compact_topk_matches_dense():
++    lengths, k, vocab = [3, 4], 5, 19
++    dense = _dense_topk(lengths, k, vocab)
++    compact = _compact(dense, lengths)
++    logits = torch.randn(1, sum(lengths), vocab, requires_grad=True)
++    dense_out = score_centering_logits_processor(logits, dense, _actor_config(_topk_config()))
++    compact_out = score_centering_logits_processor(logits, compact, _actor_config(_topk_config()))
++    for key in dense_out:
++        torch.testing.assert_close(compact_out[key], dense_out[key], atol=1e-6, rtol=1e-6)
++
++
++def test_compact_support_matches_dense():
++    lengths, k, vocab = [3, 4], 6, 19
++    dense = _dense_support(lengths, k, vocab)
++    compact = _compact(dense, lengths)
++    logits = torch.randn(1, sum(lengths), vocab, requires_grad=True)
++    dense_out = score_centering_logits_processor(logits, dense, _actor_config(_support_config()))
++    compact_out = score_centering_logits_processor(logits, compact, _actor_config(_support_config()))
++    for key in dense_out:
++        torch.testing.assert_close(compact_out[key], dense_out[key], atol=1e-6, rtol=1e-6)
++
++
++def test_shared_sampled_token_score_matches_log_softmax():
++    lengths, k, vocab = [3, 4], 4, 17
++    data = _dense_topk(lengths, k, vocab)
++    labels = torch.randint(0, vocab, (sum(lengths),))
++    logits = torch.randn(1, sum(lengths), vocab, requires_grad=True)
++    out = score_centering_logits_processor(
++        logits,
++        data,
++        _actor_config(_topk_config()),
++        sampled_token_ids=labels,
++    )
++    ref = torch.log_softmax(logits[0].float(), dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
++    torch.testing.assert_close(out["log_probs"].squeeze(0), ref, atol=1e-5, rtol=1e-5)
++
++
++def test_tail_ratio_is_one_on_verified_support_rows():
++    lengths, k, vocab = [3, 4], 6, 19
++    data = _dense_support(lengths, k, vocab)
++    logits = torch.randn(1, sum(lengths), vocab)
++    out = score_centering_logits_processor(logits, data, _actor_config(_support_config()))
++    torch.testing.assert_close(out["sc_tail_ratio"], torch.ones_like(out["sc_tail_ratio"]))
+diff --git a/tests/trainer/ppo/test_score_centering_on_cpu.py b/tests/trainer/ppo/test_score_centering_on_cpu.py
+index 1fb5ff40..3780a743 100644
+--- a/tests/trainer/ppo/test_score_centering_on_cpu.py
++++ b/tests/trainer/ppo/test_score_centering_on_cpu.py
+@@ -159,7 +159,6 @@ def test_score_centering_config_skips_checks_when_off():
+         (dict(actor_rc={"rollout_is": "sequence"}), "score_centering"),
+         (dict(actor_rc={"rollout_is_threshold": 3.0}), "match"),
+         ({"trainer.use_v1": False}, "use_v1"),
+-        ({"actor_rollout_ref.actor.strategy": "megatron"}, "strategy"),
+         ({"actor_rollout_ref.rollout.name": "sglang"}, "vllm"),
+         ({"actor_rollout_ref.rollout.topk_log_probs": 0}, "topk_log_probs"),
+         ({"actor_rollout_ref.rollout.temperature": 0}, "temperature"),
+@@ -560,6 +559,7 @@ def test_logits_processor_support_mode_adds_log_support_mass():
+         "sc_sampler_head_mass",
+         "sc_train_head_mass",
+         "sc_log_support_mass",
++        "sc_tail_ratio",
+         "sc_support_aligned",
+         "sc_sampler_tail_mass",
+         "sc_support_unknown",
+@@ -583,6 +583,7 @@ def test_logits_processor_returns_per_token_scalars():
+         "sc_sampler_head_mass",
+         "sc_train_head_mass",
+         "sc_log_support_mass",
++        "sc_tail_ratio",
+         "sc_support_aligned",
+         "sc_sampler_tail_mass",
+         "sc_support_unknown",
+diff --git a/tests/trainer/ppo/test_score_centering_vocab_parallel_on_cpu.py b/tests/trainer/ppo/test_score_centering_vocab_parallel_on_cpu.py
+new file mode 100644
+index 00000000..568ef8cf
+--- /dev/null
++++ b/tests/trainer/ppo/test_score_centering_vocab_parallel_on_cpu.py
+@@ -0,0 +1,81 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""The vocabulary-parallel head normalizer matches a full-vocabulary softmax."""
++
++import os
++import socket
++import tempfile
++
++import pytest
++import torch
++import torch.distributed as dist
++import torch.multiprocessing as mp
++from verl.trainer.ppo.score_centering import topk_log_probs_from_logits
++
++
++def _free_port() -> int:
++    with socket.socket() as sock:
++        sock.bind(("127.0.0.1", 0))
++        return sock.getsockname()[1]
++
++
++def _rank_worker(rank: int, world: int, port: int, out_dir: str) -> None:
++    os.environ["MASTER_ADDR"] = "127.0.0.1"
++    os.environ["MASTER_PORT"] = str(port)
++    dist.init_process_group("gloo", rank=rank, world_size=world)
++    group = dist.group.WORLD
++    try:
++        torch.manual_seed(7)
++        rows, vocab, k = 6, 2 * 9, 4
++        full_logits = torch.randn(rows, vocab, dtype=torch.float64)
++        ids = torch.randint(0, vocab, (rows, k))
++        full = full_logits.clone().requires_grad_()
++        ref = torch.log_softmax(full.float(), dim=-1).gather(-1, ids)
++
++        local = vocab // world
++        shard = full_logits[:, rank * local : (rank + 1) * local].clone().to(torch.float32)
++        shard.requires_grad_()
++        out = topk_log_probs_from_logits(
++            shard,
++            ids,
++            chunk_elems=3 * local,
++            process_group=group,
++            vocab_size=vocab,
++        )
++        weight = torch.arange(out.numel(), dtype=out.dtype).view_as(out) + 1
++        (out * weight).sum().backward()
++
++        # The replicated loss must scale each rank's shard gradient exactly once.
++        ref_weighted = (ref * weight).sum()
++        ref_grad = torch.autograd.grad(ref_weighted, full, retain_graph=False)[0]
++        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
++        torch.testing.assert_close(
++            shard.grad,
++            ref_grad[:, rank * local : (rank + 1) * local].to(shard.dtype),
++            atol=1e-4,
++            rtol=1e-4,
++        )
++        if rank == 0:
++            with open(os.path.join(out_dir, "ok"), "w") as handle:
++                handle.write("1")
++    finally:
++        dist.destroy_process_group()
++
++
++@pytest.mark.cpu_test
++def test_vocab_parallel_head_log_probs_match_full_vocabulary():
++    out_dir = tempfile.mkdtemp(prefix="sc_vp_")
++    world, port = 2, _free_port()
++    mp.spawn(_rank_worker, args=(world, port, out_dir), nprocs=world, join=True)
++    assert os.path.exists(os.path.join(out_dir, "ok"))
+diff --git a/tests/workers/test_score_centering_wiring_on_cpu.py b/tests/workers/test_score_centering_wiring_on_cpu.py
+index 676cf687..a1a85161 100644
+--- a/tests/workers/test_score_centering_wiring_on_cpu.py
++++ b/tests/workers/test_score_centering_wiring_on_cpu.py
+@@ -53,7 +53,7 @@ def test_prepare_model_outputs_keeps_logits_intact_for_score_centering(use_remov
+     engine = object.__new__(FSDPEngineWithLMHead)
+     engine.use_ulysses_sp = False
+ 
+-    def logits_processor(student_logits, data):
++    def logits_processor(student_logits, data, **kwargs):
+         return {"sc_correction": torch.zeros(student_logits.shape[:2])}
+ 
+     with patch(
+diff --git a/verl/models/transformers/qwen3_5.py b/verl/models/transformers/qwen3_5.py
+index 0e2bb902..acf41723 100644
+--- a/verl/models/transformers/qwen3_5.py
++++ b/verl/models/transformers/qwen3_5.py
+@@ -587,6 +587,12 @@ def forward_with_torch_backend(
+     vocab_weights = self.lm_head.weight
+     if isinstance(vocab_weights, DTensor):
+         vocab_weights = vocab_weights.full_tensor()
++    # `full_tensor()` keeps the local shard's device. With CPU offload, or while TMS has reclaimed
++    # the trainer's GPU memory, that is the host, while `hidden_states` stay on GPU and the fused
++    # matmul then fails with "mat2 is on cpu, different from other tensors on cuda". Moving the
++    # lm_head is cheaper than moving the activations.
++    if vocab_weights.device != hidden_states.device:
++        vocab_weights = vocab_weights.to(hidden_states.device)
+ 
+     ulysses_sequence_parallel_size = get_ulysses_sequence_parallel_world_size()
+     if shift_labels is None and ulysses_sequence_parallel_size > 1:
+@@ -646,6 +652,10 @@ def forward_with_triton_backend(
+     hidden_states = hidden_states.to(vocab_weights.dtype)
+     if isinstance(vocab_weights, DTensor):
+         vocab_weights = vocab_weights.full_tensor()
++    # See `forward_with_torch_backend` above: `full_tensor()` does not pin the device, and an
++    # offloaded lm_head must be moved to the activations' device before the fused matmul.
++    if vocab_weights.device != hidden_states.device:
++        vocab_weights = vocab_weights.to(hidden_states.device)
+ 
+     log_probs, entropy = linear_cross_entropy(
+         hidden_states,
+diff --git a/verl/protocol.py b/verl/protocol.py
+index e18f5849..c055b42c 100644
+--- a/verl/protocol.py
++++ b/verl/protocol.py
+@@ -933,22 +933,32 @@ class DataProto:
+         # Merge meta_info with special handling for metrics
+         merged_meta_info = {}
+         if data:
+-            # Merge non-metric meta_info and aggregate metrics from all workers.
+-            all_metrics = []
++            # Collect all keys from all workers
++            all_keys = set()
+             for d in data:
+-                for k, v in d.meta_info.items():
+-                    if k == "metrics":
++                all_keys.update(d.meta_info.keys())
++
++            # Merge non-metric meta_info and aggregate metrics from all workers.
++            all_metrics = []  # for key "metrics" only
++            for k in all_keys:
++                if k == "metrics":
++                    for d in data:
++                        v = d.meta_info.get(k)
+                         if v is not None:
+-                            if isinstance(v, list):
+-                                all_metrics.extend(v)
+-                            else:
+-                                all_metrics.append(v)
+-                    else:
+-                        if k in merged_meta_info:
+-                            # Ensure consistency for overlapping non-metric keys
+-                            assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
+-                        else:
+-                            merged_meta_info[k] = v
++                             if isinstance(v, list):
++                                 all_metrics.extend(v)
++                             else:
++                                 all_metrics.append(v)
++                elif k.endswith("_metrics"):
++                    # For xxx_metrics: merge as np.array([dict1, dict2, ...]) from each worker
++                    values = [d.meta_info.get(k) for d in data]
++                    merged_meta_info[k] = np.array(values)
++                else:
++                    # Ensure consistency for overlapping non-metric keys
++                    vals = [d.meta_info[k] for d in data if k in d.meta_info]
++                    if vals:
++                        assert all(vals[0] == v for v in vals), f"Conflicting values for meta_info key '{k}'"
++                        merged_meta_info[k] = vals[0]
+ 
+             # Flatten list of dicts to dict of lists for consistent metrics structure
+             if all_metrics:
+diff --git a/verl/trainer/config/engine/fsdp.yaml b/verl/trainer/config/engine/fsdp.yaml
+index a14ec2af..43d6735f 100644
+--- a/verl/trainer/config/engine/fsdp.yaml
++++ b/verl/trainer/config/engine/fsdp.yaml
+@@ -38,6 +38,8 @@ use_orig_params: false
+ # Random seed for reproducibility.
+ seed: 42
+ 
++load_weight: true
++
+ # Whether to enable full determinism for distributed training, only for debugging.
+ full_determinism: false
+ 
+diff --git a/verl/trainer/config/engine/megatron.yaml b/verl/trainer/config/engine/megatron.yaml
+index 0ee54390..30263441 100644
+--- a/verl/trainer/config/engine/megatron.yaml
++++ b/verl/trainer/config/engine/megatron.yaml
+@@ -63,6 +63,10 @@ entropy_from_logits_chunk_size: 2048
+ # oc.select: default val for ref.megatron.seed
+ seed: 42
+ 
++load_weight: true
++
++use_per_rank_checkpoint: False
++
+ # Allow to override Distributed Data Parallel (DDP) config
+ override_ddp_config: {}
+ 
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index afa86c25..2da754ac 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -1145,6 +1145,7 @@ def agg_loss(
+     batch_num_tokens: Optional[int] = None,
+     global_batch_size: Optional[int] = None,
+     loss_scale_factor: Optional[int] = None,
++    session_loss_weights: torch.Tensor | None = None,
+ ):
+     """
+     Aggregate the loss across global batch to ensure the loss is invariant to fsdp/megatron parallelism.
+@@ -1160,6 +1161,10 @@ def agg_loss(
+         dp_size: data parallel size
+         batch_num_tokens: number of valid tokens in global batch
+         global_batch_size: global batch size
++        session_loss_weights: Per-row reciprocal of (valid session count * session token count),
++            computed over the full training window before DP/micro-batch splitting. Shape (bs,).
++            Empty sessions receive zero weight. This mode does not use `batch_num_tokens`
++            or `global_batch_size`; splitting a session across rows must not change its weight.
+         loss_scale_factor: scale factor for "seq-mean-token-sum-norm" mode. If None, uses loss_mask.shape[-1].
+             Set this to a constant value to ensure consistent normalization throughout training.
+ 
+@@ -1167,7 +1172,15 @@ def agg_loss(
+         loss: `a scalar torch.Tensor`
+             aggregated loss
+     """
+-    if loss_agg_mode == "token-mean":
++    if loss_agg_mode == "session-mean-token-mean":
++        if session_loss_weights is None:
++            raise ValueError("session-mean-token-mean requires session_loss_weights from the full training window.")
++        if session_loss_weights.shape != loss_mat.shape[:1]:
++            raise ValueError("session_loss_weights must contain exactly one weight per loss row.")
++        # FP32 session weights keep the masked reduction stable for low precision losses.
++        session_mask = loss_mask * session_loss_weights.unsqueeze(-1)
++        loss = verl_F.masked_sum(loss_mat, session_mask) * dp_size
++    elif loss_agg_mode == "token-mean":
+         if batch_num_tokens is None:
+             if dp_size > 1:
+                 raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
+diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
+index 3de61d36..d8693de8 100644
+--- a/verl/trainer/ppo/metric_utils.py
++++ b/verl/trainer/ppo/metric_utils.py
+@@ -456,8 +456,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+     advantages = batch.batch["advantages"]
+     returns = batch.batch["returns"]
+ 
+-    max_prompt_length = batch.batch["prompts"].shape[-1]
+-    max_response_length = batch.batch["responses"].shape[-1]
++    max_prompt_length = batch.meta_info.get("max_prompt_length", batch.batch["prompts"].shape[-1])
++    max_response_length = batch.meta_info.get("max_response_length", batch.batch["responses"].shape[-1])
+ 
+     response_mask = batch.batch["response_mask"].bool()
+ 
+@@ -471,6 +471,26 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+     non_aborted_sequence_score = sequence_score[non_aborted_mask]
+     non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
+ 
++    if "original_reward_score" in batch.non_tensor_batch and "data_source" in batch.non_tensor_batch:
++        np_non_aborted_mask = non_aborted_mask.numpy()
++        non_aborted_original_scores = batch.non_tensor_batch["original_reward_score"][np_non_aborted_mask]
++        non_aborted_data_sources = batch.non_tensor_batch["data_source"][np_non_aborted_mask]
++        data_sources, data_source_counts = np.unique(non_aborted_data_sources, return_counts=True)
++        print("In this batch, the data sources are:")
++        for data_source, data_source_count in zip(data_sources, data_source_counts):
++            print(f"{data_source}: {data_source_count}")
++        print("--------------------------------")
++        data_src2original_score_metrics = defaultdict(dict)
++        for data_source in data_sources:
++            ds_mask = non_aborted_data_sources == data_source
++            ds_original_scores = non_aborted_original_scores[ds_mask]
++            data_src2original_score_metrics[data_source]["mean"] = np.mean(ds_original_scores)
++            data_src2original_score_metrics[data_source]["max"] = np.max(ds_original_scores)
++            data_src2original_score_metrics[data_source]["min"] = np.min(ds_original_scores)
++    else:
++        data_src2original_score_metrics = {}
++        data_sources = []
++
+     if non_aborted_sequence_score.numel() > 0:
+         score_mean = torch.mean(non_aborted_sequence_score).detach().item()
+         score_max = torch.max(non_aborted_sequence_score).detach().item()
+@@ -552,6 +572,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+         critic_value_metrics = {}
+ 
+     metrics = {
++        **{
++            key: value
++            for data_source in data_sources
++            for key, value in {
++                f"critic/original_score/{data_source}/mean": data_src2original_score_metrics[data_source]["mean"],
++                f"critic/original_score/{data_source}/max": data_src2original_score_metrics[data_source]["max"],
++                f"critic/original_score/{data_source}/min": data_src2original_score_metrics[data_source]["min"],
++            }.items()
++        },
+         # score
+         "critic/score/mean": score_mean,
+         "critic/score/max": score_max,
+@@ -1003,8 +1032,9 @@ def process_validation_metrics(
+ 
+             for var_name, var_vals in var2vals.items():
+                 var_vals = [value for value in var_vals if value is not None]
+-                # skip empty or string values
+-                if not var_vals or isinstance(var_vals[0], str):
++                # skip empty, string, or non-numeric values (e.g. dicts from
++                # reward_extra_info that aggregate per-loop reward metadata)
++                if not var_vals or not isinstance(var_vals[0], (int, float)):
+                     continue
+                 has_pred = (
+                     pred_vals is not None
+diff --git a/verl/trainer/ppo/padding_utils.py b/verl/trainer/ppo/padding_utils.py
+index 794378c9..c0c87eb9 100644
+--- a/verl/trainer/ppo/padding_utils.py
++++ b/verl/trainer/ppo/padding_utils.py
+@@ -23,7 +23,6 @@ from __future__ import annotations
+ 
+ import copy
+ import logging
+-import uuid
+ from typing import Any
+ 
+ import torch
+@@ -74,13 +73,18 @@ def construct_minimal_padding_template(
+     source_td: dict,
+     source_tag: dict,
+     eos_token_id: int,
++    pad_uid: int | None = None,
+ ) -> tuple[dict, dict]:
+     """Construct a text-only padding template.
+ 
++    Fields copied from the source that carry one entry per response token are shrunk to a single
++    token, so the synthetic row stays consistent with the minimal response built below.
++
+     Args:
+         source_td: A single sample dict retrieved from TransferQueue.
+         source_tag: The corresponding tag dict for that sample.
+         eos_token_id: The EOS token id from the tokenizer.
++        pad_uid: Integer uid assigned to the synthetic sample.
+ 
+     Returns:
+         A tuple of (template_sample, template_tag) ready for padding.
+@@ -89,8 +93,18 @@ def construct_minimal_padding_template(
+     template_sample = {}
+     for key in source_td.keys():
+         value = source_td[key]
++        if key.startswith("sampler_"):
++            continue
+         template_sample[key] = value.clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value)
+ 
++    # A response-token field copied from the source is longer than the one-token response built
++    # below, and `to_padded_tensor` pads each field to its own max. Shrink by length, not by name.
++    source_response_len = source_td["response_mask"].shape[0]
++    if source_response_len > 1:
++        for key, value in list(template_sample.items()):
++            if isinstance(value, torch.Tensor) and value.dim() == 1 and value.shape[0] == source_response_len:
++                template_sample[key] = torch.zeros(1, dtype=value.dtype, device=value.device)
++
+     # Deep copy the template tag from an existing sample.
+     template_tag = copy.deepcopy(source_tag)
+ 
+@@ -103,6 +117,12 @@ def construct_minimal_padding_template(
+     position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
+     routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
+ 
++    if "sampler_offsets" in source_td:
++        template_sample["sampler_offsets"] = source_td["sampler_offsets"].new_zeros(input_ids.size(0) + 1)
++        template_sample["sampler_complete"] = source_td["sampler_complete"].new_zeros(input_ids.size(0))
++        template_sample["sampler_token_ids"] = source_td["sampler_token_ids"].new_empty(0)
++        template_sample["sampler_log_probs"] = source_td["sampler_log_probs"].new_empty(0)
++
+     sequence_length = input_ids.size(0)
+     teacher_ids = template_sample.get("teacher_ids")
+     if teacher_ids is not None:
+@@ -120,8 +140,15 @@ def construct_minimal_padding_template(
+         if "rollout_support_complete" in template_sample:
+             template_sample["rollout_support_complete"] = torch.ones(sequence_length, dtype=torch.bool)
+ 
++    # Compact support transport: padding rows contribute no support (zero-length rows, no ids/values).
++    rollout_topk_lengths = template_sample.get("rollout_topk_lengths")
++    if rollout_topk_lengths is not None:
++        template_sample["rollout_topk_lengths"] = rollout_topk_lengths.new_zeros(sequence_length)
++        template_sample["rollout_support_ids"] = rollout_topk_lengths.new_empty(0)
++        template_sample["rollout_support_log_probs"] = torch.empty(0, dtype=torch.float32)
++
+     # Update the fields and remove redundant parts
+-    template_sample.update(
++    update_fields = dict(
+         prompts=prompts,
+         responses=responses,
+         input_ids=input_ids,
+@@ -133,6 +160,12 @@ def construct_minimal_padding_template(
+         rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
+         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
+     )
++    if pad_uid is not None:
++        update_fields["uid"] = pad_uid
++    template_sample.update(**update_fields)
++
++    if "parent_id" in template_sample:
++        template_sample["parent_id"] = pad_uid
+     if "multi_modal_inputs" in template_sample:
+         template_sample["multi_modal_inputs"] = {}
+     if routed_experts is not None:
+@@ -146,6 +179,7 @@ def construct_minimal_padding_template(
+         prompt_len=SYNTHETIC_PADDING_SEQ_LEN - 1,
+         response_len=1,
+         seq_len=SYNTHETIC_PADDING_SEQ_LEN,
++        parent_id=pad_uid,
+     )
+     return template_sample, template_tag
+ 
+@@ -180,26 +214,18 @@ def upsample_batch_to_divisible_size(
+     source_key = batch.keys[source_idx]
+     source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
+ 
+-    # Construct the aligned padding template
+-    template_sample, template_tag = construct_minimal_padding_template(source_td, batch.tags[source_idx], eos_token_id)
+-
+-    # All padding data use the same uid (also the same trajectory_id 0 but with ascending session_ids)
+-    # This uid is not identical to any of the actual data, so it won't affect the grpo advantage value.
+-    pad_uid = f"pad{uuid.uuid4().hex}"
+-    template_sample["uid"] = pad_uid
+-
+     # Construct the padding samples in a for-loop
+     pad_keys = []
+     pad_tags = []
+     pad_fields = []
+     pad_size = batch_multiple - remainder
+     for local_idx in range(pad_size):
+-        sample = copy.deepcopy(template_sample)
+-        # Use incremental local_idx as different session_ids
+-        pad_keys.append(f"{pad_uid}_{local_idx}_0")
+-        if "session_id" in sample:
+-            sample["session_id"] = local_idx
+-        pad_fields.append(sample)
++        pad_uid = -(local_idx + 1)
++        template_sample, template_tag = construct_minimal_padding_template(source_td, batch.tags[source_idx], eos_token_id, pad_uid)
++        pad_keys.append(f"{pad_uid}_0")
++        if "session_id" in template_sample:
++            template_sample["session_id"] = local_idx
++        pad_fields.append(template_sample)
+         pad_tags.append(copy.deepcopy(template_tag))
+ 
+     tq.kv_batch_put(
+diff --git a/verl/trainer/ppo/rollout_corr_helper.py b/verl/trainer/ppo/rollout_corr_helper.py
+index eed6de70..522c8077 100644
+--- a/verl/trainer/ppo/rollout_corr_helper.py
++++ b/verl/trainer/ppo/rollout_corr_helper.py
+@@ -762,23 +762,29 @@ def compute_is_metrics(
+     if rollout_is_weights.dim() > 1:
+         seq_mean_weights: torch.Tensor = verl_F.masked_mean(rollout_is_weights, response_mask, axis=-1)
+ 
+-        metrics["rollout_is_seq_mean"] = seq_mean_weights.mean().item()
+-        metrics["rollout_is_seq_std"] = seq_mean_weights.std().item() if seq_mean_weights.numel() > 1 else 0.0
+-        metrics["rollout_is_seq_max"] = seq_mean_weights.max().item()
+-        metrics["rollout_is_seq_min"] = seq_mean_weights.min().item()
+-
+-        # Sequence deviation from ideal weight (1.0)
+-        seq_deviation: torch.Tensor = (seq_mean_weights - 1.0).abs()
+-        metrics["rollout_is_seq_max_deviation"] = seq_deviation.max().item()
+-
+-        # Fraction of sequences with extreme weights. Use the raw (pre-truncation)
+-        # per-sequence mean: every clamped weight is <= rollout_is_threshold, so a mean
+-        # of clamped weights can never exceed it and the high fraction would be dead.
+-        raw_seq_mean_weights: torch.Tensor = verl_F.masked_mean(raw_rollout_is_weights, response_mask, axis=-1)
+-        metrics["rollout_is_seq_fraction_high"] = (raw_seq_mean_weights > rollout_is_threshold).float().mean().item()
+-        metrics["rollout_is_seq_fraction_low"] = (
+-            (raw_seq_mean_weights < rollout_is_threshold_lower).float().mean().item()
+-        )
++        seq_valid_mask_is: torch.Tensor = response_mask.sum(dim=-1) > 0
++        seq_mean_weights_valid: torch.Tensor = seq_mean_weights[seq_valid_mask_is]
++
++        if seq_mean_weights_valid.numel() > 0:
++            metrics["rollout_is_seq_mean"] = seq_mean_weights_valid.mean().item()
++            metrics["rollout_is_seq_std"] = (
++                seq_mean_weights_valid.std().item() if seq_mean_weights_valid.numel() > 1 else 0.0
++            )
++            metrics["rollout_is_seq_max"] = seq_mean_weights_valid.max().item()
++            metrics["rollout_is_seq_min"] = seq_mean_weights_valid.min().item()
++
++            # Sequence deviation from ideal weight (1.0)
++            seq_deviation: torch.Tensor = (seq_mean_weights - 1.0).abs()
++            metrics["rollout_is_seq_max_deviation"] = seq_deviation.max().item()
++
++            # Fraction of sequences with extreme weights. Use the raw (pre-truncation)
++            # per-sequence mean: every clamped weight is <= rollout_is_threshold, so a mean
++            # of clamped weights can never exceed it and the high fraction would be dead.
++            raw_seq_mean_weights: torch.Tensor = verl_F.masked_mean(raw_rollout_is_weights, response_mask, axis=-1)
++            metrics["rollout_is_seq_fraction_high"] = (raw_seq_mean_weights > rollout_is_threshold).float().mean().item()
++            metrics["rollout_is_seq_fraction_low"] = (
++                (raw_seq_mean_weights < rollout_is_threshold_lower).float().mean().item()
++            )
+ 
+     return metrics
+ 
+diff --git a/verl/trainer/ppo/score_centering.py b/verl/trainer/ppo/score_centering.py
+index 561772cc..382a9a7d 100644
+--- a/verl/trainer/ppo/score_centering.py
++++ b/verl/trainer/ppo/score_centering.py
+@@ -25,6 +25,7 @@ from collections.abc import Callable
+ from typing import Optional
+ 
+ import torch
++import torch.distributed as dist
+ from tensordict import TensorDict
+ 
+ from verl.trainer.ppo.rollout_corr_helper import _parse_rollout_is_threshold
+@@ -34,6 +35,53 @@ from verl.workers.utils.losses import ppo_loss
+ 
+ TOPK_LOG_PROB_CHUNK_SIZE = 4096
+ 
++TOPK_LOG_PROB_CHUNK_ELEMS = 64 * 1024 * 1024
++"""fp32 workspace budget per chunk, in elements (64M elements is 256 MiB).
++
++The head-log-prob primitives keep an fp32 ``(rows, vocab)`` workspace; a fixed row count would scale
++that by the vocabulary (a 150k vocab makes 4096 rows ~2.5 GiB), so the budget is expressed in
++elements and the row count is derived from the local vocabulary size.
++"""
++
++HEAD_PADDING_ID = -1
++"""Sentinel token id for support slots outside a row's recorded support."""
++
++
++def _rows_per_chunk(chunk_elems: int, vocab_local: int, rows: int) -> int:
++    """Rows per chunk that keep the fp32 workspace near ``chunk_elems`` for this vocabulary shard."""
++    if chunk_elems <= 0:
++        return max(rows, 1)
++    return max(chunk_elems // max(vocab_local, 1), 1)
++
++
++def _flatten_rows(tensor) -> torch.Tensor:
++    """Read a nested or dense per-row tensor as flat values without a Python row loop."""
++    if isinstance(tensor, torch.Tensor) and tensor.is_nested:
++        return tensor.values()
++    return torch.as_tensor(tensor)
++
++
++def _reconstruct_compact_field(lengths: torch.Tensor, flat: torch.Tensor, *, fill, dtype) -> torch.Tensor:
++    """Scatter flat per-row entries into a ``[rows, max_len]`` dense array.
++
++    ``lengths`` is one entry count per row; ``flat`` holds the concatenated entries. Unused columns
++    are filled with ``fill`` (the support sentinel). Rows are built with vectorized indexing, so the
++    row count, which can be tens of thousands, costs no Python loop.
++    """
++    rows = int(lengths.numel())
++    max_len = int(lengths.max().item()) if rows else 0
++    out = torch.full((rows, max_len), fill, dtype=dtype, device=flat.device)
++    if max_len == 0:
++        return out
++    total = int(lengths.sum().item())
++    if total:
++        row_idx = torch.repeat_interleave(torch.arange(rows, device=flat.device), lengths)
++        col_idx = torch.arange(total, device=flat.device) - torch.repeat_interleave(
++            torch.cumsum(lengths, 0) - lengths, lengths
++        )
++        out[row_idx, col_idx] = flat[:total].to(dtype)
++    return out
++
+ 
+ def dummy_rollout_topk(
+     num_rows: int, k: int, device: Optional[torch.device] = None
+@@ -130,8 +178,84 @@ class _TopKLogProbsFromLogits(torch.autograd.Function):
+         return grad_input, None, None
+ 
+ 
++class _VocabParallelTopKLogProbs(torch.autograd.Function):
++    """Full-vocab-normalized log-probs at arbitrary ids under a sharded (tensor-parallel) vocabulary.
++
++    ``logits`` is this rank's contiguous vocabulary shard ``[vocab_start, vocab_start + V_local)``; the
++    ``token_ids`` are global. The softmax normalizer is reduced across ranks and only the selected
++    logits are exchanged, so no rank materializes the full vocabulary. The fp32 workspace stays
++    ``O(chunk_size * V_local)`` in forward and backward (the softmax is recomputed in backward).
++    Outputs are replicated across ranks; the returned gradient is this rank's shard only, because the
++    replicated loss must not be all-reduced a second time (that would scale it by the world size).
++    """
++
++    @staticmethod
++    def forward(ctx, logits, token_ids, process_group, vocab_size, chunk_size):
++        n, local_vocab = logits.shape
++        rank = dist.get_rank(process_group)
++        vocab_start = rank * local_vocab
++        valid = max(0, min(local_vocab, vocab_size - vocab_start))
++        chunk_size = chunk_size if chunk_size > 0 else max(n, 1)
++        output = torch.empty(token_ids.shape, device=logits.device, dtype=torch.float32)
++        maxima = torch.empty((n, 1), device=logits.device, dtype=torch.float32)
++        denominators = torch.empty_like(maxima)
++        for start in range(0, n, chunk_size):
++            end = min(start + chunk_size, n)
++            work = logits[start:end].to(dtype=torch.float32, copy=True)
++            if valid < local_vocab:
++                work[:, valid:] = -torch.inf
++            maximum = work.max(dim=-1, keepdim=True).values
++            dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=process_group)
++            ids = token_ids[start:end]
++            owned = (ids >= vocab_start) & (ids < vocab_start + valid)
++            local_ids = (ids - vocab_start).clamp_(0, local_vocab - 1)
++            targets = work.gather(-1, local_ids).masked_fill_(~owned, 0.0)
++            dist.all_reduce(targets, op=dist.ReduceOp.SUM, group=process_group)
++            work.sub_(maximum).exp_()
++            denominator = work.sum(dim=-1, keepdim=True)
++            dist.all_reduce(denominator, group=process_group)
++            output[start:end] = (targets - maximum) - denominator.log()
++            maxima[start:end] = maximum
++            denominators[start:end] = denominator
++            del work
++        ctx.save_for_backward(logits, token_ids, maxima, denominators)
++        ctx.chunk_size = chunk_size
++        ctx.vocab_start = vocab_start
++        ctx.valid = valid
++        ctx.process_group = process_group
++        return output
++
++    @staticmethod
++    @torch.autograd.function.once_differentiable
++    def backward(ctx, grad_output):
++        logits, token_ids, maxima, denominators = ctx.saved_tensors
++        n, local_vocab = logits.shape
++        grad_input = torch.empty_like(logits)
++        for start in range(0, n, ctx.chunk_size):
++            end = min(start + ctx.chunk_size, n)
++            work = logits[start:end].to(dtype=torch.float32, copy=True)
++            if ctx.valid < local_vocab:
++                work[:, ctx.valid :] = -torch.inf
++            work.sub_(maxima[start:end]).exp_().div_(denominators[start:end])
++            grad = grad_output[start:end].float()
++            work.mul_(-grad.sum(dim=-1, keepdim=True))
++            ids = token_ids[start:end]
++            owned = (ids >= ctx.vocab_start) & (ids < ctx.vocab_start + ctx.valid)
++            local_ids = (ids - ctx.vocab_start).clamp_(0, local_vocab - 1)
++            work.scatter_add_(-1, local_ids, grad.masked_fill(~owned, 0.0))
++            grad_input[start:end] = work
++            del work
++        return grad_input, None, None, None, None
++
++
+ def topk_log_probs_from_logits(
+-    logits: torch.Tensor, token_ids: torch.Tensor, chunk_size: int = TOPK_LOG_PROB_CHUNK_SIZE
++    logits: torch.Tensor,
++    token_ids: torch.Tensor,
++    chunk_size: int = TOPK_LOG_PROB_CHUNK_SIZE,
++    *,
++    chunk_elems: Optional[int] = None,
++    process_group=None,
++    vocab_size: Optional[int] = None,
+ ) -> torch.Tensor:
+     """Compute full-vocab-normalized log-probs of ``logits`` at ``token_ids``, chunked for memory.
+ 
+@@ -142,13 +266,25 @@ def topk_log_probs_from_logits(
+     Args:
+         logits: Trainer logits, shape (N, V), any float dtype.
+         token_ids: Token ids to gather, shape (N, k), any integer dtype.
+-        chunk_size: Number of rows processed per chunk. Default: 4096.
++        chunk_size: Number of rows processed per chunk when ``chunk_elems`` is not given. Default: 4096.
++        chunk_elems: fp32 workspace budget per chunk, in elements; the row count is derived from
++            the local vocabulary size. Takes precedence over ``chunk_size``.
++        process_group: Tensor-parallel vocabulary group, or None when the local logits are the full
++            vocabulary (the FSDP path gathers the DTensor shards before calling here).
++        vocab_size: Logical vocabulary size excluding padded entries. Defaults to the full sharded
++            size; pass the real size when the vocabulary is padded to divide across ranks.
+ 
+     Returns:
+         Log-probs of ``token_ids`` under the full-vocab softmax of ``logits``, shape (N, k),
+         dtype float32, with gradient to ``logits``.
+     """
+-    return _TopKLogProbsFromLogits.apply(logits, token_ids.long(), chunk_size)
++    if chunk_elems is not None:
++        chunk_size = _rows_per_chunk(chunk_elems, logits.shape[-1], logits.shape[0])
++    if process_group is None:
++        return _TopKLogProbsFromLogits.apply(logits, token_ids.long(), chunk_size)
++    total = dist.get_world_size(process_group) * logits.shape[-1]
++    vocab_size = total if vocab_size is None else vocab_size
++    return _VocabParallelTopKLogProbs.apply(logits, token_ids.long(), process_group, vocab_size, chunk_size)
+ 
+ 
+ def score_centering_weight_fn(
+@@ -304,61 +440,163 @@ def score_centering_auto_correction(
+ 
+ 
+ def score_centering_logits_processor(
+-    student_logits: torch.Tensor, data: TensorDict, config: ActorConfig, data_format: str = "thd"
++    student_logits: torch.Tensor,
++    data: TensorDict,
++    config: ActorConfig,
++    data_format: str = "thd",
++    *,
++    process_group=None,
++    vocab_size: Optional[int] = None,
++    chunk_elems: Optional[int] = None,
++    cp_split: Optional[str] = None,
++    cp_layout: Optional[str] = None,
++    local_cp_size: Optional[int] = None,
++    quant_align_size: Optional[int] = None,
++    sampled_token_ids: Optional[torch.Tensor] = None,
+ ) -> dict[str, torch.Tensor]:
+     """Per-token centering term from the trainer logits, in the engine's logits-processor slot.
+ 
+     Args:
+         student_logits: Trainer logits, already temperature-scaled, shape (1, nnz/sp, V).
+-        data: Micro input batch, holding the nested ``rollout_topk_ids``/``rollout_topk_log_probs``
+-            sampler heads of shape [B, j, k].
++        data: Micro input batch. Accepts either the upstream dense
++            ``rollout_topk_ids``/``rollout_topk_log_probs`` nested pair or PSRL's compact
++            ``rollout_topk_lengths``/``rollout_support_ids``/``rollout_support_log_probs`` triple.
+         config: Actor configuration, used for ``policy_loss.rollout_correction``.
+         data_format: "thd" or "bshd". Only "thd" is supported.
++        process_group: Tensor-parallel vocabulary group when the logits are sharded.
++        vocab_size: Logical vocabulary size excluding padded entries.
++        chunk_elems: fp32 workspace budget per normalizer chunk, in elements.
++        cp_split: "thd"/"bshd" to pad and slice the full-sequence sampler heads onto the trainer's
++            packed rows the way distillation does, or None when the trainer does not repack.
++        cp_layout: Context-parallel partition layout used by the model forward.
++        local_cp_size: Local context-parallel size for the split.
++        quant_align_size: Packing alignment the model forward applied (FP8 padding).
++        sampled_token_ids: Local prediction labels. When set, the sampled-token log-probs are scored
++            in the same normalizer pass as the head and returned as ``log_probs`` for the engine to
++            reuse instead of a separate full-vocabulary cross entropy.
+ 
+     Returns:
+         Dict with, each of shape (1, nnz/sp):
+             sc_correction: Centering term, with gradient to ``student_logits``.
+             sc_sampler_head_mass: Sampler's head probability mass, detached.
+             sc_train_head_mass: Trainer's head probability mass, detached.
++            sc_tail_ratio: Trainer-to-sampler tail-mass ratio, detached.
+             sc_log_support_mass: Trainer's log support mass for aligned rows, zero otherwise.
+-            sc_support_aligned: Fraction indicator for verified support alignment.
++            sc_support_aligned: One for rows the receipt proved complete, zero otherwise.
+             sc_sampler_tail_mass: Sampler probability mass outside the recorded head.
+             sc_support_unknown: Approximate rows with near-unit head mass but no coverage proof.
++            log_probs: Sampled log-probs in the full-vocabulary domain, present only with
++                ``sampled_token_ids``.
+     """
+     if data_format != "thd":
+         raise NotImplementedError("score centering supports the thd (remove padding) format only.")
+-    topk_ids = data["rollout_topk_ids"].values().unsqueeze(0)
+-    topk_log_probs = data["rollout_topk_log_probs"].values().unsqueeze(0)
++    has_dense = "rollout_topk_ids" in data.keys() and "rollout_topk_log_probs" in data.keys()
++    has_compact = (
++        "rollout_topk_lengths" in data.keys()
++        and "rollout_support_ids" in data.keys()
++        and "rollout_support_log_probs" in data.keys()
++    )
++    if not (has_dense or has_compact):
++        raise RuntimeError(
++            "score centering is enabled but the micro-batch carries no sampler head: expected the "
++            "dense rollout_topk_ids/rollout_topk_log_probs pair or the compact "
++            "rollout_topk_lengths/rollout_support_ids/rollout_support_log_probs triple."
++        )
++    if has_dense:
++        topk_ids = _flatten_rows(data["rollout_topk_ids"]).unsqueeze(0)
++        topk_log_probs = _flatten_rows(data["rollout_topk_log_probs"]).unsqueeze(0)
++    else:
++        # The compact transport ships full-sequence lengths plus flat per-row entries. Rebuild the
++        # dense heads first so the shared split below pads and slices them like the dense pair.
++        lengths = _flatten_rows(data["rollout_topk_lengths"]).to(torch.long)
++        topk_ids = _reconstruct_compact_field(
++            lengths, _flatten_rows(data["rollout_support_ids"]), fill=HEAD_PADDING_ID, dtype=torch.int32
++        ).unsqueeze(0)
++        topk_log_probs = _reconstruct_compact_field(
++            lengths, _flatten_rows(data["rollout_support_log_probs"]), fill=-math.inf, dtype=torch.float32
++        ).unsqueeze(0)
++        if cp_split:
++            # preprocess_*_engine addresses rows through per-sequence offsets, so wrap the flat
++            # compact heads as a packed nested tensor carrying the model's own sequence offsets.
++            offsets = data["input_ids"].offsets()
++            topk_ids = torch.nested.nested_tensor_from_jagged(topk_ids.squeeze(0), offsets=offsets)
++            topk_log_probs = torch.nested.nested_tensor_from_jagged(topk_log_probs.squeeze(0), offsets=offsets)
++
+     receipt = data.get("rollout_support_complete", None)
+     support_complete = (
+-        receipt.values().unsqueeze(0)
++        _flatten_rows(receipt).unsqueeze(0)
+         if receipt is not None
+         else torch.zeros(topk_ids.shape[:2], device=topk_ids.device, dtype=torch.bool)
+     )
+-    if get_ulysses_sequence_parallel_world_size() > 1:
++    if cp_split:
++        # Pad and slice the sampler heads onto the trainer's packed rows exactly the way
++        # distillation does, so they align with the model logits under TP/CP padding.
++        from verl.models.mcore.util import preprocess_bshd_engine, preprocess_thd_engine
++
++        offsets = data["input_ids"].offsets()
++        if not support_complete.is_nested:
++            support_complete = torch.nested.nested_tensor_from_jagged(
++                support_complete.squeeze(0), offsets=offsets
++            )
++        if cp_split == "thd":
++            split = preprocess_thd_engine
++            split_kwargs = {
++                "quant_align_size": quant_align_size,
++                "local_cp_size": local_cp_size,
++                "cp_layout": cp_layout or "zigzag",
++            }
++        else:
++            split = preprocess_bshd_engine
++            split_kwargs = {}
++        topk_ids, *_ = split(topk_ids, pre_process=True, **split_kwargs)
++        topk_log_probs, *_ = split(topk_log_probs, pre_process=True, **split_kwargs)
++        support_complete, *_ = split(support_complete, pre_process=True, **split_kwargs)
++    elif get_ulysses_sequence_parallel_world_size() > 1:
+         topk_ids = slice_input_tensor(topk_ids, dim=1)
+         topk_log_probs = slice_input_tensor(topk_log_probs, dim=1)
+         support_complete = slice_input_tensor(support_complete, dim=1)
++
+     rollout_correction = config.policy_loss.rollout_correction
+     weight_fn = score_centering_weight_fn(
+         rollout_correction.get("rollout_is", None), rollout_correction.get("rollout_is_threshold", 2.0)
+     )
+-    train_head_log_probs = topk_log_probs_from_logits(student_logits.squeeze(0), topk_ids.squeeze(0))
+-    complete = support_complete.squeeze(0)
++    # Slots outside a recorded support carry -inf and may carry the padding id (-1). They never
++    # contribute to the correction, but the gather still needs an in-range index.
++    safe_ids = torch.where(torch.isfinite(topk_log_probs), topk_ids, torch.zeros_like(topk_ids))
++    ids_for_score = safe_ids.squeeze(0)
++    if sampled_token_ids is not None:
++        ids_for_score = torch.cat([ids_for_score, _flatten_rows(sampled_token_ids).unsqueeze(-1)], dim=-1)
++    log_probs = topk_log_probs_from_logits(
++        student_logits.squeeze(0),
++        ids_for_score,
++        chunk_elems=chunk_elems,
++        process_group=process_group,
++        vocab_size=vocab_size,
++    )
++    train_head_log_probs = log_probs[..., : topk_ids.shape[-1]]
++    sampled_log_probs = log_probs[..., -1] if sampled_token_ids is not None else None
++    complete = support_complete.squeeze(0).bool()
+     correction, log_support_mass, sampler_head_mass, train_head_mass = score_centering_auto_correction(
+         train_head_log_probs, topk_log_probs.squeeze(0), weight_fn, complete
+     )
+     tail_mass = (1 - sampler_head_mass).clamp(min=0)
+-    return {
++    # Tail ratio is the top-k rows' trainer/sampler tail-mass ratio; support rows have no tail.
++    with torch.no_grad():
++        tail_ratio = ((1 - sampler_head_mass).clamp_min(1e-6) / (1 - train_head_mass).clamp_min(1e-6))
++        tail_ratio = torch.where(complete, torch.ones_like(tail_ratio), tail_ratio)
++    outputs = {
+         "sc_correction": correction.unsqueeze(0),
+         "sc_sampler_head_mass": sampler_head_mass.unsqueeze(0),
+         "sc_train_head_mass": train_head_mass.unsqueeze(0),
++        "sc_tail_ratio": tail_ratio.unsqueeze(0),
+         "sc_log_support_mass": log_support_mass.unsqueeze(0),
+         "sc_support_aligned": complete.float().unsqueeze(0),
+         "sc_sampler_tail_mass": tail_mass.unsqueeze(0),
+         "sc_support_unknown": ((~complete) & (tail_mass <= 1e-6)).float().unsqueeze(0),
+     }
+-
++    if sampled_log_probs is not None:
++        outputs["log_probs"] = sampled_log_probs.unsqueeze(0)
++    return outputs
+ 
+ def score_centering_ppo_loss(
+     config: ActorConfig,
+diff --git a/verl/utils/checkpoint/megatron_checkpoint_manager.py b/verl/utils/checkpoint/megatron_checkpoint_manager.py
+index 3c7d487a..916a544b 100644
+--- a/verl/utils/checkpoint/megatron_checkpoint_manager.py
++++ b/verl/utils/checkpoint/megatron_checkpoint_manager.py
+@@ -173,6 +173,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         bridge=None,
+         provider=None,
+         peft_cls=None,
++        use_per_rank_checkpoint: bool = False,
+         **kwargs,
+     ):
+         super().__init__(
+@@ -198,8 +199,12 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         self.provider = provider
+         self.peft_cls = peft_cls
+         self.use_megatron_fsdp = use_megatron_fsdp
++        self.use_per_rank_checkpoint = use_per_rank_checkpoint and not self.use_megatron_fsdp
+         self.rank = torch.distributed.get_rank()
+ 
++        if self.use_per_rank_checkpoint and self.checkpoint_config.async_save:
++            raise ValueError("Per-rank checkpoints do not support asynchronous saves.")
++
+         # ``use_dist_checkpointing`` selects Megatron shards for the ``model``
+         # slot; HF weights always go through ``bridge`` when requested by
+         # ``save_contents`` / ``load_contents``.
+@@ -495,6 +500,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         transformer_config_rel = _rel(get_transformer_config_checkpoint_path(local_path))
+ 
+         contents: dict[str, dict] = {}
++        regular_format = "megatron_per_rank" if self.use_per_rank_checkpoint else "megatron_dist_checkpoint"
++        regular_backend = "torch_save_per_rank" if self.use_per_rank_checkpoint else "dist_checkpointing"
+ 
+         if self.should_save_hf_model:
+             model_entry: dict = {
+@@ -521,33 +528,33 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         if self.should_save_dist_ckpt_model:
+             contents["model"] = {
+                 "path": model_dist_rel,
+-                "format": "megatron_dist_checkpoint",
+-                "backend": "dist_checkpointing",
++                "format": regular_format,
++                "backend": regular_backend,
+             }
+ 
+         if self.should_save_hf_model and self.peft_cls is not None:
+             contents["peft_adapters"] = {
+                 "path": model_dist_rel,
+-                "format": "megatron_dist_checkpoint",
++                "format": regular_format,
+                 "note": "PEFT adapter shards sit next to base-model HF weights, under model/dist_ckpt/.",
+             }
+ 
+         if self.should_save_optimizer:
+             contents["optimizer"] = {
+                 "path": optim_dist_rel,
+-                "format": "megatron_dist_checkpoint",
++                "format": regular_format,
+             }
+             if self.lr_scheduler is not None:
+                 contents["lr_scheduler"] = {
+                     "path": optim_dist_rel,
+-                    "format": "megatron_dist_checkpoint",
++                    "format": regular_format,
+                     "key": "lr_scheduler",
+                 }
+ 
+         if self.should_save_extra:
+             contents["rng_state"] = {
+                 "path": extra_dist_rel,
+-                "format": "megatron_dist_checkpoint",
++                "format": regular_format,
+                 "key": "rng_state",
+             }
+             contents["transformer_config"] = {
+@@ -836,11 +843,22 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+             raise KeyError
+         tensor_parallel.get_cuda_rng_tracker().set_states(rng_states["rng_tracker_states"])
+ 
++    def _per_rank_checkpoint_metadata(self) -> dict:
++        """Return non-topology metadata validated by the per-rank checkpoint backend."""
++        return {
++            "optimizer_mode": "distributed" if self.use_distributed_optimizer else "replicated",
++            "architecture": self.arch,
++        }
++
+     def _load_content_metadata(self, ckpt_dir: str) -> dict:
+         """Fetch MCore's content_metadata for a dist_ckpt dir with a fallback."""
+         load_content_metadata = getattr(dist_checkpointing, "load_content_metadata", None)
+         metadata = None
+-        if load_content_metadata is not None and self._has_checkpoint_files(ckpt_dir):
++        if (
++            not self.use_per_rank_checkpoint
++            and load_content_metadata is not None
++            and self._has_checkpoint_files(ckpt_dir)
++        ):
+             metadata = load_content_metadata(checkpoint_dir=ckpt_dir)
+         if metadata is None:
+             if self.use_distributed_optimizer:
+@@ -849,6 +867,22 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+                 metadata = self._build_sharded_state_dict_metadata()
+         return metadata
+ 
++    def _load_dist_checkpoint(self, sharded_state_dict: dict, ckpt_dir: str) -> dict:
++        """Load one checkpoint content tree through the selected regular Megatron backend."""
++        if not self.use_per_rank_checkpoint:
++            return load_dist_checkpointing(
++                sharded_state_dict=sharded_state_dict,
++                ckpt_dir=ckpt_dir,
++            )
++
++        from psrl.utils.checkpoint import load_megatron_checkpoint
++
++        return load_megatron_checkpoint(
++            sharded_state_dict=sharded_state_dict,
++            ckpt_dir=ckpt_dir,
++            expected_metadata=self._per_rank_checkpoint_metadata(),
++        )
++
+     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
+         """Load a Megatron checkpoint in the v2 split layout.
+ 
+@@ -907,10 +941,13 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         # ── Load model weights ──────────────────────────────────────────────
+         if self.should_load_dist_ckpt_model or (self.should_load_hf_model and self.peft_cls is not None):
+             model_sd = self._maybe_filter_peft_state_dict(dict(model_sharded_state_dict))
+-            loaded_model = load_dist_checkpointing(
+-                sharded_state_dict=model_sd,
+-                ckpt_dir=model_dist_path,
++            log_with_rank(
++                f"Loading model checkpoint from {model_dist_path}",
++                rank=self.rank,
++                logger=logger,
++                log_only_rank_0=True,
+             )
++            loaded_model = self._load_dist_checkpoint(model_sd, model_dist_path)
+             assert "model" in loaded_model or any(
+                 f"model{vpp_rank}" in loaded_model for vpp_rank in range(len(self.model))
+             ), f"Model state dict not found in {loaded_model.keys()}. Please check the checkpoint file {local_path}."
+@@ -935,10 +972,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         # ── Load optimizer / LR scheduler ───────────────────────────────────
+         if self.should_load_optimizer:
+             optim_sd = self._build_optimizer_state_dict(model_sharded_state_dict, metadata, is_loading=True)
+-            loaded_optim = load_dist_checkpointing(
+-                sharded_state_dict=optim_sd,
+-                ckpt_dir=optim_dist_path,
+-            )
++            loaded_optim = self._load_dist_checkpoint(optim_sd, optim_dist_path)
+             assert "optimizer" in loaded_optim, (
+                 f"Optimizer state dict not found in {loaded_optim.keys()}. "
+                 f"Please check the checkpoint file {optim_dist_path}."
+@@ -959,10 +993,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         # ── Load RNG states ─────────────────────────────────────────────────
+         if self.should_load_extra:
+             extra_sd = self._build_extra_state_dict()
+-            loaded_extra = load_dist_checkpointing(
+-                sharded_state_dict=extra_sd,
+-                ckpt_dir=extra_dist_path,
+-            )
++            loaded_extra = self._load_dist_checkpoint(extra_sd, extra_dist_path)
+             assert "rng_state" in loaded_extra, (
+                 f"RNG state dict not found in {loaded_extra.keys()}. "
+                 f"Please check the checkpoint file {extra_dist_path}."
+@@ -1034,29 +1065,50 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+             )
+ 
+     def _save_dist_checkpoint(self, dist_checkpoint_path: str, state_dict: dict):
+-        """Persist ``state_dict`` via Megatron dist_checkpointing.
++        """Persist ``state_dict`` through DCP or the synchronous per-rank backend.
+ 
+-        Writes one self-contained ``torch_dist`` directory under
+-        ``dist_checkpoint_path``.  Callers compose the exact state dict to go
+-        into this directory; in the v2 layout there are up to three such
+-        directories per checkpoint (``model/dist_ckpt/``,
+-        ``optimizer/dist_ckpt/``, ``extra/dist_ckpt/``).
++        Callers compose the exact state dict written under ``dist_checkpoint_path``.
++        The v2 layout has up to three independent trees per checkpoint
++        (``model/dist_ckpt/``, ``optimizer/dist_ckpt/``, ``extra/dist_ckpt/``).
+ 
+         Returns the async save request when ``async_save`` is enabled, or
+         ``None`` for synchronous saves.
+         """
+         sharded_sd_metadata = self._build_sharded_state_dict_metadata()
+ 
+-        async_save_request = save_dist_checkpointing(
+-            sharded_state_dict=state_dict,
+-            ckpt_path=dist_checkpoint_path,
+-            async_save=self.checkpoint_config.async_save,
+-            content_metadata=sharded_sd_metadata,
+-        )
++        if self.use_per_rank_checkpoint:
++            from psrl.utils.checkpoint import save_megatron_checkpoint
++            log_with_rank(
++                f"Using PSRL per-rank checkpoint save (UCX-safe) to {dist_checkpoint_path}",
++                rank=self.rank,
++                logger=logger,
++                log_only_rank_0=True,
++            )
++            save_megatron_checkpoint(
++                sharded_state_dict=state_dict,
++                ckpt_path=dist_checkpoint_path,
++                async_save=False,
++                metadata=self._per_rank_checkpoint_metadata(),
++            )
++            async_save_request = None
++        else:
++            log_with_rank(
++                f"Using DCP save to {dist_checkpoint_path}",
++                rank=self.rank,
++                logger=logger,
++                log_only_rank_0=True,
++            )
++            async_save_request = save_dist_checkpointing(
++                sharded_state_dict=state_dict,
++                ckpt_path=dist_checkpoint_path,
++                async_save=self.checkpoint_config.async_save,
++                content_metadata=sharded_sd_metadata,
++            )
+ 
+-        if not self.checkpoint_config.async_save:
+-            assert async_save_request is None, "Async save request should be None when not using async save."
+-            torch.distributed.barrier()
++            # Synchronize all async save requests
++            if not self.checkpoint_config.async_save:
++                assert async_save_request is None, "Async save request should be None when not using async save."
++                torch.distributed.barrier()
+ 
+         return async_save_request
+ 
+@@ -1141,10 +1193,18 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         """
+         if self.checkpoint_config.async_save and async_requests:
+             async_requests[-1].add_finalize_fn(finalize_save_fn)
+-            from megatron.core.dist_checkpointing.strategies.base import async_calls
+-
++            from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
++
++            # AsyncCallsQueue is a per-instance queue; create it once per save batch and
++            # schedule all requests through it.  persistent=True means the worker process
++            # was already spawned (not forked), so it does not inherit the parent's UCX /
++            # NIXL context — safe to run alongside the NIXL progress thread.
++            queue = AsyncCallsQueue(persistent=True)
++            queue.warmup_persistent_caller(torch.distributed.get_rank())
+             for req in async_requests:
+-                async_calls.schedule_async_request(req)
++                queue.schedule_async_request(req)
++            queue.maybe_finalize_async_calls(blocking=True)
++            queue.close()
+         else:
+             finalize_save_fn()
+ 
+diff --git a/verl/utils/config.py b/verl/utils/config.py
+index 83ca7e72..7bf3e30d 100644
+--- a/verl/utils/config.py
++++ b/verl/utils/config.py
+@@ -86,39 +86,48 @@ def _validate_router_replay_config(actor_config: Any, rollout_correction: Any) -
+ 
+ 
+ def _validate_score_centering_config(config: DictConfig) -> None:
+-    algorithm_rc = config.algorithm.get("rollout_correction") or {}
+-    actor_rc = config.actor_rollout_ref.actor.policy_loss.get("rollout_correction") or {}
++    # PSRL mounts its rollout/actor groups under gen_actor_rollout_ref / train_actor_rollout_ref and
++    # runs its own trainer on both FSDP and Megatron, so the upstream v1 + FSDP-only restriction is
++    # enforced only when the stock actor_rollout_ref group is present.
++    actor_cfg = config.get("actor_rollout_ref")
++    algorithm_rc = (config.get("algorithm") or {}).get("rollout_correction") or {}
++    actor_rc = (actor_cfg.actor.policy_loss.get("rollout_correction") or {}) if actor_cfg is not None else {}
+     if not (algorithm_rc.get("score_centering", False) or actor_rc.get("score_centering", False)):
+         return
+-    if not (algorithm_rc.get("score_centering", False) and actor_rc.get("score_centering", False)):
+-        raise ValueError(
+-            "score centering must be enabled on both algorithm.rollout_correction and "
+-            "actor_rollout_ref.actor.policy_loss.rollout_correction."
+-        )
+     from verl.trainer.config.algorithm import RolloutCorrectionConfig
+ 
+-    # the actor-side mirror is a plain mapping, so run the dataclass checks on it here
+-    RolloutCorrectionConfig(**actor_rc)
+-    for key in ("bypass_mode", "loss_type", "rollout_is", "rollout_is_threshold"):
+-        if actor_rc.get(key) != algorithm_rc.get(key):
++    # The algorithm-level rollout_correction must itself satisfy the score-centering contract
++    # (bypass_mode=True, loss_type="reinforce", rollout_is None/"token", no batch normalize). It may
++    # be a plain mapping with no actor mirror, so validate it directly rather than only via the actor.
++    RolloutCorrectionConfig(**algorithm_rc)
++    if actor_cfg is not None:
++        if not (algorithm_rc.get("score_centering", False) and actor_rc.get("score_centering", False)):
+             raise ValueError(
+-                f"score centering requires actor_rollout_ref.actor.policy_loss.rollout_correction.{key} to match "
+-                f"algorithm.rollout_correction.{key}."
++                "score centering must be enabled on both algorithm.rollout_correction and "
++                "actor_rollout_ref.actor.policy_loss.rollout_correction."
+             )
+-    if not config.trainer.get("use_v1", True):
+-        raise ValueError("score centering requires the v1 trainer (trainer.use_v1=True).")
+-    if config.actor_rollout_ref.actor.get("strategy") not in ("fsdp", "fsdp2"):
+-        raise ValueError("score centering requires actor_rollout_ref.actor.strategy=fsdp or fsdp2.")
+-    if config.actor_rollout_ref.rollout.get("name") != "vllm":
+-        raise ValueError("score centering requires actor_rollout_ref.rollout.name=vllm.")
+-    if not config.actor_rollout_ref.rollout.get("topk_log_probs", 0):
+-        raise ValueError("score centering requires actor_rollout_ref.rollout.topk_log_probs > 0.")
+-    if config.actor_rollout_ref.rollout.get("temperature", 1.0) <= 0:
+-        raise ValueError("score centering requires stochastic training rollouts with temperature > 0.")
++        # the actor-side mirror is a plain mapping, so run the dataclass checks on it here
++        RolloutCorrectionConfig(**actor_rc)
++        for key in ("bypass_mode", "loss_type", "rollout_is", "rollout_is_threshold"):
++            if actor_rc.get(key) != algorithm_rc.get(key):
++                raise ValueError(
++                    f"score centering requires actor_rollout_ref.actor.policy_loss.rollout_correction.{key} to match "
++                    f"algorithm.rollout_correction.{key}."
++                )
++        strategy = actor_cfg.actor.get("strategy")
++        if strategy is not None and strategy not in ("fsdp", "fsdp2", "megatron"):
++            raise ValueError("score centering requires actor strategy fsdp, fsdp2 or megatron.")
++        if strategy in ("fsdp", "fsdp2") and not config.trainer.get("use_v1", True):
++            raise ValueError("score centering requires the v1 trainer (trainer.use_v1=True) for FSDP.")
++        if actor_cfg.rollout.get("name") != "vllm":
++            raise ValueError("score centering requires actor_rollout_ref.rollout.name=vllm.")
++        if not actor_cfg.rollout.get("topk_log_probs", 0):
++            raise ValueError("score centering requires actor_rollout_ref.rollout.topk_log_probs > 0.")
++        if actor_cfg.rollout.get("temperature", 1.0) <= 0:
++            raise ValueError("score centering requires stochastic training rollouts with temperature > 0.")
+     if (config.get("distillation") or {}).get("enabled", False):
+         raise ValueError("score centering cannot be combined with distillation.")
+ 
+-
+ def validate_config(
+     config: DictConfig,
+     use_reference_policy: bool,
+diff --git a/verl/utils/dataset/rl_dataset.py b/verl/utils/dataset/rl_dataset.py
+index aad0655b..4b9fbb10 100644
+--- a/verl/utils/dataset/rl_dataset.py
++++ b/verl/utils/dataset/rl_dataset.py
+@@ -27,7 +27,7 @@ from typing import Any, Optional
+ import datasets
+ import numpy as np
+ import torch
+-from omegaconf import DictConfig, ListConfig
++from omegaconf import DictConfig, ListConfig, OmegaConf
+ from PIL import Image
+ from torch.utils.data import Dataset
+ from transformers import PreTrainedTokenizer, ProcessorMixin
+@@ -120,6 +120,21 @@ class RLHFDataset(Dataset):
+         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+         self.mm_processor_kwargs = config.get("mm_processor_kwargs", {})
+ 
++        self.data_source_name = config.get("data_source_name", data_files[0])
++        default_reward_model_dict = {
++            "reward_loop_type": "naive",
++            "reward_fn": "default",
++            "reward_model_name": "null",
++            "reward_coef": 1.0,
++        }
++        if config.get("reward_model_dicts", None):
++            self.reward_model_dicts = OmegaConf.to_container(
++                config.get("reward_model_dicts", [default_reward_model_dict]),
++                resolve=True,
++            )
++        else:
++            self.reward_model_dicts = None
++
+         # Mirror AgentLoopWorker's tool loading so length filtering sees the
+         # same schemas the rollout will.
+         self.tool_config_path = config.get("tool_config_path", None)
+@@ -283,6 +298,17 @@ class RLHFDataset(Dataset):
+         else:
+             print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
+ 
++    def over_sample_dataset(self, over_sample_ratio: float = 1.0):
++        assert over_sample_ratio >= 1.0, "over_sample_ratio must be >= 1.0"
++
++        total = len(self.dataframe)
++        target_size = int(np.ceil(total * over_sample_ratio))
++        repeat_times = int(np.ceil(over_sample_ratio))
++        indices = np.tile(np.arange(total), repeat_times)[:target_size]
++
++        self.dataframe = self.dataframe.select(indices.tolist())
++        print(f"over sampled dataset len: {len(self.dataframe)}")
++
+     def __getstate__(self):
+         if not self.serialize_dataset:
+             state = self.__dict__.copy()
+@@ -407,6 +433,13 @@ class RLHFDataset(Dataset):
+             logger.warning("tools_kwargs is empty for index %s, data source: %s", index, row_dict["data_source"])
+         row_dict["index"] = index
+         row_dict["tools_kwargs"] = tools_kwargs
++        # add reward loop type and reward fn
++        row_dict["reward_model_dicts"] = self.reward_model_dicts
++
++        data_source = row_dict.get("data_source", None)
++        if data_source is None:
++            data_source = self.data_source_name
++        row_dict["data_source"] = data_source
+         row_dict["interaction_kwargs"] = interaction_kwargs
+         return row_dict
+ 
+diff --git a/verl/utils/experimental/torch_functional.py b/verl/utils/experimental/torch_functional.py
+index 9a8778c1..21f63e08 100644
+--- a/verl/utils/experimental/torch_functional.py
++++ b/verl/utils/experimental/torch_functional.py
+@@ -47,8 +47,17 @@ def _fused_linear_for_ppo_fwd(
+     entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
+ 
+     if _FLASH_ATTN_CROSS_ENTROPY_AVAILABLE:
+-        per_token_entropy_loss = cross_entropy_loss(logits, input_ids)[0]
+-        token_log_probs = -per_token_entropy_loss
++        # flash-attn's Triton kernel derives `n_rows, n_cols = logits.shape` and asserts
++        # `labels.shape == (n_rows,)`, so it accepts only 2D logits with 1D labels while
++        # `hidden_states` here are batched. Flatten for the kernel and restore the caller's shape.
++        flat_logits = logits.reshape(-1, logits.shape[-1])
++        flat_labels = input_ids.reshape(-1)
++        assert flat_logits.shape[0] == flat_labels.shape[0], (
++            f"token count mismatch: {flat_logits.shape[0]} logits rows vs "
++            f"{flat_labels.shape[0]} labels; Ulysses SP slices labels but not VLM hidden states"
++        )
++        per_token_entropy_loss = cross_entropy_loss(flat_logits, flat_labels)[0]
++        token_log_probs = -per_token_entropy_loss.view(input_ids.shape)
+     else:
+         # Fallback to original PyTorch implementation
+         log_probs = logits.log_softmax(dim=-1)
+diff --git a/verl/utils/megatron/dist_checkpointing.py b/verl/utils/megatron/dist_checkpointing.py
+index 98c0e546..e0c9bbe1 100644
+--- a/verl/utils/megatron/dist_checkpointing.py
++++ b/verl/utils/megatron/dist_checkpointing.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import megatron.core
++import queue
+ import torch
+ from megatron.core import dist_checkpointing, mpu
+ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+@@ -25,6 +26,51 @@ from megatron.core.dist_checkpointing.strategies.torch import (
+ )
+ from packaging import version
+ 
++# ---------------------------------------------------------------------------
++# NCCL no-fork patch for DCP async save
++#
++# DCP's FileSystemWriterAsync.write_preloaded_data_multiproc forks child
++# processes via mp.get_context("fork"). Forked children inherit NCCL
++# communicators; when the child exits, ncclCommAbort runs and corrupts the
++# parent's NCCL state, eventually causing a 600-second timeout and SIGABRT.
++#
++# The fix: replace the multiproc entry-point with a sequential in-process
++# version that uses stdlib queue.SimpleQueue instead of forking.
++# ---------------------------------------------------------------------------
++from megatron.core.dist_checkpointing.strategies import filesystem_async as _fsa
++
++_orig_write_preloaded_data = _fsa.FileSystemWriterAsync.write_preloaded_data
++
++
++def _write_preloaded_data_multiproc_nofork(transform_list, use_msc, rank, write_buckets, global_results_queue):
++    """Sequential no-fork replacement for FileSystemWriterAsync.write_preloaded_data_multiproc.
++
++    Processes write buckets one at a time in the current process to avoid
++    forking NCCL communicators which causes ncclCommAbort corruption.
++    """
++    write_results = {}
++    for i, write_bucket in enumerate(write_buckets):
++        results_q = queue.SimpleQueue()
++        count_q = queue.Queue()
++        count_q.put(i)
++        kwargs = {
++            "local_proc_idx": i,
++            "write_bucket": write_bucket,
++            "results_queue": results_q,
++            "count_queue": count_q,
++            "use_fsync": True,
++        }
++        if use_msc:
++            kwargs["use_msc"] = use_msc
++        _orig_write_preloaded_data(transform_list, **kwargs)
++        local_proc_idx, local_results_or_exc = results_q.get()
++        if isinstance(local_results_or_exc, Exception):
++            raise local_results_or_exc
++        write_results[local_proc_idx] = local_results_or_exc
++    global_results_queue.put(write_results)
++
++
++_fsa.FileSystemWriterAsync.write_preloaded_data_multiproc = staticmethod(_write_preloaded_data_multiproc_nofork)
+ 
+ def save_dist_checkpointing(
+     sharded_state_dict,
+@@ -44,9 +90,15 @@ def save_dist_checkpointing(
+     # Save model sharded state dicts
+     save_kwargs = dict(
+         sharded_strategy=save_strategy,
+-        async_sharded_save=async_save,
+         validate_access_integrity=validate_sharding_integrity,
+     )
++    if async_save:
++        # Use nvrx async strategy: persistent=True worker is spawn-based and does not
++        # inherit the parent's UCX / NIXL context, so it is safe alongside the NIXL
++        # progress thread.  The mcore "fork"-based async_sharded_save path is not safe.
++        save_kwargs["async_strategy"] = "nvrx"
++    else:
++        save_kwargs["async_sharded_save"] = False
+     if content_metadata is not None:
+         if mcore_ge_014:
+             save_kwargs["content_metadata"] = content_metadata
+diff --git a/verl/utils/tokenizer/tokenizer.py b/verl/utils/tokenizer/tokenizer.py
+index 65f528bb..2ce27eb2 100644
+--- a/verl/utils/tokenizer/tokenizer.py
++++ b/verl/utils/tokenizer/tokenizer.py
+@@ -13,7 +13,7 @@
+ # limitations under the License.
+ """Utils for tokenization."""
+ 
+-import types
++import functools
+ import warnings
+ 
+ __all__ = [
+@@ -236,9 +236,9 @@ def hf_processor(name_or_path, **kwargs):
+                 raise ValueError(f"Unsupported processor type: {processor.__class__.__name__}")
+ 
+         if model_class is not None:
+-            processor.get_rope_index = types.MethodType(model_class.get_rope_index, processor)
++            processor.get_rope_index = functools.partial(model_class.get_rope_index, processor)
+             if hasattr(model_class, "get_vision_position_ids"):
+-                processor.get_vision_position_ids = types.MethodType(model_class.get_vision_position_ids, processor)
++                processor.get_vision_position_ids = functools.partial(model_class.get_vision_position_ids, processor)
+     except Exception as e:
+         processor = None
+         # TODO(haibin.lin): try-catch should be removed after adding transformer version req to setup.py to avoid
+diff --git a/verl/workers/config/actor.py b/verl/workers/config/actor.py
+index 731b26c2..9e781f41 100644
+--- a/verl/workers/config/actor.py
++++ b/verl/workers/config/actor.py
+@@ -214,6 +214,7 @@ class ActorConfig(BaseConfig):
+             "seq-mean-token-sum",
+             "seq-mean-token-mean",
+             "seq-mean-token-sum-norm",
++            "session-mean-token-mean",
+         ]
+         if self.loss_agg_mode not in valid_loss_agg_modes:
+             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+index 00cea677..420a893c 100644
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -110,10 +110,16 @@ class EngineConfig(BaseConfig):
+     use_remove_padding: bool = True
+ 
+     seed: int = 42
++    load_weight: bool = True
+ 
+     full_determinism: bool = False
+     router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
+ 
++    # Score-centering head computation: fp32 workspace budget per chunk, in elements. The row count
++    # is derived from the local vocabulary size, so one value works for any vocab. Applies to FSDP
++    # and Megatron.
++    score_centering_chunk_elems: int = 64 * 1024 * 1024
++
+     def __post_init__(self):
+         pass
+         # TODO: turn on this check after we reorg config
+@@ -199,6 +205,7 @@ class McoreEngineConfig(EngineConfig):
+     pad_to_length: bool = False
+     pad_to_length_bucket: int = 512
+     use_dist_checkpointing: bool = False
++    use_per_rank_checkpoint: bool = False
+     dist_checkpointing_path: Optional[str] = None
+     dist_checkpointing_prefix: str = ""
+     dist_ckpt_optim_fully_reshardable: bool = False
+diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
+index 4bfef74d..e200e063 100644
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -260,6 +260,10 @@ class RolloutConfig(BaseConfig):
+     # Sampler top-k log-probs per generated token and support-recording budget for score centering; 0 disables.
+     topk_log_probs: int = 0
+ 
++    # Sampler support replay for score centering: the captured head is the sampler's complete
++    # truncated support (top_p<1 / top_k>0), scored exactly with no tail model.
++    sampler_support: bool = False
++
+     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
+ 
+     trace: TraceConfig = field(default_factory=TraceConfig)
+@@ -397,5 +401,13 @@ class RolloutConfig(BaseConfig):
+                     UserWarning,
+                     stacklevel=2,
+                 )
++            if not self.sampler_support and (self.top_p != 1.0 or self.top_k != -1):
++                warnings.warn(
++                    "rollout.topk_log_probs with truncated sampling and sampler_support=False records the "
++                    "sampler's top-k head, which does not prove complete support; score centering falls "
++                    "back to the trainer-tail approximation for those rows.",
++                    UserWarning,
++                    stacklevel=2,
++                )
+             vllm_kwargs = self.engine_kwargs.setdefault("vllm", {})
+             vllm_kwargs["max_logprobs"] = max(vllm_kwargs.get("max_logprobs", 0), self.topk_log_probs)
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index fa5d3e89..dc769e66 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -29,6 +29,7 @@ from tensordict import TensorDict
+ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+ from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+ from torch.distributed.tensor import DTensor
++from tqdm import tqdm
+ 
+ import verl.utils.torch_functional as verl_F
+ from verl.models.transformers.monkey_patch import apply_monkey_patch
+@@ -83,6 +84,13 @@ from ..utils import (
+ )
+ from .utils import create_device_mesh, get_sharding_strategy, unfuse_moe_params
+ 
++USE_TMS = False
++if os.environ.get("PSRL_TMS_ENABLE", "0") == "1":
++    USE_TMS = True
++    from torch_memory_saver import torch_memory_saver
++else:
++    torch_memory_saver = None
++
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+@@ -277,12 +285,19 @@ class FSDPEngine(BaseEngine):
+             if self.model_config.model_type == "language_model":
+                 auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
+ 
+-                module = auto_class.from_pretrained(
+-                    pretrained_model_name_or_path=self.model_config.local_path,
+-                    torch_dtype=torch_dtype,
+-                    config=self.model_config.hf_config,
+-                    trust_remote_code=self.model_config.trust_remote_code,
+-                )
++                if self.engine_config.load_weight:
++                    module = auto_class.from_pretrained(
++                        pretrained_model_name_or_path=self.model_config.local_path,
++                        torch_dtype=torch_dtype,
++                        config=self.model_config.hf_config,
++                        trust_remote_code=self.model_config.trust_remote_code,
++                    )
++                else:
++                    module = auto_class.from_config(
++                        self.model_config.hf_config,
++                        torch_dtype=torch_dtype,
++                        trust_remote_code=self.model_config.trust_remote_code,
++                    )
+ 
+                 # Strip sub-modules listed in _verl_strip_modules (e.g.
+                 # talker / code2wav for Qwen3-Omni Thinker-only training).
+@@ -301,12 +316,20 @@ class FSDPEngine(BaseEngine):
+                 self.model_config.hf_config.classifier_dropout = 0.0
+                 self.model_config.hf_config.hidden_dropout = "0"
+                 self.model_config.hf_config.summary_dropout_prob = 0.0
+-                module = load_valuehead_model(
+-                    local_path=self.model_config.local_path,
+-                    torch_dtype=torch_dtype,
+-                    model_config=self.model_config.hf_config,
+-                    trust_remote_code=self.model_config.trust_remote_code,
+-                )
++                if self.engine_config.load_weight:
++                    module = load_valuehead_model(
++                        local_path=self.model_config.local_path,
++                        torch_dtype=torch_dtype,
++                        model_config=self.model_config.hf_config,
++                        trust_remote_code=self.model_config.trust_remote_code,
++                    )
++                else:
++                    from transformers import AutoModelForTokenClassification
++
++                    module = AutoModelForTokenClassification.from_config(
++                        self.model_config.hf_config,
++                        torch_dtype=torch_dtype,
++                    )
+ 
+             use_liger = self.model_config.use_liger
+             # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
+@@ -592,36 +615,40 @@ class FSDPEngine(BaseEngine):
+     def _build_model_optimizer(self):
+         from verl.utils.model import print_model_size
+ 
+-        # Load base model with specified configuration and dtype
+-        module = self._build_module()
+-        try:
+-            self.pass_packed_cu_seqlens = "cu_seqlens" in signature(module.forward).parameters
+-        except (TypeError, ValueError):
+-            self.pass_packed_cu_seqlens = False
+-        # Apply LoRA adapters if low-rank adaptation is enabled
+-        if self._is_lora:
+-            module = self._build_lora_module(module)
+-
+-        # Apply QAT before FSDP wrapping (training only)
+-        if self._qat_enabled and not self.engine_config.forward_only:
+-            module = self._apply_qat(module)
+-
+-        # Synchronize all distributed processes before proceeding
+-        torch.distributed.barrier()
+-        if self.rank == 0:
+-            print_model_size(module)
+-        log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
+-
+-        # Wrap model with FSDP for distributed training (sharding, mixed precision, etc.)
+-        log_gpu_memory_usage("Before FSDP", logger=None)
+-        module = self._build_fsdp_module(module)
+-        log_gpu_memory_usage("After FSDP", logger=None)
++        tms_weight_ctx = torch_memory_saver.region() if USE_TMS else nullcontext()
++        with tms_weight_ctx:
++            # Load base model with specified configuration and dtype
++            module = self._build_module()
++            try:
++                self.pass_packed_cu_seqlens = "cu_seqlens" in signature(module.forward).parameters
++            except (TypeError, ValueError):
++                self.pass_packed_cu_seqlens = False
++            # Apply LoRA adapters if low-rank adaptation is enabled
++            if self._is_lora:
++                module = self._build_lora_module(module)
++
++            # Apply QAT before FSDP wrapping (training only)
++            if self._qat_enabled and not self.engine_config.forward_only:
++                module = self._apply_qat(module)
++
++            # Synchronize all distributed processes before proceeding
++            torch.distributed.barrier()
++            if self.rank == 0:
++                print_model_size(module)
++            log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
++
++            # Wrap model with FSDP for distributed training (sharding, mixed precision, etc.)
++            log_gpu_memory_usage("Before FSDP", logger=None)
++            module = self._build_fsdp_module(module)
++            log_gpu_memory_usage("After FSDP", logger=None)
+ 
+         if not self.engine_config.forward_only:
+-            # Initialize optimizer with model parameters and config settings
+-            optimizer = self._build_optimizer(module)
+-            # Create learning rate scheduler with warmup and decay settings
+-            lr_scheduler = self._build_lr_scheduler(optimizer)
++            tms_optim_ctx = torch_memory_saver.region(enable_cpu_backup=True) if USE_TMS else nullcontext()
++            with tms_optim_ctx:
++                # Initialize optimizer with model parameters and config settings
++                optimizer = self._build_optimizer(module)
++                # Create learning rate scheduler with warmup and decay settings
++                lr_scheduler = self._build_lr_scheduler(optimizer)
+         else:
+             optimizer = None
+             lr_scheduler = None
+@@ -750,7 +777,21 @@ class FSDPEngine(BaseEngine):
+         # and _build_fsdp_module, so self.scaler may not be set.
+         scaler = getattr(self, "scaler", None)
+ 
+-        for micro_batch_idx, micro_batch in enumerate(micro_batches):
++        # Micro-batch progress, rank 0 only so the training workers do not interleave. This loop is
++        # where a step spends most of its time, and without progress a slow step is
++        # indistinguishable from a hung one.
++        micro_batch_iter = enumerate(micro_batches)
++        if getattr(self, "rank", -1) == 0:
++            phase = "recompute log_prob" if forward_only else "actor training"
++            step = tu.get(data, "global_steps", None)
++            if isinstance(step, (list, tuple)):
++                step = step[0] if step else None
++            desc = f"step {step} | {phase}" if step is not None else phase
++            micro_batch_iter = enumerate(
++                tqdm(micro_batches, desc=desc, total=len(micro_batches), dynamic_ncols=True, leave=False)
++            )
++
++        for micro_batch_idx, micro_batch in micro_batch_iter:
+             sync_ctx = (
+                 nullcontext()
+                 if forward_only
+@@ -1427,18 +1468,38 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                         )
+ 
+                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
++                log_probs = None
+                 if distillation_use_topk or score_centering:
+-                    outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
++                    processor_kwargs = {"student_logits": logits_rmpad.unsqueeze(0), "data": micro_batch}
++                    if score_centering:
++                        engine_config = getattr(self, "engine_config", None)
++                        processor_kwargs["chunk_elems"] = getattr(engine_config, "score_centering_chunk_elems", None)
++                        # Share the head scoring with the sampled-token score so the cross entropy is
++                        # not computed twice over the same full-vocabulary forward.
++                        processor_kwargs["sampled_token_ids"] = input_ids_rmpad_rolled
++                    outputs = logits_processor_func(**processor_kwargs)
+                     cu_seqlens = input_ids.offsets()
+-                    for k, v in outputs.items():
+-                        v = v.squeeze(0)
+-                        assert v.shape == (logits_rmpad.shape[0],), (
+-                            f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
+-                        )
+-                        v = self._gather_and_unpad_packed(v, output_args["pad_size"])
+-                        model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
++                    if score_centering:
++                        # The shared path returns the sampled log-probs so the engine can skip its own
++                        # cross entropy; the remaining fields are per-token scalars gathered together.
++                        log_probs = outputs.pop("log_probs", None)
++                        if log_probs is not None:
++                            log_probs = log_probs.squeeze(0)
++                        names = list(outputs.keys())
++                        packed = torch.stack([outputs[name].squeeze(0) for name in names], dim=1)
++                        packed = self._gather_and_unpad_packed(packed, output_args["pad_size"])
++                        for index, name in enumerate(names):
++                            model_output[name] = torch.nested.nested_tensor_from_jagged(packed[:, index], cu_seqlens)
++                    else:
++                        for k, v in outputs.items():
++                            v = v.squeeze(0)
++                            assert v.shape == (logits_rmpad.shape[0],), (
++                                f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
++                            )
++                            v = self._gather_and_unpad_packed(v, output_args["pad_size"])
++                            model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+ 
+-                if not distillation_only:
++                if not distillation_only and log_probs is None:
+                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                     # entropy and the score centering hook reuse the logits in their backward
+                     inplace_backward = not (calculate_entropy or score_centering)
+@@ -1525,8 +1586,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                     # (log_probs is also not gathered) and pad_size is only
+                     # populated in output_args along the use_remove_padding=True
+                     # path of prepare_model_inputs.
++                    log_probs = None
+                     if distillation_use_topk or score_centering:
+-                        outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
++                        processor_kwargs = {"student_logits": logits_rmpad.unsqueeze(0), "data": micro_batch}
++                        if score_centering:
++                            engine_config = getattr(self, "engine_config", None)
++                            processor_kwargs["chunk_elems"] = getattr(engine_config, "score_centering_chunk_elems", None)
++                            processor_kwargs["sampled_token_ids"] = input_ids_rmpad_rolled
++                        outputs = logits_processor_func(**processor_kwargs)
++                        log_probs = None
++                        if score_centering:
++                            log_probs = outputs.pop("log_probs", None)
++                            if log_probs is not None:
++                                log_probs = log_probs.squeeze(0)
+                         for k, v in outputs.items():
+                             v = v.squeeze(0)
+                             assert v.shape == (logits_rmpad.shape[0],), (
+@@ -1534,8 +1606,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                             )
+                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+ 
+-                    log_probs = None
+-                    if not distillation_only:
++                    if not distillation_only and log_probs is None:
+                         log_probs = logprobs_from_logits(
+                             logits=logits_rmpad,
+                             labels=input_ids_rmpad_rolled,
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index d473ce66..f47d208a 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -15,6 +15,7 @@
+ import inspect
+ import logging
+ import os
++from contextlib import nullcontext
+ from functools import partial
+ from typing import Any, Callable, ContextManager, Iterator
+ 
+@@ -25,6 +26,7 @@ from megatron.core.package_info import __version__
+ from megatron.core.pipeline_parallel import get_forward_backward_func
+ from omegaconf import OmegaConf
+ from tensordict import TensorDict
++from tqdm import tqdm
+ 
+ import verl.utils.torch_functional as verl_F
+ from verl.trainer.config import CheckpointConfig
+@@ -82,6 +84,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
+ from ..utils import detach_tree, postprocess_batch_func, prepare_micro_batches
+ from .utils import set_random_seed
+ 
++USE_TMS = False
++if os.environ.get("PSRL_TMS_ENABLE", "0") == "1":
++    USE_TMS = True
++    from torch_memory_saver import torch_memory_saver
++else:
++    torch_memory_saver = None
++
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+@@ -456,15 +465,21 @@ class MegatronEngine(BaseEngine):
+         self.tf_config = updated_tf_config
+         print(f"module: {len(module)}")
+ 
+-        if self.engine_config.use_dist_checkpointing:
+-            load_mcore_dist_weights(
+-                module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
+-            )
+-        else:
+-            allowed_mismatched_params = ["output_layer.weight"] if self.is_value_model else []
+-            self.bridge.load_hf_weights(
+-                module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
+-            )
++        if self.engine_config.load_weight:
++            if self.engine_config.use_dist_checkpointing:
++                load_mcore_dist_weights(
++                    module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
++                )
++            else:
++                if self.vanilla_bridge:
++                    self.bridge.load_weights(module, self.model_config.local_path)
++                else:
++                    allowed_mismatched_params = []
++                    if self.is_value_model:
++                        allowed_mismatched_params = ["output_layer.weight"]
++                    self.bridge.load_hf_weights(
++                        module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
++                    )
+ 
+         if torch.distributed.get_rank() == 0:
+             print_model_size(module[0])
+@@ -531,85 +546,90 @@ class MegatronEngine(BaseEngine):
+     def initialize(self):
+         self._hf_export_tasks = None
+         self._build_tf_config()
+-        _check_dcp_unsupported_features(self.engine_config, self.model_config, tf_config=self.tf_config)
++        tms_weight_ctx = torch_memory_saver.region() if USE_TMS else nullcontext()
++        with tms_weight_ctx:
++            _check_dcp_unsupported_features(self.engine_config, self.model_config, tf_config=self.tf_config)
+ 
+-        self.module = self._build_megatron_module()
++            self.module = self._build_megatron_module()
+ 
+-        if self._qat_enabled and not self.engine_config.forward_only:
+-            from verl.utils.qat.modelopt import apply_qat_to_modules
++            if self._qat_enabled and not self.engine_config.forward_only:
++                from verl.utils.qat.modelopt import apply_qat_to_modules
+ 
+-            self.module = apply_qat_to_modules(self.module, self._qat_config)
++                self.module = apply_qat_to_modules(self.module, self._qat_config)
+ 
+-        self._maybe_enable_fused_kernels()
++            self._maybe_enable_fused_kernels()
+ 
+-        if self.model_config.mtp.enable:
+-            patch_engine_mtp(self.module, self.model_config)
+-        elif (
+-            self.engine_config.forward_only
+-            and self.engine_config.override_transformer_config.get("mtp_num_layers") == 0
+-        ):
+-            from verl.models.mcore.mtp_patch import patch_postprocess
+-
+-            for model in self.module:
+-                patch_postprocess(model)
++            if self.model_config.mtp.enable:
++                patch_engine_mtp(self.module, self.model_config)
++            elif (
++                self.engine_config.forward_only
++                and self.engine_config.override_transformer_config.get("mtp_num_layers") == 0
++            ):
++                from verl.models.mcore.mtp_patch import patch_postprocess
+ 
+-        # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
+-        if self.engine_config.forward_only:
+-            self.optimizer = None
+-            self.lr_scheduler = None
+-            self.to(device="cpu", model=self._is_offload_param, optimizer=False, grad=False)
+-            log_gpu_memory_usage("After offload model during init (forward_only)", logger=logger)
+-            return
++                for model in self.module:
++                    patch_postprocess(model)
+ 
+-        self.optimizer = self._build_optimizer()
+-        self.lr_scheduler = self._build_lr_scheduler()
++            # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
++            if self.engine_config.forward_only:
++                self.optimizer = None
++                self.lr_scheduler = None
++                self.to(device="cpu", model=self._is_offload_param, optimizer=False, grad=False)
++                log_gpu_memory_usage("After offload model during init (forward_only)", logger=logger)
++                return
+ 
+-        full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
+-        mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
++        tms_optim_ctx = torch_memory_saver.region(enable_cpu_backup=True) if USE_TMS else nullcontext()
++        with tms_optim_ctx:
++            self.optimizer = self._build_optimizer()
++            self.lr_scheduler = self._build_lr_scheduler()
+ 
+-        tmp_config = OmegaConf.create(
+-            {
+-                "model": {"path": self.model_config.local_path},
+-                "megatron": {
+-                    "dist_ckpt_optim_fully_reshardable": full_reshardable,
+-                    "distrib_optim_fully_reshardable_mem_efficient": mem_eff,
+-                },
+-            }
+-        )
++            full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
++            mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
+ 
+-        role = "actor" if not self.is_value_model else "critic"
++            tmp_config = OmegaConf.create(
++                {
++                    "model": {"path": self.model_config.local_path},
++                    "megatron": {
++                        "dist_ckpt_optim_fully_reshardable": full_reshardable,
++                        "distrib_optim_fully_reshardable_mem_efficient": mem_eff,
++                    },
++                }
++            )
+ 
+-        self.checkpoint_mananager = MegatronCheckpointManager(
+-            config=tmp_config,
+-            checkpoint_config=self.checkpoint_config,
+-            model_config=self.model_config.hf_config,
+-            transformer_config=self.tf_config,
+-            role=role,
+-            model=self.module,
+-            arch=self.model_config.architectures[0],
+-            hf_config=self.model_config.hf_config,
+-            param_dtype=self.param_dtype,
+-            share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
+-            processing_class=self.model_config.get_processor(),
+-            optimizer=self.optimizer,
+-            optimizer_scheduler=self.lr_scheduler,
+-            use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
+-            use_checkpoint_opt_param_scheduler=self.optimizer_config.use_checkpoint_opt_param_scheduler,
+-            use_dist_checkpointing=self.engine_config.use_dist_checkpointing,
+-            bridge=self.bridge,
+-            provider=self.provider,
+-            peft_cls=self.peft_cls,
+-            use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
+-        )
++            role = "actor" if not self.is_value_model else "critic"
++
++            self.checkpoint_mananager = MegatronCheckpointManager(
++                config=tmp_config,
++                checkpoint_config=self.checkpoint_config,
++                model_config=self.model_config.hf_config,
++                transformer_config=self.tf_config,
++                role=role,
++                model=self.module,
++                arch=self.model_config.architectures[0],
++                hf_config=self.model_config.hf_config,
++                param_dtype=self.param_dtype,
++                share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
++                processing_class=self.model_config.get_processor(),
++                optimizer=self.optimizer,
++                optimizer_scheduler=self.lr_scheduler,
++                use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
++                use_checkpoint_opt_param_scheduler=self.optimizer_config.use_checkpoint_opt_param_scheduler,
++                use_dist_checkpointing=self.engine_config.use_dist_checkpointing,
++                bridge=self.bridge,
++                provider=self.provider,
++                peft_cls=self.peft_cls,
++                use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
++                use_per_rank_checkpoint=self.engine_config.use_per_rank_checkpoint,
++            )
+ 
+-        self.to(
+-            device="cpu",
+-            model=self._is_offload_param,
+-            optimizer=self._is_offload_optimizer,
+-            grad=self._is_offload_param,
+-        )
++            self.to(
++                device="cpu",
++                model=self._is_offload_param,
++                optimizer=self._is_offload_optimizer,
++                grad=self._is_offload_param,
++            )
+ 
+-        log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
++            log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
+ 
+     def train_mode(self, **kwargs):
+         """
+@@ -915,17 +935,43 @@ class MegatronEngine(BaseEngine):
+         # batch should be a list of batches inside micro-batches
+         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
+ 
++        # Track one iterator on global rank 0. Under VPP every model chunk owns an iterator over the
++        # same logical micro-batches, so tracking all of them would multiply the displayed total by
++        # the number of virtual pipeline stages.
++        progress_bar = None
++        if torch.distributed.get_rank() == 0:
++            phase = "recompute log_prob" if forward_only else "actor training"
++            step = tu.get(data, "global_steps", None)
++            if isinstance(step, (list, tuple)):
++                step = step[0] if step else None
++            desc = f"step {step} | {phase}" if step is not None else phase
++            progress_bar = tqdm(total=n_micro_batch, desc=desc, dynamic_ncols=True, leave=False)
++
++            def track_micro_batches(batch_iter):
++                for micro_batch in batch_iter:
++                    progress_bar.update(1)
++                    yield micro_batch
++
++            if isinstance(batch_generator, list):
++                batch_generator[0] = track_micro_batches(batch_generator[0])
++            else:
++                batch_generator = track_micro_batches(batch_generator)
++
+         # TODO: we may use the new schedule instead
+         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
+-        losses_reduced = forward_backward_func(
+-            forward_step_func=forward_step,
+-            data_iterator=batch_generator,
+-            model=self.module,
+-            num_microbatches=n_micro_batch,
+-            seq_length=1,  # the communication shape is obtained via p2p comm
+-            micro_batch_size=1,  # the communication shape is obtained via p2p comm
+-            forward_only=forward_only,
+-        )
++        try:
++            losses_reduced = forward_backward_func(
++                forward_step_func=forward_step,
++                data_iterator=batch_generator,
++                model=self.module,
++                num_microbatches=n_micro_batch,
++                seq_length=1,  # the communication shape is obtained via p2p comm
++                micro_batch_size=1,  # the communication shape is obtained via p2p comm
++                forward_only=forward_only,
++            )
++        finally:
++            if progress_bar is not None:
++                progress_bar.close()
+ 
+         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
+             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
+@@ -1158,6 +1204,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         data_format: str,
+         cp_layout: str = "zigzag",
+         local_cp_size: int | None = None,
++        score_centering: bool = False,
+     ):
+         assert logits.shape[:2] == label.shape[:2]
+         # avoid non-positive temperature such as padding
+@@ -1204,8 +1251,37 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                     local_cp_size=local_cp_size,
+                 )
+             )
++        if score_centering:
++            from verl.models.mcore.util import get_thd_quant_align_size
++
++            # The trainer logits are vocab-sharded under TP, so the head log-probs are gathered with
++            # the tensor-parallel group and normalized over the full (unpadded) vocabulary. The model
++            # forward repacks and pads every sequence to the TP/CP alignment, so the sampler heads run
++            # through the same padding/slicing even at CP=1.
++            ret.update(
++                logits_processor_func(
++                    student_logits=logits_bak,
++                    data=batch,
++                    data_format=data_format,
++                    process_group=mpu.get_tensor_model_parallel_group(),
++                    vocab_size=getattr(self.model_config.hf_config, "vocab_size", None),
++                    chunk_elems=self.engine_config.score_centering_chunk_elems,
++                    cp_split=data_format,
++                    cp_layout=cp_layout,
++                    local_cp_size=local_cp_size,
++                    quant_align_size=get_thd_quant_align_size(self.tf_config),
++                    sampled_token_ids=label,
++                )
++            )
+         if not distillation_only:
+-            ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
++            # Score centering scores the sampled token in the same normalizer pass as the head, so
++            # the separate cross entropy (which mutates its saved logits) is skipped.
++            log_probs = ret.pop("log_probs", None) if score_centering else None
++            if log_probs is not None:
++                ret["log_probs"] = log_probs
++            else:
++                label_logits = logits_bak.clone() if score_centering else logits_bak
++                ret["log_probs"] = vocab_parallel_log_probs_from_logits(label_logits, label)
+ 
+         return ret
+ 
+@@ -1227,6 +1303,21 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
+         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
++        score_centering = tu.get_non_tensor_data(batch, key="score_centering", default=False)
++        if score_centering and use_fused_kernels:
++            raise ValueError("score_centering requires materialized logits.")
++        if score_centering and distillation_use_topk:
++            raise ValueError("score_centering cannot be combined with top-K distillation.")
++        if score_centering and self.model_config.mtp.enable and self.model_config.mtp.enable_train:
++            raise ValueError("score_centering with MTP training needs an explicit target alignment.")
++        if score_centering and self.engine_config.dynamic_context_parallel:
++            # Dynamic CP changes the row assignment per micro-batch, so a static head slice cannot
++            # align with it (the same reason distillation rejects dynamic CP).
++            raise NotImplementedError(
++                "score centering does not support dynamic context parallel; use static context "
++                "parallel or context_parallel_size=1."
++            )
++
+         pad_to_length_bucket = (
+             self.engine_config.pad_to_length_bucket
+             if self.engine_config.pad_to_length and self.engine_config.use_remove_padding
+@@ -1235,6 +1326,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
+ 
+         if pad_to_length_bucket is not None and distillation_use_topk:
+             raise RuntimeError("pad_to_length is not supported with top-K distillation")
++        if pad_to_length_bucket is not None and score_centering:
++            # The sampler heads are padded with preprocess_thd_engine, which does not apply the
++            # static pad_to_length bucket, so the head and the logits rows would diverge.
++            raise RuntimeError("pad_to_length is not supported with score centering")
+         if pad_to_length_bucket is not None and self.enable_routing_replay:
+             raise RuntimeError("pad_to_length is not supported with router replay")
+ 
+@@ -1344,6 +1439,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 data_format=data_format,
+                 cp_layout=cp_layout,
+                 local_cp_size=local_cp_size,
++                score_centering=score_centering,
+             )
+ 
+             response_attention_mask = None
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index b724eae7..9cf2539e 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -118,8 +118,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
+ 
+         from verl.workers.engine import BaseEngine, EngineRegistry
+ 
+-        initialize_global_process_group_ray(timeout_second=None)
+-
+         set_numa_affinity()
+ 
+         self.config = config
+@@ -289,6 +287,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
+         epochs = tu.pop(data, key="epochs", default=1)
+         seed = tu.pop(data, key="seed", default=42)
+         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
++        advance_lr_scheduler = tu.pop(data, key="advance_lr_scheduler", default=True)
+ 
+         assert mini_batch_size is not None or num_mini_batch is not None
+ 
+@@ -337,7 +336,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
+                 tu.assign_non_tensor(
+                     mini_batch_td,
+                     global_token_num=NonTensorData(global_token_num),
+-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
++                    update_lr_scheduler=advance_lr_scheduler and batch_idx == total_num_iterations - 1,
+                     disable_auto_offload=True,
+                 )
+                 # Name the mini-batch in the trace so each iteration of this otherwise identical
+@@ -575,6 +574,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+     def init_model(self):
+         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
+         liger_capacity = _plan_liger_flsce_capacity(self.config, self.role)
++        # Idempotent: TrainingWorker also calls this, but PSRL's actor may build engines here first.
++        initialize_global_process_group_ray(timeout_second=None)
+ 
+         # 1. build reference model
+         if "ref" in self.role:
+diff --git a/verl/workers/utils/losses.py b/verl/workers/utils/losses.py
+index aff27653..7fba900f 100644
+--- a/verl/workers/utils/losses.py
++++ b/verl/workers/utils/losses.py
+@@ -66,6 +66,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+             "sc_correction",
+             "sc_sampler_head_mass",
+             "sc_train_head_mass",
++            "sc_tail_ratio",
+             "sc_support_aligned",
+             "sc_sampler_tail_mass",
+             "sc_support_unknown",
+@@ -95,6 +96,24 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+     metrics = {}
+ 
+     # select fields and convert to padded tensor
++    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
++    # Weights remain dense row scalars while response fields are padded below.
++    config.global_batch_info.pop("session_loss_weights", None)
++    if config.loss_agg_mode == "session-mean-token-mean":
++        if loss_mode in {"gspo", "sapo", "geo_mean"}:
++            raise ValueError(
++                f"Policy loss {loss_mode!r} fixes its own aggregation and cannot use session-mean-token-mean."
++            )
++        correction = config.policy_loss.get("rollout_correction")
++        if loss_mode == "bypass_mode" and correction and correction.get("rollout_rs") is not None:
++            raise ValueError(
++                "session-mean-token-mean requires rejection masks before session normalization. "
++                "Use decoupled rollout correction instead of bypass rejection sampling."
++            )
++        if "session_loss_weights" not in data:
++            raise ValueError("session-mean-token-mean requires session_loss_weights in the training batch.")
++        config.global_batch_info["session_loss_weights"] = data["session_loss_weights"]
++        metric_aggregation = AggregationType.SUM
+     fields = ["response_mask", "old_log_probs", "advantages"]
+     if "rollout_is_weights" in data:
+         fields.append("rollout_is_weights")
+@@ -110,8 +129,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+ 
+     loss_agg_mode = config.loss_agg_mode
+ 
+-    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+-
+     policy_loss_fn = get_policy_loss_fn(loss_mode)
+     policy_loss_kwargs = {"sc_correction": sc_outputs["sc_correction"]} if sc_outputs else {}
+     pg_loss, pg_metrics = policy_loss_fn(
+@@ -135,6 +152,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+         for key in (
+             "sc_sampler_head_mass",
+             "sc_train_head_mass",
++            "sc_tail_ratio",
+             "sc_support_aligned",
+             "sc_sampler_tail_mass",
+             "sc_support_unknown",

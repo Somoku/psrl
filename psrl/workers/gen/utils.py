@@ -4,6 +4,7 @@ from typing import Any
 import torch
 
 from psrl.utils.routed_experts import canonicalize_routed_experts
+from psrl.utils.sampler_distribution import SamplerCapture, SamplerDistribution
 
 # (worker_id, data_parallel_rank)
 RolloutInstanceId = tuple[str, int]
@@ -72,6 +73,12 @@ class TokenOutput:
     """logprobs of response token ids"""
     routed_experts: Any | None = None
     """routed experts of response token ids"""
+    sampler_distribution: SamplerDistribution | None = None
+    """
+    Compact sampler rows aligned with the response, including empty environment rows.
+    """
+    sampler_capture: SamplerCapture = field(default_factory=SamplerCapture)
+    """Resolved capture config (mode, budget, compact transport) that produced ``sampler_distribution``."""
     # NOTE(linsh): Pooling models return embedding or classification tensors in
     # `pooling_output`, which remains `None` for generative models.
     pooling_output: Any | None = None
@@ -156,6 +163,32 @@ class TokenOutput:
         )
         if routed_experts is not None:
             output["routed_experts"] = routed_experts
+
+        if self.sampler_distribution is not None:
+            from psrl.utils.sampler_adapter import to_compact_support, to_dense_support, to_dense_topk
+
+            capture = self.sampler_capture
+            self.sampler_distribution.validate_capture(capture, self.response_mask)
+            if capture.mode == "topk":
+                output.update(
+                    to_dense_topk(
+                        self.sampler_distribution,
+                        self.response_mask,
+                        prompt_length=len(self.prompt_ids),
+                    )
+                )
+            elif capture.mode == "support":
+                adapter = to_compact_support if capture.compact_support else to_dense_support
+                output.update(
+                    adapter(
+                        self.sampler_distribution,
+                        self.response_mask,
+                        width=capture.width,
+                        prompt_length=len(self.prompt_ids),
+                    )
+                )
+            else:
+                raise ValueError(f"sampler_distribution present with unsupported capture mode {capture.mode!r}.")
 
         reward_score = output.get("reward_score", None)
         if reward_score is not None:

@@ -166,41 +166,59 @@ async def collect_git_patch(
         raise
     if result.exit_code != 0:
         diagnostics, unavailable = await _read_collector_diagnostics(session, diag_path)
+        status, status_error, lost = await _sandbox_status(session)
+        probe = await _collector_environment_probe(session, workdir, staging_dir)
+        sandbox_id = getattr(session.ref, "sandbox_id", "")
+        node_id = getattr(session, "node_id", "")
+        alive = status == SandboxStatus.RUNNING.value
         detail = (
-            f"Could not collect harness patch (exit {result.exit_code}, cwd={workdir!r}): "
-            f"{result.stderr.strip() or '<backend reported no stderr>'}\n"
-            f"collector diagnostics:\n{diagnostics}"
+            f"Harness patch collection failed (exit {result.exit_code}, cwd={workdir!r}, "
+            f"sandbox={sandbox_id!r}, node={node_id!r}, status={status!r}"
+            f"{f', status_error={status_error}' if status_error else ''}).\n"
+            f"stdout (tail):\n{_tail(result.stdout)}\n"
+            f"stderr (tail):\n{_tail(result.stderr)}\n"
+            f"collector diagnostics (unavailable={unavailable}):\n{diagnostics}\n"
+            f"environment probe:\n{probe}"
         )
-        # The collector's exit code and its own diagnostics are the only evidence
-        # available for telling these apart, and they lead to different caller
-        # responses:
-        #
-        # - 137 is SIGKILL. If the sandbox is no longer running, the kernel killed
-        #   it for memory and the episode is a resource loss; if it is still
-        #   running, a child was killed and the sandbox is usable.
-        # - 126/127 mean the shell could not execute the collector's tools. The
-        #   sandbox's execution environment is not what the harness needs.
-        # - A diagnostics file that cannot be read at all, after a non-137 exit,
-        #   means the collector's filesystem or shell never worked. Reporting the
-        #   episode as a collector error would blame the harness for a broken
-        #   sandbox.
-        if result.exit_code == 137:
-            if not await _sandbox_is_running(session):
-                raise SandboxSessionLostError(
-                    detail,
-                    exit_reason=SandboxExitReason.OOM,
+        if not alive:
+            # Only the sandbox's own liveness decides whether the episode is a
+            # lost session. A collector that could not run -- including one whose
+            # diagnostics file was never created -- is not evidence that the
+            # sandbox is gone; the runtime's answer is. A status that cannot be
+            # read is treated as gone, which is the safe direction when the
+            # sandbox's state is unknown.
+            #
+            # If the status call itself reported the loss, its attribution (the
+            # service's exit code and finish time) is stronger evidence than
+            # anything reconstructed from the collector, so it is carried over.
+            reason = (
+                lost.exit_reason
+                if lost is not None and lost.exit_reason != SandboxExitReason.UNKNOWN
+                else (
+                    SandboxExitReason.OOM
+                    if result.exit_code == 137
+                    else SandboxExitReason.CONTAINER_EXITED
                 )
-            raise SandboxCollectorError(detail, exit_code=137, diagnostics=diagnostics)
-        if unavailable:
+            )
             raise SandboxSessionLostError(
-                f"Harness patch collection could not run in the sandbox: {detail}",
-                exit_reason=SandboxExitReason.CONTAINER_EXITED,
+                detail,
+                sandbox_id=sandbox_id or (lost.sandbox_id if lost is not None else ""),
+                exit_reason=reason,
+                exit_code=(
+                    lost.exit_code
+                    if lost is not None and lost.exit_code is not None
+                    else result.exit_code
+                ),
+                state_error=lost.state_error if lost is not None else "",
+                finished_at=lost.finished_at if lost is not None else "",
             )
-        if result.exit_code in (126, 127):
-            raise SandboxCollectorError(
-                detail, exit_code=result.exit_code, diagnostics=diagnostics
-            )
-        raise RuntimeError(detail)
+        # The sandbox is alive: its execution environment could not run the
+        # collector. This is a collector fault, not a lost session, and calling
+        # it a session loss destroys a healthy sandbox and blames the wrong
+        # layer. The probe above names the missing tool, directory, or limit.
+        raise SandboxCollectorError(
+            detail, exit_code=result.exit_code, diagnostics=diagnostics
+        )
     try:
         payload = await session.read_bytes(patch_path)
     except Exception as exc:
@@ -215,19 +233,76 @@ async def collect_git_patch(
     return payload.decode(errors="replace")
 
 
-async def _sandbox_is_running(session: SandboxSession) -> bool:
-    """Report whether the sandbox survived a collector that was SIGKILLed.
+async def _sandbox_status(
+    session: SandboxSession,
+) -> tuple[str, str, SandboxSessionLostError | None]:
+    """Return the sandbox's status, why it could not be read, and its loss.
 
-    A 137 exit can be the sandbox dying or a child process being killed for
-    memory inside a healthy one. The distinction decides whether the episode is
-    a resource loss or a collector fault, so it is asked rather than guessed. A
-    status call that fails is treated as "not running": the caller then replaces
-    the sandbox, which is the safe direction when its state cannot be read.
+    The status is the only evidence that decides whether a failed collector is
+    a collector fault or a lost session. A status call that fails is reported as
+    ``unreadable`` rather than guessed at; the caller treats it as gone, which is
+    the safe direction when the sandbox's state cannot be established. A status
+    call that reports a lost session is returned as that error so its exit code
+    and finish time survive into the caller's attribution.
     """
     try:
-        return await session.status() == SandboxStatus.RUNNING
-    except Exception:  # noqa: BLE001 - an unreadable status is not evidence of health
-        return False
+        status = await session.status()
+    except SandboxSessionLostError as exc:
+        return "lost", str(exc), exc
+    except Exception as exc:  # noqa: BLE001 - an unreadable status is diagnostic
+        return "unreadable", repr(exc), None
+    return getattr(status, "value", str(status)), "", None
+
+
+def _tail(text: str | None, limit: int = 2000) -> str:
+    """Keep the end of a command's output, where a failure is reported."""
+    trimmed = (text or "").strip()
+    return trimmed[-limit:] if trimmed else "<empty>"
+
+
+async def _collector_environment_probe(
+    session: SandboxSession, workdir: str, staging_dir: str
+) -> str:
+    """Report, from inside the sandbox, why the collector could not start.
+
+    The collector writes its diagnostics in its first lines, so a missing file
+    means it never reached them -- and its exit code alone does not say which
+    precondition failed. This probe asks the sandbox directly: whether the shell
+    can run, which tools are on ``PATH``, whether the work and staging
+    directories exist, whether the filesystem has room, and what the cgroup and
+    host memory pressure are. It is only run after a collector failure, so it
+    costs one exec on the failure path and nothing on the success path.
+    """
+    probe = (
+        'echo "cwd=$(pwd)"\n'
+        'echo "path=$PATH"\n'
+        "id 2>&1 || true\n"
+        "ulimit -u 2>&1 || true\n"
+        "for tool in sh git wc dirname xargs tr mkdir; do\n"
+        '    printf "%s=%s\\n" "$tool" "$(command -v "$tool" 2>/dev/null || echo MISSING)"\n'
+        "done\n"
+        f"ls -ld {shlex.quote(workdir)} {shlex.quote(staging_dir)} 2>&1 || true\n"
+        f"df -h {shlex.quote(workdir)} {shlex.quote(staging_dir)} 2>&1 || true\n"
+        "for path in"
+        " /sys/fs/cgroup/memory.max"
+        " /sys/fs/cgroup/memory/memory.limit_in_bytes"
+        " /sys/fs/cgroup/memory.current"
+        " /sys/fs/cgroup/memory/memory.usage_in_bytes"
+        " /sys/fs/cgroup/pids.current"
+        " /sys/fs/cgroup/pids.max; do\n"
+        '    [ -r "$path" ] && printf "%s=%s\\n" "$path" "$(cat "$path")"\n'
+        "done\n"
+        "head -3 /proc/meminfo 2>&1 || true\n"
+    )
+    try:
+        result = await session.exec(probe, cwd=workdir, timeout_s=30)
+    except Exception as exc:  # noqa: BLE001 - the probe's failure is the diagnosis
+        return f"<probe could not run: {exc!r}>"
+    return (
+        f"exit={result.exit_code}\n"
+        f"stdout:\n{_tail(result.stdout)}\n"
+        f"stderr:\n{_tail(result.stderr)}"
+    )
 
 
 async def _read_collector_diagnostics(
@@ -236,10 +311,9 @@ async def _read_collector_diagnostics(
     """Read the collector's self-report after a non-zero exit.
 
     Returns the text and whether the report was *unavailable* rather than simply
-    empty. The second value is what lets a caller distinguish "the collector ran
-    and said why it failed" from "the sandbox could not produce the file at
-    all" -- two failures that used to be the same string, and the second of which
-    points at the sandbox rather than at the collector.
+    empty. The second value is diagnostic, not a classification: a missing file
+    in a live sandbox says the collector never created it, while a missing
+    sandbox is established by ``status()``, not by a file read.
 
     Read as a file rather than from the exec response because the sandbox exec
     channel does not carry stderr on every backend. Failure to read is itself

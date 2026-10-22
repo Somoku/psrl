@@ -72,6 +72,7 @@ class FakeSandbox(SandboxSession):
         collect_exit_code: int = 0,
         diag_missing: bool = False,
         status_value: SandboxStatus = SandboxStatus.RUNNING,
+        status_error: BaseException | None = None,
     ) -> None:
         self.runtime_available = runtime_available
         self.block_cli = block_cli
@@ -82,6 +83,7 @@ class FakeSandbox(SandboxSession):
         # can be attributed to OOM or to a killed child.
         self.diag_missing = diag_missing
         self.status_value = status_value
+        self.status_error = status_error
         self.commands: list[tuple[str, str | None, Mapping[str, str] | None]] = []
         self.writes: dict[str, bytes] = {}
         self.cli_started = asyncio.Event()
@@ -107,6 +109,9 @@ class FakeSandbox(SandboxSession):
         # The prepare probe creates the state dir and checks the mounted CLI.
         if command.startswith("mkdir -p /root/.psrl-harness"):
             return ExecResult(0 if self.runtime_available else 1, "", "" if self.runtime_available else "no such file")
+        if "ulimit -u" in command:
+            # The failed-collector environment probe: names the missing tool.
+            return ExecResult(0, "cwd=/testbed\npath=/usr/bin\nwc=MISSING\n", "")
         if _HARNESS_PATCH_NAME in command:
             # The patch collector. Its diagnostics are read back through the file API,
             # never from this response (the backend does not carry stderr).
@@ -131,6 +136,8 @@ class FakeSandbox(SandboxSession):
         self.writes[path] = data
 
     async def status(self) -> SandboxStatus:
+        if self.status_error is not None:
+            raise self.status_error
         return self.status_value
 
     async def terminate(self) -> None:
@@ -443,14 +450,65 @@ async def test_a_sigkill_inside_a_live_sandbox_is_a_collector_fault() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_missing_diagnostics_file_after_a_non_sigkill_is_a_lost_environment() -> None:
-    """The collector creates the file first, so its absence means the script never ran."""
+async def test_a_missing_diagnostics_file_in_a_live_sandbox_is_a_collector_fault() -> None:
+    """A live sandbox whose collector never wrote its report did not lose its session.
+
+    The container is still running (the runtime answers `running`), so the
+    failure is the collector's execution environment. Reporting it as a lost
+    session would destroy a healthy sandbox and blame the wrong layer.
+    """
     sandbox = FakeSandbox(collect_exit_code=128, diag_missing=True)
+
+    with pytest.raises(SandboxCollectorError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.exit_code == 128
+    assert "status='running'" in str(excinfo.value)
+    assert "environment probe" in str(excinfo.value)
+    assert "wc=MISSING" in str(excinfo.value)
+    assert "sandbox='sandbox-1'" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_missing_diagnostics_file_after_the_sandbox_died_is_a_lost_session() -> None:
+    """The same collector failure with a dead sandbox is a lost session."""
+    sandbox = FakeSandbox(
+        collect_exit_code=128,
+        diag_missing=True,
+        status_value=SandboxStatus.TERMINATED,
+    )
 
     with pytest.raises(SandboxSessionLostError) as excinfo:
         await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
 
     assert excinfo.value.exit_reason is SandboxExitReason.CONTAINER_EXITED
+    assert excinfo.value.exit_code == 128
+
+
+@pytest.mark.asyncio
+async def test_a_status_that_reports_the_loss_keeps_its_exit_attribution() -> None:
+    """The service's exit code and finish time are stronger than the collector's."""
+    lost = SandboxSessionLostError(
+        "sandbox is gone",
+        sandbox_id="sb-attributed",
+        exit_reason=SandboxExitReason.OOM,
+        exit_code=137,
+        finished_at="2026-10-22T02:13:07Z",
+    )
+    sandbox = FakeSandbox(
+        collect_exit_code=137,
+        diag_missing=True,
+        status_error=lost,
+    )
+
+    with pytest.raises(SandboxSessionLostError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.sandbox_id == "sandbox-1"
+    assert excinfo.value.exit_reason is SandboxExitReason.OOM
+    assert excinfo.value.exit_code == 137
+    assert excinfo.value.finished_at == "2026-10-22T02:13:07Z"
+    assert "environment probe" in str(excinfo.value)
 
 
 @pytest.mark.asyncio

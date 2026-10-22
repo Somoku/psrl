@@ -27,9 +27,13 @@ type fakeEngine struct {
 	execCreateBody   string
 	execStartStatus  int
 	execStartBody    string
-	archiveStatus    int
-	archiveBody      string
-	inspectBody      string
+	// execStartOutput is a 200 response's hijacked stream, where runc reports a
+	// container it could not enter. execInspectBody is the exec's final state.
+	execStartOutput []byte
+	execInspectBody string
+	archiveStatus   int
+	archiveBody     string
+	inspectBody     string
 
 	mu          sync.Mutex
 	inFlight    int
@@ -89,7 +93,14 @@ func (f *fakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+		if len(f.execStartOutput) > 0 {
+			_, _ = w.Write(f.execStartOutput)
+		}
 	case strings.Contains(r.URL.Path, "/exec/exec-1/json"):
+		if f.execInspectBody != "" {
+			writeBody(w, f.execInspectBody)
+			return
+		}
 		writeBody(w, `{"ExitCode":0,"Running":false}`)
 	case strings.Contains(r.URL.Path, "/archive"):
 		if f.archiveStatus != 0 {

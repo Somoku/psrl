@@ -68,6 +68,52 @@ func TestExecMapsAStoppedContainerToRuntimeGone(t *testing.T) {
 	}
 }
 
+func TestExecMapsAnOciExecFailureToRuntimeGone(t *testing.T) {
+	// The Engine answers 200 and the exec exits 127, but the output is runc
+	// saying it could not enter the container's namespaces. That is a dead
+	// runtime, not a command that returned 127.
+	engine := &fakeEngine{
+		execStartOutput: frame(1, "OCI runtime exec failed: exec failed: unable to start container process: "+
+			"error executing setns process: exit status 1; nsexec-1[1]: failed to open "+
+			"/proc/42/ns/ipc: No such file or directory\n"),
+		execInspectBody: `{"ExitCode":127,"Running":false}`,
+	}
+	b := newFakeBackend(t, engine, time.Second, 0)
+	handle := backend.Handle{Backend: "docker", SandboxID: "c-1"}
+
+	_, err := b.Exec(context.Background(), handle, "", "true", "", nil)
+	if !errors.Is(err, backend.ErrRuntimeGone) {
+		t.Fatalf("an OCI exec failure must be ErrRuntimeGone, got %v", err)
+	}
+}
+
+func TestExecKeepsAnOrdinaryExit127AsACommandResult(t *testing.T) {
+	engine := &fakeEngine{
+		execStartOutput: frame(1, "wc: not found\n"),
+		execInspectBody: `{"ExitCode":127,"Running":false}`,
+	}
+	b := newFakeBackend(t, engine, time.Second, 0)
+	handle := backend.Handle{Backend: "docker", SandboxID: "c-1"}
+
+	result, err := b.Exec(context.Background(), handle, "", "wc -c", "", nil)
+	if err != nil {
+		t.Fatalf("a missing tool is a command result, got %v", err)
+	}
+	if result.ExitCode != 127 || result.Stdout != "wc: not found\n" {
+		t.Fatalf("result %+v, want the command's own 127 and output", result)
+	}
+}
+
+func TestAContainerWithNoWritableLayerIsGone(t *testing.T) {
+	err := &apiError{
+		status: 500,
+		body:   `{"message":"RWLayer of container c-1 is unexpectedly nil"}`,
+	}
+	if !isContainerGone(err) {
+		t.Fatal("a nil writable layer is a removed container, not a transport fault")
+	}
+}
+
 func TestExecDoesNotMapAPausedContainerToRuntimeGone(t *testing.T) {
 	engine := &fakeEngine{
 		execCreateStatus: 409,

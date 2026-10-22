@@ -937,12 +937,34 @@ func (b *Backend) execOneShot(ctx context.Context, handle backend.Handle, comman
 		return backend.ExecResult{}, commandError("docker exec inspect", err)
 	}
 	stdout, stderr, truncated := demultiplexStreams(output)
+	if stoppedExecOutput(stdout, stderr) {
+		// runc/OCI reports a container whose namespaces are gone on the exec's
+		// output stream, not as an Engine error: the API call succeeds, the exec
+		// exits 127, and the text says why. Returning that as a command result
+		// makes a dead sandbox look like a collector that exited 127. It is a
+		// runtime fact, so it takes the same ErrRuntimeGone path as a 409.
+		detail := strings.TrimSpace(strings.TrimSpace(stdout) + " " + strings.TrimSpace(stderr))
+		return backend.ExecResult{}, fmt.Errorf("docker exec: %w: %s", backend.ErrRuntimeGone, detail)
+	}
 	return backend.ExecResult{
 		ExitCode:  inspected.ExitCode,
 		Stdout:    stdout,
 		Stderr:    stderr,
 		Truncated: truncated,
 	}, nil
+}
+
+// stoppedExecOutput reports whether the exec's own output is runc saying the
+// container could not be entered.
+//
+// The Engine returns HTTP 200 for an exec that starts and immediately fails in
+// the runtime; the OCI error text is the only signal. These phrases are runc's
+// stable wording for a container whose init process or namespaces are gone.
+func stoppedExecOutput(stdout, stderr string) bool {
+	text := stdout + "\n" + stderr
+	return strings.Contains(text, "OCI runtime exec failed") ||
+		strings.Contains(text, "cannot exec in a stopped container") ||
+		(strings.Contains(text, "RWLayer of container") && strings.Contains(text, "unexpectedly nil"))
 }
 
 // commandError classifies a failed Engine call.
@@ -1493,9 +1515,12 @@ func apiErrorDetail(err error) (status int, body string, ok bool) {
 //
 // Both are 409 or 404 bodies rather than distinct status codes, so the message
 // is the only signal. The two phrases are Docker's own stable wording:
-// "Container <id> is not running" for a stopped container and "No such
-// container" for a removed one. A paused container also answers 409, and is
-// deliberately not included: it can be resumed, so it is not gone.
+// "Container <id> is not running" for a stopped container, "cannot exec in a
+// stopped container" from the exec start, and "No such container" for a removed
+// one. A removed container can also answer 500 with a nil writable layer, which
+// is the daemon's storage backend reporting the same fact. A paused container
+// also answers 409, and is deliberately not included: it can be resumed, so it
+// is not gone.
 func isContainerGone(err error) bool {
 	status, body, ok := apiErrorDetail(err)
 	if !ok {
@@ -1504,9 +1529,13 @@ func isContainerGone(err error) bool {
 	lowered := strings.ToLower(body)
 	switch status {
 	case http.StatusConflict:
-		return strings.Contains(lowered, "is not running")
+		return strings.Contains(lowered, "is not running") ||
+			strings.Contains(lowered, "cannot exec in a stopped container")
 	case http.StatusNotFound:
 		return strings.Contains(lowered, "no such container")
+	case http.StatusInternalServerError:
+		return strings.Contains(lowered, "rwlayer of container") &&
+			strings.Contains(lowered, "unexpectedly nil")
 	}
 	return false
 }

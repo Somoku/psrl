@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import shutil
+import subprocess
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
@@ -139,6 +141,54 @@ class FakeSandbox(SandboxSession):
         if self.status_error is not None:
             raise self.status_error
         return self.status_value
+
+    async def terminate(self) -> None:
+        return None
+
+
+class LocalSession(SandboxSession):
+    """Run the collector's real shell script against a local temporary repository.
+
+    The rest of the harness tests script command results, which cannot catch a
+    shell-level regression in the collector. This session executes the exact
+    command string, so the size caps and the per-file diff loop are exercised.
+    """
+
+    @property
+    def ref(self) -> SandboxRef:
+        return SandboxRef("local", "local")
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities()
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_s: float | None = None,
+    ) -> ExecResult:
+        completed = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd,
+            env=dict(env) if env is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        return ExecResult(completed.returncode, completed.stdout, completed.stderr)
+
+    async def read_bytes(self, path: str) -> bytes:
+        return Path(path).read_bytes()
+
+    async def write_bytes(self, path: str, data: bytes) -> None:
+        Path(path).write_bytes(data)
+
+    async def status(self) -> SandboxStatus:
+        return SandboxStatus.RUNNING
 
     async def terminate(self) -> None:
         return None
@@ -376,9 +426,12 @@ async def test_patch_collection_reads_the_patch_file_in_full() -> None:
 
     script, cwd, _ = sandbox.commands[-1]
     assert cwd == "/testbed"
-    # Staged (index vs base/HEAD) and unstaged (worktree vs index) tracked changes.
-    assert "git diff --cached --binary --submodule=diff --" in script
-    assert "git diff --binary --submodule=diff --" in script
+    # Staged (index vs base/HEAD) and unstaged (worktree vs index) tracked changes,
+    # emitted one bounded diff per file so a large artifact cannot OOM the sandbox.
+    assert "cached=--cached" in script
+    assert "git diff $cached --binary --submodule=diff" in script
+    assert "skipped_tracked" in script
+    assert "patch_capped" in script
     # Untracked files become new-file diffs, but nested repositories are skipped.
     assert "git ls-files --others --exclude-standard" in script
     assert '[ -e "$d/.git" ]' in script
@@ -398,6 +451,77 @@ async def test_patch_collection_reads_the_patch_file_in_full() -> None:
     assert "command -v" in script
     assert "cat " not in script
     assert patch == collected.decode()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
+@pytest.mark.asyncio
+async def test_collector_skips_an_untracked_file_above_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large untracked artifact is skipped and named, not diffed into the sandbox.
+
+    An unbounded `git diff --binary` on an agent-created file is what turned a
+    collector failure into a sandbox OOM and then into a whole-group replacement.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("one\n")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "base"], cwd=repo, check=True, capture_output=True
+    )
+    (repo / "a.txt").write_text("one\ntwo\n")
+    (repo / "big.bin").write_bytes(b"x" * 4096)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(
+        "examples.mini_swe.utils.harness_task._MAX_UNTRACKED_FILE_BYTES", 1024
+    )
+
+    patch = await collect_git_patch(LocalSession(), str(repo), staging_dir=str(staging))
+
+    assert "+two" in patch
+    assert "big.bin" not in patch
+    diag = (staging / _HARNESS_DIAG_NAME).read_text()
+    assert "skipped_untracked=big.bin" in diag
+    assert "collector=done" in diag
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
+@pytest.mark.asyncio
+async def test_collector_stops_at_the_total_patch_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A patch over the budget fails as a collector fault, not as an OOM.
+
+    The sandbox stays alive; the episode is replaced by the collector's own
+    classification and the diagnostics name the cap.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("one\n")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "base"], cwd=repo, check=True, capture_output=True
+    )
+    (repo / "a.txt").write_text("one\n" + ("two\n" * 4096))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(
+        "examples.mini_swe.utils.harness_task._MAX_PATCH_BYTES", 512
+    )
+
+    with pytest.raises(SandboxCollectorError) as excinfo:
+        await collect_git_patch(LocalSession(), str(repo), staging_dir=str(staging))
+
+    assert "patch_capped=1" in str(excinfo.value)
+    assert "status='running'" in str(excinfo.value)
 
 
 @pytest.mark.asyncio

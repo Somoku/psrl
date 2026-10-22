@@ -1,6 +1,7 @@
 """Task-specific helpers shared by sandboxed coding harnesses."""
 
 import logging
+import os
 import shlex
 from pathlib import PurePosixPath
 
@@ -33,6 +34,20 @@ _PATCH_COLLECT_TIMEOUT_S = 600.0
 # because only the grader may judge it, but a repository that the agent filled with
 # build output is worth reporting before it reaches the grading container.
 _PATCH_SIZE_WARNING_BYTES = 64 * 1024 * 1024
+# The collector runs inside the sandbox, so an unbounded `git diff --binary` on a
+# file the agent created can exhaust the sandbox's memory and kill the episode (and
+# its whole group). Bound the work at the source: skip a file above this size, stop
+# once the patch reaches the total budget, and report both in the diagnostics. A
+# skipped file is build output or a data artifact far more often than a solution.
+_MAX_UNTRACKED_FILE_BYTES = int(
+    os.environ.get("PSRL_COLLECTOR_MAX_UNTRACKED_FILE_BYTES", 16 * 1024 * 1024)
+)
+_MAX_TRACKED_FILE_BYTES = int(
+    os.environ.get("PSRL_COLLECTOR_MAX_TRACKED_FILE_BYTES", 32 * 1024 * 1024)
+)
+_MAX_PATCH_BYTES = int(
+    os.environ.get("PSRL_COLLECTOR_MAX_PATCH_BYTES", _PATCH_SIZE_WARNING_BYTES)
+)
 
 
 def build_harness_prompt(problem_statement: str) -> str:
@@ -92,11 +107,41 @@ async def collect_git_patch(
     """
     patch_path = str(PurePosixPath(staging_dir) / _HARNESS_PATCH_NAME)
     diag_path = str(PurePosixPath(staging_dir) / _HARNESS_DIAG_NAME)
-    base_arg = f"{shlex.quote(base_commit)} --" if base_commit else "--"
+    base_arg = shlex.quote(base_commit) if base_commit else ""
     patch_arg = shlex.quote(patch_path)
     diag_arg = shlex.quote(diag_path)
     staging_arg = shlex.quote(staging_dir)
     workdir_arg = shlex.quote(workdir)
+    # Per-file bodies, executed by `sh` via `xargs -0`. Both bound the work before
+    # invoking Git: an untracked artifact or a large modified file is skipped with
+    # a diagnostic line, and the whole patch stops at the total budget. This is
+    # what keeps a collector from exhausting a sandbox whose memory was priced for
+    # the agent, and it makes the skipped files visible instead of an OOM.
+    tracked_body = (
+        "for f do\n"
+        '    [ -z "$f" ] && continue\n'
+        '    size=$(wc -c < "$f" 2>/dev/null || echo 0)\n'
+        '    if [ "${size:-0}" -gt "$max_file" ]; then\n'
+        '        echo "skipped_tracked=$f size=$size" >> "$diag"\n'
+        '        continue\n'
+        "    fi\n"
+        '    out_size=$(wc -c < "$out" 2>/dev/null || echo 0)\n'
+        '    if [ "$out_size" -ge "$max_patch" ]; then\n'
+        '        echo "patch_capped=1" >> "$diag"\n'
+        "        break\n"
+        "    fi\n"
+        '    if [ -n "$base" ]; then\n'
+        '        git diff $cached --binary --submodule=diff --no-renames "$base" -- "$f" >> "$out" 2>>"$diag" || true\n'
+        "    else\n"
+        '        git diff $cached --binary --submodule=diff --no-renames -- "$f" >> "$out" 2>>"$diag" || true\n'
+        "    fi\n"
+        '    out_size=$(wc -c < "$out" 2>/dev/null || echo 0)\n'
+        '    if [ "$out_size" -ge "$max_patch" ]; then\n'
+        '        echo "patch_capped=1" >> "$diag"\n'
+        "        break\n"
+        "    fi\n"
+        "done\n"
+    )
     # Per-file body for the untracked pass. It is executed by `sh` (via `xargs -0`),
     # not by a `while read -d` loop: the sandbox runs commands with `/bin/sh`, and
     # dash's `read` has no `-d`, so the bash form silently skipped every untracked
@@ -112,15 +157,36 @@ async def collect_git_patch(
         '        d=$(dirname "$d")\n'
         "    done\n"
         '    if [ "$skip" = 1 ]; then continue; fi\n'
+        '    size=$(wc -c < "$f" 2>/dev/null || echo 0)\n'
+        '    if [ "${size:-0}" -gt "$max_file" ]; then\n'
+        '        echo "skipped_untracked=$f size=$size" >> "$diag"\n'
+        '        continue\n'
+        "    fi\n"
+        '    out_size=$(wc -c < "$out" 2>/dev/null || echo 0)\n'
+        '    if [ "$out_size" -ge "$max_patch" ]; then\n'
+        '        echo "patch_capped=1" >> "$diag"\n'
+        "        break\n"
+        "    fi\n"
         # `--no-index` exits 1 when the files differ, which is the normal case here.
         '    git diff --no-index --binary /dev/null -- "$f" >> "$out" 2>>"$diag" || true\n'
+        '    out_size=$(wc -c < "$out" 2>/dev/null || echo 0)\n'
+        '    if [ "$out_size" -ge "$max_patch" ]; then\n'
+        '        echo "patch_capped=1" >> "$diag"\n'
+        "        break\n"
+        "    fi\n"
         "done\n"
     )
     script = (
         "set -u\n"
         f"out={patch_arg}\n"
         f"diag={diag_arg}\n"
-        "export out diag\n"
+        f"base={base_arg}\n"
+        f"max_tracked={_MAX_TRACKED_FILE_BYTES}\n"
+        f"max_untracked={_MAX_UNTRACKED_FILE_BYTES}\n"
+        f"max_patch={_MAX_PATCH_BYTES}\n"
+        "cached=--cached\n"
+        "max_file=$max_tracked\n"
+        "export out diag base cached max_file max_patch\n"
         # The staging directory belongs to the harness, but nothing here may assume the
         # step that created it still ran or still holds: the agent has a shell in this
         # container too. One builtin buys independence from any directory it removed.
@@ -133,21 +199,37 @@ async def collect_git_patch(
         '    echo "cwd=$(pwd)"\n'
         f'    echo "wanted_cwd={workdir}"\n'
         f'    echo "staging_dir={staging_dir}"\n'
-        "    for tool in git wc dirname xargs tr; do\n"
+        '    echo "base=${base:-<none>}"\n'
+        '    echo "max_tracked=$max_tracked"\n'
+        '    echo "max_untracked=$max_untracked"\n'
+        '    echo "max_patch=$max_patch"\n'
+        "    for tool in git wc dirname xargs tr grep; do\n"
         '        printf "%s=%s\\n" "$tool" "$(command -v "$tool" 2>/dev/null || echo MISSING)"\n'
         "    done\n"
         f"    ls -ld {workdir_arg} {staging_arg} 2>&1 || true\n"
         '} >> "$diag" 2>&1\n'
-        # staged changes (index vs base / HEAD)
-        f'git diff --cached --binary --submodule=diff {base_arg} >> "$out" 2>>"$diag" '
-        '|| echo "cached_diff_rc=$?" >> "$diag"\n'
-        # unstaged changes (worktree vs index)
-        'git diff --binary --submodule=diff -- >> "$out" 2>>"$diag" '
-        '|| echo "worktree_diff_rc=$?" >> "$diag"\n'
+        # staged changes (index vs base / HEAD), one bounded diff per file
+        'git diff $cached --name-only -z --no-renames --diff-filter=ACMRTUXB ${base:+$base --} '
+        '2>>"$diag" | xargs -0 sh -c '
+        f"{shlex.quote(tracked_body)} sh\n"
+        # unstaged changes (worktree vs index), with no base commit
+        "base=\n"
+        "cached=\n"
+        "export base cached\n"
+        'git diff $cached --name-only -z --no-renames --diff-filter=ACMRTUXB '
+        '2>>"$diag" | xargs -0 sh -c '
+        f"{shlex.quote(tracked_body)} sh\n"
         'echo "untracked=$(git ls-files --others --exclude-standard -z | tr -cd "\\000" | wc -c)" '
         '>> "$diag"\n'
         # untracked files, excluding nested git repositories (agent scratch repos)
-        f"git ls-files --others --exclude-standard -z | xargs -0 sh -c {shlex.quote(untracked_body)} sh\n"
+        "max_file=$max_untracked\n"
+        "export max_file\n"
+        'git ls-files --others --exclude-standard -z 2>>"$diag" '
+        f"| xargs -0 sh -c {shlex.quote(untracked_body)} sh\n"
+        'if grep -q "^patch_capped=1" "$diag" 2>/dev/null; then\n'
+        '    echo "collector=capped" >> "$diag"\n'
+        "    exit 3\n"
+        "fi\n"
         'echo "collector=done" >> "$diag"\n'
         'wc -c < "$out"\n'
     )

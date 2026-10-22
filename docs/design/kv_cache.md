@@ -140,7 +140,9 @@ version. PSRL therefore starts LMCache only for a rollout pool running a
 multi-turn agent loop. Validation is single-turn and version-fenced after every
 weight update; a generate-only rollout has one request per trajectory; reward
 and teacher models produce no reusable generation KV. Those pools skip the
-server unless `enable_validation` or `enable_single_turn` is set.
+server unless `enable_validation` or `enable_single_turn` is set. P2P is the
+exception for a generate-only rollout: a request re-routed mid-generation
+still saves a re-prefill when its prefix migrates.
 
 When stores are enabled for a mixed workload, set `lazy_offload: true`: stores
 are batched behind finished requests instead of competing with the next

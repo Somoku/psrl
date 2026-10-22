@@ -514,5 +514,8 @@ class TestEnableForPool:
         assert enable_for_pool({"enable": True, "enable_single_turn": True}, "rollout", is_single_turn=True)
         assert enable_for_pool({"enable": True}, "rollout", is_single_turn=False)
 
+    def test_single_turn_stays_on_when_p2p_can_migrate_it(self):
+        assert enable_for_pool({"enable": True, "enable_p2p": True}, "rollout", is_single_turn=True)
+
     def test_disabled_globally_stays_disabled(self):
         assert not enable_for_pool({"enable": False}, "rollout")

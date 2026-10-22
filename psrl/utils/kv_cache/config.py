@@ -514,6 +514,8 @@ def enable_for_pool(
     Reward and teacher models produce no reusable generation KV at all. A
     generate-only rollout pool has the same problem: one request per trajectory
     and a new version every step. All of them would pay the copy for nothing.
+    Partial-rollout P2P is the exception: a request re-routed mid-generation
+    still avoids a re-prefill when the prefix migrates with it.
 
     Args:
         lmcache_raw: The resolved `psrl.lmcache` config node.
@@ -531,6 +533,12 @@ def enable_for_pool(
         return False
     if tag == "validate" and not lmcache_raw.get("enable_validation", False):
         return False
-    if is_single_turn and not lmcache_raw.get("enable_single_turn", False):
+    if (
+        is_single_turn
+        and not lmcache_raw.get("enable_single_turn", False)
+        # P2P is the exception: a partial rollout re-routed mid-generation
+        # still avoids a re-prefill by migrating the prefix to the new instance.
+        and not lmcache_raw.get("enable_p2p", False)
+    ):
         return False
     return True

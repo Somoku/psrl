@@ -549,6 +549,36 @@ func TestTheProberSkipsABusySandbox(t *testing.T) {
 	}
 }
 
+func TestReserveReRegistersAnOwnerForgottenBetweenAdmitAndReserve(t *testing.T) {
+	gate := mustGate(t, envelope())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
+	grant, refusal, ok := gate.Reserve("rollout", "worker", Resources{MemoryMB: 10})
+	if !ok {
+		t.Fatalf("reserve: %q", refusal)
+	}
+	// A sweep between Admit and Reserve sees no allocation and forgets the
+	// owner; the reservation must put it back, or every renewal is ignored and
+	// the sandbox is reclaimed as an orphan.
+	gate.RetainOwners(map[string]struct{}{})
+	life.Reserve(grant, "worker", "", testLifetime)
+
+	if !gate.OwnerAlive("worker") {
+		t.Fatal("the reservation must re-register its owner")
+	}
+}
+
+func TestSnapshotReportsTheOwnersItHolds(t *testing.T) {
+	gate := mustGate(t, envelope())
+	life, _ := NewLifecycle("node-a", gate, time.Second)
+	adopt(t, life, gate, &fakeBackend{}, "sb-owner")
+
+	report := life.Snapshot()
+
+	if len(report.LiveOwners) != 1 || report.LiveOwners[0] != "worker" {
+		t.Fatalf("live owners %v, want the owner of the resident sandbox", report.LiveOwners)
+	}
+}
+
 func TestMarkLostIsIdempotentAndAttributedBeforeCleanup(t *testing.T) {
 	gate := mustGate(t, envelope())
 	life, _ := NewLifecycle("node-a", gate, time.Second)

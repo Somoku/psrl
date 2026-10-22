@@ -362,6 +362,7 @@ type nodeViewWire struct {
 	InventoryReported  bool               `json:"inventory_reported"`
 	InventoryTruncated bool               `json:"inventory_truncated"`
 	LiveSandboxIDs     []string           `json:"live_sandbox_ids"`
+	LiveOwners         []string           `json:"live_owners"`
 	Diagnostics        map[string]float64 `json:"diagnostics"`
 }
 
@@ -403,6 +404,7 @@ func nodeViewToWire(view placement.NodeView) nodeViewWire {
 		InventoryReported:  view.InventoryReported,
 		InventoryTruncated: view.InventoryTruncated,
 		LiveSandboxIDs:     view.LiveSandboxIDs,
+		LiveOwners:         view.LiveOwners,
 		Diagnostics:        view.Diagnostics,
 	}
 	for class, h := range view.ClassHeadroom {
@@ -453,6 +455,7 @@ func nodeViewFromWire(w nodeViewWire) placement.NodeView {
 		InventoryReported:  w.InventoryReported,
 		InventoryTruncated: w.InventoryTruncated,
 		LiveSandboxIDs:     w.LiveSandboxIDs,
+		LiveOwners:         w.LiveOwners,
 		Diagnostics:        w.Diagnostics,
 		Envelope: placement.Headroom{
 			MemoryMB: w.Envelope.MemoryMB, CPUMillis: w.Envelope.CPUMillis,

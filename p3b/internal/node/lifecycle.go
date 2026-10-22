@@ -235,6 +235,10 @@ func (l *Lifecycle) Reserve(grant Grant, owner, execMode string, lifetime time.D
 		execMode: execMode, grant: grant, state: allocReserved,
 		createdAt: now, lifetime: lifetime, lastActivity: now,
 	}
+	// Admit and Reserve are separate locks; a sweep between them can forget an
+	// owner that has no allocation yet. Registering after the record is visible
+	// closes that window without letting a renewal resurrect an idle owner.
+	l.admission.RegisterOwner(owner)
 }
 
 // Claim takes a reserved grant for creation, consuming it exactly once.
@@ -1029,6 +1033,11 @@ type LifecycleReport struct {
 	InventoryReported  bool
 	InventoryTruncated bool
 	LiveSandboxIDs     []string
+	// LiveOwners is the distinct set of callers this node holds sandboxes for.
+	// The control plane renews an owner on the nodes that hold it, and its own
+	// create records can miss a node after a restart or a lost release; this is
+	// the node's own answer, so a renewal does not have to depend on them.
+	LiveOwners []string
 }
 
 // maxReportedInventory bounds the sandbox list one report carries. A report
@@ -1076,11 +1085,24 @@ func (l *Lifecycle) Snapshot() LifecycleReport {
 	if truncated {
 		live = live[:maxReportedInventory]
 	}
+	owners := make([]string, 0, len(l.allocations))
+	seenOwners := make(map[string]struct{}, len(l.allocations))
+	for _, held := range l.allocations {
+		if held.owner == "" {
+			continue
+		}
+		if _, seen := seenOwners[held.owner]; seen {
+			continue
+		}
+		seenOwners[held.owner] = struct{}{}
+		owners = append(owners, held.owner)
+	}
+	sort.Strings(owners)
 	return LifecycleReport{
 		Resident: len(l.bySandbox), Busy: busy,
 		Destroying: destroying, CleanupFailed: failed, Draining: l.draining,
 		Exits: exits, Failures: l.failures,
 		ReportSeq: l.reportSeq, InventoryReported: true,
-		InventoryTruncated: truncated, LiveSandboxIDs: live,
+		InventoryTruncated: truncated, LiveSandboxIDs: live, LiveOwners: owners,
 	}
 }

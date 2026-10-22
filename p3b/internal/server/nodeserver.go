@@ -463,6 +463,7 @@ func (n *Node) View() placement.NodeView {
 	view.InventoryReported = life.InventoryReported
 	view.InventoryTruncated = life.InventoryTruncated
 	view.LiveSandboxIDs = life.LiveSandboxIDs
+	view.LiveOwners = life.LiveOwners
 	view.Diagnostics = map[string]float64{
 		"lifecycle/resident":       float64(life.Resident),
 		"lifecycle/busy":           float64(life.Busy),

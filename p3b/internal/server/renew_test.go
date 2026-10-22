@@ -107,6 +107,27 @@ func TestRenewOwnerTargetsOnlyTheNodesHoldingTheOwnersSandboxes(t *testing.T) {
 	}
 }
 
+func TestRenewOwnerReachesANodeTheControlHasNoRecordFor(t *testing.T) {
+	// A control restart or a lost release can leave a live sandbox out of
+	// c.sandbox. The node's own LiveOwners is then the only evidence the
+	// control has, and without it that node's owner lease expires and the node
+	// reclaims every sandbox it holds.
+	nodes := &renewClient{stubNodes: &stubNodes{}}
+	control, _ := newTestControl(t, nodes, time.Now)
+	control.monitor.Report(placement.NodeView{
+		NodeID: "node-a", SeenAt: time.Now(), LiveOwners: []string{"owner-1"},
+	})
+	control.monitor.Report(placement.NodeView{
+		NodeID: "node-b", SeenAt: time.Now(), LiveOwners: []string{"owner-other"},
+	})
+
+	control.RenewOwner(context.Background(), "owner-1")
+
+	if called := nodes.calledNodes(); len(called) != 1 || called[0] != "node-a" {
+		t.Fatalf("renewal reached %v, want only the node reporting the owner", called)
+	}
+}
+
 func TestRenewOwnerFallsBackToTheLiveFleetAfterAControlRestart(t *testing.T) {
 	// A control plane that has no records yet still has to keep the caller's
 	// sandboxes alive; the live fleet is the only evidence it has.

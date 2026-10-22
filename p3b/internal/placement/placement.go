@@ -140,6 +140,10 @@ type NodeView struct {
 	InventoryReported  bool
 	InventoryTruncated bool
 	LiveSandboxIDs     []string
+	// LiveOwners is the set of callers this node holds sandboxes for. Renewal
+	// targets the holders, and this is the node's own answer when the control's
+	// create records are incomplete.
+	LiveOwners []string
 
 	// Diagnostics are the node's own counters, carried beside the scheduling
 	// view so an operator can see why a node is refusing or reaping without

@@ -1025,7 +1025,12 @@ func (c *Control) RenewOwner(ctx context.Context, owner string) {
 }
 
 // renewalNodes returns the nodes that hold this owner's sandboxes, or the live
-// fleet when the control has no record of the owner.
+// fleet when neither the control's records nor the nodes themselves name one.
+//
+// The node's own LiveOwners is the authority: a control restart, a lost release
+// response, or a reconciliation can leave a sandbox out of `c.sandbox` while
+// the node still holds it, and targeting only the recorded nodes would let that
+// node's owner lease expire and reclaim every sandbox it holds for this owner.
 func (c *Control) renewalNodes(owner string) []string {
 	seen := map[string]struct{}{}
 	c.mu.Lock()
@@ -1035,6 +1040,14 @@ func (c *Control) renewalNodes(owner string) []string {
 		}
 	}
 	c.mu.Unlock()
+	for _, view := range c.monitor.LiveFleet() {
+		for _, heldOwner := range view.LiveOwners {
+			if heldOwner == owner {
+				seen[view.NodeID] = struct{}{}
+				break
+			}
+		}
+	}
 	if len(seen) == 0 {
 		for _, view := range c.monitor.LiveFleet() {
 			seen[view.NodeID] = struct{}{}

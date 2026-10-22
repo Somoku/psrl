@@ -1057,6 +1057,24 @@ func (a *Admission) claimedIndicesLocked(indices []int32) []int32 {
 }
 
 // Renew records that an owner still holds its grants.
+// RegisterOwner records a caller that now holds a record on this node.
+//
+// Admit already records the owner, but it and Reserve are separate locks. A
+// sweep that runs between them sees no allocation, forgets the owner, and then
+// ignores every renewal for it; the sandbox is reclaimed as an orphan even
+// though its owner is alive. Reserve calls this after the record is visible, so
+// the owner is never lost in that window. Unlike Renew, this is allowed to
+// create an entry: the caller has a record here, so its liveness matters.
+func (a *Admission) RegisterOwner(owner string) {
+	if owner == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.owners[owner] = a.now()
+}
+
+// Renew records a heartbeat from an owner this node already knows.
 func (a *Admission) Renew(owner string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

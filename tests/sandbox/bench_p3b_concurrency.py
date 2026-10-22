@@ -4,13 +4,18 @@ Measures create+exec+release latency under increasing concurrency levels,
 then compares to the Python sandbox's per-worker envelope ceiling.
 """
 import asyncio
+import os
 import statistics
 import sys
 import time
 
 from sandboxd import Resources, SandboxClient, SandboxSpec, Source
 
-ENDPOINT = "unix:///run/sandboxd.sock"
+# The endpoint is a deployment argument, never a repository setting: a benchmark
+# that only runs against a local socket cannot measure a fleet.
+ENDPOINT = os.environ.get("PSRL_BENCH_ENDPOINT", "unix:///run/sandboxd.sock")
+if len(sys.argv) > 1:
+    ENDPOINT = sys.argv[1]
 IMAGE = "alpine:latest"
 MEM_MB = 256   # 256 MB per sandbox — same as psrl live test default
 CONCURRENCY_LEVELS = [8, 16, 32, 64]
@@ -45,6 +50,7 @@ async def run_level(n: int) -> dict:
         "n": n,
         "ok": len(ok),
         "errs": len(errs),
+        "errors": [repr(e) for e in errs[:3]],
         "elapsed_s": round(elapsed, 2),
         "throughput": round(len(ok) / elapsed, 2) if elapsed > 0 else 0,
         "p50_ms": round(statistics.median(ok), 0) if ok else 0,
@@ -66,6 +72,8 @@ async def main():
         print(f"{result['n']:>12} {result['ok']:>4}/{result['n']:<5} "
               f"{result['elapsed_s']:>8.1f}s {result['throughput']:>11.2f}/s "
               f"{result['p50_ms']:>8.0f}ms {result['p95_ms']:>8.0f}ms")
+        for error in result["errors"]:
+            print(f"    error: {error}")
 
     print("\nNOTE: Create latency dominated by Docker container start (~1s).")
     print("p3b throughput advantage is in fleet-wide quota accounting across workers,")

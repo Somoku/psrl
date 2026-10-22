@@ -40,10 +40,22 @@ class SandboxSessionLost(SandboxError):
     must not be counted as evidence that the harness is broken.
     """
 
-    def __init__(self, message: str, *, sandbox_id: str = "", exit_reason: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_id: str = "",
+        exit_reason: str = "",
+        exit_code: int | None = None,
+        finished_at: str = "",
+    ) -> None:
         super().__init__(message)
         self.sandbox_id = sandbox_id
         self.exit_reason = exit_reason
+        # The runtime's own evidence, when it reported any. `None` means the
+        # service never observed a code, which is different from a clean exit 0.
+        self.exit_code = exit_code
+        self.finished_at = finished_at
 
 
 class SandboxOomError(SandboxError):

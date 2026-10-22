@@ -347,9 +347,17 @@ class TestFailuresKeepTheirAttribution:
         assert isinstance(translated, SandboxPathNotFoundError)
         assert not isinstance(translated, p3b_backend.SandboxSessionLostError)
 
-    def test_a_lost_session_keeps_its_exit_reason(self):
+    def test_a_lost_session_keeps_its_exit_attribution(self):
         translated = p3b_backend._translate(
-            service_errors.SandboxSessionLost("gone", sandbox_id="sb-1", exit_reason="oom")
+            service_errors.SandboxSessionLost(
+                "gone",
+                sandbox_id="sb-1",
+                exit_reason="oom",
+                exit_code=137,
+                finished_at="2026-10-22T02:13:07Z",
+            )
         )
 
         assert translated.exit_reason is SandboxExitReason.OOM
+        assert translated.exit_code == 137
+        assert translated.finished_at == "2026-10-22T02:13:07Z"

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -546,19 +547,53 @@ type sessionGoneError struct {
 	sandboxID string
 	nodeID    string
 	reason    string
+	exitCode  int
+	codeKnown bool
+	finished  time.Time
+}
+
+// sessionGone builds the failure from the lifecycle's attribution. Keeping the
+// construction in one place is what makes the exit code and finish time travel
+// with every path that discovers a loss, rather than only the one that happens
+// to remember them.
+func sessionGone(sandboxID, nodeID string, attribution node.ExitAttribution) *sessionGoneError {
+	return &sessionGoneError{
+		sandboxID: sandboxID,
+		nodeID:    nodeID,
+		reason:    string(attribution.Reason),
+		exitCode:  attribution.ExitCode,
+		codeKnown: attribution.ExitCodeKnown,
+		finished:  attribution.FinishedAt,
+	}
 }
 
 func (e *sessionGoneError) Error() string {
+	message := fmt.Sprintf("sandbox %q is not held by node %q", e.sandboxID, e.nodeID)
+	var details []string
 	if e.reason != "" {
-		return fmt.Sprintf("sandbox %q is not held by node %q (exit_reason=%s)",
-			e.sandboxID, e.nodeID, e.reason)
+		details = append(details, "exit_reason="+e.reason)
 	}
-	return fmt.Sprintf("sandbox %q is not held by node %q", e.sandboxID, e.nodeID)
+	if e.codeKnown {
+		details = append(details, fmt.Sprintf("exit_code=%d", e.exitCode))
+	}
+	if !e.finished.IsZero() {
+		details = append(details, "finished_at="+e.finished.UTC().Format(time.RFC3339Nano))
+	}
+	if len(details) > 0 {
+		message += " (" + strings.Join(details, ", ") + ")"
+	}
+	return message
 }
 
 // ExitReason exposes the attribution to the wire layer without that layer
 // having to type-switch on this package's concrete error.
 func (e *sessionGoneError) ExitReason() string { return e.reason }
+
+// ExitCode reports the runtime's exit code, when one was observed.
+func (e *sessionGoneError) ExitCode() (int, bool) { return e.exitCode, e.codeKnown }
+
+// FinishedAt reports when the runtime observed the stop, when it did.
+func (e *sessionGoneError) FinishedAt() time.Time { return e.finished }
 
 // WireCode names the caller-facing classification. It is checked before the
 // gRPC status so a lost session stays a lost session across every hop.
@@ -607,12 +642,8 @@ func (n *Node) Exec(ctx context.Context, handle backend.Handle, command, workdir
 		// The sandbox is gone. Report why it left when the lifecycle still
 		// remembers, so the caller can tell a reaped sandbox from one that was
 		// never here -- and gets a lost-session rather than a transport fault.
-		reason, _ := n.lifecycle.ExitReasonOf(handle.SandboxID)
-		return backend.ExecResult{}, &sessionGoneError{
-			sandboxID: handle.SandboxID,
-			nodeID:    n.nodeID,
-			reason:    string(reason),
-		}
+		attribution, _ := n.lifecycle.ExitAttributionOf(handle.SandboxID)
+		return backend.ExecResult{}, sessionGone(handle.SandboxID, n.nodeID, attribution)
 	}
 	// Mark the sandbox busy for the whole command, so the reclamation sweep
 	// cannot read a long command as idle and pause a running test suite.
@@ -645,14 +676,14 @@ func (n *Node) classifyRuntimeFailure(
 ) error {
 	switch {
 	case errors.Is(err, backend.ErrRuntimeGone):
-		reason := n.runtimeGoneReason(ctx, held, handle)
-		n.lifecycle.MarkLost(handle.SandboxID, reason)
-		return &sessionGoneError{sandboxID: handle.SandboxID, nodeID: n.nodeID, reason: string(reason)}
+		attribution := n.runtimeGoneAttribution(ctx, held, handle)
+		n.lifecycle.MarkLost(handle.SandboxID, attribution)
+		return sessionGone(handle.SandboxID, n.nodeID, attribution)
 	case errors.Is(err, backend.ErrSessionLost):
 		// The command session is gone, but the container may still be healthy.
 		// The caller replaces the sandbox; the node does not release a runtime
-		// it has no evidence is dead.
-		return &sessionGoneError{sandboxID: handle.SandboxID, nodeID: n.nodeID}
+		// it has no evidence is dead, so there is no exit code to report.
+		return sessionGone(handle.SandboxID, n.nodeID, node.ExitAttribution{})
 	case errors.Is(err, backend.ErrPathNotFound):
 		return &pathNotFoundError{path: "", err: err}
 	default:
@@ -660,24 +691,52 @@ func (n *Node) classifyRuntimeFailure(
 	}
 }
 
-// runtimeGoneReason asks the runtime why it is gone, with a short budget. A
-// failed or slow probe answers "exited": the caller still needs the sandbox
-// replaced, and an unknown cause is not a reason to leave the charge in place.
-func (n *Node) runtimeGoneReason(ctx context.Context, held backend.Backend, handle backend.Handle) node.ExitReason {
+// runtimeGoneAttribution asks the runtime why it is gone, with a short budget.
+// A failed or slow probe answers "exited" with no code: the caller still needs
+// the sandbox replaced, and an unknown cause is not a reason to leave the charge
+// in place -- but neither is it a reason to invent an exit code.
+func (n *Node) runtimeGoneAttribution(
+	ctx context.Context, held backend.Backend, handle backend.Handle,
+) node.ExitAttribution {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
+	if detailer, ok := held.(backend.ExitDetailer); ok {
+		if detail, err := detailer.ExitDetail(probeCtx, handle); err == nil {
+			attribution := node.ExitAttribution{
+				Reason:        node.ExitExited,
+				ExitCode:      detail.ExitCode,
+				ExitCodeKnown: detail.ExitCodeKnown,
+				FinishedAt:    detail.FinishedAt,
+			}
+			if detail.OOMKilled {
+				attribution.Reason = node.ExitOOM
+				if !attribution.ExitCodeKnown || attribution.ExitCode == 0 {
+					attribution.ExitCode = 137
+					attribution.ExitCodeKnown = true
+				}
+			}
+			if attribution.FinishedAt.IsZero() {
+				attribution.FinishedAt = time.Now()
+			}
+			return attribution
+		}
+	}
 	status, err := held.Status(probeCtx, handle)
 	if err != nil {
-		return node.ExitExited
+		return node.ExitAttribution{Reason: node.ExitExited, FinishedAt: time.Now()}
 	}
+	reason := node.ExitExited
 	switch status {
 	case "oom":
-		return node.ExitOOM
+		reason = node.ExitOOM
 	case "terminated":
-		return node.ExitRuntimeGone
-	default:
-		return node.ExitExited
+		reason = node.ExitRuntimeGone
 	}
+	attribution := node.ExitAttribution{Reason: reason, FinishedAt: time.Now()}
+	if reason == node.ExitOOM {
+		attribution.ExitCode, attribution.ExitCodeKnown = 137, true
+	}
+	return attribution
 }
 
 // renewOwnerOf refreshes the owner's liveness on this node. An owner this node
@@ -694,8 +753,8 @@ func (n *Node) renewOwnerOf(sandboxID string) {
 func (n *Node) ReadBytes(ctx context.Context, handle backend.Handle, path string) ([]byte, error) {
 	_, held, owned := n.lifecycle.Lookup(handle.SandboxID)
 	if !owned {
-		reason, _ := n.lifecycle.ExitReasonOf(handle.SandboxID)
-		return nil, &sessionGoneError{sandboxID: handle.SandboxID, nodeID: n.nodeID, reason: string(reason)}
+		attribution, _ := n.lifecycle.ExitAttributionOf(handle.SandboxID)
+		return nil, sessionGone(handle.SandboxID, n.nodeID, attribution)
 	}
 	n.renewOwnerOf(handle.SandboxID)
 	if files, ok := held.(backend.FileHandler); ok {
@@ -742,8 +801,8 @@ func (n *Node) ReadBytes(ctx context.Context, handle backend.Handle, path string
 func (n *Node) WriteBytes(ctx context.Context, handle backend.Handle, path string, data []byte) error {
 	_, held, owned := n.lifecycle.Lookup(handle.SandboxID)
 	if !owned {
-		reason, _ := n.lifecycle.ExitReasonOf(handle.SandboxID)
-		return &sessionGoneError{sandboxID: handle.SandboxID, nodeID: n.nodeID, reason: string(reason)}
+		attribution, _ := n.lifecycle.ExitAttributionOf(handle.SandboxID)
+		return sessionGone(handle.SandboxID, n.nodeID, attribution)
 	}
 	n.renewOwnerOf(handle.SandboxID)
 	if files, ok := held.(backend.FileHandler); ok {

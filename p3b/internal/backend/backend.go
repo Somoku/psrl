@@ -339,6 +339,9 @@ type Reconciled struct {
 	// refused instead of a bare "not running".
 	OOMKilled bool
 	ExitCode  int
+	// FinishedAt is when the runtime observed the container stop. It is the
+	// clock a post mortem compares against a node's cgroup and kernel events.
+	FinishedAt time.Time
 	// Name is the runtime's name for the object, when it has one. It is what
 	// distinguishes unclaimed warm-pool inventory from a sandbox: a label written at
 	// create cannot be removed when an entry is claimed, but a name can be changed.
@@ -350,6 +353,28 @@ type Reconciled struct {
 	// CgroupParent is where the object actually runs, so a restarted node can tell a
 	// sandbox it may adopt from one the sampler cannot see.
 	CgroupParent string
+}
+
+// ExitDetail is the runtime's attribution for a sandbox that stopped.
+//
+// It is more than Status's one-word answer: a caller that is about to release a
+// sandbox and blame a resource or an exit path needs the daemon's exit code and
+// the moment it happened, not a reconstruction from the reason.
+type ExitDetail struct {
+	Running   bool
+	OOMKilled bool
+	ExitCode  int
+	// ExitCodeKnown distinguishes a clean exit 0 from a runtime that had no
+	// code to report (a removed container, or one that never started).
+	ExitCodeKnown bool
+	FinishedAt    time.Time
+}
+
+// ExitDetailer is a backend that can report why a sandbox stopped, not merely
+// that it did. It is optional: a backend that cannot inspect keeps the
+// status-only attribution.
+type ExitDetailer interface {
+	ExitDetail(ctx context.Context, handle Handle) (ExitDetail, error)
 }
 
 // PoolBudget is what a backend that prefetches containers has to ask before it

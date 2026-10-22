@@ -57,6 +57,12 @@ type allocation struct {
 	// pendingReason is why the sweep decided to remove this record, kept until
 	// the removal confirms so the record can be attributed when it is dropped.
 	pendingReason ExitReason
+	// pendingExitCode and pendingFinishedAt are the runtime's attribution for
+	// the stop, carried from the decision to removeLocked so the caller that
+	// discovered the loss can report it before cleanup runs.
+	pendingExitCode   int
+	pendingCodeKnown  bool
+	pendingFinishedAt time.Time
 	// cleanupAttempts and nextCleanupAt pace the retries of a refused removal.
 	cleanupAttempts int
 	nextCleanupAt   time.Time

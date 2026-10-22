@@ -219,6 +219,8 @@ class Transport:
                 error.get("message", ""),
                 exit_reason=error.get("exit_reason") or "",
                 sandbox_id=str(payload.get("sandbox_id") or ""),
+                exit_code=error.get("exit_code"),
+                finished_at=error.get("finished_at") or "",
             )
         return reply.get("result") or {}
 
@@ -236,18 +238,29 @@ class Transport:
 
 
 def _error_for(
-    code: str, message: str, *, exit_reason: str = "", sandbox_id: str = ""
+    code: str,
+    message: str,
+    *,
+    exit_reason: str = "",
+    sandbox_id: str = "",
+    exit_code: int | None = None,
+    finished_at: str = "",
 ) -> SandboxError:
     """Rebuild a typed failure from the service's reply.
 
     The type is the service's classification, not a guess from the message: the
     caller's response differs per type, and an infrastructure fault read as a
     task result corrupts a reward. A lost session also carries the service's
-    attribution, so a post mortem does not have to infer why it went.
+    attribution -- reason, exit code, and finish time -- so a post mortem does
+    not have to infer why it went.
     """
     if code == "session_lost":
         return SandboxSessionLost(
-            message, sandbox_id=sandbox_id, exit_reason=exit_reason
+            message,
+            sandbox_id=sandbox_id,
+            exit_reason=exit_reason,
+            exit_code=exit_code,
+            finished_at=finished_at,
         )
     return {
         "capacity_timeout": SandboxCapacityTimeout,

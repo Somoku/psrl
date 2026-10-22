@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -127,9 +128,16 @@ type wireError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 	// ExitReason attributes a `session_lost` sandbox (released/reaped_idle/
-	// reaped_lifetime/reclaimed_orphan) so a post mortem does not have to guess.
-	// Empty when the failure carries no attribution.
+	// reaped_lifetime/reclaimed_orphan/oom/exited/runtime_gone) so a post mortem
+	// does not have to guess. Empty when the failure carries no attribution.
 	ExitReason string `json:"exit_reason,omitempty"`
+	// ExitCode is the runtime's exit code, when it observed one. It is a pointer
+	// so "the process exited 0" and "the runtime never reported a code" are not
+	// the same JSON value.
+	ExitCode *int `json:"exit_code,omitempty"`
+	// FinishedAt is when the runtime observed the stop, RFC 3339 in UTC. It is
+	// the clock an operator correlates with the node's cgroup and kernel events.
+	FinishedAt string `json:"finished_at,omitempty"`
 }
 
 func (j *JSONListener) handle(ctx context.Context, conn net.Conn) {
@@ -203,7 +211,14 @@ func classify(err error) *wireError {
 			code = "command_timeout"
 		}
 	}
-	return &wireError{Code: code, Message: err.Error(), ExitReason: exitReasonOf(err)}
+	out := &wireError{Code: code, Message: err.Error(), ExitReason: exitReasonOf(err)}
+	if exitCode, ok := exitCodeOf(err); ok {
+		out.ExitCode = &exitCode
+	}
+	if finished := finishedAtOf(err); !finished.IsZero() {
+		out.FinishedAt = finished.UTC().Format(time.RFC3339Nano)
+	}
+	return out
 }
 
 // exitReasonOf extracts an attribution from an error that carries one. The
@@ -258,6 +273,25 @@ func exitReasonOf(err error) string {
 		return attributed.ExitReason()
 	}
 	return ""
+}
+
+// exitCodeOf extracts the runtime's exit code when the error carries one. A
+// separate accessor from ExitReason keeps "unknown" distinct from "exited 0".
+func exitCodeOf(err error) (int, bool) {
+	var attributed interface{ ExitCode() (int, bool) }
+	if errors.As(err, &attributed) {
+		return attributed.ExitCode()
+	}
+	return 0, false
+}
+
+// finishedAtOf extracts when the runtime observed the stop, if it did.
+func finishedAtOf(err error) time.Time {
+	var attributed interface{ FinishedAt() time.Time }
+	if errors.As(err, &attributed) {
+		return attributed.FinishedAt()
+	}
+	return time.Time{}
 }
 
 func (j *JSONListener) dispatch(ctx context.Context, req request) (any, error) {

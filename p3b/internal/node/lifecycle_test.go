@@ -486,8 +486,8 @@ func TestTheProberReclaimsAnExitedSandboxAndReturnsItsBudget(t *testing.T) {
 	}
 	life.WaitCleanup()
 
-	if reason, ok := life.ExitReasonOf("sb-1"); !ok || reason != ExitExited {
-		t.Fatalf("exit reason %q (known=%v), want %q", reason, ok, ExitExited)
+	if attribution, ok := life.ExitAttributionOf("sb-1"); !ok || attribution.Reason != ExitExited {
+		t.Fatalf("exit attribution %+v (known=%v), want %q", attribution, ok, ExitExited)
 	}
 	if after := gate.Headroom("rollout").MemoryMB; after != before+10 {
 		t.Fatalf("headroom went %d -> %d, want +10MB returned after the runtime was gone", before, after)
@@ -508,8 +508,10 @@ func TestTheProberAttributesAnOom(t *testing.T) {
 		t.Fatalf("probe report %+v, want one OOM", report)
 	}
 	life.WaitCleanup()
-	if reason, ok := life.ExitReasonOf("sb-oom"); !ok || reason != ExitOOM {
-		t.Fatalf("exit reason %q (known=%v), want %q", reason, ok, ExitOOM)
+	if attribution, ok := life.ExitAttributionOf("sb-oom"); !ok || attribution.Reason != ExitOOM {
+		t.Fatalf("exit attribution %+v (known=%v), want %q", attribution, ok, ExitOOM)
+	} else if !attribution.ExitCodeKnown || attribution.ExitCode != 137 {
+		t.Fatalf("exit code %d (known=%v), want 137", attribution.ExitCode, attribution.ExitCodeKnown)
 	}
 }
 
@@ -553,18 +555,18 @@ func TestMarkLostIsIdempotentAndAttributedBeforeCleanup(t *testing.T) {
 	fake := &fakeBackend{releaseBlock: make(chan struct{})}
 	adopt(t, life, gate, fake, "sb-lost")
 
-	if !life.MarkLost("sb-lost", ExitExited) {
+	if !life.MarkLost("sb-lost", ExitAttribution{Reason: ExitExited}) {
 		t.Fatal("the first mark must win")
 	}
-	if life.MarkLost("sb-lost", ExitOOM) {
+	if life.MarkLost("sb-lost", ExitAttribution{Reason: ExitOOM}) {
 		t.Fatal("a second mark must not decide twice")
 	}
-	if reason, ok := life.ExitReasonOf("sb-lost"); !ok || reason != ExitExited {
-		t.Fatalf("reason %q (known=%v), want %q while cleanup is in flight", reason, ok, ExitExited)
+	if attribution, ok := life.ExitAttributionOf("sb-lost"); !ok || attribution.Reason != ExitExited {
+		t.Fatalf("attribution %+v (known=%v), want %q while cleanup is in flight", attribution, ok, ExitExited)
 	}
 	close(fake.releaseBlock)
 	life.WaitCleanup()
-	if reason, ok := life.ExitReasonOf("sb-lost"); !ok || reason != ExitExited {
-		t.Fatalf("reason after cleanup %q (known=%v), want %q", reason, ok, ExitExited)
+	if attribution, ok := life.ExitAttributionOf("sb-lost"); !ok || attribution.Reason != ExitExited {
+		t.Fatalf("attribution after cleanup %+v (known=%v), want %q", attribution, ok, ExitExited)
 	}
 }

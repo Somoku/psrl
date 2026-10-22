@@ -637,6 +637,43 @@ func (b *Backend) Status(ctx context.Context, handle backend.Handle) (string, er
 	}
 }
 
+// ExitDetail reports the daemon's exit code and finish time for a sandbox that
+// stopped. A container the daemon no longer has answers with Running=false and
+// an unknown code rather than an error: "removed" is a stronger statement than
+// "stopped", and the node's own attribution names it.
+func (b *Backend) ExitDetail(ctx context.Context, handle backend.Handle) (backend.ExitDetail, error) {
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	var inspected struct {
+		State struct {
+			Running    bool   `json:"Running"`
+			OOMKilled  bool   `json:"OOMKilled"`
+			ExitCode   int    `json:"ExitCode"`
+			FinishedAt string `json:"FinishedAt"`
+		} `json:"State"`
+	}
+	if err := b.call(ctx, http.MethodGet, "/containers/"+handle.SandboxID+"/json", nil, &inspected); err != nil {
+		if isNotFound(err) {
+			// The container is removed, not merely stopped. The caller's
+			// status vocabulary has a distinct word for that, so this reports
+			// the sentinel rather than an empty detail that would read as a
+			// plain exit.
+			return backend.ExitDetail{}, backend.ErrRuntimeGone
+		}
+		return backend.ExitDetail{}, err
+	}
+	detail := backend.ExitDetail{
+		Running:       inspected.State.Running,
+		OOMKilled:     inspected.State.OOMKilled && !inspected.State.Running,
+		ExitCode:      inspected.State.ExitCode,
+		ExitCodeKnown: !inspected.State.Running,
+	}
+	if finished, err := time.Parse(time.RFC3339Nano, inspected.State.FinishedAt); err == nil {
+		detail.FinishedAt = finished
+	}
+	return detail, nil
+}
+
 // Pause freezes a container's process tree, keeping it resident on this node.
 func (b *Backend) Pause(ctx context.Context, handle backend.Handle, mode string) error {
 	if mode != "" && mode != "freeze" {
@@ -1101,10 +1138,11 @@ func (b *Backend) inspectOne(ctx context.Context, id string) (backend.Reconciled
 		Name    string `json:"Name"`
 		Created string `json:"Created"`
 		State   struct {
-			Running   bool   `json:"Running"`
-			OOMKilled bool   `json:"OOMKilled"`
-			ExitCode  int    `json:"ExitCode"`
-			Status    string `json:"Status"`
+			Running    bool   `json:"Running"`
+			OOMKilled  bool   `json:"OOMKilled"`
+			ExitCode   int    `json:"ExitCode"`
+			Status     string `json:"Status"`
+			FinishedAt string `json:"FinishedAt"`
 		} `json:"State"`
 		Config struct {
 			Labels map[string]string `json:"Labels"`
@@ -1153,6 +1191,9 @@ func (b *Backend) inspectOne(ctx context.Context, id string) (backend.Reconciled
 	}
 	if created, err := time.Parse(time.RFC3339Nano, inspected.Created); err == nil {
 		rec.CreatedAt = created
+	}
+	if finished, err := time.Parse(time.RFC3339Nano, inspected.State.FinishedAt); err == nil {
+		rec.FinishedAt = finished
 	}
 	for _, entry := range inspected.Config.Env {
 		if value, found := strings.CutPrefix(entry, "CUDA_VISIBLE_DEVICES="); found {

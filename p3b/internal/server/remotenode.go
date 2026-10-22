@@ -432,7 +432,22 @@ func cutPrefix(s, prefix string) (string, bool) {
 }
 
 func wireErrorToStatus(e *wireError) error {
-	return &nodeFailure{code: wireErrorCode(e.Code), class: e.Code, message: e.Message, exitReason: e.ExitReason}
+	failure := &nodeFailure{
+		code:       wireErrorCode(e.Code),
+		class:      e.Code,
+		message:    e.Message,
+		exitReason: e.ExitReason,
+	}
+	if e.ExitCode != nil {
+		failure.exitCode = *e.ExitCode
+		failure.codeKnown = true
+	}
+	if e.FinishedAt != "" {
+		if finished, err := time.Parse(time.RFC3339Nano, e.FinishedAt); err == nil {
+			failure.finishedAt = finished
+		}
+	}
+	return failure
 }
 
 // wireErrorCode maps a wire classification onto the gRPC code a caller reads.
@@ -471,6 +486,9 @@ type nodeFailure struct {
 	class      string
 	message    string
 	exitReason string
+	exitCode   int
+	codeKnown  bool
+	finishedAt time.Time
 }
 
 func (e *nodeFailure) Error() string { return e.message }
@@ -483,6 +501,13 @@ func (e *nodeFailure) WireCode() string { return e.class }
 func (e *nodeFailure) GRPCStatus() *status.Status { return status.New(e.code, e.message) }
 
 func (e *nodeFailure) ExitReason() string { return e.exitReason }
+
+// ExitCode keeps the runtime's exit code across the control hop, so the SDK and
+// the trainer see the code the node observed rather than None.
+func (e *nodeFailure) ExitCode() (int, bool) { return e.exitCode, e.codeKnown }
+
+// FinishedAt keeps the runtime's stop time across the control hop.
+func (e *nodeFailure) FinishedAt() time.Time { return e.finishedAt }
 
 func mustMarshal(v any) json.RawMessage {
 	b, err := json.Marshal(v)

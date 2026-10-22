@@ -431,9 +431,9 @@ func TestASandboxKilledAtItsCeilingIsEndedAndSaidSo(t *testing.T) {
 	if len(report.Ended) != 1 || report.Ended[0] != "sb-1" {
 		t.Fatalf("ended: got %v, want this sandbox", report.Ended)
 	}
-	reason, known := agent.lifecycle.ExitReasonOf("sb-1")
-	if !known || reason != node.ExitOOM {
-		t.Errorf("exit reason: got %q (known=%v), want %q", reason, known, node.ExitOOM)
+	attribution, known := agent.lifecycle.ExitAttributionOf("sb-1")
+	if !known || attribution.Reason != node.ExitOOM {
+		t.Errorf("exit attribution: got %+v (known=%v), want %q", attribution, known, node.ExitOOM)
 	}
 }
 

@@ -67,10 +67,35 @@ const (
 	ExitRuntimeGone ExitReason = "runtime_gone"
 )
 
+// ExitAttribution is why a sandbox left this node and what the runtime reported
+// about it. The exit code travels beside the reason because the reason is a
+// classification, not evidence: an operator correlating a sandbox loss with a
+// node's cgroup or kernel events needs the code and the moment.
+type ExitAttribution struct {
+	Reason        ExitReason
+	ExitCode      int
+	ExitCodeKnown bool
+	FinishedAt    time.Time
+}
+
+// exitCodeForReason states the exit code a reason implies when the runtime did
+// not report one. Only an OOM kill has an answer the classification itself
+// establishes (SIGKILL, 137); every other reason leaves the code unknown rather
+// than claiming a clean exit.
+func exitCodeForReason(reason ExitReason) (int, bool) {
+	if reason == ExitOOM {
+		return 137, true
+	}
+	return 0, false
+}
+
 // exitRecord attributes a sandbox that is no longer held.
 type exitRecord struct {
-	reason ExitReason
-	at     time.Time
+	reason     ExitReason
+	exitCode   int
+	codeKnown  bool
+	at         time.Time
+	finishedAt time.Time
 }
 
 // Lifecycle owns every sandbox on one node and reclaims them in one sweep.
@@ -365,6 +390,8 @@ func (l *Lifecycle) Release(ctx context.Context, sandboxID string, reason ExitRe
 	}
 	held.state = allocDestroying
 	held.pendingReason = reason
+	held.pendingExitCode, held.pendingCodeKnown = exitCodeForReason(reason)
+	held.pendingFinishedAt = l.now()
 	leaseID, handle, hosted := held.leaseID, held.handle, held.backend
 	l.mu.Unlock()
 
@@ -382,30 +409,54 @@ func (l *Lifecycle) removeLocked(held *allocation, reason ExitReason) {
 	delete(l.allocations, held.leaseID)
 	if held.sandboxID != "" {
 		delete(l.bySandbox, held.sandboxID)
-		l.lastExit[held.sandboxID] = exitRecord{reason: reason, at: l.now()}
+		finished := held.pendingFinishedAt
+		if finished.IsZero() {
+			finished = l.now()
+		}
+		l.lastExit[held.sandboxID] = exitRecord{
+			reason:     reason,
+			exitCode:   held.pendingExitCode,
+			codeKnown:  held.pendingCodeKnown,
+			at:         l.now(),
+			finishedAt: finished,
+		}
 	}
 	l.counters[reason]++
 	l.admission.Return(held.grant)
 }
 
-// ExitReasonOf reports why a sandbox this node used to hold left it.
+// ExitAttributionOf reports why and how a sandbox this node used to hold left it.
 //
-// A caller that reaches for a sandbox after it is gone gets the attribution
-// rather than an empty answer. The second result is false when the sandbox was
-// never held here or its record has aged out.
-func (l *Lifecycle) ExitReasonOf(sandboxID string) (ExitReason, bool) {
+// A caller that reaches for a sandbox after it is gone gets the runtime's
+// attribution rather than an empty answer. The second result is false when the
+// sandbox was never held here or its record has aged out.
+func (l *Lifecycle) ExitAttributionOf(sandboxID string) (ExitAttribution, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if rec, ok := l.lastExit[sandboxID]; ok {
-		return rec.reason, true
+		return ExitAttribution{
+			Reason:        rec.reason,
+			ExitCode:      rec.exitCode,
+			ExitCodeKnown: rec.codeKnown,
+			FinishedAt:    rec.finishedAt,
+		}, true
 	}
 	// A record that is already being destroyed has a decided reason but has not
 	// reached removeLocked yet. Reporting it now is what lets the command that
 	// discovered the loss name the cause instead of waiting a cleanup round.
 	if held, ok := l.bySandbox[sandboxID]; ok && held.pendingReason != "" {
-		return held.pendingReason, true
+		finished := held.pendingFinishedAt
+		if finished.IsZero() {
+			finished = l.now()
+		}
+		return ExitAttribution{
+			Reason:        held.pendingReason,
+			ExitCode:      held.pendingExitCode,
+			ExitCodeKnown: held.pendingCodeKnown,
+			FinishedAt:    finished,
+		}, true
 	}
-	return "", false
+	return ExitAttribution{}, false
 }
 
 // MarkLost decides that a resident sandbox's runtime is gone and hands its
@@ -416,9 +467,15 @@ func (l *Lifecycle) ExitReasonOf(sandboxID string) (ExitReason, bool) {
 // the caller needs an attribution before it returns. The transition is decided
 // under the lock and the enqueue happens outside it, exactly as Sweep does, so
 // a full cleanup queue restores the record rather than losing it.
-func (l *Lifecycle) MarkLost(sandboxID string, reason ExitReason) bool {
-	if reason == "" {
-		reason = ExitExited
+func (l *Lifecycle) MarkLost(sandboxID string, attribution ExitAttribution) bool {
+	if attribution.Reason == "" {
+		attribution.Reason = ExitExited
+	}
+	if !attribution.ExitCodeKnown {
+		attribution.ExitCode, attribution.ExitCodeKnown = exitCodeForReason(attribution.Reason)
+	}
+	if attribution.FinishedAt.IsZero() {
+		attribution.FinishedAt = l.now()
 	}
 	l.mu.Lock()
 	held, ok := l.bySandbox[sandboxID]
@@ -427,7 +484,10 @@ func (l *Lifecycle) MarkLost(sandboxID string, reason ExitReason) bool {
 		return false
 	}
 	held.state = allocDestroying
-	held.pendingReason = reason
+	held.pendingReason = attribution.Reason
+	held.pendingExitCode = attribution.ExitCode
+	held.pendingCodeKnown = attribution.ExitCodeKnown
+	held.pendingFinishedAt = attribution.FinishedAt
 	leaseID := held.leaseID
 	l.mu.Unlock()
 
@@ -436,6 +496,9 @@ func (l *Lifecycle) MarkLost(sandboxID string, reason ExitReason) bool {
 		if current, still := l.allocations[leaseID]; still && current.state == allocDestroying {
 			current.state = allocResident
 			current.pendingReason = ""
+			current.pendingExitCode = 0
+			current.pendingCodeKnown = false
+			current.pendingFinishedAt = time.Time{}
 		}
 		l.failures++
 		l.mu.Unlock()
@@ -597,6 +660,8 @@ func (l *Lifecycle) Sweep(ctx context.Context) SweepReport {
 		}
 		held.state = allocDestroying
 		held.pendingReason = d.reason
+		held.pendingExitCode, held.pendingCodeKnown = exitCodeForReason(d.reason)
+		held.pendingFinishedAt = l.now()
 		l.mu.Unlock()
 
 		if !l.cleanup.enqueue(d.leaseID) {
@@ -605,6 +670,10 @@ func (l *Lifecycle) Sweep(ctx context.Context) SweepReport {
 			l.mu.Lock()
 			if current, still := l.allocations[d.leaseID]; still && current.state == allocDestroying {
 				current.state = allocResident
+				current.pendingReason = ""
+				current.pendingExitCode = 0
+				current.pendingCodeKnown = false
+				current.pendingFinishedAt = time.Time{}
 			}
 			l.mu.Unlock()
 			report.Failures++
@@ -700,6 +769,8 @@ func (l *Lifecycle) ProbeRuntime(ctx context.Context) ProbeReport {
 	type outcome struct {
 		candidate probeCandidate
 		status    string
+		detail    backend.ExitDetail
+		detailOK  bool
 		err       error
 	}
 	results := make(chan outcome, len(candidates))
@@ -712,8 +783,20 @@ func (l *Lifecycle) ProbeRuntime(ctx context.Context) ProbeReport {
 			for candidate := range jobs {
 				probeCtx, cancel := context.WithTimeout(ctx, timeout)
 				status, err := candidate.backend.Status(probeCtx, candidate.handle)
+				out := outcome{candidate: candidate, status: status, err: err}
+				// A gone container's exit code and finish time are what an
+				// operator correlates with the node's cgroup and kernel logs.
+				// Only ask when the status already says the process is gone:
+				// a running sandbox has no exit to explain.
+				if err == nil && (status == "oom" || status == "exited" || status == "terminated") {
+					if detailer, ok := candidate.backend.(backend.ExitDetailer); ok {
+						if detail, detailErr := detailer.ExitDetail(probeCtx, candidate.handle); detailErr == nil {
+							out.detail, out.detailOK = detail, true
+						}
+					}
+				}
 				cancel()
-				results <- outcome{candidate: candidate, status: status, err: err}
+				results <- out
 			}
 		}()
 	}
@@ -746,7 +829,24 @@ func (l *Lifecycle) ProbeRuntime(ctx context.Context) ProbeReport {
 			// a state this probe does not recognize is not permission to destroy.
 			continue
 		}
-		gone, failed := l.markProbedGone(result.candidate, reason)
+		attribution := ExitAttribution{Reason: reason, FinishedAt: l.now()}
+		if result.detailOK {
+			attribution.ExitCode = result.detail.ExitCode
+			attribution.ExitCodeKnown = result.detail.ExitCodeKnown
+			if !result.detail.FinishedAt.IsZero() {
+				attribution.FinishedAt = result.detail.FinishedAt
+			}
+			if reason == ExitOOM && (!attribution.ExitCodeKnown || attribution.ExitCode == 0) {
+				// The daemon can report OOMKilled without a code when the
+				// container was killed by the kernel; the signal is SIGKILL.
+				attribution.ExitCode = 137
+				attribution.ExitCodeKnown = true
+			}
+		}
+		if !attribution.ExitCodeKnown {
+			attribution.ExitCode, attribution.ExitCodeKnown = exitCodeForReason(reason)
+		}
+		gone, failed := l.markProbedGone(result.candidate, attribution)
 		if gone {
 			report.Gone++
 			if reason == ExitOOM {
@@ -771,7 +871,7 @@ func (l *Lifecycle) ProbeRuntime(ctx context.Context) ProbeReport {
 // lock that a command did not begin while the probe was in flight. A command
 // that started mid-probe means the container is alive enough to serve it; the
 // next pass will look again.
-func (l *Lifecycle) markProbedGone(candidate probeCandidate, reason ExitReason) (gone, failed bool) {
+func (l *Lifecycle) markProbedGone(candidate probeCandidate, attribution ExitAttribution) (gone, failed bool) {
 	l.mu.Lock()
 	held, ok := l.bySandbox[candidate.sandboxID]
 	if !ok || held.leaseID != candidate.leaseID || held.state != allocResident || held.inFlight > 0 {
@@ -779,7 +879,10 @@ func (l *Lifecycle) markProbedGone(candidate probeCandidate, reason ExitReason) 
 		return false, false
 	}
 	held.state = allocDestroying
-	held.pendingReason = reason
+	held.pendingReason = attribution.Reason
+	held.pendingExitCode = attribution.ExitCode
+	held.pendingCodeKnown = attribution.ExitCodeKnown
+	held.pendingFinishedAt = attribution.FinishedAt
 	l.mu.Unlock()
 
 	if !l.cleanup.enqueue(candidate.leaseID) {
@@ -787,6 +890,9 @@ func (l *Lifecycle) markProbedGone(candidate probeCandidate, reason ExitReason) 
 		if current, still := l.allocations[candidate.leaseID]; still && current.state == allocDestroying {
 			current.state = allocResident
 			current.pendingReason = ""
+			current.pendingExitCode = 0
+			current.pendingCodeKnown = false
+			current.pendingFinishedAt = time.Time{}
 		}
 		l.failures++
 		l.mu.Unlock()

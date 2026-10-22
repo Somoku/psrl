@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -76,6 +77,19 @@ func TestExecOnAStoppedContainerIsSessionLostAndReleasesTheCharge(t *testing.T) 
 	if gone.reason != "oom" {
 		t.Fatalf("exit reason %q, want oom from the runtime's own status", gone.reason)
 	}
+	if !gone.codeKnown || gone.exitCode != 137 {
+		t.Fatalf("exit code %d (known=%v), want 137 from the OOM attribution", gone.exitCode, gone.codeKnown)
+	}
+	if gone.finished.IsZero() {
+		t.Fatal("a lost session must carry when the runtime observed the stop")
+	}
+	wire := classify(err)
+	if wire.ExitCode == nil || *wire.ExitCode != 137 {
+		t.Fatalf("wire exit code %v, want 137", wire.ExitCode)
+	}
+	if wire.FinishedAt == "" {
+		t.Fatal("wire attribution must carry finished_at")
+	}
 	life.WaitCleanup()
 	if len(hosted.release) != 1 {
 		t.Fatalf("the backend saw %d releases, want 1", len(hosted.release))
@@ -121,6 +135,30 @@ func TestClassifyPreservesPathNotFoundAcrossTheNodePlane(t *testing.T) {
 
 	if code := classify(acrossTheHop).Code; code != "path_not_found" {
 		t.Fatalf("wire code after the node hop %q, want path_not_found", code)
+	}
+}
+
+func TestClassifyPreservesExitAttributionAcrossTheNodePlane(t *testing.T) {
+	code := 137
+	finished := time.Date(2026, 10, 22, 2, 13, 7, 0, time.UTC)
+	original := &wireError{
+		Code:       "session_lost",
+		Message:    `sandbox "sb-1" is not held by node "node-a"`,
+		ExitReason: "oom",
+		ExitCode:   &code,
+		FinishedAt: finished.Format(time.RFC3339Nano),
+	}
+	acrossTheHop := wireErrorToStatus(original)
+	out := classify(acrossTheHop)
+
+	if out.ExitReason != "oom" {
+		t.Fatalf("exit reason after the node hop %q, want oom", out.ExitReason)
+	}
+	if out.ExitCode == nil || *out.ExitCode != 137 {
+		t.Fatalf("exit code after the node hop %v, want 137", out.ExitCode)
+	}
+	if out.FinishedAt != finished.Format(time.RFC3339Nano) {
+		t.Fatalf("finished_at after the node hop %q, want %q", out.FinishedAt, finished.Format(time.RFC3339Nano))
 	}
 }
 

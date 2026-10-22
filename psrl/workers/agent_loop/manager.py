@@ -994,9 +994,16 @@ class PSRL_AgentLoopManager:
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
             failed_group_ids = self._failed_val_group_ids if is_validate else self._failed_train_group_ids
             if parent_id in failed_group_ids:
-                psrl_logger.warning(
-                    f"Duplicate group failure: parent_id={parent_id}, "
-                    f"is_validate={is_validate}, failed_uid={failed_uid}. Skipping."
+                # The first child to fail already aborted every sibling and
+                # logged the cause. Each aborted sibling reaches this path with
+                # the same diagnosis, so a warning per sibling would add dozens
+                # of identical lines per group and bury the one line an operator
+                # needs. Count them at debug; the first report carries the cause.
+                psrl_logger.debug(
+                    "Duplicate group failure: parent_id=%s, is_validate=%s, failed_uid=%s. Skipping.",
+                    parent_id,
+                    is_validate,
+                    failed_uid,
                 )
                 return
             failed_group_ids.add(parent_id)

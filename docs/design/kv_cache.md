@@ -17,9 +17,10 @@ cache, reuse prefixes across turns, and move prefixes between rollout instances.
 
 Config: `psrl.lmcache.*`
 
-LMCache runs as a standalone multiprocess (MP) server, one per node. vLLM
-workers are clients of that server, and the server owns all cache state. Three
-tiers matter:
+LMCache runs as a standalone multiprocess (MP) server, one per rollout
+instance (one per node when an instance spans the node). vLLM workers are
+clients of that server, and the server owns all KV ranks of that instance.
+Three tiers matter:
 
 1. **L1** is the server's own memory pool, sized by `offload_size_gb`.
 2. **L2** is optional extra storage registered per server, for example a local
@@ -249,14 +250,25 @@ coordination.
 
 ## Gotchas
 
-- **L1 is shared by every local KV rank.** `offload_size_gb` is one server's
-  capacity, not per rank. Setting it to the per-rank value over-allocates by the
-  tensor parallel size.
+- **L1 is shared by every local KV rank of one instance.** `offload_size_gb`
+  is that instance's server capacity, not per rank and not per node. A node
+  running several single-GPU instances owns one pool per instance; size the
+  per-instance value, not the node total.
 - **Multi-node instances must avoid pipeline parallelism.** The connector
   rejects multi-server plus PP greater than one. Keep
   `rollout_nnodes_per_instance: 1`, or use tensor parallelism only.
 - **P2P alignment.** Below `l1_align_bytes: 65536`, RDMA reads work but are less
   efficient. Raise it when `enable_p2p` is on.
+- **The destination must have registered its layout.** A warm prefetch is
+  refused with 503 until one engine on the destination has registered its KV
+  cache, because the server cannot size L1 objects before that. In a running
+  replica this is implicit; a transfer that races instance startup fails and
+  the request simply re-prefills.
+- **The copy path is the compatible one.** PSRL runs vLLM sleep mode, whose
+  KV allocations are not exportable through legacy CUDA IPC handles.
+  `mp_transfer_mode: engine_driven` copies through the worker and is the
+  default; `lmcache_driven` is faster but requires KV memory that CUDA IPC can
+  export (for example a deployment with sleep mode off).
 - **Adding tags changes L2 key encoding.** An L2 cache written before this
   version cannot be read back and must be invalidated.
 - **`clear_on_weight_update` also drops pins.** A forced clear discards client

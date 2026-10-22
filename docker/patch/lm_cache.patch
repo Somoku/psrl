@@ -1,5 +1,5 @@
 diff --git a/docs/source/mp/configuration.rst b/docs/source/mp/configuration.rst
-index dfc98fe8..51187fa8 100644
+index dfc98fe..51187fa 100644
 --- a/docs/source/mp/configuration.rst
 +++ b/docs/source/mp/configuration.rst
 @@ -471,6 +471,47 @@ Source: ``lmcache/v1/distributed/config.py``
@@ -51,7 +51,7 @@ index dfc98fe8..51187fa8 100644
  -----------
  
 diff --git a/lmcache/v1/distributed/api.py b/lmcache/v1/distributed/api.py
-index ab8876cc..ba67d964 100644
+index ab8876c..ba67d96 100644
 --- a/lmcache/v1/distributed/api.py
 +++ b/lmcache/v1/distributed/api.py
 @@ -7,7 +7,7 @@ Could be implemented by native code in the future
@@ -250,7 +250,7 @@ index ab8876cc..ba67d964 100644
              for chunk_hash in chunk_hashes
              for kv_rank in kv_ranks
 diff --git a/lmcache/v1/distributed/config.py b/lmcache/v1/distributed/config.py
-index a5899b04..a5d29e3d 100644
+index a5899b0..a5d29e3 100644
 --- a/lmcache/v1/distributed/config.py
 +++ b/lmcache/v1/distributed/config.py
 @@ -284,6 +284,32 @@ class EvictionConfig:
@@ -373,7 +373,7 @@ index a5899b04..a5d29e3d 100644
          store_policy=args.l2_store_policy,
          prefetch_policy=args.l2_prefetch_policy,
 diff --git a/lmcache/v1/distributed/l1_manager.py b/lmcache/v1/distributed/l1_manager.py
-index 4c9db61a..29311bf3 100644
+index 4c9db61..29311bf 100644
 --- a/lmcache/v1/distributed/l1_manager.py
 +++ b/lmcache/v1/distributed/l1_manager.py
 @@ -50,6 +50,23 @@ class L1ObjectState:
@@ -610,7 +610,7 @@ index 4c9db61a..29311bf3 100644
              "memory_total_bytes": total,
              "memory_configured_bytes": self._configured_capacity_bytes,
 diff --git a/lmcache/v1/distributed/l2_adapters/bigtable_key_encoder.py b/lmcache/v1/distributed/l2_adapters/bigtable_key_encoder.py
-index a93ee91f..26bf0bd4 100644
+index a93ee91..26bf0bd 100644
 --- a/lmcache/v1/distributed/l2_adapters/bigtable_key_encoder.py
 +++ b/lmcache/v1/distributed/l2_adapters/bigtable_key_encoder.py
 @@ -4,7 +4,7 @@ Bigtable key encoder for translating ObjectKeys to row keys.
@@ -642,7 +642,7 @@ index a93ee91f..26bf0bd4 100644
 +            row_key_str += f"@{encode_tags(key.tags)}"
          return row_key_str.encode("utf-8")
 diff --git a/lmcache/v1/distributed/l2_adapters/fs_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/fs_l2_adapter.py
-index 816c34e6..f1e94a72 100644
+index 816c34e..f1e94a7 100644
 --- a/lmcache/v1/distributed/l2_adapters/fs_l2_adapter.py
 +++ b/lmcache/v1/distributed/l2_adapters/fs_l2_adapter.py
 @@ -31,7 +31,7 @@ import aiofiles.os
@@ -736,7 +736,7 @@ index 816c34e6..f1e94a72 100644
      except ValueError:
          return None
 diff --git a/lmcache/v1/distributed/l2_adapters/s3_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/s3_l2_adapter.py
-index 8e7a169a..8026f896 100644
+index 8e7a169..8026f89 100644
 --- a/lmcache/v1/distributed/l2_adapters/s3_l2_adapter.py
 +++ b/lmcache/v1/distributed/l2_adapters/s3_l2_adapter.py
 @@ -38,7 +38,7 @@ from awscrt.io import ClientTlsContext, TlsConnectionOptions, TlsContextOptions
@@ -825,7 +825,7 @@ index 8e7a169a..8026f896 100644
  
  def _format_safe_path(key_str: str) -> str:
 diff --git a/lmcache/v1/distributed/l2_adapters/sagemaker_hyperpod_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/sagemaker_hyperpod_l2_adapter.py
-index 5fb347f4..85aaa057 100644
+index 5fb347f..85aaa05 100644
 --- a/lmcache/v1/distributed/l2_adapters/sagemaker_hyperpod_l2_adapter.py
 +++ b/lmcache/v1/distributed/l2_adapters/sagemaker_hyperpod_l2_adapter.py
 @@ -39,19 +39,23 @@ logger = init_logger(__name__)
@@ -857,7 +857,7 @@ index 5fb347f4..85aaa057 100644
  class SageMakerHyperPodL2AdapterConfig(L2AdapterConfigBase):
 diff --git a/lmcache/v1/distributed/pin_groups.py b/lmcache/v1/distributed/pin_groups.py
 new file mode 100644
-index 00000000..d84f2812
+index 0000000..d84f281
 --- /dev/null
 +++ b/lmcache/v1/distributed/pin_groups.py
 @@ -0,0 +1,444 @@
@@ -1306,7 +1306,7 @@ index 00000000..d84f2812
 +        return None, frozenset()
 +    return hashes[-1], frozenset(hashes)
 diff --git a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
-index ef78cee0..4b4e1ff1 100644
+index ef78cee..66ddd45 100644
 --- a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
 +++ b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
 @@ -71,6 +71,7 @@ from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_ranked
@@ -1317,7 +1317,22 @@ index ef78cee0..4b4e1ff1 100644
  from lmcache.v1.distributed.storage_controller import StorageControllerInterface
  from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
      AddAdapterOp,
-@@ -266,6 +267,8 @@ class PrefetchController(StorageControllerInterface):
+@@ -209,6 +210,14 @@ class InFlightPrefetchRequest:
+     loaded keys permanent and acquires no read lock; ``LOOKUP`` defers
+     retention to the policy and read-locks loaded keys."""
+ 
++    pin_group: str = ""
++    """Pin group to hold the loaded keys under, empty when the caller does not
++    want them retained past the idle TTL."""
++    pin_version: str = ""
++    """Model version the loaded objects belong to, used to fence older groups."""
++    pin_tail: bytes = b""
++    """Chunk hash of the prefix's last complete chunk."""
++
+     # Lookup phase: adapter_idx -> task_id (removed as results arrive)
+     pending_lookup_tasks: dict[int, L2TaskId] = field(default_factory=dict)
+     # Lookup phase: adapter_idx -> bitmap (populated as results arrive)
+@@ -266,6 +275,8 @@ class PrefetchController(StorageControllerInterface):
          adapter_descriptors: Descriptors for each L2 adapter (same order).
          policy: The prefetch policy for load plan decisions.
          max_in_flight: Maximum number of concurrent prefetch requests.
@@ -1326,7 +1341,7 @@ index ef78cee0..4b4e1ff1 100644
      """
  
      # Singleton dispatch for the in-flight load gauges: tests may construct
-@@ -282,8 +285,10 @@ class PrefetchController(StorageControllerInterface):
+@@ -282,8 +293,10 @@ class PrefetchController(StorageControllerInterface):
          adapter_descriptors: list[AdapterDescriptor],
          policy: PrefetchPolicy,
          max_in_flight: int = 8,
@@ -1337,7 +1352,7 @@ index ef78cee0..4b4e1ff1 100644
          self._l2_adapters: dict[int, L2AdapterInterface] = {
              desc.index: adapter
              for desc, adapter in zip(adapter_descriptors, l2_adapters, strict=True)
-@@ -392,6 +397,37 @@ class PrefetchController(StorageControllerInterface):
+@@ -392,6 +405,37 @@ class PrefetchController(StorageControllerInterface):
      # External API (thread-safe)
      # =========================================================================
  
@@ -1375,7 +1390,17 @@ index ef78cee0..4b4e1ff1 100644
      def submit_prefetch_request(
          self,
          spec: PrefetchRequestSpec,
-@@ -1343,6 +1379,7 @@ class PrefetchController(StorageControllerInterface):
+@@ -892,6 +936,9 @@ class PrefetchController(StorageControllerInterface):
+             policy=spec.policy,
+             attn_desc=spec.attn_desc,
+             mode=spec.mode,
++            pin_group=spec.pin_group,
++            pin_version=spec.pin_version,
++            pin_tail=spec.pin_tail,
+             group_layout_descs=spec.group_layout_descs,
+             l1_readlocks=l1_readlocks,
+         )
+@@ -1343,6 +1390,7 @@ class PrefetchController(StorageControllerInterface):
              if request.mode is PrefetchMode.WARM:
                  # Warm: make ready, lock nothing.
                  l1_mgr.finish_write(loaded_keys)
@@ -1384,7 +1409,7 @@ index ef78cee0..4b4e1ff1 100644
                  # write-locked -> read-locked; num_kv_readers so each TP
                  # worker gets its own read lock.
 diff --git a/lmcache/v1/distributed/storage_manager.py b/lmcache/v1/distributed/storage_manager.py
-index 1bd26022..022be4d5 100644
+index 1bd2602..022be4d 100644
 --- a/lmcache/v1/distributed/storage_manager.py
 +++ b/lmcache/v1/distributed/storage_manager.py
 @@ -41,6 +41,7 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
@@ -1483,7 +1508,7 @@ index 1bd26022..022be4d5 100644
          self,
      ) -> list[tuple[int | float, dict[str, object]]]:
 diff --git a/lmcache/v1/mp_coordinator/cache_events.py b/lmcache/v1/mp_coordinator/cache_events.py
-index 409b887b..12abd34b 100644
+index 409b887..12abd34 100644
 --- a/lmcache/v1/mp_coordinator/cache_events.py
 +++ b/lmcache/v1/mp_coordinator/cache_events.py
 @@ -15,6 +15,8 @@ emission thread or task. See
@@ -1669,7 +1694,7 @@ index 409b887b..12abd34b 100644
  class _ChunkTokens:
      """One chunk's token content, held between its token-binding event
 diff --git a/lmcache/v1/mp_coordinator/controllers/eviction_controller.py b/lmcache/v1/mp_coordinator/controllers/eviction_controller.py
-index f7856388..4cfd2327 100644
+index f785638..4cfd232 100644
 --- a/lmcache/v1/mp_coordinator/controllers/eviction_controller.py
 +++ b/lmcache/v1/mp_coordinator/controllers/eviction_controller.py
 @@ -479,5 +479,8 @@ def _decode_pin(entry: Mapping[str, object]) -> tuple[ObjectKey, int]:
@@ -1682,7 +1707,7 @@ index f7856388..4cfd2327 100644
      )
      return encoded.to_object_key(), cast(int, entry["count"])
 diff --git a/lmcache/v1/mp_coordinator/http_apis/cache_api.py b/lmcache/v1/mp_coordinator/http_apis/cache_api.py
-index 36df9128..8e8c5fd1 100644
+index 36df912..8e8c5fd 100644
 --- a/lmcache/v1/mp_coordinator/http_apis/cache_api.py
 +++ b/lmcache/v1/mp_coordinator/http_apis/cache_api.py
 @@ -175,6 +175,7 @@ async def request_pin(body: PinRequest, request: Request) -> PinResponse:
@@ -1710,7 +1735,7 @@ index 36df9128..8e8c5fd1 100644
      except ValueError as exc:
          raise HTTPException(status_code=400, detail=str(exc)) from None
 diff --git a/lmcache/v1/mp_coordinator/http_apis/directory_api.py b/lmcache/v1/mp_coordinator/http_apis/directory_api.py
-index 1e8b7bbc..5d837815 100644
+index 1e8b7bb..5d83781 100644
 --- a/lmcache/v1/mp_coordinator/http_apis/directory_api.py
 +++ b/lmcache/v1/mp_coordinator/http_apis/directory_api.py
 @@ -74,6 +74,7 @@ async def lookup_placements(
@@ -1722,7 +1747,7 @@ index 1e8b7bbc..5d837815 100644
          except ValueError as exc:
              raise HTTPException(status_code=400, detail=str(exc)) from exc
 diff --git a/lmcache/v1/mp_coordinator/registrar.py b/lmcache/v1/mp_coordinator/registrar.py
-index d676923b..1df5ba23 100644
+index d676923..1df5ba2 100644
 --- a/lmcache/v1/mp_coordinator/registrar.py
 +++ b/lmcache/v1/mp_coordinator/registrar.py
 @@ -41,6 +41,7 @@ async def register(
@@ -1775,7 +1800,7 @@ index d676923b..1df5ba23 100644
                      logger.info("Registered with coordinator as %s", assigned_id)
                      on_registered()
 diff --git a/lmcache/v1/mp_coordinator/schemas.py b/lmcache/v1/mp_coordinator/schemas.py
-index 224e3b02..0de96a86 100644
+index 224e3b0..0de96a8 100644
 --- a/lmcache/v1/mp_coordinator/schemas.py
 +++ b/lmcache/v1/mp_coordinator/schemas.py
 @@ -10,7 +10,7 @@ This module holds HTTP models only.
@@ -1836,7 +1861,7 @@ index 224e3b02..0de96a86 100644
      force: bool = False
  
 diff --git a/lmcache/v1/multiprocess/cache_control/key_resolver.py b/lmcache/v1/multiprocess/cache_control/key_resolver.py
-index dde71f34..a9bbe4d2 100644
+index dde71f3..a9bbe4d 100644
 --- a/lmcache/v1/multiprocess/cache_control/key_resolver.py
 +++ b/lmcache/v1/multiprocess/cache_control/key_resolver.py
 @@ -13,7 +13,7 @@ also need the L1 layout do the readiness lookup themselves before calling it.
@@ -1885,7 +1910,7 @@ index dde71f34..a9bbe4d2 100644
      if not chunk_hashes:
 diff --git a/lmcache/v1/multiprocess/cache_control/pin_service.py b/lmcache/v1/multiprocess/cache_control/pin_service.py
 new file mode 100644
-index 00000000..50d9eb4a
+index 0000000..50d9eb4
 --- /dev/null
 +++ b/lmcache/v1/multiprocess/cache_control/pin_service.py
 @@ -0,0 +1,144 @@
@@ -2034,7 +2059,7 @@ index 00000000..50d9eb4a
 +        except ValueError as exc:
 +            raise InvalidRequest(str(exc)) from None
 diff --git a/lmcache/v1/multiprocess/cache_control/prefetch_service.py b/lmcache/v1/multiprocess/cache_control/prefetch_service.py
-index 692922da..5ffd9b77 100644
+index 692922d..5ffd9b7 100644
 --- a/lmcache/v1/multiprocess/cache_control/prefetch_service.py
 +++ b/lmcache/v1/multiprocess/cache_control/prefetch_service.py
 @@ -13,6 +13,11 @@ from typing import Any
@@ -2131,7 +2156,7 @@ index 692922da..5ffd9b77 100644
          """Report a job's status, finalizing it on the first completed poll.
  
 diff --git a/lmcache/v1/multiprocess/config.py b/lmcache/v1/multiprocess/config.py
-index 396f24d9..6d604b25 100644
+index 396f24d..6d604b2 100644
 --- a/lmcache/v1/multiprocess/config.py
 +++ b/lmcache/v1/multiprocess/config.py
 @@ -242,6 +242,16 @@ class CoordinatorConfig:
@@ -2223,7 +2248,7 @@ index 396f24d9..6d604b25 100644
          blend_match_concurrency=blend_match_concurrency,
      )
 diff --git a/lmcache/v1/multiprocess/custom_types.py b/lmcache/v1/multiprocess/custom_types.py
-index b8ecdb8d..55ca3b80 100644
+index b8ecdb8..55ca3b8 100644
 --- a/lmcache/v1/multiprocess/custom_types.py
 +++ b/lmcache/v1/multiprocess/custom_types.py
 @@ -61,7 +61,9 @@ class IPCCacheServerKey:
@@ -2270,7 +2295,7 @@ index b8ecdb8d..55ca3b80 100644
          """Declared reader count; rejects keys from pre-field clients.
  
 diff --git a/lmcache/v1/multiprocess/http_apis/cache_api.py b/lmcache/v1/multiprocess/http_apis/cache_api.py
-index 22459c43..9976c7bf 100644
+index 22459c4..9976c7b 100644
 --- a/lmcache/v1/multiprocess/http_apis/cache_api.py
 +++ b/lmcache/v1/multiprocess/http_apis/cache_api.py
 @@ -10,6 +10,11 @@ A single ``/cache/*`` surface, thin over the typed services in
@@ -2407,7 +2432,7 @@ index 22459c43..9976c7bf 100644
  # Diagnostics (clear, checksums) -- engine-local; validated inline
  # ---------------------------------------------------------------------------
 diff --git a/lmcache/v1/multiprocess/http_apis/dependencies.py b/lmcache/v1/multiprocess/http_apis/dependencies.py
-index 25c95271..14e2fa95 100644
+index 25c9527..14e2fa9 100644
 --- a/lmcache/v1/multiprocess/http_apis/dependencies.py
 +++ b/lmcache/v1/multiprocess/http_apis/dependencies.py
 @@ -18,6 +18,7 @@ from fastapi import HTTPException, Request
@@ -2442,7 +2467,7 @@ index 25c95271..14e2fa95 100644
  
 diff --git a/lmcache/v1/multiprocess/http_apis/events_api.py b/lmcache/v1/multiprocess/http_apis/events_api.py
 new file mode 100644
-index 00000000..e50198eb
+index 0000000..e50198e
 --- /dev/null
 +++ b/lmcache/v1/multiprocess/http_apis/events_api.py
 @@ -0,0 +1,82 @@
@@ -2529,7 +2554,7 @@ index 00000000..e50198eb
 +        )
 +    return stream.stats()
 diff --git a/lmcache/v1/multiprocess/http_apis/schemas.py b/lmcache/v1/multiprocess/http_apis/schemas.py
-index 4595884c..9b8a228d 100644
+index 4595884..9b8a228 100644
 --- a/lmcache/v1/multiprocess/http_apis/schemas.py
 +++ b/lmcache/v1/multiprocess/http_apis/schemas.py
 @@ -9,6 +9,7 @@ belong to the ``cache_control`` services. ``Tier`` is imported from the domain
@@ -2568,7 +2593,7 @@ index 4595884c..9b8a228d 100644
  @dataclass(frozen=True)
  class ClearRequest:
 diff --git a/lmcache/v1/multiprocess/http_server.py b/lmcache/v1/multiprocess/http_server.py
-index ed6f9b84..7fc46a52 100644
+index ed6f9b8..7fc46a5 100644
 --- a/lmcache/v1/multiprocess/http_server.py
 +++ b/lmcache/v1/multiprocess/http_server.py
 @@ -21,8 +21,12 @@ from lmcache.v1.distributed.config import (
@@ -2625,7 +2650,7 @@ index ed6f9b84..7fc46a52 100644
                  # Server start time: fences out placements this instance
                  # reported before a restart (its pools restarted empty).
 diff --git a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
-index 90688f19..15485246 100644
+index 90688f1..1548524 100644
 --- a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
 +++ b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
 @@ -22,6 +22,7 @@ from lmcache.v1.distributed.api import (
@@ -2821,7 +2846,7 @@ index 90688f19..15485246 100644
                  num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
 diff --git a/lmcache/v1/multiprocess/pin_policy.py b/lmcache/v1/multiprocess/pin_policy.py
 new file mode 100644
-index 00000000..f7b8eb0e
+index 0000000..f7b8eb0
 --- /dev/null
 +++ b/lmcache/v1/multiprocess/pin_policy.py
 @@ -0,0 +1,89 @@
@@ -2914,8 +2939,27 @@ index 00000000..f7b8eb0e
 +        keys=tuple(obj_key for group_keys in resolved for obj_key in group_keys),
 +        prefix_hashes=prefix_hashes,
 +    )
+diff --git a/lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/common_pb2.pyi b/lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/common_pb2.pyi
+index bc49016..0c6eeb8 100644
+--- a/lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/common_pb2.pyi
++++ b/lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/common_pb2.pyi
+@@ -40,7 +40,7 @@ class EventIpcHandleResult(_message.Message):
+     SUCCESS_FIELD_NUMBER: _ClassVar[int]
+     event_ipc_handle: bytes
+     success: bool
+-    def __init__(self, event_ipc_handle: _Optional[bytes] = ..., success: bool = ...) -> None: ...
++    def __init__(self, event_ipc_handle: _Optional[bytes] = ..., success: _Optional[bool] = ...) -> None: ...
+ 
+ class BlockIdGroup(_message.Message):
+     __slots__ = ("block_ids",)
+@@ -68,4 +68,4 @@ class EngineGroupInfo(_message.Message):
+     sw_size_tokens: int
+     extra_object_group_tag: int
+     recurrent_state: bool
+-    def __init__(self, engine_group_id: _Optional[int] = ..., layer_indices: _Optional[_Iterable[int]] = ..., tokens_per_block: _Optional[int] = ..., sw_size_tokens: _Optional[int] = ..., extra_object_group_tag: _Optional[int] = ..., recurrent_state: bool = ...) -> None: ...
++    def __init__(self, engine_group_id: _Optional[int] = ..., layer_indices: _Optional[_Iterable[int]] = ..., tokens_per_block: _Optional[int] = ..., sw_size_tokens: _Optional[int] = ..., extra_object_group_tag: _Optional[int] = ..., recurrent_state: _Optional[bool] = ...) -> None: ...
 diff --git a/lmcache/v1/multiprocess/warm_prefetch.py b/lmcache/v1/multiprocess/warm_prefetch.py
-index 13558231..1b66cba9 100644
+index 1355823..1b66cba 100644
 --- a/lmcache/v1/multiprocess/warm_prefetch.py
 +++ b/lmcache/v1/multiprocess/warm_prefetch.py
 @@ -78,6 +78,9 @@ class WarmPrefetchJobs:
@@ -2951,7 +2995,7 @@ index 13558231..1b66cba9 100644
          request_id = uuid.uuid4().hex
 diff --git a/tests/v1/distributed/test_pin_groups.py b/tests/v1/distributed/test_pin_groups.py
 new file mode 100644
-index 00000000..98df2e76
+index 0000000..98df2e7
 --- /dev/null
 +++ b/tests/v1/distributed/test_pin_groups.py
 @@ -0,0 +1,280 @@

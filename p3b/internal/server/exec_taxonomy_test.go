@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,9 +21,11 @@ import (
 // classification.
 type typedBackend struct {
 	*fakeDirect
-	execErr error
-	readErr error
-	status  string
+	execErr   error
+	readErr   error
+	status    string
+	detail    *backend.ExitDetail
+	detailErr error
 }
 
 func (b *typedBackend) Exec(
@@ -46,6 +49,16 @@ func (b *typedBackend) Status(context.Context, backend.Handle) (string, error) {
 	return "running", nil
 }
 
+func (b *typedBackend) ExitDetail(context.Context, backend.Handle) (backend.ExitDetail, error) {
+	if b.detailErr != nil {
+		return backend.ExitDetail{}, b.detailErr
+	}
+	if b.detail != nil {
+		return *b.detail, nil
+	}
+	return backend.ExitDetail{}, errors.New("no exit detail configured")
+}
+
 func createOneSandbox(
 	t *testing.T, hosted backend.Backend,
 ) (*Node, *node.Lifecycle, backend.Handle) {
@@ -63,6 +76,65 @@ func createOneSandbox(
 		NodeID:    "node-a",
 	}
 	return agent, life, handle
+}
+
+func TestALossCarriesTheRuntimeEvidenceForItsExitCode(t *testing.T) {
+	finished := time.Date(2026, 10, 23, 11, 5, 23, 0, time.UTC)
+	started := finished.Add(-42 * time.Minute)
+	detail := backend.ExitDetail{
+		Status:        "exited",
+		ExitCode:      0,
+		ExitCodeKnown: true,
+		StartedAt:     started,
+		FinishedAt:    finished,
+	}
+	hosted := &typedBackend{
+		fakeDirect: &fakeDirect{}, execErr: backend.ErrRuntimeGone, detail: &detail,
+	}
+	agent, _, handle := createOneSandbox(t, hosted)
+
+	_, err := agent.Exec(context.Background(), handle, "true", "", nil)
+	var gone *sessionGoneError
+	if !errors.As(err, &gone) {
+		t.Fatalf("a stopped container must be a lost session, got %v", err)
+	}
+	if !gone.codeKnown || gone.exitCode != 0 {
+		t.Fatalf("exit code %d (known=%v), want the daemon's 0", gone.exitCode, gone.codeKnown)
+	}
+	for _, want := range []string{"status=exited", "exit_code=0", "started_at=", "finished_at="} {
+		if !strings.Contains(gone.stateError, want) {
+			t.Fatalf("state_error %q does not contain %q", gone.stateError, want)
+		}
+	}
+	wire := classify(err)
+	if wire.StateError != gone.stateError {
+		t.Fatalf("wire state_error %q, want %q", wire.StateError, gone.stateError)
+	}
+	if wire.ExitCode == nil || *wire.ExitCode != 0 {
+		t.Fatalf("wire exit code %v, want 0", wire.ExitCode)
+	}
+}
+
+func TestALossWithoutInspectEvidenceNamesTheInspectFailure(t *testing.T) {
+	hosted := &typedBackend{
+		fakeDirect: &fakeDirect{},
+		execErr:    backend.ErrRuntimeGone,
+		status:     "exited",
+		detailErr:  errors.New("container disappeared during inspect"),
+	}
+	agent, _, handle := createOneSandbox(t, hosted)
+
+	_, err := agent.Exec(context.Background(), handle, "true", "", nil)
+	var gone *sessionGoneError
+	if !errors.As(err, &gone) {
+		t.Fatalf("want a lost session, got %v", err)
+	}
+	if !strings.Contains(gone.stateError, "container disappeared during inspect") {
+		t.Fatalf("state_error %q does not name the inspect failure", gone.stateError)
+	}
+	if gone.codeKnown {
+		t.Fatal("an uninspectable container must not claim a known exit code")
+	}
 }
 
 func TestExecOnAStoppedContainerIsSessionLostAndReleasesTheCharge(t *testing.T) {

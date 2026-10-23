@@ -389,9 +389,11 @@ class TestFailuresKeepTheirAttribution:
                 exit_reason="oom",
                 exit_code=137,
                 finished_at="2026-10-22T02:13:07Z",
+                state_error="status=exited exit_code=137 oom_killed=true",
             )
         )
 
         assert translated.exit_reason is SandboxExitReason.OOM
         assert translated.exit_code == 137
         assert translated.finished_at == "2026-10-22T02:13:07Z"
+        assert "oom_killed=true" in translated.state_error

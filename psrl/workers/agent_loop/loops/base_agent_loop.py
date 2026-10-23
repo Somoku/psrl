@@ -816,12 +816,14 @@ class AgentLoopBase(ABC):
             # must not read a container or host lifecycle fault as a broken harness.
             self._record_error(exc)
             psrl_logger.error(
-                "Sandbox was lost mid-episode for request %s (reason=%s, exit_code=%s, finished_at=%s).\n"
+                "Sandbox was lost mid-episode for request %s (reason=%s, exit_code=%s, "
+                "finished_at=%s, state_error=%s).\n"
                 "Underlying failure:\n%s",
                 request_ids,
                 exc.exit_reason.value,
                 exc.exit_code,
                 exc.finished_at or "<unknown>",
+                exc.state_error or "<none>",
                 self.last_error_traceback,
             )
             return None, TerminateReason.CONTAINER_LOST

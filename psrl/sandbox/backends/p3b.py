@@ -121,6 +121,7 @@ def _translate(exc: service_errors.SandboxError) -> BaseException:
             exit_reason=_exit_reason(exc.exit_reason),
             exit_code=exc.exit_code,
             finished_at=exc.finished_at,
+            state_error=exc.state_error,
         )
     if isinstance(exc, service_errors.SandboxCapacityTimeout):
         return SandboxCapacityTimeout(str(exc))

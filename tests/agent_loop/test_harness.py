@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import logging
 import shutil
 import subprocess
 import tomllib
@@ -522,6 +523,35 @@ async def test_collector_stops_at_the_total_patch_budget(
 
     assert "patch_capped=1" in str(excinfo.value)
     assert "status='running'" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_loss_before_collection_logs_the_runtime_evidence(caplog) -> None:
+    """A lost sandbox leaves the daemon's evidence in the collector log.
+
+    The collector has nothing else to add once the sandbox is gone, so the
+    exception's exit code, finish time and state_error are the post mortem's
+    sandbox-side record.
+    """
+
+    class LostSession(FakeSandbox):
+        async def exec(self, command, **kwargs):
+            raise SandboxSessionLostError(
+                "gone",
+                sandbox_id="sandbox-1",
+                exit_reason=SandboxExitReason.OOM,
+                exit_code=137,
+                finished_at="2026-10-23T11:05:23Z",
+                state_error="status=exited exit_code=137 oom_killed=true",
+            )
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(SandboxSessionLostError):
+            await collect_git_patch(LostSession(), "/testbed", staging_dir=_STAGING_DIR)
+
+    message = "\n".join(record.getMessage() for record in caplog.records)
+    assert "exit_code=137" in message
+    assert "state_error=status=exited exit_code=137 oom_killed=true" in message
 
 
 @pytest.mark.asyncio

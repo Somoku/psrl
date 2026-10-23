@@ -367,7 +367,42 @@ type ExitDetail struct {
 	// ExitCodeKnown distinguishes a clean exit 0 from a runtime that had no
 	// code to report (a removed container, or one that never started).
 	ExitCodeKnown bool
-	FinishedAt    time.Time
+	// Status and Error are the daemon's own state and error text. They are what
+	// separates "the entrypoint exited 0" from "the runtime killed it" in a post
+	// mortem; the exit code alone does not name which process or why.
+	Status string
+	Error  string
+	// StartedAt precedes FinishedAt, so a loss report carries the lifetime the
+	// sandbox actually had, not just the moment it stopped.
+	StartedAt    time.Time
+	FinishedAt   time.Time
+	RestartCount int
+}
+
+// Evidence renders the daemon's account of the stop in one line. It is what
+// distinguishes an entrypoint that exited cleanly from a runtime kill when the
+// service's reason alone says only "exited".
+func (d ExitDetail) Evidence() string {
+	return fmt.Sprintf(
+		"status=%s running=%t oom_killed=%t exit_code=%d exit_code_known=%t error=%q "+
+			"started_at=%s finished_at=%s restart_count=%d",
+		d.Status,
+		d.Running,
+		d.OOMKilled,
+		d.ExitCode,
+		d.ExitCodeKnown,
+		d.Error,
+		evidenceTime(d.StartedAt),
+		evidenceTime(d.FinishedAt),
+		d.RestartCount,
+	)
+}
+
+func evidenceTime(t time.Time) string {
+	if t.IsZero() {
+		return "<unknown>"
+	}
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 // ExitDetailer is a backend that can report why a sandbox stopped, not merely

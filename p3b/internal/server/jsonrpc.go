@@ -138,6 +138,10 @@ type wireError struct {
 	// FinishedAt is when the runtime observed the stop, RFC 3339 in UTC. It is
 	// the clock an operator correlates with the node's cgroup and kernel events.
 	FinishedAt string `json:"finished_at,omitempty"`
+	// StateError is the runtime's own account of the stop, or the inspect error
+	// that made the exit code unknown. A loss with no code is diagnosable only
+	// if this travels with it.
+	StateError string `json:"state_error,omitempty"`
 }
 
 func (j *JSONListener) handle(ctx context.Context, conn net.Conn) {
@@ -218,6 +222,7 @@ func classify(err error) *wireError {
 	if finished := finishedAtOf(err); !finished.IsZero() {
 		out.FinishedAt = finished.UTC().Format(time.RFC3339Nano)
 	}
+	out.StateError = stateErrorOf(err)
 	return out
 }
 
@@ -292,6 +297,15 @@ func finishedAtOf(err error) time.Time {
 		return attributed.FinishedAt()
 	}
 	return time.Time{}
+}
+
+// stateErrorOf extracts the runtime evidence or inspect failure behind a loss.
+func stateErrorOf(err error) string {
+	var attributed interface{ StateError() string }
+	if errors.As(err, &attributed) {
+		return attributed.StateError()
+	}
+	return ""
 }
 
 func (j *JSONListener) dispatch(ctx context.Context, req request) (any, error) {

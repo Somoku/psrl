@@ -645,10 +645,14 @@ func (b *Backend) ExitDetail(ctx context.Context, handle backend.Handle) (backen
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
 	var inspected struct {
-		State struct {
+		RestartCount int `json:"RestartCount"`
+		State        struct {
+			Status     string `json:"Status"`
 			Running    bool   `json:"Running"`
 			OOMKilled  bool   `json:"OOMKilled"`
 			ExitCode   int    `json:"ExitCode"`
+			Error      string `json:"Error"`
+			StartedAt  string `json:"StartedAt"`
 			FinishedAt string `json:"FinishedAt"`
 		} `json:"State"`
 	}
@@ -667,6 +671,12 @@ func (b *Backend) ExitDetail(ctx context.Context, handle backend.Handle) (backen
 		OOMKilled:     inspected.State.OOMKilled && !inspected.State.Running,
 		ExitCode:      inspected.State.ExitCode,
 		ExitCodeKnown: !inspected.State.Running,
+		Status:        inspected.State.Status,
+		Error:         inspected.State.Error,
+		RestartCount:  inspected.RestartCount,
+	}
+	if started, err := time.Parse(time.RFC3339Nano, inspected.State.StartedAt); err == nil {
+		detail.StartedAt = started
 	}
 	if finished, err := time.Parse(time.RFC3339Nano, inspected.State.FinishedAt); err == nil {
 		detail.FinishedAt = finished

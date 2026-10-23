@@ -48,6 +48,7 @@ class SandboxSessionLost(SandboxError):
         exit_reason: str = "",
         exit_code: int | None = None,
         finished_at: str = "",
+        state_error: str = "",
     ) -> None:
         super().__init__(message)
         self.sandbox_id = sandbox_id
@@ -56,6 +57,9 @@ class SandboxSessionLost(SandboxError):
         # service never observed a code, which is different from a clean exit 0.
         self.exit_code = exit_code
         self.finished_at = finished_at
+        # The daemon's state text, or the inspect failure that made the code
+        # unknown; a loss with no code is diagnosable through this.
+        self.state_error = state_error
 
 
 class SandboxOomError(SandboxError):

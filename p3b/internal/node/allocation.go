@@ -63,6 +63,7 @@ type allocation struct {
 	pendingExitCode   int
 	pendingCodeKnown  bool
 	pendingFinishedAt time.Time
+	pendingStateError string
 	// cleanupAttempts and nextCleanupAt pace the retries of a refused removal.
 	cleanupAttempts int
 	nextCleanupAt   time.Time

@@ -235,14 +235,25 @@ async def collect_git_patch(
     )
     try:
         result = await session.exec(script, cwd=workdir, timeout_s=timeout_s)
-    except SandboxSessionLostError:
+    except SandboxSessionLostError as exc:
         # The sandbox is gone, so there is no patch to collect and never will be. Reported
         # as itself rather than as a patch-collection failure: the worker classifies it as
         # an infrastructure fault, which replaces the group without counting the episode
         # against the harness. Raising a bare RuntimeError here instead is what made a
         # released lease look like a broken collector.
+        #
+        # The runtime's evidence travels on the error: the exit code and finish
+        # time, plus the daemon's state text or the inspect failure that made the
+        # code unknown. The collector has nothing else to add once the sandbox is
+        # gone, so this line is the post mortem's sandbox-side record.
         psrl_logger.warning(
-            "Sandbox was lost before the harness patch could be collected, so this episode has no patch.",
+            "Sandbox was lost before the harness patch could be collected "
+            "(reason=%s, exit_code=%s, finished_at=%s, state_error=%s), so this "
+            "episode has no patch.",
+            getattr(exc.exit_reason, "value", exc.exit_reason),
+            exc.exit_code if exc.exit_code is not None else "unknown",
+            exc.finished_at or "<unknown>",
+            exc.state_error or "<none>",
             exc_info=True,
         )
         raise

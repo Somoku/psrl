@@ -76,6 +76,10 @@ type ExitAttribution struct {
 	ExitCode      int
 	ExitCodeKnown bool
 	FinishedAt    time.Time
+	// StateError is the evidence behind the attribution: the daemon's state
+	// text when the code is known, or the inspect error that made it unknown.
+	// A loss with no code is diagnosable only if this travels with it.
+	StateError string
 }
 
 // exitCodeForReason states the exit code a reason implies when the runtime did
@@ -96,6 +100,7 @@ type exitRecord struct {
 	codeKnown  bool
 	at         time.Time
 	finishedAt time.Time
+	stateError string
 }
 
 // Lifecycle owns every sandbox on one node and reclaims them in one sweep.
@@ -423,6 +428,7 @@ func (l *Lifecycle) removeLocked(held *allocation, reason ExitReason) {
 			codeKnown:  held.pendingCodeKnown,
 			at:         l.now(),
 			finishedAt: finished,
+			stateError: held.pendingStateError,
 		}
 	}
 	l.counters[reason]++
@@ -443,6 +449,7 @@ func (l *Lifecycle) ExitAttributionOf(sandboxID string) (ExitAttribution, bool) 
 			ExitCode:      rec.exitCode,
 			ExitCodeKnown: rec.codeKnown,
 			FinishedAt:    rec.finishedAt,
+			StateError:    rec.stateError,
 		}, true
 	}
 	// A record that is already being destroyed has a decided reason but has not
@@ -458,6 +465,7 @@ func (l *Lifecycle) ExitAttributionOf(sandboxID string) (ExitAttribution, bool) 
 			ExitCode:      held.pendingExitCode,
 			ExitCodeKnown: held.pendingCodeKnown,
 			FinishedAt:    finished,
+			StateError:    held.pendingStateError,
 		}, true
 	}
 	return ExitAttribution{}, false
@@ -492,6 +500,7 @@ func (l *Lifecycle) MarkLost(sandboxID string, attribution ExitAttribution) bool
 	held.pendingExitCode = attribution.ExitCode
 	held.pendingCodeKnown = attribution.ExitCodeKnown
 	held.pendingFinishedAt = attribution.FinishedAt
+	held.pendingStateError = attribution.StateError
 	leaseID := held.leaseID
 	l.mu.Unlock()
 
@@ -503,6 +512,7 @@ func (l *Lifecycle) MarkLost(sandboxID string, attribution ExitAttribution) bool
 			current.pendingExitCode = 0
 			current.pendingCodeKnown = false
 			current.pendingFinishedAt = time.Time{}
+			current.pendingStateError = ""
 		}
 		l.failures++
 		l.mu.Unlock()
@@ -678,6 +688,7 @@ func (l *Lifecycle) Sweep(ctx context.Context) SweepReport {
 				current.pendingExitCode = 0
 				current.pendingCodeKnown = false
 				current.pendingFinishedAt = time.Time{}
+				current.pendingStateError = ""
 			}
 			l.mu.Unlock()
 			report.Failures++
@@ -775,6 +786,7 @@ func (l *Lifecycle) ProbeRuntime(ctx context.Context) ProbeReport {
 		status    string
 		detail    backend.ExitDetail
 		detailOK  bool
+		detailErr error
 		err       error
 	}
 	results := make(chan outcome, len(candidates))
@@ -796,7 +808,11 @@ func (l *Lifecycle) ProbeRuntime(ctx context.Context) ProbeReport {
 					if detailer, ok := candidate.backend.(backend.ExitDetailer); ok {
 						if detail, detailErr := detailer.ExitDetail(probeCtx, candidate.handle); detailErr == nil {
 							out.detail, out.detailOK = detail, true
+						} else {
+							out.detailErr = detailErr
 						}
+					} else {
+						out.detailErr = fmt.Errorf("backend does not implement ExitDetailer")
 					}
 				}
 				cancel()
@@ -835,6 +851,7 @@ func (l *Lifecycle) ProbeRuntime(ctx context.Context) ProbeReport {
 		}
 		attribution := ExitAttribution{Reason: reason, FinishedAt: l.now()}
 		if result.detailOK {
+			attribution.StateError = result.detail.Evidence()
 			attribution.ExitCode = result.detail.ExitCode
 			attribution.ExitCodeKnown = result.detail.ExitCodeKnown
 			if !result.detail.FinishedAt.IsZero() {
@@ -846,6 +863,8 @@ func (l *Lifecycle) ProbeRuntime(ctx context.Context) ProbeReport {
 				attribution.ExitCode = 137
 				attribution.ExitCodeKnown = true
 			}
+		} else if result.detailErr != nil {
+			attribution.StateError = fmt.Sprintf("exit_detail_error=%q", result.detailErr)
 		}
 		if !attribution.ExitCodeKnown {
 			attribution.ExitCode, attribution.ExitCodeKnown = exitCodeForReason(reason)
@@ -887,6 +906,7 @@ func (l *Lifecycle) markProbedGone(candidate probeCandidate, attribution ExitAtt
 	held.pendingExitCode = attribution.ExitCode
 	held.pendingCodeKnown = attribution.ExitCodeKnown
 	held.pendingFinishedAt = attribution.FinishedAt
+	held.pendingStateError = attribution.StateError
 	l.mu.Unlock()
 
 	if !l.cleanup.enqueue(candidate.leaseID) {
@@ -897,6 +917,7 @@ func (l *Lifecycle) markProbedGone(candidate probeCandidate, attribution ExitAtt
 			current.pendingExitCode = 0
 			current.pendingCodeKnown = false
 			current.pendingFinishedAt = time.Time{}
+			current.pendingStateError = ""
 		}
 		l.failures++
 		l.mu.Unlock()

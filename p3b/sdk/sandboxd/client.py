@@ -221,6 +221,7 @@ class Transport:
                 sandbox_id=str(payload.get("sandbox_id") or ""),
                 exit_code=error.get("exit_code"),
                 finished_at=error.get("finished_at") or "",
+                state_error=error.get("state_error") or "",
             )
         return reply.get("result") or {}
 
@@ -245,6 +246,7 @@ def _error_for(
     sandbox_id: str = "",
     exit_code: int | None = None,
     finished_at: str = "",
+    state_error: str = "",
 ) -> SandboxError:
     """Rebuild a typed failure from the service's reply.
 
@@ -261,6 +263,7 @@ def _error_for(
             exit_reason=exit_reason,
             exit_code=exit_code,
             finished_at=finished_at,
+            state_error=state_error,
         )
     return {
         "capacity_timeout": SandboxCapacityTimeout,

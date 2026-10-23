@@ -547,12 +547,13 @@ func (n *Node) Sweep(ctx context.Context, _ *v1.Empty) (*v1.SweepReport, error) 
 // gRPC NotFound so an SDK classifies it as a lost session rather than a
 // transport fault. `reason` is empty when the node never held the sandbox.
 type sessionGoneError struct {
-	sandboxID string
-	nodeID    string
-	reason    string
-	exitCode  int
-	codeKnown bool
-	finished  time.Time
+	sandboxID  string
+	nodeID     string
+	reason     string
+	exitCode   int
+	codeKnown  bool
+	finished   time.Time
+	stateError string
 }
 
 // sessionGone builds the failure from the lifecycle's attribution. Keeping the
@@ -561,12 +562,13 @@ type sessionGoneError struct {
 // to remember them.
 func sessionGone(sandboxID, nodeID string, attribution node.ExitAttribution) *sessionGoneError {
 	return &sessionGoneError{
-		sandboxID: sandboxID,
-		nodeID:    nodeID,
-		reason:    string(attribution.Reason),
-		exitCode:  attribution.ExitCode,
-		codeKnown: attribution.ExitCodeKnown,
-		finished:  attribution.FinishedAt,
+		sandboxID:  sandboxID,
+		nodeID:     nodeID,
+		reason:     string(attribution.Reason),
+		exitCode:   attribution.ExitCode,
+		codeKnown:  attribution.ExitCodeKnown,
+		finished:   attribution.FinishedAt,
+		stateError: attribution.StateError,
 	}
 }
 
@@ -578,9 +580,14 @@ func (e *sessionGoneError) Error() string {
 	}
 	if e.codeKnown {
 		details = append(details, fmt.Sprintf("exit_code=%d", e.exitCode))
+	} else if e.reason != "" {
+		details = append(details, "exit_code=unknown")
 	}
 	if !e.finished.IsZero() {
 		details = append(details, "finished_at="+e.finished.UTC().Format(time.RFC3339Nano))
+	}
+	if e.stateError != "" {
+		details = append(details, fmt.Sprintf("state_error=%q", e.stateError))
 	}
 	if len(details) > 0 {
 		message += " (" + strings.Join(details, ", ") + ")"
@@ -597,6 +604,10 @@ func (e *sessionGoneError) ExitCode() (int, bool) { return e.exitCode, e.codeKno
 
 // FinishedAt reports when the runtime observed the stop, when it did.
 func (e *sessionGoneError) FinishedAt() time.Time { return e.finished }
+
+// StateError exposes the runtime evidence or the inspect failure behind the
+// attribution.
+func (e *sessionGoneError) StateError() string { return e.stateError }
 
 // WireCode names the caller-facing classification. It is checked before the
 // gRPC status so a lost session stays a lost session across every hop.
@@ -708,6 +719,7 @@ func (n *Node) runtimeGoneAttribution(
 ) node.ExitAttribution {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
+	var inspectErr error
 	if detailer, ok := held.(backend.ExitDetailer); ok {
 		if detail, err := detailer.ExitDetail(probeCtx, handle); err == nil {
 			attribution := node.ExitAttribution{
@@ -715,6 +727,7 @@ func (n *Node) runtimeGoneAttribution(
 				ExitCode:      detail.ExitCode,
 				ExitCodeKnown: detail.ExitCodeKnown,
 				FinishedAt:    detail.FinishedAt,
+				StateError:    exitEvidence(detail),
 			}
 			if detail.OOMKilled {
 				attribution.Reason = node.ExitOOM
@@ -727,11 +740,19 @@ func (n *Node) runtimeGoneAttribution(
 				attribution.FinishedAt = time.Now()
 			}
 			return attribution
+		} else {
+			inspectErr = err
 		}
+	} else {
+		inspectErr = fmt.Errorf("backend %q does not implement ExitDetailer", held.Name())
 	}
-	status, err := held.Status(probeCtx, handle)
-	if err != nil {
-		return node.ExitAttribution{Reason: node.ExitExited, FinishedAt: time.Now()}
+	status, statusErr := held.Status(probeCtx, handle)
+	if statusErr != nil {
+		return node.ExitAttribution{
+			Reason:     node.ExitExited,
+			FinishedAt: time.Now(),
+			StateError: fmt.Sprintf("exit_detail_error=%q status_error=%q", inspectErr, statusErr),
+		}
 	}
 	reason := node.ExitExited
 	switch status {
@@ -740,11 +761,22 @@ func (n *Node) runtimeGoneAttribution(
 	case "terminated":
 		reason = node.ExitRuntimeGone
 	}
-	attribution := node.ExitAttribution{Reason: reason, FinishedAt: time.Now()}
+	attribution := node.ExitAttribution{
+		Reason:     reason,
+		FinishedAt: time.Now(),
+		StateError: fmt.Sprintf("exit_detail_error=%q status=%q", inspectErr, status),
+	}
 	if reason == node.ExitOOM {
 		attribution.ExitCode, attribution.ExitCodeKnown = 137, true
 	}
 	return attribution
+}
+
+// exitEvidence is the daemon's own account of a stopped sandbox, in one line.
+// It is what lets a post mortem tell an entrypoint that exited cleanly from a
+// runtime kill when the service's reason alone says only "exited".
+func exitEvidence(detail backend.ExitDetail) string {
+	return detail.Evidence()
 }
 
 // renewOwnerOf refreshes the owner's liveness on this node. An owner this node

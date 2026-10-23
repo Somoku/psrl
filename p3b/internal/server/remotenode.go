@@ -437,6 +437,7 @@ func wireErrorToStatus(e *wireError) error {
 		class:      e.Code,
 		message:    e.Message,
 		exitReason: e.ExitReason,
+		stateError: e.StateError,
 	}
 	if e.ExitCode != nil {
 		failure.exitCode = *e.ExitCode
@@ -489,6 +490,7 @@ type nodeFailure struct {
 	exitCode   int
 	codeKnown  bool
 	finishedAt time.Time
+	stateError string
 }
 
 func (e *nodeFailure) Error() string { return e.message }
@@ -508,6 +510,10 @@ func (e *nodeFailure) ExitCode() (int, bool) { return e.exitCode, e.codeKnown }
 
 // FinishedAt keeps the runtime's stop time across the control hop.
 func (e *nodeFailure) FinishedAt() time.Time { return e.finishedAt }
+
+// StateError keeps the runtime evidence or the inspect failure across the
+// control hop, so a loss without an exit code still names its cause.
+func (e *nodeFailure) StateError() string { return e.stateError }
 
 func mustMarshal(v any) json.RawMessage {
 	b, err := json.Marshal(v)

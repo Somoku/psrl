@@ -273,5 +273,6 @@ The 8B Megatron TP2 runs above differ only in score centering. The optimizer-dom
 unchanged (72.44 GB allocated, the same to 0.001 GB); the chunked fp32 normalizer workspace stays
 under the 256 MiB element budget instead of growing with the vocabulary. Actor update time per
 training token is 404 tok/s with centering against 417 tok/s without it (~3% more), and MFU drops
-from 0.344 to 0.298. On FSDP2 the same processor adds a bounded workspace on top of the
-materialized logits rather than a second vocabulary-sized buffer.
+from 0.344 to 0.298. On FSDP2, 8B at top-k 32 peaks at 42.0 GB allocated (45.7 GB reserved) for a
+~2.0k-token micro-batch and updates at 155 training tok/s: the processor's workspace is bounded on
+top of the materialized logits, not a second vocabulary-sized buffer.

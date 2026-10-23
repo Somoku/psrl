@@ -346,5 +346,6 @@ rollout 卡）。vocab-parallel normalizer 的 head mass 在 0.5B 上与 sampler
 上面的 8B Megatron TP2 两次运行只有 score centering 不同。被优化器状态主导的峰值显存不变（分配峰值
 72.44 GB，差异小于 0.001 GB）；chunk 化的 fp32 normalizer 工作区受 256 MiB 元素预算约束，不随词表
 增长。按训练 token 计，开启中心化时 actor update 为 404 tok/s，关闭时为 417 tok/s（约 3% 开销），
-MFU 从 0.344 降到 0.298。在 FSDP2 上，processor 同样只是在已物化 logits 之上增加有界工作区，
-而不是再开一份词表大小的缓冲。
+MFU 从 0.344 降到 0.298。在 FSDP2 上，8B、top-k 32 在约 2.0k token 的 micro-batch 上分配峰值 42.0 GB（预留 45.7 GB），
+actor update 为 155 训练 token/s：processor 的工作区有界，叠加在已物化 logits 之上，而不是再开
+一份词表大小的缓冲。

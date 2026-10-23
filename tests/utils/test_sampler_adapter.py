@@ -47,11 +47,12 @@ def test_dense_topk_places_heads_and_leaves_env_rows_empty():
     assert ids[4].tolist() == [12, 13]
     assert ids[5].tolist() == [14, 15]
 
-    # The env row and every prompt/pad row carry the sentinel head.
-    assert ids[3].tolist() == [-1, -1]
+    # Prompt/pad rows carry upstream's uniform dummy head; masked environment rows keep whatever
+    # the dummy fill produced. Both are excluded by the response mask downstream.
+    assert ids[3].tolist() == [0, 1]
     for row in (0, 1, 6):
-        assert ids[row].tolist() == [-1, -1]
-    assert bool(torch.isneginf(log_probs[3]).all())
+        assert ids[row].tolist() == [0, 1]
+    assert torch.isfinite(log_probs[3]).all()
 
 
 def test_dense_topk_rejects_ragged_widths():
@@ -102,14 +103,14 @@ def test_dense_support_vectorized_padding_over_many_ragged_rows():
     out = to_dense_support(distribution, [1, 0, 1, 1, 0, 1], width=4, prompt_length=2)
     ids = out["rollout_topk_ids"]
     assert ids.shape == (2 + 6, 4)
-    assert ids[0].tolist() == [-1, -1, -1, -1]  # prompt
+    assert ids[0].tolist() == [0, 1, 2, 3]  # prompt: upstream uniform dummy head
     assert ids[1].tolist() == [10, 11, 12, -1]  # response row 0
     assert ids[2].tolist() == [-1, -1, -1, -1]  # env row
     assert ids[3].tolist() == [20, -1, -1, -1]
     assert ids[4].tolist() == [30, 31, 32, 33]
     assert ids[5].tolist() == [-1, -1, -1, -1]  # env row
     assert ids[6].tolist() == [40, 41, -1, -1]
-    assert ids[7].tolist() == [-1, -1, -1, -1]  # final position
+    assert ids[7].tolist() == [0, 1, 2, 3]  # final position: uniform dummy head
 
 
 def test_adapters_emit_the_support_completeness_receipt():

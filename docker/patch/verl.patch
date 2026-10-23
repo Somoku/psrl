@@ -279,7 +279,7 @@ index 00000000..1abe7ac5
 +    out = score_centering_logits_processor(logits, data, _actor_config(_support_config()))
 +    torch.testing.assert_close(out["sc_tail_ratio"], torch.ones_like(out["sc_tail_ratio"]))
 diff --git a/tests/trainer/ppo/test_score_centering_on_cpu.py b/tests/trainer/ppo/test_score_centering_on_cpu.py
-index 1fb5ff40..3780a743 100644
+index 1fb5ff40..ceb969ec 100644
 --- a/tests/trainer/ppo/test_score_centering_on_cpu.py
 +++ b/tests/trainer/ppo/test_score_centering_on_cpu.py
 @@ -159,7 +159,6 @@ def test_score_centering_config_skips_checks_when_off():
@@ -290,22 +290,54 @@ index 1fb5ff40..3780a743 100644
          ({"actor_rollout_ref.rollout.name": "sglang"}, "vllm"),
          ({"actor_rollout_ref.rollout.topk_log_probs": 0}, "topk_log_probs"),
          ({"actor_rollout_ref.rollout.temperature": 0}, "temperature"),
-@@ -560,6 +559,7 @@ def test_logits_processor_support_mode_adds_log_support_mass():
+@@ -559,16 +558,17 @@ def test_logits_processor_support_mode_adds_log_support_mass():
+         "sc_correction",
          "sc_sampler_head_mass",
          "sc_train_head_mass",
-         "sc_log_support_mass",
+-        "sc_log_support_mass",
 +        "sc_tail_ratio",
          "sc_support_aligned",
          "sc_sampler_tail_mass",
          "sc_support_unknown",
-@@ -583,6 +583,7 @@ def test_logits_processor_returns_per_token_scalars():
+     }
+     for v in out.values():
+         assert v.shape == (1, sum(lengths))
+-    assert out["sc_correction"].requires_grad and out["sc_log_support_mass"].requires_grad
++    assert out["sc_correction"].requires_grad
+     torch.testing.assert_close(out["sc_sampler_head_mass"], torch.ones(1, sum(lengths)))
+-    torch.testing.assert_close(out["sc_train_head_mass"], out["sc_log_support_mass"].detach().exp())
++    torch.testing.assert_close(out["sc_support_aligned"], torch.ones(1, sum(lengths)))
++    assert (out["sc_train_head_mass"] > 0).all() and (out["sc_train_head_mass"] <= 1 + 1e-6).all()
+ 
+ 
+ def test_logits_processor_returns_per_token_scalars():
+@@ -582,7 +582,7 @@ def test_logits_processor_returns_per_token_scalars():
+         "sc_correction",
          "sc_sampler_head_mass",
          "sc_train_head_mass",
-         "sc_log_support_mass",
+-        "sc_log_support_mass",
 +        "sc_tail_ratio",
          "sc_support_aligned",
          "sc_sampler_tail_mass",
          "sc_support_unknown",
+@@ -789,12 +789,12 @@ def test_ppo_loss_support_mode_scores_the_sampled_token_on_the_support():
+ 
+     config = _actor_config(_support_rollout_correction(rollout_is="token", rollout_is_threshold=2.0))
+     logits_ = logits.clone().requires_grad_(True)
+-    full_vocab_, _ = sampled_log_probs(logits_)
+-    model_output = {"log_probs": torch.nested.nested_tensor_from_jagged(full_vocab_, cu_seqlens)}
+-    hook = score_centering_ppo_loss(config, student_logits=logits_.unsqueeze(0), data=data)
+-    model_output.update(
+-        {key: torch.nested.nested_tensor_from_jagged(value.squeeze(0), cu_seqlens) for key, value in hook.items()}
++    hook = score_centering_ppo_loss(
++        config, student_logits=logits_.unsqueeze(0), data=data, sampled_token_ids=next_ids
+     )
++    model_output = {
++        key: torch.nested.nested_tensor_from_jagged(value.squeeze(0), cu_seqlens) for key, value in hook.items()
++    }
+     loss, metrics = score_centering_ppo_loss(config, model_output=model_output, data=data)
+     grad = torch.autograd.grad(loss, logits_)[0]
+ 
 diff --git a/tests/trainer/ppo/test_score_centering_vocab_parallel_on_cpu.py b/tests/trainer/ppo/test_score_centering_vocab_parallel_on_cpu.py
 new file mode 100644
 index 00000000..568ef8cf
@@ -809,7 +841,7 @@ index eed6de70..522c8077 100644
      return metrics
  
 diff --git a/verl/trainer/ppo/score_centering.py b/verl/trainer/ppo/score_centering.py
-index 561772cc..382a9a7d 100644
+index 561772cc..0f55453f 100644
 --- a/verl/trainer/ppo/score_centering.py
 +++ b/verl/trainer/ppo/score_centering.py
 @@ -25,6 +25,7 @@ from collections.abc import Callable
@@ -988,7 +1020,7 @@ index 561772cc..382a9a7d 100644
  
  
  def score_centering_weight_fn(
-@@ -304,61 +440,163 @@ def score_centering_auto_correction(
+@@ -304,61 +440,169 @@ def score_centering_auto_correction(
  
  
  def score_centering_logits_processor(
@@ -1035,9 +1067,9 @@ index 561772cc..382a9a7d 100644
              sc_correction: Centering term, with gradient to ``student_logits``.
              sc_sampler_head_mass: Sampler's head probability mass, detached.
              sc_train_head_mass: Trainer's head probability mass, detached.
-+            sc_tail_ratio: Trainer-to-sampler tail-mass ratio, detached.
-             sc_log_support_mass: Trainer's log support mass for aligned rows, zero otherwise.
+-            sc_log_support_mass: Trainer's log support mass for aligned rows, zero otherwise.
 -            sc_support_aligned: Fraction indicator for verified support alignment.
++            sc_tail_ratio: Trainer-to-sampler tail-mass ratio, detached.
 +            sc_support_aligned: One for rows the receipt proved complete, zero otherwise.
              sc_sampler_tail_mass: Sampler probability mass outside the recorded head.
              sc_support_unknown: Approximate rows with near-unit head mass but no coverage proof.
@@ -1073,13 +1105,6 @@ index 561772cc..382a9a7d 100644
 +        topk_log_probs = _reconstruct_compact_field(
 +            lengths, _flatten_rows(data["rollout_support_log_probs"]), fill=-math.inf, dtype=torch.float32
 +        ).unsqueeze(0)
-+        if cp_split:
-+            # preprocess_*_engine addresses rows through per-sequence offsets, so wrap the flat
-+            # compact heads as a packed nested tensor carrying the model's own sequence offsets.
-+            offsets = data["input_ids"].offsets()
-+            topk_ids = torch.nested.nested_tensor_from_jagged(topk_ids.squeeze(0), offsets=offsets)
-+            topk_log_probs = torch.nested.nested_tensor_from_jagged(topk_log_probs.squeeze(0), offsets=offsets)
-+
      receipt = data.get("rollout_support_complete", None)
      support_complete = (
 -        receipt.values().unsqueeze(0)
@@ -1091,9 +1116,14 @@ index 561772cc..382a9a7d 100644
 +    if cp_split:
 +        # Pad and slice the sampler heads onto the trainer's packed rows exactly the way
 +        # distillation does, so they align with the model logits under TP/CP padding.
++        # preprocess_*_engine addresses rows through per-sequence offsets, so wrap every flat
++        # head as a packed nested tensor carrying the model's own sequence offsets.
 +        from verl.models.mcore.util import preprocess_bshd_engine, preprocess_thd_engine
 +
 +        offsets = data["input_ids"].offsets()
++        if not topk_ids.is_nested:
++            topk_ids = torch.nested.nested_tensor_from_jagged(topk_ids.squeeze(0), offsets=offsets)
++            topk_log_probs = torch.nested.nested_tensor_from_jagged(topk_log_probs.squeeze(0), offsets=offsets)
 +        if not support_complete.is_nested:
 +            support_complete = torch.nested.nested_tensor_from_jagged(
 +                support_complete.squeeze(0), offsets=offsets
@@ -1125,9 +1155,15 @@ index 561772cc..382a9a7d 100644
 +    # Slots outside a recorded support carry -inf and may carry the padding id (-1). They never
 +    # contribute to the correction, but the gather still needs an in-range index.
 +    safe_ids = torch.where(torch.isfinite(topk_log_probs), topk_ids, torch.zeros_like(topk_ids))
-+    ids_for_score = safe_ids.squeeze(0)
++    # The engine hands the processor already-packed, already-CP-sliced logits and labels, so both
++    # sides are flattened to rows; reshaping keeps a nested label's trailing dimension from
++    # turning the column into a third rank.
++    ids_for_score = safe_ids.reshape(-1, safe_ids.shape[-1])
 +    if sampled_token_ids is not None:
-+        ids_for_score = torch.cat([ids_for_score, _flatten_rows(sampled_token_ids).unsqueeze(-1)], dim=-1)
++        ids_for_score = torch.cat(
++            [ids_for_score, _flatten_rows(sampled_token_ids).reshape(-1, 1).to(ids_for_score.dtype)],
++            dim=-1,
++        )
 +    log_probs = topk_log_probs_from_logits(
 +        student_logits.squeeze(0),
 +        ids_for_score,
@@ -1151,19 +1187,53 @@ index 561772cc..382a9a7d 100644
          "sc_correction": correction.unsqueeze(0),
          "sc_sampler_head_mass": sampler_head_mass.unsqueeze(0),
          "sc_train_head_mass": train_head_mass.unsqueeze(0),
+-        "sc_log_support_mass": log_support_mass.unsqueeze(0),
 +        "sc_tail_ratio": tail_ratio.unsqueeze(0),
-         "sc_log_support_mass": log_support_mass.unsqueeze(0),
          "sc_support_aligned": complete.float().unsqueeze(0),
          "sc_sampler_tail_mass": tail_mass.unsqueeze(0),
          "sc_support_unknown": ((~complete) & (tail_mass <= 1e-6)).float().unsqueeze(0),
      }
 -
 +    if sampled_log_probs is not None:
-+        outputs["log_probs"] = sampled_log_probs.unsqueeze(0)
++        # Renormalize here, while both fields are engine-local and identically shaped. The
++        # post-processed ragged tensors can legitimately differ in trailing rows (a support
++        # normalizer only exists where a support does), so deferring the subtraction to the
++        # loss would have to align two independently trimmed nested tensors.
++        outputs["log_probs"] = (sampled_log_probs - log_support_mass).unsqueeze(0)
 +    return outputs
  
  def score_centering_ppo_loss(
      config: ActorConfig,
+@@ -367,6 +611,7 @@ def score_centering_ppo_loss(
+     dp_group=None,
+     student_logits: torch.Tensor = None,
+     data_format: str = "thd",
++    **logits_processor_kwargs,
+ ):
+     """Actor loss function used both for the logits processor and the final policy loss.
+     - student_logits is not None, compute the centering term in the logits processor.
+@@ -385,7 +630,9 @@ def score_centering_ppo_loss(
+         student_logits is None: the (loss, metrics) tuple from ``ppo_loss``.
+     """
+     if student_logits is not None:
+-        return score_centering_logits_processor(student_logits, data, config, data_format)
++        return score_centering_logits_processor(
++            student_logits, data, config, data_format, **logits_processor_kwargs
++        )
+     rollout_correction = config.policy_loss.get("rollout_correction", None) or {}
+     if rollout_correction.get("score_centering", False) and "sc_correction" not in model_output:
+         # an entrypoint that never sets the micro-batch flag would otherwise train plain bypass PG
+@@ -393,8 +640,6 @@ def score_centering_ppo_loss(
+             "score centering is enabled but the logits processor did not run: the trainer must set the "
+             "score_centering micro-batch flag (supported by the v1 trainer only)."
+         )
+-    if "sc_log_support_mass" in model_output:
+-        # score the sampled token under the trainer renormalized over the sampler's support
+-        model_output = dict(model_output)
+-        model_output["log_probs"] = model_output["log_probs"] - model_output.pop("sc_log_support_mass")
++    # ``sc_log_support_mass`` was already subtracted from ``log_probs`` inside the logits
++    # processor, while both tensors were engine-local and identically shaped.
+     return ppo_loss(config, model_output, data, dp_group)
 diff --git a/verl/utils/checkpoint/megatron_checkpoint_manager.py b/verl/utils/checkpoint/megatron_checkpoint_manager.py
 index 3c7d487a..916a544b 100644
 --- a/verl/utils/checkpoint/megatron_checkpoint_manager.py
@@ -2009,7 +2079,7 @@ index fa5d3e89..dc769e66 100644
                              logits=logits_rmpad,
                              labels=input_ids_rmpad_rolled,
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index d473ce66..f47d208a 100644
+index d473ce66..6a156600 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
 @@ -15,6 +15,7 @@
@@ -2042,7 +2112,7 @@ index d473ce66..f47d208a 100644
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
  
-@@ -456,15 +465,21 @@ class MegatronEngine(BaseEngine):
+@@ -456,15 +465,16 @@ class MegatronEngine(BaseEngine):
          self.tf_config = updated_tf_config
          print(f"module: {len(module)}")
  
@@ -2061,19 +2131,14 @@ index d473ce66..f47d208a 100644
 +                    module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
 +                )
 +            else:
-+                if self.vanilla_bridge:
-+                    self.bridge.load_weights(module, self.model_config.local_path)
-+                else:
-+                    allowed_mismatched_params = []
-+                    if self.is_value_model:
-+                        allowed_mismatched_params = ["output_layer.weight"]
-+                    self.bridge.load_hf_weights(
-+                        module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
-+                    )
++                allowed_mismatched_params = ["output_layer.weight"] if self.is_value_model else []
++                self.bridge.load_hf_weights(
++                    module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
++                )
  
          if torch.distributed.get_rank() == 0:
              print_model_size(module[0])
-@@ -531,85 +546,90 @@ class MegatronEngine(BaseEngine):
+@@ -531,85 +541,90 @@ class MegatronEngine(BaseEngine):
      def initialize(self):
          self._hf_export_tasks = None
          self._build_tf_config()
@@ -2103,9 +2168,6 @@ index d473ce66..f47d208a 100644
 -            and self.engine_config.override_transformer_config.get("mtp_num_layers") == 0
 -        ):
 -            from verl.models.mcore.mtp_patch import patch_postprocess
--
--            for model in self.module:
--                patch_postprocess(model)
 +            if self.model_config.mtp.enable:
 +                patch_engine_mtp(self.module, self.model_config)
 +            elif (
@@ -2114,6 +2176,11 @@ index d473ce66..f47d208a 100644
 +            ):
 +                from verl.models.mcore.mtp_patch import patch_postprocess
  
+-            for model in self.module:
+-                patch_postprocess(model)
++                for model in self.module:
++                    patch_postprocess(model)
+ 
 -        # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
 -        if self.engine_config.forward_only:
 -            self.optimizer = None
@@ -2121,11 +2188,6 @@ index d473ce66..f47d208a 100644
 -            self.to(device="cpu", model=self._is_offload_param, optimizer=False, grad=False)
 -            log_gpu_memory_usage("After offload model during init (forward_only)", logger=logger)
 -            return
-+                for model in self.module:
-+                    patch_postprocess(model)
- 
--        self.optimizer = self._build_optimizer()
--        self.lr_scheduler = self._build_lr_scheduler()
 +            # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
 +            if self.engine_config.forward_only:
 +                self.optimizer = None
@@ -2134,12 +2196,17 @@ index d473ce66..f47d208a 100644
 +                log_gpu_memory_usage("After offload model during init (forward_only)", logger=logger)
 +                return
  
--        full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
--        mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
+-        self.optimizer = self._build_optimizer()
+-        self.lr_scheduler = self._build_lr_scheduler()
 +        tms_optim_ctx = torch_memory_saver.region(enable_cpu_backup=True) if USE_TMS else nullcontext()
 +        with tms_optim_ctx:
 +            self.optimizer = self._build_optimizer()
 +            self.lr_scheduler = self._build_lr_scheduler()
+ 
+-        full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
+-        mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
++            full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
++            mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
  
 -        tmp_config = OmegaConf.create(
 -            {
@@ -2150,9 +2217,7 @@ index d473ce66..f47d208a 100644
 -                },
 -            }
 -        )
-+            full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
-+            mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
- 
+-
 -        role = "actor" if not self.is_value_model else "critic"
 +            tmp_config = OmegaConf.create(
 +                {
@@ -2230,7 +2295,7 @@ index d473ce66..f47d208a 100644
  
      def train_mode(self, **kwargs):
          """
-@@ -915,17 +935,43 @@ class MegatronEngine(BaseEngine):
+@@ -915,17 +930,43 @@ class MegatronEngine(BaseEngine):
          # batch should be a list of batches inside micro-batches
          batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
  
@@ -2283,7 +2348,7 @@ index d473ce66..f47d208a 100644
  
          if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
              # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
-@@ -1158,6 +1204,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1158,6 +1199,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
          data_format: str,
          cp_layout: str = "zigzag",
          local_cp_size: int | None = None,
@@ -2291,7 +2356,7 @@ index d473ce66..f47d208a 100644
      ):
          assert logits.shape[:2] == label.shape[:2]
          # avoid non-positive temperature such as padding
-@@ -1204,8 +1251,37 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1204,8 +1246,37 @@ class MegatronEngineWithLMHead(MegatronEngine):
                      local_cp_size=local_cp_size,
                  )
              )
@@ -2330,7 +2395,7 @@ index d473ce66..f47d208a 100644
  
          return ret
  
-@@ -1227,6 +1303,21 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1227,6 +1298,21 @@ class MegatronEngineWithLMHead(MegatronEngine):
          calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
          distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
          distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
@@ -2352,7 +2417,7 @@ index d473ce66..f47d208a 100644
          pad_to_length_bucket = (
              self.engine_config.pad_to_length_bucket
              if self.engine_config.pad_to_length and self.engine_config.use_remove_padding
-@@ -1235,6 +1326,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1235,6 +1321,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
  
          if pad_to_length_bucket is not None and distillation_use_topk:
              raise RuntimeError("pad_to_length is not supported with top-K distillation")
@@ -2363,7 +2428,7 @@ index d473ce66..f47d208a 100644
          if pad_to_length_bucket is not None and self.enable_routing_replay:
              raise RuntimeError("pad_to_length is not supported with router replay")
  
-@@ -1344,6 +1439,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1344,6 +1434,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                  data_format=data_format,
                  cp_layout=cp_layout,
                  local_cp_size=local_cp_size,

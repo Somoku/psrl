@@ -91,10 +91,10 @@ vocabulary. `rho` and `alpha` carry the tail approximation.
 **support** is the exact model for truncated sampling (`top_p < 1` or `top_k > 0`). The head is the
 sampler's complete support, proven complete by a sentinel entry, so there is no tail and `alpha` is
 zero. Here the trainer distribution is the support-conditional one: the trainer renormalizes its
-`p` over the recorded support, and the sampled token's policy log-prob used by the REINFORCE term
-(`sc_policy_log_prob`) is renormalized the same way, so the policy term and the correction share one
-distribution and one gradient. The full-vocabulary log-prob is kept for the KL term. This is what
-makes support mode exact rather than tail-approximated.
+`p` over the recorded support, and the sampled token's policy log-prob is shifted by
+`sc_log_support_mass` before the REINFORCE term sees it, so the policy term and the correction share
+one distribution and one gradient. The full-vocabulary log-prob is kept for the KL term. This is
+what makes support mode exact rather than tail-approximated.
 
 ## 4. Importance-weight rules
 
@@ -205,10 +205,10 @@ Costs to budget for, not bugs:
 | `psrl/workers/gen/session_router.py` | Capture request contract per protocol |
 | `psrl/workers/agent_loop/loops/` | Per-turn capture, TITO session handling, `/generate` decode |
 | `third_party/verl/verl/trainer/ppo/score_centering.py` | Head log-prob primitives, centering term, logits processor, loss entry |
-| `third_party/verl/verl/workers/utils/losses.py` | Adds `sc_correction` to the policy loss and renormalizes the policy log-prob |
+| `third_party/verl/verl/workers/utils/losses.py` | Adds `sc_correction` to the policy loss; the logits processor already renormalizes the sampled log-prob over the support |
 | `third_party/verl/verl/workers/engine/{fsdp,megatron}/transformer_impl.py` | Engine wiring, chunk budget, CP split and Megatron CE clone |
 
-The veRL changes ship as `patch/verl/8718ca30.patch`, applied to the pinned veRL revision.
+The veRL changes ship as `patch/verl/dc709af.patch`, applied to the pinned veRL revision.
 
 ## Verification
 
@@ -227,3 +227,48 @@ This covers the capture contract, the two head models, the loss integration and 
 alignment. It does not replace accelerator runs: validate the FSDP/Ulysses and Megatron TP/CP/PP
 combinations you actually train with, and measure peak training memory and capture bandwidth at the
 chosen capture width.
+
+## 8. Validation results
+
+The CPU suites above pin the estimator. The accelerator path is checked end to end with GSM8K on a
+single 8-GPU node: 4 training GPUs, one rollout instance and one validate instance. FSDP2 runs use
+Qwen2.5-0.5B-Instruct, top-k 32 at `temperature=1.0, top_p=1.0`, and support captures at
+`top_p=0.9`; responses are capped at 1024 tokens. Reward uses a test-only GSM8K scorer that accepts
+both `####` and `\boxed{}` answers, because an instruct model often ignores the requested format and
+would otherwise return zero reward for correct answers.
+
+| Head | IS rule | `sc_support_aligned` | sampler head mass | trainer head mass | `sc_correction` |
+|---|---|---|---|---|---|
+| top-k 32 | none | 0 | 0.988 | 0.987 | -4.5e-4 |
+| support | none | 1.000 | 1.000 | 0.976 | -8.2e-4 |
+| support | IcePop 0.9-1.1 | 1.000 | 1.000 | 0.976 | +1.9e-2 |
+| top-k 32 | TIS 2.0 | 0 | 0.994 | 0.994 | -5.4e-5 |
+
+What the rows establish:
+
+- Support rows report `sc_sampler_head_mass = 1`, `sc_sampler_tail_mass ≈ 0` and
+  `sc_support_aligned = 1`, i.e. the captured nucleus is complete and the trainer renormalizes on it.
+- The trainer and sampler head masses agree to ~1e-5 on top-k rows while the sampled log-probs agree
+  to ~1e-3 (`rollout_corr/log_ppl_diff`), so the two engines see the same distribution to the
+  precision the estimator needs. The correction stays near zero on-policy as it should.
+- IcePop's band rejects 2.2% of token ratios (`rollout_is_oob_ratio`) while support alignment remains
+  exact, and TIS reports `rollout_is_mean ≈ 1`, max ratio 1.19 and effective sample size 0.999.
+- A support budget that is too small fails closed: with `sampler_max_tokens=128` the nucleus on
+  GSM8K exceeds the budget and the agent loop raises `Sampler support exceeds the capture budget`.
+  `512` covers this distribution; size the budget from the realized nucleus, not from the head mass.
+
+The Megatron engine was run through the same path with tensor parallelism 2 on Qwen2.5-0.5B and
+Qwen3-8B (single node, 2 training GPUs, 4 rollout GPUs). The vocab-parallel normalizer reports head
+masses within 1e-4 of the sampler on the 0.5B model (0.99515 vs 0.99517) and within 1e-6 on the 8B
+base model (0.9999987 vs 0.9999988, sampled log-prob difference 7.4e-4), the same agreement FSDP
+shows. The THD split paths for heads, completion receipts and sampled labels are exercised on every
+step; tensor parallelism 4 uses the same code path with a wider vocabulary shard.
+
+### Training cost
+
+The 8B Megatron TP2 runs above differ only in score centering. The optimizer-dominated peak is
+unchanged (72.44 GB allocated, the same to 0.001 GB); the chunked fp32 normalizer workspace stays
+under the 256 MiB element budget instead of growing with the vocabulary. Actor update time per
+training token is 404 tok/s with centering against 417 tok/s without it (~3% more), and MFU drops
+from 0.344 to 0.298. On FSDP2 the same processor adds a bounded workspace on top of the
+materialized logits rather than a second vocabulary-sized buffer.

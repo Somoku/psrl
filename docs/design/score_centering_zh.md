@@ -177,7 +177,7 @@ $H$ 是 rollout 阶段采样器记录下来的 head。PSRL 支持两种建模方
 
 **support** 是截断采样（$top\_p < 1$ 或 $top\_k > 0$）下的精确模式。head 就是采样器的完整支撑，由一个
 哨兵条目证明其完整性，于是没有尾部、$\alpha = 0$。这里训练器分布取「支撑条件分布」：训练器把 $p_\theta$
-在记录的支撑上重归一化，同时 REINFORCE 项所用的「被采样 token 的策略 log-prob」（`sc_policy_log_prob`）
+在记录的支撑上重归一化，同时 REINFORCE 项所用的「被采样 token 的策略 log-prob」（先减去 `sc_log_support_mass`）
 也做同样的重归一化，于是策略项与校正项共享同一个分布与同一个梯度，而全词表 log-prob 保留给 KL 项。这
 正是 support 模式精确、而非尾部近似的根本原因。
 
@@ -285,10 +285,10 @@ context parallel，且验证会话会关闭捕获。
 | `psrl/workers/gen/session_router.py` | 各协议的捕获请求契约 |
 | `psrl/workers/agent_loop/loops/` | 逐轮捕获、TITO 会话处理、`/generate` 解码 |
 | `third_party/verl/verl/trainer/ppo/score_centering.py` | head log-prob primitive、居中项、logits processor、损失入口 |
-| `third_party/verl/verl/workers/utils/losses.py` | 把 `sc_correction` 加到策略损失，并重归一化策略 log-prob |
+| `third_party/verl/verl/workers/utils/losses.py` | 把 `sc_correction` 加到策略损失；采样 log-prob 的支撑重归一化已在 logits processor 内完成 |
 | `third_party/verl/verl/workers/engine/{fsdp,megatron}/transformer_impl.py` | engine 接线、chunk 预算、CP 切分与 Megatron CE clone |
 
-veRL 侧改动以 `patch/verl/8718ca30.patch` 的形式发布，应用到固定的 veRL 版本上。
+veRL 侧改动以 `patch/verl/dc709af.patch` 的形式发布，应用到固定的 veRL 版本上。
 
 ## 验证
 
@@ -305,3 +305,44 @@ PYTHONPATH=third_party/verl python -m pytest -q \
 
 这套用例覆盖捕获契约、两种 head 模型、损失集成与多轮对齐，但不替代加速器上的验证：请按你实际训练的
 FSDP/Ulysses 与 Megatron TP/CP/PP 组合验证，并在所选捕获宽度下测量训练峰值显存与捕获带宽。
+
+
+## 验证结果
+
+CPU 套件锁定了估计器本身。加速器路径在单机 8 卡上用 GSM8K 做了端到端验证：4 张训练卡、1 个 rollout
+实例和 1 个 validate 实例。FSDP2 使用 Qwen2.5-0.5B-Instruct；top-k 32 取
+`temperature=1.0, top_p=1.0`，support 捕获取 `top_p=0.9`，回复上限 1024 token。奖励使用仅用于验证的
+GSM8K 打分器，同时接受 `####` 与 `\boxed{}`；否则 instruct 模型不接受格式时正确答案也会得 0 分。
+
+| Head | IS 规则 | `sc_support_aligned` | sampler head mass | trainer head mass | `sc_correction` |
+|---|---|---|---|---|---|
+| top-k 32 | 无 | 0 | 0.988 | 0.987 | -4.5e-4 |
+| support | 无 | 1.000 | 1.000 | 0.976 | -8.2e-4 |
+| support | IcePop 0.9-1.1 | 1.000 | 1.000 | 0.976 | +1.9e-2 |
+| top-k 32 | TIS 2.0 | 0 | 0.994 | 0.994 | -5.4e-5 |
+
+这些结果说明：
+
+- support 行的 `sc_sampler_head_mass = 1`、`sc_sampler_tail_mass ≈ 0`、`sc_support_aligned = 1`，
+  即核采样支撑被完整捕获，训练端在该支撑上重归一化。
+- top-k 行上 trainer 与 sampler 的 head mass 一致到约 1e-5，采样 token 的 log-prob 一致到约 1e-3
+  （`rollout_corr/log_ppl_diff`），同策略下中心化项接近 0。
+- IcePop 的区间拒绝了 2.2% 的 token 比率（`rollout_is_oob_ratio`）且 support 对齐仍精确；TIS 的
+  `rollout_is_mean ≈ 1`、最大比率 1.19、有效样本率 0.999。
+- 支撑预算不足会 fail closed：`sampler_max_tokens=128` 时 GSM8K 上的核超过预算，agent loop 抛出
+  `Sampler support exceeds the capture budget`。本数据分布用 `512` 足够；应按实际核大小而不是
+  head mass 配置预算。
+
+Megatron 引擎走同一路径，在单机上用张量并行 2 分别跑 Qwen2.5-0.5B 与 Qwen3-8B（2 张训练卡、4 张
+rollout 卡）。vocab-parallel normalizer 的 head mass 在 0.5B 上与 sampler 一致到 1e-4（0.99515 对
+0.99517），在 8B base 上一致到 1e-6（0.9999987 对 0.9999988，采样 log-prob 差 7.4e-4），与 FSDP
+同级；head、complete receipt 与 sampled label 的 THD 切分路径每步都会执行，张量并行 4 走同一条
+代码路径，只是词表分片更宽。
+
+### 训练开销
+
+上面的 8B Megatron TP2 两次运行只有 score centering 不同。被优化器状态主导的峰值显存不变（分配峰值
+72.44 GB，差异小于 0.001 GB）；chunk 化的 fp32 normalizer 工作区受 256 MiB 元素预算约束，不随词表
+增长。按训练 token 计，开启中心化时 actor update 为 404 tok/s，关闭时为 417 tok/s（约 3% 开销），
+MFU 从 0.344 降到 0.298。在 FSDP2 上，processor 同样只是在已物化 logits 之上增加有界工作区，
+而不是再开一份词表大小的缓冲。

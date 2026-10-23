@@ -2188,7 +2188,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # so actor cold-boot overlapped with gateway boot).
             ray.get(actor_nixl_futures)
             psrl_logger.info("Initialized NIXL client in actor worker group")
-            self.actor_wg.init_model("empty")
+            self.actor_wg.init_model(self._actor_init_mode())
             ray.get(self.actor_wg.execute_all_async("nixl_convert_params"))
             ray.get(self.actor_wg.execute_all_async("nixl_sleep", "meta"))
 
@@ -2235,7 +2235,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             psrl_logger.info("Initializing actor model")
             self.actor_wg = all_wg["actor"]
-            self.actor_wg.init_model("empty")
+            self.actor_wg.init_model(self._actor_init_mode())
             actor_nixl_futures = self.actor_wg.execute_all_async("init_nixl_client")
             ray.get(actor_nixl_futures)
             ray.get(self.actor_wg.execute_all_async("nixl_convert_params"))
@@ -3148,6 +3148,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         self._actor_resume_loaded = True
 
+    def _actor_init_mode(self) -> str:
+        """How the trainer initializes its parameters.
+
+        A PS-backed run loads the PS copy into the actor, so the skeletal init is enough.
+        Under trainer-direct supply there is no PS copy and the train ranks are the
+        published source: initializing them empty would publish uninitialized weights to
+        every rollout.
+        """
+        return "empty" if has_ps_data_plane(self.config.psrl.ps_mode) else "full"
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
@@ -3715,17 +3725,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # micro-batch flag to attach the logits processor (upstream FSDP and the Megatron branch).
         rollout_correction = self.config.algorithm.get("rollout_correction", None) or {}
         score_centering = bool(rollout_correction.get("score_centering", False))
-        # Support (exact top_p<1) mode renormalizes the trainer over the recorded support. The engine
-        # passes this flag to the score-centering logits processor.
-        sampler_support = (
-            self.config.gen_actor_rollout_ref.rollout.get("sampler_distribution", "disabled") == "support"
-        )
         base_extra_info = {
             "calculate_entropy": calculate_entropy,
             "multi_turn": self.config.gen_actor_rollout_ref.rollout.multi_turn.enable,
             "distillation_use_topk": distillation_use_topk,
             "score_centering": score_centering,
-            "sampler_support": sampler_support,
             "compute_loss": True,
         }
         actor_metrics = self._run_scheduled_update(

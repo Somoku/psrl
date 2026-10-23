@@ -125,6 +125,27 @@ def resolve_train_model_dtype(config: DictConfig) -> str:
     return engine_cfg.get("model_dtype", "fp32")
 
 
+def _reject_qat_for_direct_supply(config: DictConfig) -> None:
+    """Direct supply publishes its own wire format; upstream QAT is a different mechanism.
+
+    veRL's ``rollout.quantization`` presets make the *trainer* quantize every refit with
+    compressed-tensors and make vLLM load that format. PSRL's publisher already casts and
+    quantizes the shards it publishes, so combining the two would advertise a format the
+    trainer never produced.
+    """
+    for name, rollout in (
+        ("gen_actor_rollout_ref", config.gen_actor_rollout_ref.rollout),
+        ("train_actor_rollout_ref", config.train_actor_rollout_ref.rollout),
+    ):
+        quantization = rollout.get("quantization") or {}
+        if quantization.get("linear") or quantization.get("moe") or quantization.get("config_file"):
+            raise ValueError(
+                f"{name}.rollout.quantization is the trainer-side QAT path; direct supply "
+                "publishes its own blocks. Set psrl.nixl.rollout_quantization=fp8 for an FP8 "
+                "rollout instead."
+            )
+
+
 def _resolve_publish_cast(config: DictConfig) -> None:
     """
     Record which dtype the trainer stores and which the rollout loads, so the train side publishes a cast.
@@ -135,24 +156,13 @@ def _resolve_publish_cast(config: DictConfig) -> None:
     rollout = config.gen_actor_rollout_ref.rollout
     nixl.publish_train_dtype = resolve_train_model_dtype(config)
     nixl.publish_rollout_dtype = str(rollout.dtype)
-    quantization = rollout.get("quantization")
+    _reject_qat_for_direct_supply(config)
+    quantization = nixl.get("rollout_quantization", None)
     assert quantization in (None, "fp8"), (
-        f"Direct supply publishes block FP8 only, got rollout quantization {quantization!r}."
+        f"Direct supply publishes bf16 or block FP8 only, got psrl.nixl.rollout_quantization={quantization!r}."
     )
-    # A validate instance is a separate vLLM engine built from the train-side rollout
-    # config; it reads the same published bytes as the rollout fleet. If the two disagree
-    # on quantization, one side loads bf16 while the source advertises FP8 and its first
-    # pull fails on a dtype assertion -- after startup, during a validation wake.
-    validate_rollout = config.train_actor_rollout_ref.rollout
-    validate_quantization = validate_rollout.get("quantization")
-    if config.psrl.colocate_validate_and_train:
-        assert validate_quantization == quantization, (
-            "Validation and generation rollouts consume the same published weight format, so "
-            "they must agree on quantization: "
-            f"train_actor_rollout_ref.rollout.quantization={validate_quantization!r} but "
-            f"gen_actor_rollout_ref.rollout.quantization={quantization!r}."
-        )
-    # verl's online FP8 rollout is block quantised on 128 x 128 tiles.
+    # The published tile is what both the generation and validation engines load; one global
+    # setting keeps them from disagreeing on the wire format.
     nixl.publish_fp8_block = [128, 128] if quantization == "fp8" else None
 
 
@@ -395,10 +405,8 @@ def validate_config(
             },
             capture,
         )
-        # Mirror the resolved mode onto the veRL rollout config so its own init validation
-        # (top_p/top_k, max_logprobs) agrees with the capture mode instead of an untruncated sampler.
-        with open_dict(rollout_config):
-            rollout_config.sampler_support = capture_mode == "support"
+        # Upstream's rollout validation derives its own support checks from the sampler head and
+        # receipt, so no additional sampler_support flag is mirrored into veRL.
         if rollout_config.logprobs_mode != "processed_logprobs":
             raise ValueError("Sampler capture requires rollout.logprobs_mode=processed_logprobs.")
         if OmegaConf.select(rollout_config, "mtp.enable", default=False) or OmegaConf.select(

@@ -6,6 +6,10 @@ server_ip: ${psrl.ps_manager_ip}
 # Server port
 server_port: 23456
 
+# Wire format the trainer publishes for the rollout: null (bf16) or fp8 (128x128 blocks).
+# This is PSRL's transport format, not veRL's trainer-side QAT path.
+rollout_quantization: null
+
 # Pinned temp memory slots num for non-contiguous transfer
 max_pinned_temp_memory_slots: 16
 

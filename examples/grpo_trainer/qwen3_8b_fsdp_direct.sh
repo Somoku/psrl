@@ -71,10 +71,18 @@ val_do_sample=False
 # Optional FP8 gen: set GEN_QUANTIZATION=fp8 to exercise the bf16→FP8 publish path.
 GEN_QUANTIZATION=${GEN_QUANTIZATION:-}
 GEN_QUANT_OVERRIDE=""
-if [ -n "$GEN_QUANTIZATION" ]; then
-  GEN_QUANT_OVERRIDE="gen_actor_rollout_ref.rollout.quantization=${GEN_QUANTIZATION}"
-  experiment_name="${experiment_name}-${GEN_QUANTIZATION}gen"
-fi
+case "${GEN_QUANTIZATION}" in
+  "")
+    ;;
+  fp8)
+    GEN_QUANT_OVERRIDE="psrl.nixl.rollout_quantization=fp8"
+    experiment_name="${experiment_name}-fp8gen"
+    ;;
+  *)
+    echo "GEN_QUANTIZATION must be 'fp8' or empty, got '${GEN_QUANTIZATION}'" >&2
+    exit 2
+    ;;
+esac
 
 
 python3 -m psrl.trainer.main_ppo --config-path=./config \

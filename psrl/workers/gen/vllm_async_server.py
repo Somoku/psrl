@@ -17,10 +17,6 @@ from omegaconf import OmegaConf
 from ray.actor import ActorHandle
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
-from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
-
-from psrl.workers.gen.lmcache_kv_events import LMCacheKvEventBridge
-from psrl.workers.gen.lmcache_servicer import PSRLVllmEngineServicer
 from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 from verl.plugin.platform import get_platform
@@ -62,6 +58,8 @@ from psrl.utils.nixl.pull_engine import WeightRefreshFailed
 from psrl.utils.ps_mode import has_ps_data_plane, uses_nixl
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
+from psrl.workers.gen.lmcache_kv_events import LMCacheKvEventBridge
+from psrl.workers.gen.lmcache_servicer import PSRLVllmEngineServicer
 from psrl.workers.gen.smg_adapter import (
     build_worker_registration_payload,
     is_cache_aware_method,
@@ -417,7 +415,38 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
             set_expandable_segments(True)
 
-        quantization, hf_overrides = self._apply_quantization()
+        hf_overrides = self._apply_quantization()
+        # PSRL's publisher casts the trainer's shards itself, so the engine must load the same
+        # block layout. This is the transport's wire format, separate from veRL's trainer-side
+        # QAT presets (which vLLM routes to compressed-tensors kernels).
+        transport_quantization = (self.psrl_config.get("nixl") or {}).get("rollout_quantization", None)
+        quantization_arg = None
+        if transport_quantization is not None:
+            if transport_quantization != "fp8":
+                raise ValueError(
+                    f"Unsupported psrl.nixl.rollout_quantization={transport_quantization!r}; expected null or fp8."
+                )
+            if hf_overrides:
+                raise ValueError("Direct-supply FP8 cannot be combined with a model quantization_config.")
+            num_layers = self.model_config.hf_config.num_hidden_layers
+            hf_overrides["quantization_config"] = {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+                "ignored_layers": [f"model.layers.{layer}.mlp.gate" for layer in range(num_layers)],
+            }
+            quantization_arg = "fp8"
+        if transport_quantization is None:
+            # veRL defaults trainer-quantized (compressed-tensors) rollouts to DeepGEMM. That
+            # kernel does not support every accelerator this transport targets, and the
+            # publisher's block-FP8 format is served by vLLM's auto-selected kernel list, so
+            # leave the choice to vLLM for direct-supply FP8.
+            hf_quantization_config = getattr(self.model_config.hf_config, "quantization_config", None)
+            effective_quantization_config = hf_overrides.get("quantization_config") or hf_quantization_config
+            from verl.utils.vllm.vllm_quant_utils import set_default_vllm_quantization_backends
+
+            set_default_vllm_quantization_backends(effective_quantization_config, engine_kwargs)
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
@@ -459,7 +488,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
             "seed": self.replica_rank + (self.config.get("seed") or 0),
             "override_generation_config": json.dumps(override_generation_config),
-            "quantization": quantization,
+            "quantization": quantization_arg,
             "hf_overrides": hf_overrides,
             "scheduling_policy": self.config.scheduling_policy,
             "compilation_config": compilation_config,

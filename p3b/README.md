@@ -271,8 +271,10 @@ something it retries.
 - **A stopped container and a missing file are different 404s.** The node asks
   the runtime which one it got: `runtime gone` releases the sandbox and its
   charge, `path not found` leaves a healthy sandbox usable. A lost session also
-  carries the runtime's `exit_code` and `finished_at`, so a post mortem can line
-  the stop up with the node's cgroup and kernel events; a caller that sees
+  carries the runtime's `exit_code`, `finished_at`, and a `state_error` with the
+  daemon's status/OOM/start/finish evidence or the inspect failure that made the
+  code unknown, so a post mortem can line the stop up with the node's cgroup and
+  kernel events instead of reading a bare `None`; a caller that sees
   `SandboxTransportError` for an exec on a dead node is seeing a stale node, not
   a task result, and the node's own prober will release the charge when it
   returns.

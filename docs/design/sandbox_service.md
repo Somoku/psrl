@@ -404,6 +404,11 @@ carried across the node→control hop as a string beside the gRPC code, so
 code. A bare gRPC `NotFound` still means a lost session for callers that speak
 the proto directly.
 
+A lost session also carries `state_error`: the runtime's status, exit code, OOM
+flag, start and finish times and restart count, or the inspect failure that made
+the exit code unknown. A report whose `exit_code` is absent therefore still
+names the reason it is absent, instead of leaving the operator with `None`.
+
 The same rule applies one layer up: a collector failure is not a lost session.
 The harness asks the sandbox for its status and only a non-running answer is a
 loss. A live sandbox whose diagnostics file was never created is a collector or

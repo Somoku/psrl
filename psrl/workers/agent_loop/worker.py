@@ -560,11 +560,20 @@ class PSRL_AgentLoopWorker:
                 # recover it. A member-level refill keeps the same child id, so an
                 # abort issued after `notify_group_failed` would abort the refill
                 # the manager had just dispatched.
+                #
+                # Abort only this child. Letting the PSManager abort the whole
+                # group because one member is missing clears the group's buffer
+                # reservation, and the refill then has no entry to rejoin; the
+                # buffer it was counted in still expects the missing payload and
+                # fails validation. The manager issues its own whole-group abort
+                # if the member's retries are exhausted.
                 if output is None and terminate_reason != TerminateReason.ABORTED:
                     psrl_logger.warning(
                         f"Aborting failed generation: request_ids={request_ids!r}, reason={terminate_reason.value!r}."
                     )
-                    await self.ps_manager_handle.abort_requests.remote(request_ids)
+                    await self.ps_manager_handle.abort_requests.remote(
+                        request_ids, abort_group=False
+                    )
 
                 # Only the manager can purge the partial group and dispatch a replacement
                 # prompt, and it owns the breaker that ends a deterministically failing run.

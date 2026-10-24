@@ -523,7 +523,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     python -c \
         "import torch; expected='${expected_cuda}'; assert torch.version.cuda == expected, \
         f'Expected PyTorch CUDA {expected}, got {torch.version.cuda}.'" && \
-    python -c "import psrl, smg.router, torch, transfer_queue, verl, vllm, vllm_patches" && \
+    python -c "import psrl, smg.router, torch, transfer_queue, verl, vllm, vllm_patches, deep_gemm" && \
     python -c "import lmcache, nixl, torch_memory_saver" && \
     python -c "from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue; print('nvrx OK')"
 

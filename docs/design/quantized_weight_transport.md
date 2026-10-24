@@ -384,6 +384,12 @@ Multi-node:
 - **Hardware.** MXFP8 and NVFP4 kernels are not available on every accelerator. Format
   and packing can be validated without the kernel. End to end validation needs a
   supported GPU.
+- **Kernel backend defaults.** On the H20 environment, compressed-tensors `FP8_BLOCK`
+  initializes with an explicit non-DeepGEMM backend such as `cutlass` or `marlin`. The
+  automatic choice reaches DeepGEMM and fails while transforming block scales, because
+  the DeepGEMM JIT requires a newer NVCC than the image ships. Phase 2 therefore needs
+  an explicit backend capability probe rather than inheriting upstream's DeepGEMM
+  default.
 - **Model layouts.** Fused QKV with grouped-query attention and head sizes smaller than
   the quantization tile cannot be expressed by a naive scale view. The converter must
   reject them at validation or map them with a dedicated rule.

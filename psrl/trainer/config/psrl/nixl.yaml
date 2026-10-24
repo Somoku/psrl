@@ -6,9 +6,18 @@ server_ip: ${psrl.ps_manager_ip}
 # Server port
 server_port: 23456
 
-# Wire format the trainer publishes for the rollout: null (bf16) or fp8 (128x128 blocks).
-# This is PSRL's transport format, not veRL's trainer-side QAT path.
-rollout_quantization: null
+# Wire format the trainer publishes for the rollout. This is the transport format that
+# the publisher produces and both rollout roles load, not veRL's trainer-side QAT path.
+weight_quantization:
+  # none | fp8. mxfp8, nvfp4 and compressed_tensors are recognized and rejected until
+  # their publisher and engine paths land.
+  scheme: none
+  # Quantization tile on the last two dimensions. null selects the scheme default.
+  block: null
+  # Compressed-tensors options, reserved for the later phases.
+  preset: null
+  ignore: []
+  config_file: null
 
 # Pinned temp memory slots num for non-contiguous transfer
 max_pinned_temp_memory_slots: 16
@@ -63,8 +72,8 @@ publish_copy_budget_mb: null
 # the rollout loads. When they differ the trainer publishes contiguous copies cast to the latter.
 publish_train_dtype: null
 publish_rollout_dtype: null
-# Tile of the block FP8 the rollout loads, or null when it loads unquantised weights.
-publish_fp8_block: null
+# Resolved by `validate_config`: the serialized plan every participant rebuilds.
+publish_quantization: null
 
 # Registration granularity for CUDA memory.
 #

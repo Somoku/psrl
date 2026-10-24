@@ -67,18 +67,23 @@ def _first(entry) -> torch.Tensor:
     return entry.shards[0] if isinstance(entry, GroupedShards) else entry
 
 
-def block_scales_of(state_dict: dict) -> dict[str, tuple[str, tuple[int, ...]]]:
+def block_scales_of(
+    state_dict: dict,
+    *,
+    scale_suffix: str = SCALE_SUFFIX,
+    weight_dtype: torch.dtype = FP8_DTYPE,
+) -> dict[str, tuple[str, tuple[int, ...]]]:
     """
-    `{scale_key: (weight_key, tile)}` for every FP8 weight in `state_dict` that has a scale.
+    `{scale_key: (weight_key, tile)}` for every quantized weight in `state_dict` that has a scale.
 
     A grouped expert key has a leading expert dim, whose tile is 1.
     """
     found = {}
     for key, entry in state_dict.items():
-        if not key.endswith(SCALE_SUFFIX):
+        if not key.endswith(scale_suffix):
             continue
-        base = key[: -len(SCALE_SUFFIX)]
-        if base not in state_dict or _first(state_dict[base]).dtype != FP8_DTYPE:
+        base = key[: -len(scale_suffix)]
+        if base not in state_dict or _first(state_dict[base]).dtype != weight_dtype:
             continue
         weight, scale = _first(state_dict[base]), _first(entry)
         tile = tuple(w // s for w, s in zip(weight.shape, scale.shape))

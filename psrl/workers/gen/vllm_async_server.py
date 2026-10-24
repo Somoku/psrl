@@ -56,6 +56,7 @@ from psrl.utils.logger import (
 )
 from psrl.utils.nixl.pull_engine import WeightRefreshFailed
 from psrl.utils.ps_mode import has_ps_data_plane, uses_nixl
+from psrl.utils.quantization import QuantizationPlan
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
 from psrl.workers.gen.lmcache_kv_events import LMCacheKvEventBridge
@@ -419,12 +420,14 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # PSRL's publisher casts the trainer's shards itself, so the engine must load the same
         # block layout. This is the transport's wire format, separate from veRL's trainer-side
         # QAT presets (which vLLM routes to compressed-tensors kernels).
-        transport_quantization = (self.psrl_config.get("nixl") or {}).get("rollout_quantization", None)
+        quantization_plan = QuantizationPlan.from_config(
+            (self.psrl_config.get("nixl") or {}).get("publish_quantization")
+        )
         quantization_arg = None
-        if transport_quantization is not None:
-            if transport_quantization != "fp8":
+        if quantization_plan.is_quantized:
+            if quantization_plan.scheme != "fp8":
                 raise ValueError(
-                    f"Unsupported psrl.nixl.rollout_quantization={transport_quantization!r}; expected null or fp8."
+                    f"Scheme {quantization_plan.scheme!r} has no rollout engine path yet."
                 )
             if hf_overrides:
                 raise ValueError("Direct-supply FP8 cannot be combined with a model quantization_config.")
@@ -442,7 +445,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         from verl.utils.vllm.vllm_quant_utils import set_default_vllm_quantization_backends
 
         set_default_vllm_quantization_backends(effective_quantization_config, engine_kwargs)
-        if transport_quantization == "fp8" and engine_kwargs.get("linear_backend") == "deep_gemm":
+        if quantization_plan.scheme == "fp8" and engine_kwargs.get("linear_backend") == "deep_gemm":
             from vllm.utils.import_utils import has_deep_gemm
 
             if not has_deep_gemm():
@@ -1162,7 +1165,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         await self._is_init_model.wait()
         await self.collective_rpc(
             method="nixl_convert_params",
-            args=(self.model_config,),
+            args=(self.model_config, self.psrl_config.nixl.get("publish_quantization")),
         )
 
     async def nixl_protocol(self, mode: str = "full"):
@@ -1172,7 +1175,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         psrl_logger.info(f"vLLM server NIXL protocol (mode={mode!r}): dispatching to workers.")
         await self.collective_rpc(
             method="nixl_protocol",
-            args=(self.model_config, mode),
+            args=(self.model_config, mode, self.psrl_config.nixl.get("publish_quantization")),
         )
         psrl_logger.info(f"vLLM server NIXL protocol (mode={mode!r}) done.")
 

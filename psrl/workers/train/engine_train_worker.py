@@ -27,6 +27,7 @@ from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.param_sync import ParamSyncPlan
+from psrl.utils.quantization import QuantizationPlan
 
 # Set an architecture before guarded Megatron imports on CPU workers.
 if not is_cuda_available and "TORCH_CUDA_ARCH_LIST" not in os.environ:
@@ -314,8 +315,9 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 PrecisionType.to_dtype(nixl_config.publish_train_dtype),
                 PrecisionType.to_dtype(nixl_config.publish_rollout_dtype),
             )
-        if nixl_config.get("publish_fp8_block") is not None:
-            self.nixl_storage_client.set_publish_fp8(tuple(nixl_config.publish_fp8_block))
+        quantization = QuantizationPlan.from_config(nixl_config.get("publish_quantization"))
+        if quantization.is_quantized:
+            self.nixl_storage_client.set_publish_quantization(quantization)
         self.nixl_storage_client.register_local_tensors(
             self.unified_state_dict, unified_sharding_dict, meta_only=meta_only
         )

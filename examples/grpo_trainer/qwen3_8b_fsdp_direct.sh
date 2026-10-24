@@ -75,7 +75,7 @@ case "${GEN_QUANTIZATION}" in
   "")
     ;;
   fp8)
-    GEN_QUANT_OVERRIDE="psrl.nixl.rollout_quantization=fp8"
+    GEN_QUANT_OVERRIDE="psrl.nixl.weight_quantization.scheme=fp8"
     experiment_name="${experiment_name}-fp8gen"
     ;;
   *)

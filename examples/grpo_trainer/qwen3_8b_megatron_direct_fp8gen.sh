@@ -2,13 +2,13 @@
 # Direct supply with block-FP8 rollout, optionally with FP8 training.
 #
 # The publish point quantises the trainer's shards into 128x128 block FP8 (scales
-# travel with the bytes, `psrl.nixl.publish_fp8_block`), and the rollout and validate
-# engines run vLLM in block-FP8 mode (`psrl.nixl.rollout_quantization=fp8`). `TRAIN_FP8=true` additionally runs the
+# travel with the bytes, `psrl.nixl.weight_quantization.scheme=fp8`), and the rollout and validate
+# engines run vLLM in block-FP8 mode (`psrl.nixl.weight_quantization.scheme=fp8`). `TRAIN_FP8=true` additionally runs the
 # trainer's GEMMs in FP8 through Transformer Engine hybrid autocast; parameters stay
 # in bf16 either way, so the wire is identical and only training compute changes.
 #
 # The run is aligned with `qwen3_8b_megatron_direct.sh` on data, batch sizes, step count,
-# placement, and validation; `psrl.nixl.rollout_quantization=fp8` on both rollout roles is the only
+# placement, and validation; `psrl.nixl.weight_quantization.scheme=fp8` on both rollout roles is the only
 # difference. Compare the arms' per-step training and validation metrics to see what
 # the extra quantization costs; a failure in one arm and not the other is attributable to
 # this path.
@@ -198,7 +198,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     gen_actor_rollout_ref.rollout.temperature=${train_temperature} \
     gen_actor_rollout_ref.rollout.top_p=${train_top_p} \
     gen_actor_rollout_ref.rollout.top_k=${train_top_k} \
-    psrl.nixl.rollout_quantization=fp8 \
+    psrl.nixl.weight_quantization.scheme=fp8 \
     \
     reward.launch_reward_fn_async=True \
     \

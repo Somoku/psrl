@@ -38,8 +38,9 @@ from psrl.utils.converter.vllm_module_info import (
     is_moe_experts_module,
 )
 from psrl.utils.converter.weight_layout_plan import PlanExecutor
-from psrl.utils.nixl.block_fp8 import FP8_DTYPE, SCALE_SUFFIX, block_scales_of, scale_key_of, scale_view
+from psrl.utils.nixl.block_fp8 import block_scales_of, scale_key_of, scale_view
 from psrl.utils.nixl.nixl_spec import NIXLSharding
+from psrl.utils.quantization import QuantizationPlan, plan_dtype
 
 # vLLM QKV shard identifiers map to split tensor indices.
 QKV_SHARD_ID_MAP: dict[str, int] = {"q": 0, "k": 1, "v": 2}
@@ -52,6 +53,24 @@ _VLLM_ROUTED_EXPERTS_SEGMENT = ".experts.routed_experts."
 def canonical_vllm_name(name: str) -> str:
     """Map a vLLM-emitted unified name onto the canonical HF namespace."""
     return name.replace(_VLLM_ROUTED_EXPERTS_SEGMENT, ".experts.")
+
+def is_auxiliary_parameter(module, name: str, quantization: QuantizationPlan) -> bool:
+    """Whether a module parameter is the auxiliary tensor of a sibling weight."""
+    suffix = quantization.scale_suffix
+    if suffix is None or not name.endswith(suffix):
+        return False
+    base = name[: -len(suffix)]
+    return base in dict(module.named_parameters(recurse=False))
+
+
+def fused_auxiliary(module, name: str, param, quantization: QuantizationPlan):
+    """The auxiliary tensor stored beside a fused or reshaped weight."""
+    suffix = quantization.scale_suffix
+    weight_dtype = plan_dtype(quantization, "weight_dtype")
+    if suffix is None or weight_dtype is None or param.dtype != weight_dtype:
+        return None
+    return getattr(module, name + suffix, None)
+
 
 
 @dataclass
@@ -70,11 +89,18 @@ def enable_sharded_weight_attrs(params: dict[str, Parameter]):
 class VllmConverter(BaseConverter):
     """Convert vLLM model to a unified format (i.e., HuggingFace) and generate sharding info."""
 
-    def __init__(self, parameter_mapping: ParameterMapping | None, tp_rank: int | None = 0, ep_rank: int = 0):
+    def __init__(
+        self,
+        parameter_mapping: ParameterMapping | None,
+        tp_rank: int | None = 0,
+        ep_rank: int = 0,
+        quantization: QuantizationPlan | None = None,
+    ):
         super().__init__(parameter_mapping)
         self.parameter_mapping = parameter_mapping
         self.tp_rank = tp_rank
         self.ep_rank = ep_rank
+        self.quantization = quantization or QuantizationPlan()
 
     def _build_fused_mappings(
         self,
@@ -171,12 +197,10 @@ class VllmConverter(BaseConverter):
                     continue
 
                 full_name = f"{module_prefix}.{param_name}" if module_prefix else param_name
-                # A block scale is emitted beside each canonical view of its weight, not as the fused tensor.
-                if param_name.endswith(SCALE_SUFFIX) and param_name[: -len(SCALE_SUFFIX)] in dict(
-                    module.named_parameters(recurse=False)
-                ):
+                # An auxiliary parameter is emitted beside each canonical view of its weight, not as the fused tensor.
+                if is_auxiliary_parameter(module, param_name, self.quantization):
                     continue
-                fused_scale = getattr(module, param_name + SCALE_SUFFIX, None) if param.dtype == FP8_DTYPE else None
+                fused_scale = fused_auxiliary(module, param_name, param, self.quantization)
 
                 for converted in executor.execute(full_name, param, module):
                     sharding = converted.sharding
@@ -600,6 +624,7 @@ def convert_vllm_inplace(
     ep_rank: int = 0,
     *,
     parameter_mapping: ParameterMapping | None = None,
+    quantization: QuantizationPlan | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
     """
     Convert a vLLM model to unified HF-format state dict with NIXL sharding info.
@@ -608,10 +633,22 @@ def convert_vllm_inplace(
     For custom models not yet supporting the interface, pass parameter_mapping as
     a keyword argument.
     """
-    converter = VllmConverter(parameter_mapping=parameter_mapping, tp_rank=tp_rank, ep_rank=ep_rank)
+    plan = quantization or QuantizationPlan()
+    converter = VllmConverter(
+        parameter_mapping=parameter_mapping,
+        tp_rank=tp_rank,
+        ep_rank=ep_rank,
+        quantization=plan,
+    )
     state_dict, sharding_dict = converter.convert_state_and_sharding_dict(model)
-    # A refined grid (vLLM upsamples FP8 MoE scales when a TP cut splits a tile) differs from the
-    # quantisation tile, so each scale declares its own tile for the trainer to publish on.
-    for scale_key, (_, tile) in block_scales_of(state_dict).items():
-        sharding_dict[scale_key].scale_tile = tuple(tile[-2:])
+    # A refined grid (vLLM upsamples scales when a TP cut splits a tile) differs from the
+    # quantization tile, so each scale declares its own tile for the trainer to publish on.
+    quantized_dtype = plan_dtype(plan, "weight_dtype")
+    if plan.scale_suffix is not None and quantized_dtype is not None:
+        for scale_key, (_, tile) in block_scales_of(
+            state_dict,
+            scale_suffix=plan.scale_suffix,
+            weight_dtype=quantized_dtype,
+        ).items():
+            sharding_dict[scale_key].scale_tile = tuple(tile[-2:])
     return state_dict, sharding_dict

@@ -19,6 +19,7 @@ from psrl.utils.nixl import (
     NIXLStorageClient,
 )
 from psrl.utils.nixl.pull_engine import ChunkUnavailable, PullPreempted, PullVerdict, TornPull
+from psrl.utils.quantization import QuantizationPlan
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -122,11 +123,12 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
-    def nixl_convert_params(self, model_config: DictConfig):
+    def nixl_convert_params(self, model_config: DictConfig, quantization: dict | None = None):
         """Convert the model parameters to unified format.
 
         Args:
-            config (DictConfig): Configuration object containing training settings.
+            model_config (DictConfig): Configuration object containing model settings.
+            quantization (dict | None): Resolved wire-format plan from the driver.
         """
         vllm_model = self.model_runner.model
         if isinstance(vllm_model, CUDAGraphWrapper):
@@ -139,9 +141,10 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             tp_rank=self.get_instance_local_tp_rank(),
             ep_rank=self.get_instance_local_ep_rank(),
             parameter_mapping=param_mapping,
+            quantization=QuantizationPlan.from_config(quantization),
         )
 
-    def nixl_protocol(self, model_config: DictConfig, mode: str = "full"):
+    def nixl_protocol(self, model_config: DictConfig, mode: str = "full", quantization: dict | None = None):
         """Run the NIXL server protocol.
 
         Args:
@@ -155,7 +158,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         # Register the state dict and sharding dict to the NIXL client
         meta_only = mode == "meta"
         if self.unified_state_dict is None or self.local_sharding_dict is None:
-            self.nixl_convert_params(model_config)
+            self.nixl_convert_params(model_config, quantization)
         psrl_logger.info("nixl client protocol step 1: connect_to_server")
         self.nixl_storage_client.connect_to_server()
         psrl_logger.info("nixl client protocol step 2: send_local_sharding")

@@ -147,11 +147,11 @@ def _reject_qat_for_direct_supply(config: DictConfig) -> None:
             )
 
 
-def _resolve_publish_cast(config: DictConfig) -> None:
+def _resolve_publish_format(config: DictConfig) -> None:
     """
-    Record which dtype the trainer stores and which the rollout loads, so the train side publishes a cast.
+    Record the trainer and rollout dtypes and resolve the published weight format.
 
-    Written into the config so the cast a run used is visible in its dump.
+    Written into the config so the format a run used is visible in its dump.
     """
     nixl = config.psrl.nixl
     rollout = config.gen_actor_rollout_ref.rollout
@@ -622,7 +622,7 @@ def validate_config(
         _validate_nixl_offload_flags(config)
         _validate_nixl_lora(config)
         _resolve_version_barrier(config)
-        _resolve_publish_cast(config)
+        _resolve_publish_format(config)
         _resolve_write_gate(config)
         assert not config.psrl.get("lmcache", {}).get("enable_p2p", False), (
             "psrl.lmcache.enable_p2p requires a PS to route through; it cannot be used "

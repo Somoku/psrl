@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 from omegaconf import OmegaConf
-from psrl.utils.config import _resolve_publish_cast
+from psrl.utils.config import _resolve_publish_format
 
 pytestmark = pytest.mark.cpu_test
 
@@ -34,7 +34,7 @@ def _config(scheme: str = "none", **weight_quantization):
 
 def test_an_fp8_plan_publishes_block_fp8():
     config = _config("fp8")
-    _resolve_publish_cast(config)
+    _resolve_publish_format(config)
 
     plan = config.psrl.nixl.publish_quantization
     assert plan.scheme == "fp8"
@@ -44,23 +44,23 @@ def test_an_fp8_plan_publishes_block_fp8():
 
 def test_a_none_plan_publishes_the_trainer_dtype():
     config = _config()
-    _resolve_publish_cast(config)
+    _resolve_publish_format(config)
 
     assert config.psrl.nixl.publish_quantization.scheme == "none"
 
 
 def test_a_reserved_scheme_is_rejected_at_validation():
     with pytest.raises(ValueError, match="reserved for Phase 2"):
-        _resolve_publish_cast(_config("mxfp8"))
+        _resolve_publish_format(_config("mxfp8"))
 
 
 def test_an_unknown_scheme_is_rejected_at_validation():
     with pytest.raises(ValueError, match="Unknown psrl.nixl.weight_quantization.scheme"):
-        _resolve_publish_cast(_config("int4"))
+        _resolve_publish_format(_config("int4"))
 
 
 def test_trainer_side_qat_is_refused_under_direct_supply():
     config = _config()
     config.gen_actor_rollout_ref.rollout.quantization = {"linear": "FP8_BLOCK"}
     with pytest.raises(ValueError, match="trainer-side QAT path"):
-        _resolve_publish_cast(config)
+        _resolve_publish_format(config)

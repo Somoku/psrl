@@ -437,16 +437,20 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 "ignored_layers": [f"model.layers.{layer}.mlp.gate" for layer in range(num_layers)],
             }
             quantization_arg = "fp8"
-        if transport_quantization is None:
-            # veRL defaults trainer-quantized (compressed-tensors) rollouts to DeepGEMM. That
-            # kernel does not support every accelerator this transport targets, and the
-            # publisher's block-FP8 format is served by vLLM's auto-selected kernel list, so
-            # leave the choice to vLLM for direct-supply FP8.
-            hf_quantization_config = getattr(self.model_config.hf_config, "quantization_config", None)
-            effective_quantization_config = hf_overrides.get("quantization_config") or hf_quantization_config
-            from verl.utils.vllm.vllm_quant_utils import set_default_vllm_quantization_backends
+        hf_quantization_config = getattr(self.model_config.hf_config, "quantization_config", None)
+        effective_quantization_config = hf_overrides.get("quantization_config") or hf_quantization_config
+        from verl.utils.vllm.vllm_quant_utils import set_default_vllm_quantization_backends
 
-            set_default_vllm_quantization_backends(effective_quantization_config, engine_kwargs)
+        set_default_vllm_quantization_backends(effective_quantization_config, engine_kwargs)
+        if transport_quantization == "fp8" and engine_kwargs.get("linear_backend") == "deep_gemm":
+            from vllm.utils.import_utils import has_deep_gemm
+
+            if not has_deep_gemm():
+                raise RuntimeError(
+                    "Direct-supply FP8 defaults to vLLM's DeepGEMM linear backend, but the "
+                    "deep_gemm package is unavailable. Install the pinned DeepGEMM build or set "
+                    "the vLLM linear_backend to a supported alternative explicitly."
+                )
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):

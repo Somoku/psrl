@@ -498,6 +498,13 @@ scale grid 可组合、scale dtype 在 `_DTYPE_MAP` 里、每个 fp8 weight 都�
 | **MXFP8** | `check_mxfp8_support` → False：`compute capability 10.0 or higher` | ❌ Hopper 不支持 | 需要 F8 的 MXFP8 分支（含 scale 的 unswizzle）。`torch.float8_e8m0fnu` 已存在，缺的是硬件与布局转换 |
 | **FP4** | vLLM 的 FP4 kernel 要 SM100+ | ❌ 同上 | `torch.float4_e2m1fn_x2` 已存在；§3.8.1 的两处（scale dtype、grid 可组合性）仍要显式处理 |
 
+**DeepGEMM 后端。** vLLM 0.30 对 block-scaled FP8 线性层默认选择 DeepGEMM，veRL 的
+`set_default_vllm_quantization_backends` 会把 `linear_backend` 设为 `deep_gemm`。本仓库固定的
+DeepGEMM 版本在 JIT 编译时强制要求 nvcc >= 12.9；GPU 镜像基于 CUDA 13.0.3，满足该要求并在
+vLLM 之后安装同一 pin。开发机若只有更老的 toolkit，需要把 `CUDA_HOME` 指向 12.9+ 的 toolkit，
+或显式设置 `gen_actor_rollout_ref.rollout.engine_kwargs.vllm.linear_backend=cutlass`。包缺失时
+direct-supply FP8 会在启动阶段直接报错并给出这两条出路，不会静默回退到别的 kernel。
+
 **结论：三条都卡在硬件或 CUDA 版本上，但没有一条只靠升级就完成。** 升级 CUDA 到 12.9 让 Hopper 上的
 blockwise FP8 训练跑起来，可 PSRL 仍要把 TE 的 scale 布局翻译成 rollout 声明的那一种，否则只能像现在这样
 反量化再重量化（实测每 rank 发布刷新 513 ms，现已被融合 kernel 降到 56 ms 量级）。

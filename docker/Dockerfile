@@ -45,6 +45,10 @@ ARG FLASH_ATTN_VERSION=2.8.3.post1
 # relocated CCCL headers, and vendors a CUDA 13-compatible CUTLASS revision.
 ARG FLASH_ATTN_3_REF=df61ab6c4a0fb1f94f1f43b2a23479a0ab92b8ab
 ARG FLASHINFER_VERSION=0.6.11.post3
+# Keep in sync with vLLM's cmake/external_projects/deepgemm.cmake. CUDA 13
+# satisfies the CUDA 12.9 runtime-API floor that DeepGEMM's static assert
+# enforces.
+ARG DEEPGEMM_REF=e1f418c2a4f20818221f6b0e578b4c2f634d4c3f
 
 ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
     CUDA_HOME=/usr/local/cuda \
@@ -326,6 +330,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     python use_existing_torch.py && \
     uv pip install -r requirements/build/cuda.txt && \
     uv pip install --no-build-isolation -e .
+
+# DeepGEMM provides the block-scaled FP8 and grouped GEMM kernels vLLM selects
+# when VLLM_USE_DEEP_GEMM is on. Build the same pinned revision vLLM's CMake
+# fetches instead of relying on vLLM's source build to vendor it.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    git clone https://github.com/vllm-project/DeepGEMM.git ${PSRL_THIRD_PARTY}/DeepGEMM && \
+    git -C ${PSRL_THIRD_PARTY}/DeepGEMM checkout ${DEEPGEMM_REF} && \
+    git -C ${PSRL_THIRD_PARTY}/DeepGEMM submodule update --init --recursive --depth 1 && \
+    cd ${PSRL_THIRD_PARTY}/DeepGEMM && \
+    touch scripts/__init__.py && \
+    DG_FORCE_BUILD=1 python setup.py bdist_wheel && \
+    uv pip install dist/*.whl && \
+    cd /root && rm -rf ${PSRL_THIRD_PARTY}/DeepGEMM
 
 # Match vLLM's DeepEP v2 installation path. The helper installs the pinned
 # DeepEP revision and its legacy NVSHMEM backend for workloads that still use it.

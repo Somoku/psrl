@@ -265,7 +265,7 @@ shows. The THD split paths for heads, completion receipts and sampled labels are
 step; tensor parallelism 4 uses the same code path with a wider vocabulary shard. The same 8B TP2
 run also completed with a block-FP8 rollout (`psrl.nixl.rollout_quantization=fp8`): each rollout
 rank pulled 4.72 GB, sampler and trainer head masses still agreed to 3e-7, and the expected
-quantization gap appeared as KL 5.0e-3.
+quantization gap appeared as KL 5.0e-3 with the CUTLASS kernel and 8.8e-3 with DeepGEMM.
 
 ### Training cost
 

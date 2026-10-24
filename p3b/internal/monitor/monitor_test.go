@@ -28,6 +28,34 @@ func TestAReportBecomesVisibleInTheFleet(t *testing.T) {
 	}
 }
 
+func TestLiveFleetDropsStaleNodesButKeepsDrainingOnes(t *testing.T) {
+	// The historical view is what a fleet report explains a drain from; the live
+	// view is what a caller may act on. A stale node in the latter makes every
+	// renewal pay a dead node's timeout.
+	m := New(time.Minute)
+	fresh := view("fresh")
+	draining := view("draining")
+	draining.Draining = true
+	stale := view("stale")
+	stale.SeenAt = time.Now().Add(-2 * time.Minute)
+	m.Report(fresh)
+	m.Report(draining)
+	m.Report(stale)
+
+	live := m.LiveFleet()
+	if len(live) != 2 {
+		t.Fatalf("live fleet is %v, want fresh and draining", live)
+	}
+	for _, node := range live {
+		if node.NodeID == "stale" {
+			t.Fatal("a stale node must not appear in the live fleet")
+		}
+	}
+	if len(m.Fleet()) != 3 {
+		t.Fatalf("the historical fleet kept %d nodes, want 3", len(m.Fleet()))
+	}
+}
+
 func TestTheFleetIsOrderedSoReplicasAgree(t *testing.T) {
 	// Two placement replicas reading the same version must see the same order, or
 	// a tie-break is not reproducible across them.

@@ -14,11 +14,13 @@ class SandboxError(RuntimeError):
 
 
 class SandboxCapacityTimeout(SandboxError):
-    """Admission never granted a sandbox in time.
+    """Admission did not grant a sandbox.
 
-    No sandbox existed, so no episode ran: this is capacity planning rather than
-    a task, model, or harness failure. Reported as its own type so a caller can
-    classify it apart from a cancelled or failed episode.
+    Two shapes, both capacity faults rather than task failures. A request that
+    fits its class but had to wait is a `capacity_timeout`; one the class can
+    never hold is refused outright as `cannot_admit`. Either way no sandbox
+    existed, so no episode ran, and the caller classifies it apart from a
+    cancelled or failed episode rather than as a failing harness.
     """
 
 
@@ -38,10 +40,26 @@ class SandboxSessionLost(SandboxError):
     must not be counted as evidence that the harness is broken.
     """
 
-    def __init__(self, message: str, *, sandbox_id: str = "", exit_reason: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_id: str = "",
+        exit_reason: str = "",
+        exit_code: int | None = None,
+        finished_at: str = "",
+        state_error: str = "",
+    ) -> None:
         super().__init__(message)
         self.sandbox_id = sandbox_id
         self.exit_reason = exit_reason
+        # The runtime's own evidence, when it reported any. `None` means the
+        # service never observed a code, which is different from a clean exit 0.
+        self.exit_code = exit_code
+        self.finished_at = finished_at
+        # The daemon's state text, or the inspect failure that made the code
+        # unknown; a loss with no code is diagnosable through this.
+        self.state_error = state_error
 
 
 class SandboxOomError(SandboxError):
@@ -74,6 +92,16 @@ class SandboxSetupError(SandboxError):
     The environment is not what the task needs, so a captured version of it
     would be wrong for every later reuse. A task preparation fault rather than a
     sandbox or model one.
+    """
+
+
+class SandboxPathNotFound(SandboxError):
+    """A file operation addressed a path the sandbox does not have.
+
+    The sandbox itself is healthy and stays usable. This is deliberately not a
+    lost session: a missing diagnostics file and a dead container are both 404s
+    from the runtime, and reading the first as the second made a harness report
+    say the sandbox had died when the real problem was a file that was gone.
     """
 
 

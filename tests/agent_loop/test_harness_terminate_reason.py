@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from psrl.workers.agent_loop.harness import STOP_REASON_MAX_TURNS, HarnessEpisodeSummary
 from psrl.workers.agent_loop.loops.harness_agent_loop import HarnessAgentLoop, _raise_if_episode_is_over
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 from psrl.workers.agent_loop.worker import _classify_rollout_failure
@@ -19,12 +20,16 @@ def _reason(
     *,
     grader_unavailable: bool = False,
     grader_capacity_timeout: bool = False,
+    agent_timed_out: bool = False,
+    episode_stop_reason: str | None = None,
 ) -> TerminateReason:
     loop = SimpleNamespace(
         rollout_budget=_BUDGET,
         max_turns=_MAX_TURNS,
         grader_unavailable=grader_unavailable,
         grader_capacity_timeout=grader_capacity_timeout,
+        _agent_timed_out=agent_timed_out,
+        _episode_summary=(HarnessEpisodeSummary(stop_reason=episode_stop_reason) if episode_stop_reason else None),
     )
     return HarnessAgentLoop.get_harness_terminate_reason(loop, training_data)
 
@@ -59,16 +64,94 @@ def test_response_length_exceeded_reports_when_the_budget_overflows() -> None:
     assert _reason(data) is TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
 
-def test_budget_overflow_wins_over_the_turn_cap() -> None:
+def test_the_harness_own_verdict_wins_over_the_length_check() -> None:
+    # Both are budget truncations, so the only question is which reason to report. The
+    # harness's own verdict is a fact about why it stopped; the length check is the
+    # framework's reconstruction of what it could train, and it cannot see either a
+    # context rewrite or a subagent.
     data = [_item(prompt_tokens=_BUDGET, response_tokens=1, num_turns=_MAX_TURNS)]
 
-    assert _reason(data) is TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+    assert _reason(data, episode_stop_reason=STOP_REASON_MAX_TURNS) is TerminateReason.MAX_TURNS_EXCEEDED
 
 
-def test_turn_cap_reports_when_the_budget_fits() -> None:
+def test_turn_cap_reports_when_the_harness_says_it_hit_one() -> None:
     data = [_item(prompt_tokens=1000, response_tokens=1000, num_turns=_MAX_TURNS)]
 
-    assert _reason(data) is TerminateReason.MAX_TURNS_EXCEEDED
+    assert _reason(data, episode_stop_reason=STOP_REASON_MAX_TURNS) is TerminateReason.MAX_TURNS_EXCEEDED
+
+
+def test_a_count_reaching_the_cap_is_not_a_turn_cap_by_itself() -> None:
+    """The framework's own count must not stand in for the harness's verdict.
+
+    A context rewrite cuts a trajectory mid-run while the CLI's counter keeps going, so a
+    trajectory whose own count reaches the configured cap may have been stopped by the
+    harness's cap, or may just be the longest segment of a run that was nowhere near it.
+    Reporting the cap from the count alone mislabels in both directions.
+    """
+    data = [_item(prompt_tokens=1000, response_tokens=1000, num_turns=_MAX_TURNS * 2)]
+
+    assert _reason(data) is TerminateReason.FINISHED
+
+
+def test_an_unlimited_episode_finishes_instead_of_exceeding_turns() -> None:
+    # With no turn cap the episode is bounded by the trajectory time budget, so a
+    # high turn count is finished, not exhausted.
+    loop = SimpleNamespace(
+        rollout_budget=_BUDGET,
+        max_turns=None,
+        grader_unavailable=False,
+        grader_capacity_timeout=False,
+        _agent_timed_out=False,
+        _episode_summary=None,
+    )
+    data = [_item(prompt_tokens=1000, response_tokens=1000, num_turns=10_000)]
+
+    assert HarnessAgentLoop.get_harness_terminate_reason(loop, data) is TerminateReason.FINISHED
+
+
+def _limit_loop(kind: str, *, cli_takes_turn_cap: bool, max_turns: int | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        harness_config=SimpleNamespace(kind=kind, cli_takes_turn_cap=cli_takes_turn_cap),
+        max_turns=max_turns,
+    )
+
+
+@pytest.mark.parametrize("configured", [None, -1, 0, -5])
+def test_a_non_positive_turn_budget_means_unlimited(configured) -> None:
+    loop = _limit_loop("claude_code", cli_takes_turn_cap=True)
+
+    assert HarnessAgentLoop._resolve_turn_limit(loop, configured) is None
+
+
+def test_a_positive_turn_budget_is_a_cap() -> None:
+    loop = _limit_loop("claude_code", cli_takes_turn_cap=True)
+
+    assert HarnessAgentLoop._resolve_turn_limit(loop, 80) == 80
+
+
+def test_a_harness_whose_cli_takes_no_cap_declares_the_session_budget() -> None:
+    """A CLI that cannot be handed a cap is held to it by the session it talks to.
+
+    Codex exposes no `--max-turns`, so the configured cap reaches it as the session's turn
+    budget instead of silently doing nothing.
+    """
+    loop = _limit_loop("codex", cli_takes_turn_cap=False, max_turns=80)
+
+    assert HarnessAgentLoop.session_turn_budget(loop) == 80
+
+
+def test_a_harness_whose_cli_takes_the_cap_declares_no_session_budget() -> None:
+    # Its CLI already counts the parent agent's turns, so a second counter would have to
+    # guess at the same number.
+    loop = _limit_loop("claude_code", cli_takes_turn_cap=True, max_turns=80)
+
+    assert HarnessAgentLoop.session_turn_budget(loop) is None
+
+
+def test_an_unset_turn_budget_declares_nothing() -> None:
+    loop = _limit_loop("codex", cli_takes_turn_cap=False, max_turns=None)
+
+    assert HarnessAgentLoop.session_turn_budget(loop) is None
 
 
 def test_any_trajectory_over_budget_marks_the_request_truncated() -> None:
@@ -107,6 +190,109 @@ def test_a_grader_that_was_never_admitted_reports_the_capacity_reason() -> None:
     assert reason.is_successful
     assert reason.is_coordination_fault
     assert not reason.counts_toward_refill_breaker()
+
+
+@pytest.mark.parametrize(
+    ("action", "keeps"),
+    [("discard", False), ("keep", True), (" keep ", True)],
+)
+def test_the_timeout_action_selects_whether_partial_work_is_kept(action: str, keeps: bool) -> None:
+    loop = SimpleNamespace(trajectory_timeout_action=action)
+
+    assert HarnessAgentLoop._resolve_timeout_action(loop) is keeps
+
+
+def test_an_unset_timeout_action_discards_the_partial_trajectory() -> None:
+    # The shipped default preserves the pre-existing behavior: the episode is
+    # cancelled and retried, losing the partial work. An absent key and an empty
+    # value both mean "use the default", the same way `grading_timeout: null` does.
+    assert HarnessAgentLoop._resolve_timeout_action(SimpleNamespace()) is False
+    assert HarnessAgentLoop._resolve_timeout_action(SimpleNamespace(trajectory_timeout_action=None)) is False
+    assert HarnessAgentLoop._resolve_timeout_action(SimpleNamespace(trajectory_timeout_action="")) is False
+
+
+@pytest.mark.parametrize("action", ["halt", "KEEP", "none"])
+def test_an_unknown_timeout_action_is_refused(action: str) -> None:
+    loop = SimpleNamespace(trajectory_timeout_action=action)
+
+    with pytest.raises(ValueError, match="trajectory_timeout_action"):
+        HarnessAgentLoop._resolve_timeout_action(loop)
+
+
+def test_an_episode_whose_deadline_stopped_the_agent_is_a_kept_success() -> None:
+    """`keep` stops the agent at the deadline and grades the partial trajectory.
+
+    It must report `AGENT_TIMEOUT` -- a success kept for training -- rather than the
+    `TRAJECTORY_TIMEOUT` that discards and retries, so the episode's own turns are not
+    thrown away and its reward is not read as a failure.
+    """
+    data = [_item(prompt_tokens=1000, response_tokens=1000, num_turns=10)]
+
+    reason = _reason(data, agent_timed_out=True)
+
+    assert reason is TerminateReason.AGENT_TIMEOUT
+    assert reason.is_successful
+    assert reason.is_timeout is False
+    assert reason.is_error is False
+    assert not reason.needs_worker_retry()
+    assert not reason.needs_manager_retry()
+    # A deadline is an infrastructure cutoff, not budget exhaustion, so it must not be
+    # gated by the truncation mask that penalises a genuinely over-budget episode.
+    assert reason.is_budget_truncated is False
+
+
+def test_a_deadline_stopped_agent_is_reported_before_a_turn_cap() -> None:
+    # The episode was cut off by the wall clock, so whatever turn count it reached is
+    # incidental and must not be reported as a turn-cap exhaustion.
+    data = [_item(prompt_tokens=1000, response_tokens=1000, num_turns=_MAX_TURNS)]
+
+    assert _reason(data, agent_timed_out=True) is TerminateReason.AGENT_TIMEOUT
+
+
+def _agent_config(action: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            gen_actor_rollout_ref=SimpleNamespace(
+                rollout=SimpleNamespace(
+                    agent=SimpleNamespace(trajectory_timeout_action=action, traj_reward_mode="traj"),
+                    multi_turn=SimpleNamespace(enable=True),
+                )
+            )
+        )
+    )
+
+
+class _ConcreteHarnessLoop(HarnessAgentLoop):
+    """A concrete subclass so the abstract `HarnessAgentLoop` can be instantiated."""
+
+    async def prepare_harness_task(self, request):  # pragma: no cover - never called
+        raise NotImplementedError
+
+
+@pytest.mark.parametrize(("action", "owns_budget"), [("discard", False), ("keep", True)])
+def test_keep_mode_makes_the_loop_own_the_episode_budget(monkeypatch, action, owns_budget) -> None:
+    """`keep` moves the deadline into the loop, so the base must stop enforcing it.
+
+    This is the wiring that lets the loop stop its own agent work at the deadline and
+    carry on to collection and grading, instead of the base cancelling the episode. It
+    is set from the same switch as `keeps_partial_on_timeout`, so the two cannot drift.
+    """
+    from psrl.workers.agent_loop.loops import session_agent_loop
+
+    def _stub_init(self, context):
+        # Skip the heavy framework wiring `SessionAgentLoop.__init__` performs; the
+        # only value `HarnessAgentLoop.__init__` reads back is the strategy.
+        self.trajectory_id_strategy = "auto"
+
+    monkeypatch.setattr(session_agent_loop.SessionAgentLoop, "__init__", _stub_init)
+
+    loop = _ConcreteHarnessLoop(
+        context=_agent_config(action),
+        harness={"kind": "codex", "executable": "codex"},
+    )
+
+    assert loop.keeps_partial_on_timeout is owns_budget
+    assert loop.episode_budget_enforced_by_loop is owns_budget
 
 
 @pytest.mark.asyncio

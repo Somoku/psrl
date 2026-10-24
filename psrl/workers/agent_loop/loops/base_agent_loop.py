@@ -16,7 +16,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
 from verl.utils.tokenizer.chat_template import apply_chat_template, initialize_system_prompt
 
-from psrl.sandbox import SandboxCapacityTimeout, SandboxSessionLostError
+from psrl.sandbox import SandboxCapacityTimeout, SandboxCollectorError, SandboxSessionLostError
 from psrl.utils.common.http_io_thread import get_http_io_thread
 from psrl.utils.common.http_utils import (
     RequestAbortedByGatewayError,
@@ -36,7 +36,6 @@ from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.budget import (
     EpisodeBudget,
     EpisodeBudgetExpired,
-    RolloutDeadlineExceeded,
 )
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 from psrl.workers.agent_loop.timeouts import resolve_from_config
@@ -52,12 +51,20 @@ class AgentLoopBase(ABC):
 
     A loop that provisions a sandbox before doing episode work sets
     `episode_starts_after_provisioning` and calls `arm_episode_budget` once the
-    sandbox and environment are ready. That keeps node capacity admission, which is
-    scheduling latency, out of the episode budget. The admission deadline bounds it
-    instead. Loops that do no provisioning keep the default and are timed from the call.
+    sandbox and environment are ready. That keeps node capacity admission and
+    provisioning, which are scheduling latency, out of the episode budget; those
+    phases are bounded by the sandbox service's own liveness instead. Loops that do no
+    provisioning keep the default and are timed from the call.
     """
 
     episode_starts_after_provisioning = False
+
+    # Whether the loop bounds its own episode and must not be cut off by the base's
+    # budget. A loop that keeps a partial trajectory on timeout (`keep`) stops its own
+    # agent work at the deadline and carries on to collection and grading, so the base
+    # must not cancel the very episode the loop is trying to wrap up. Loops that leave
+    # this False have their episode enforced here by cancelling `run`.
+    episode_budget_enforced_by_loop = False
 
     def __init__(
         self,
@@ -73,8 +80,8 @@ class AgentLoopBase(ABC):
         self.rollout_config = self.config.gen_actor_rollout_ref.rollout
         self.sampler_capture = SamplerCapture.from_rollout_config(self.rollout_config)
         self.rollout_gateway_url = context.rollout_gateway_url.rstrip("/")
-        # One ladder for every deadline this loop enforces, derived from the episode budget so the
-        # harness cap, the setup allowance, and the manager's stall threshold cannot disagree.
+        # The rollout's two budgets: the episode (agent work) and grading. Read in one
+        # place so the loop and the trainer cannot report different values.
         self.timeouts = resolve_from_config(self.config)
 
         self.reward_manager = context.reward_manager
@@ -778,39 +785,36 @@ class AgentLoopBase(ABC):
                 else:
                     psrl_logger.exception(f"Unsupported value: type={type(v)!r}, key={k!r}.")
 
-            # The budget excludes sandbox admission and preparation for loops that provision a
-            # sandbox, since that time is scheduling latency rather than episode work.
+            # The budget excludes sandbox admission and provisioning for loops that
+            # provision a sandbox: that time is scheduling latency rather than episode
+            # work, and the sandbox service bounds it by liveness instead.
             self.episode_budget = EpisodeBudget(
-                self.timeouts.episode_timeout_s,
+                self.timeouts.trajectory_timeout_s,
                 starts_after_provisioning=self.episode_starts_after_provisioning,
-                setup_limit_s=self.timeouts.setup_timeout_s,
             )
             output, terminate_reason = None, None
             run_task = asyncio.ensure_future(self.run(prompt))
-            try:
-                output, terminate_reason = await self.episode_budget.wait_for(run_task)
-            except RolloutDeadlineExceeded as expired:
-                run_task.cancel()
-                await asyncio.gather(run_task, return_exceptions=True)
-                self._record_error(expired)
-                psrl_logger.error(
-                    "Rollout for request %s never started an episode within its %ss setup allowance.",
-                    request_ids,
-                    self.timeouts.setup_timeout_s,
-                )
-                return None, TerminateReason.ROLLOUT_DEADLINE_EXCEEDED
-            except EpisodeBudgetExpired as expired:
-                run_task.cancel()
-                await asyncio.gather(run_task, return_exceptions=True)
-                self._record_error(expired)
-                psrl_logger.error(
-                    "Episode budget expired in agent_loop.run for request %s after %ss of episode time "
-                    "(%.0fs spent in admission and preparation).",
-                    request_ids,
-                    self.episode_budget.total_s,
-                    self.episode_budget.wait_s(),
-                )
-                return None, TerminateReason.TRAJECTORY_TIMEOUT
+            if self.episode_budget_enforced_by_loop:
+                # The loop owns the deadline: it stops its own agent work at the budget
+                # and keeps the partial trajectory (`keep`), so the base must not cancel
+                # it here. `episode_budget` is still armed for the loop to read the time
+                # left; it just is not what stops the episode.
+                output, terminate_reason = await run_task
+            else:
+                try:
+                    output, terminate_reason = await self.episode_budget.wait_for(run_task)
+                except EpisodeBudgetExpired as expired:
+                    run_task.cancel()
+                    await asyncio.gather(run_task, return_exceptions=True)
+                    self._record_error(expired)
+                    psrl_logger.error(
+                        "Episode budget expired in agent_loop.run for request %s after %ss of episode time "
+                        "(%.0fs spent in admission and preparation).",
+                        request_ids,
+                        self.episode_budget.total_s,
+                        self.episode_budget.wait_s(),
+                    )
+                    return None, TerminateReason.TRAJECTORY_TIMEOUT
             if output is not None:
                 await self._resolve_version_for_dump(output, prompt)
                 self._attach_loop_timing(output)
@@ -865,15 +869,32 @@ class AgentLoopBase(ABC):
             # must not read a container or host lifecycle fault as a broken harness.
             self._record_error(exc)
             psrl_logger.error(
-                "Sandbox was lost mid-episode for request %s (reason=%s, exit_code=%s, finished_at=%s).\n"
+                "Sandbox was lost mid-episode for request %s (reason=%s, exit_code=%s, "
+                "finished_at=%s, state_error=%s).\n"
                 "Underlying failure:\n%s",
                 request_ids,
                 exc.exit_reason.value,
                 exc.exit_code,
                 exc.finished_at or "<unknown>",
+                exc.state_error or "<none>",
                 self.last_error_traceback,
             )
             return None, TerminateReason.CONTAINER_LOST
+        except SandboxCollectorError as exc:
+            # The episode ran, but the sandbox's own execution environment could
+            # not run the artifact collector (a missing tool, a shell that never
+            # started). Nothing about the model or the harness is implicated, so
+            # this is a coordination fault: the group is replaced, not the run.
+            self._record_error(exc)
+            psrl_logger.error(
+                "Harness artifact collection failed inside the sandbox for request %s "
+                "(exit_code=%s).\nCollector diagnostics:\n%s\nUnderlying failure:\n%s",
+                request_ids,
+                exc.exit_code,
+                exc.diagnostics or "<none>",
+                self.last_error_traceback,
+            )
+            return None, TerminateReason.SANDBOX_COLLECT_FAILED
         except asyncio.TimeoutError as exc:
             # A call inside the episode timed out, which is an infrastructure fault
             # rather than the configured episode budget. Record its traceback first.
@@ -969,9 +990,18 @@ class AgentLoopBase(ABC):
         n_env = out.response_mask.count(0) if out.response_mask else 0
         total_tokens = n_prompt + n_assistant + n_env
 
-        turns = info.get("num_turns")
+        # This trajectory's own count, which is what the log is about. It is not
+        # `num_turns`: that one is the session's, since one session is one episode and a
+        # harness that rewrites its context leaves its trajectories at different lengths.
+        turns = info.get("trajectory_num_turns")
+        if turns is None:
+            turns = info.get("num_turns")
         if turns is None:
             turns = out.num_turns if out.num_turns is not None else 0
+        episode_turns = info.get("num_turns")
+        turn_fields = f"turns: {turns}"
+        if episode_turns is not None:
+            turn_fields += f", episode_turns: {episode_turns}"
 
         # Prefer the loop's wall-clock timing. Mini-SWE carries finer timing under
         # agent_reward_info['timing'] (assistant/env/prep/grading) measured in the runner.
@@ -1007,7 +1037,7 @@ class AgentLoopBase(ABC):
             text += f"=== Submission ===\n{patch}\n\n"
         text += (
             "=== Summary ===\n"
-            f"turns: {turns}, patch: {'yes' if patch else 'no'}, "
+            f"{turn_fields}, patch: {'yes' if patch else 'no'}, "
             f"stop: {terminate_reason.value}, elapsed: {elapsed_s:.1f}s\n"
             f"[Token Counts] prompt: {n_prompt} | assistant: {n_assistant} | "
             f"env: {n_env} | total: {total_tokens}\n"

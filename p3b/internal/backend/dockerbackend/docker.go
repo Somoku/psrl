@@ -15,13 +15,19 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +43,20 @@ const (
 	labelOwner   = "psrl.owner"
 	labelClass   = "psrl.resource_class"
 	labelNode    = "psrl.node"
+	// These carry what a restart cannot otherwise recover: how the sandbox is
+	// executed, how long it may live, and which create produced it.
+	labelExecMode    = "psrl.exec_mode"
+	labelLifetime    = "psrl.lifetime_s"
+	labelIdempotency = "psrl.idempotency_key"
+	// Disk is charged by the node but not enforced by the Engine, so unlike
+	// memory and CPU it cannot be read back from the container's limits.
+	labelDisk = "psrl.disk_mb"
 )
+
+// DefaultPullTimeout is the image pull budget a node uses when its configuration
+// states none. It is exported because a control plane that bounds a create over
+// the node plane has to allow for the same pull before it gives up.
+const DefaultPullTimeout = 10 * time.Minute
 
 // Config is one node's Docker settings.
 type Config struct {
@@ -50,16 +69,29 @@ type Config struct {
 	OwnerID    string
 	// Runtime selects a stronger isolation boundary when the node provides one.
 	Runtime string
+	// CgroupParent is the cgroup subtree every sandbox is created in, relative to the
+	// daemon's own cgroup root. It is what makes the measured memory domain describe
+	// sandboxes rather than everything the daemon's host happens to be doing, so an
+	// empty value means the sampler has nothing narrower than the root to read.
+	//
+	// The cgroupfs driver places a container at <parent>/<id>; the systemd driver
+	// treats the value as a slice name instead, which is why preflight refuses a
+	// daemon that would interpret it differently.
+	CgroupParent string
 	// NetworkMode is the Docker network mode for new containers.
 	// "host" removes per-container veth/netns creation and iptables rule churn,
 	// which are the primary kernel-lock bottlenecks under concurrent creates.
 	// Leave empty for the daemon default (bridge).
 	NetworkMode string
 	// MaxCreateConcurrency caps the number of concurrent /containers/create +
-	// /start pairs in-flight to dockerd. Zero means unlimited. Setting this to
-	// match dockerd's own internal worker count (typically GOMAXPROCS) prevents
-	// the daemon's create queue from growing unboundedly under burst creates,
-	// which causes the long-tail latency observed at high concurrency.
+	// /start pairs in-flight to dockerd. It is the `max_create_concurrency`
+	// deployment switch, and zero means unbounded.
+	//
+	// A daemon serializes parts of container setup in the kernel, so an unbounded
+	// burst turns latency into timeouts rather than throughput. Size it from the
+	// daemon rather than from the machine: a many-core node reports a GOMAXPROCS
+	// far above what the create path can schedule at once, so leaving this unset on
+	// a large node is what produced the create and exec timeouts it exists to stop.
 	MaxCreateConcurrency int
 	// RequestTimeout bounds one Engine call. A create that pulls an image can
 	// legitimately exceed it, so the pull is a separate call with its own budget.
@@ -69,6 +101,16 @@ type Config struct {
 	// that matches the pool's spec claims one instantly rather than paying the
 	// container-build cost. Zero-value Size disables the pool.
 	WarmPool WarmPoolConfig
+	// MountAllowlist is the set of host path prefixes a sandbox may be given. Empty
+	// means none, and a spec that asks for a mount is then refused rather than
+	// created without it.
+	//
+	// A host mount is the one request in the contract that is about the machine rather
+	// than the sandbox: it hands a sandbox a view of a path the node owns, and a node
+	// that honoured any path would let any caller read or overwrite anything that user
+	// can reach -- including the daemon's own socket. So the node states which trees it
+	// is willing to share, and everything else is refused at create.
+	MountAllowlist []string
 }
 
 // Backend is the Docker runtime for one node.
@@ -113,10 +155,15 @@ func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 		cfg.RequestTimeout = 30 * time.Second
 	}
 	if cfg.PullTimeout <= 0 {
-		cfg.PullTimeout = 10 * time.Minute
+		cfg.PullTimeout = DefaultPullTimeout
 	}
 	if !mode.Valid() {
 		return nil, fmt.Errorf("docker backend scheduling mode %q is not direct or provider", mode)
+	}
+	if cfg.MaxCreateConcurrency < 0 {
+		return nil, fmt.Errorf(
+			"docker backend max create concurrency %d is negative, and zero is what means unbounded",
+			cfg.MaxCreateConcurrency)
 	}
 	var createSem chan struct{}
 	if cfg.MaxCreateConcurrency > 0 {
@@ -145,6 +192,7 @@ func New(cfg Config, mode backend.SchedulingMode) (*Backend, error) {
 	pool, err := newWarmPool(cfg.WarmPool,
 		b.createPoolEntry,
 		b.remove,
+		nil, // installed by SetPoolBudget once the admission gate exists
 	)
 	if err != nil {
 		return nil, fmt.Errorf("docker warm pool: %w", err)
@@ -166,7 +214,12 @@ func (b *Backend) Mode() backend.SchedulingMode { return b.mode }
 // isolation boundary needs a configured runtime, and claiming one the node lacks
 // would admit a spec and then run it with less isolation than it asked for.
 func (b *Backend) Capabilities() backend.Capabilities {
-	features := []string{"freeze", "host_mount", "filesystem_snapshot", "restore", "credential_injection"}
+	// host_mount is earned: a node with no allowlist shares nothing, and claiming the
+	// feature there would let a caller ask for a mount it can only be refused.
+	features := []string{"freeze", "filesystem_snapshot", "restore", "credential_injection"}
+	if len(b.cfg.MountAllowlist) > 0 {
+		features = append(features, "host_mount")
+	}
 	if b.cfg.Runtime != "" {
 		features = append(features, "isolation_runtime")
 	}
@@ -208,29 +261,32 @@ func (b *Backend) Create(ctx context.Context, nodeID string, spec backend.Spec, 
 	}
 	// Try the warm pool first. A cache hit skips image pull, container creation,
 	// and the start call — the three steps whose latency scales with concurrency.
-	if containerID, ok := b.pool.claim(ctx, spec); ok {
-		return b.adoptWarm(containerID, spec, nodeID), nil
+	// A claim that cannot be verified falls through rather than failing the create:
+	// the caller is already admitted, and a cold create is what it would have had.
+	if entry, ok := b.pool.claim(ctx, spec); ok {
+		if created, adopted := b.adoptWarm(ctx, entry, spec, nodeID); adopted {
+			return created, nil
+		}
+	}
+	// Mounts are resolved before anything is created: a mount this node will not make is
+	// a refusal, and refusing after the image pull would waste the pull and leave the
+	// caller with a slower failure and the same answer.
+	binds, err := b.binds(spec)
+	if err != nil {
+		return backend.Created{}, err
 	}
 	if err := b.ensureImage(ctx, spec.Source.Reference); err != nil {
 		return backend.Created{}, err
 	}
-	// Acquire the create semaphore before touching the daemon. This bounds the
-	// number of concurrent /containers/create + /start pairs in-flight, preventing
-	// dockerd's internal queues from growing unboundedly and inflating p95 latency.
-	if b.createSem != nil {
-		select {
-		case b.createSem <- struct{}{}:
-			defer func() { <-b.createSem }()
-		case <-ctx.Done():
-			return backend.Created{}, ctx.Err()
-		}
+	release, err := b.acquireCreateSlot(ctx)
+	if err != nil {
+		return backend.Created{}, err
 	}
-	body := b.createBody(spec, nodeID)
-	var created struct {
-		ID       string   `json:"Id"`
-		Warnings []string `json:"Warnings"`
-	}
-	if err := b.call(ctx, http.MethodPost, "/containers/create", body, &created); err != nil {
+	defer release()
+
+	body := b.createBody(spec, nodeID, binds)
+	created, err := b.createNamed(ctx, sandboxNamePrefix, body)
+	if err != nil {
 		return backend.Created{}, fmt.Errorf("docker create: %w", err)
 	}
 	if err := b.call(ctx, http.MethodPost, "/containers/"+created.ID+"/start", nil, nil); err != nil {
@@ -251,7 +307,79 @@ func (b *Backend) Create(ctx context.Context, nodeID string, spec backend.Spec, 
 	}, nil
 }
 
-func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
+// The prefixes every container this service creates carries.
+//
+// A warm-pool entry has to be distinguishable from a claimed sandbox, and the marker
+// has to be changeable when the entry is adopted: the label set is written at create
+// and immutable afterwards, so a label that said "inventory" would still say it about a
+// live sandbox. That is the state that made a restarting node refuse to serve, and the
+// state that would make it destroy a live sandbox if only the refusal were removed. A
+// name is the one attribute the daemon lets us change after creation, so inventory is
+// marked here and cleared by a rename at claim.
+const (
+	warmNamePrefix    = "psrl-warm-"
+	sandboxNamePrefix = "psrl-sbx-"
+)
+
+// createdContainer is the reply to a create.
+type createdContainer struct {
+	ID       string   `json:"Id"`
+	Warnings []string `json:"Warnings"`
+}
+
+// newContainerName returns a prefixed name with a random suffix.
+func newContainerName(prefix string) string {
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		// crypto/rand does not fail on Linux in practice. A timestamp keeps the
+		// function total, and a duplicate is retried by the caller as a conflict.
+		return prefix + strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return prefix + hex.EncodeToString(suffix[:])
+}
+
+// createNamed creates a container under a name this service chose.
+//
+// The name is not cosmetic: it is how pool inventory is told from a claimed sandbox,
+// and how an operator finds the container behind a sandbox id. A conflict means the
+// random suffix collided, which is cheap to retry and must not surface as a create
+// failure.
+func (b *Backend) createNamed(ctx context.Context, prefix string, body map[string]any) (createdContainer, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		var created createdContainer
+		err := b.call(ctx, http.MethodPost,
+			"/containers/create?name="+url.QueryEscape(newContainerName(prefix)), body, &created)
+		if err == nil {
+			return created, nil
+		}
+		lastErr = err
+		var apiErr *apiError
+		if !asAPIError(err, &apiErr) || apiErr.status != http.StatusConflict {
+			return createdContainer{}, err
+		}
+	}
+	return createdContainer{}, lastErr
+}
+
+// acquireCreateSlot takes one of the backend's create slots and returns its release.
+//
+// Create and the pool's refill share it: the gate exists to bound the daemon's queue,
+// and a refill that bypassed it would stampede that queue at the moment the pool is
+// supposed to be keeping the node quiet.
+func (b *Backend) acquireCreateSlot(ctx context.Context) (func(), error) {
+	if b.createSem == nil {
+		return func() {}, nil
+	}
+	select {
+	case b.createSem <- struct{}{}:
+		return func() { <-b.createSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (b *Backend) createBody(spec backend.Spec, nodeID string, binds []string) map[string]any {
 	env := make([]string, 0, len(spec.Env))
 	for key, value := range spec.Env {
 		env = append(env, key+"="+value)
@@ -263,6 +391,18 @@ func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
 		labelOwner:   b.cfg.OwnerID,
 		labelClass:   spec.ResourceClass,
 		labelNode:    nodeID,
+	}
+	if spec.ExecMode != "" {
+		labels[labelExecMode] = spec.ExecMode
+	}
+	if spec.Lifetime > 0 {
+		labels[labelLifetime] = strconv.FormatInt(int64(spec.Lifetime/time.Second), 10)
+	}
+	if spec.Resources.DiskMB > 0 {
+		labels[labelDisk] = strconv.FormatInt(spec.Resources.DiskMB, 10)
+	}
+	if spec.IdempotencyKey != "" {
+		labels[labelIdempotency] = spec.IdempotencyKey
 	}
 	for key, value := range spec.Metadata {
 		labels[key] = value
@@ -289,6 +429,12 @@ func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
 	}
 	if b.cfg.Runtime != "" {
 		hostConfig["Runtime"] = b.cfg.Runtime
+	}
+	if b.cfg.CgroupParent != "" {
+		hostConfig["CgroupParent"] = b.cfg.CgroupParent
+	}
+	if len(binds) > 0 {
+		hostConfig["Binds"] = binds
 	}
 	if len(spec.AssignedGPUs) > 0 {
 		hostConfig["DeviceRequests"] = []map[string]any{{
@@ -317,6 +463,73 @@ func (b *Backend) createBody(spec backend.Spec, nodeID string) map[string]any {
 		body["WorkingDir"] = spec.Workdir
 	}
 	return body
+}
+
+// binds turns a spec's mounts into the daemon's bind strings, refusing what this node
+// will not share.
+//
+// Two things make this more than a string join. A path is resolved before it is compared,
+// because a symlink inside an allowed tree is a way out of it: a caller who can create a
+// link under /shared can otherwise mount /etc. And a path that does not exist is refused
+// rather than passed through, because the daemon creates a missing bind source as a
+// directory on the host -- a caller would get an empty mount and no error, which reads as
+// success for a request that was never honoured.
+func (b *Backend) binds(spec backend.Spec) ([]string, error) {
+	if len(spec.Mounts) == 0 {
+		return nil, nil
+	}
+	if len(b.cfg.MountAllowlist) == 0 {
+		return nil, fmt.Errorf(
+			"docker: this sandbox asks for %d host mount(s) but this node allows none; "+
+				"set backends[].mount_allowlist to the host trees this node may share", len(spec.Mounts))
+	}
+	var allowed []string
+	for _, root := range b.cfg.MountAllowlist {
+		resolved, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			return nil, fmt.Errorf("docker: mount allowlist entry %q is not a path on this node: %w", root, err)
+		}
+		allowed = append(allowed, resolved)
+	}
+	binds := make([]string, 0, len(spec.Mounts))
+	for _, mount := range spec.Mounts {
+		if mount.Target == "" {
+			return nil, fmt.Errorf("docker: mount source %q names no path inside the sandbox", mount.Source)
+		}
+		source, err := filepath.EvalSymlinks(mount.Source)
+		if err != nil {
+			return nil, fmt.Errorf("docker: mount source %q is not a path on this node: %w", mount.Source, err)
+		}
+		permitted := false
+		for _, root := range allowed {
+			if withinPath(root, source) {
+				permitted = true
+				break
+			}
+		}
+		if !permitted {
+			return nil, fmt.Errorf(
+				"docker: mount source %q is outside this node's mount allowlist (%s)",
+				source, strings.Join(b.cfg.MountAllowlist, ", "))
+		}
+		mode := "rw"
+		if mount.ReadOnly {
+			mode = "ro"
+		}
+		binds = append(binds, fmt.Sprintf("%s:%s:%s", source, mount.Target, mode))
+	}
+	return binds, nil
+}
+
+// withinPath reports whether path is root itself or lives under it.
+//
+// The separator is part of the comparison: a prefix check alone would let
+// /shared/psrl-secrets through an allowlist of /shared/psrl.
+func withinPath(root, path string) bool {
+	if path == root {
+		return true
+	}
+	return strings.HasPrefix(path, root+string(filepath.Separator))
 }
 
 func deviceIDs(indices []int32) []string {
@@ -409,12 +622,66 @@ func (b *Backend) Status(ctx context.Context, handle backend.Handle) (string, er
 	case inspected.State.Paused:
 		return "paused", nil
 	case inspected.State.Running:
+		// Running wins over OOMKilled: a container that was restarted after an
+		// OOM reports the historical flag while its process is healthy, and
+		// reading that as "oom" would reap a live sandbox.
 		return "running", nil
+	case inspected.State.OOMKill:
+		return "oom", nil
 	case inspected.State.Status == "exited" || inspected.State.Status == "dead":
 		return "exited", nil
 	default:
+		// "created" and "restarting" are transitional; a caller that read them
+		// as gone would destroy a sandbox the daemon is bringing back.
 		return "unknown", nil
 	}
+}
+
+// ExitDetail reports the daemon's exit code and finish time for a sandbox that
+// stopped. A container the daemon no longer has answers with Running=false and
+// an unknown code rather than an error: "removed" is a stronger statement than
+// "stopped", and the node's own attribution names it.
+func (b *Backend) ExitDetail(ctx context.Context, handle backend.Handle) (backend.ExitDetail, error) {
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	var inspected struct {
+		RestartCount int `json:"RestartCount"`
+		State        struct {
+			Status     string `json:"Status"`
+			Running    bool   `json:"Running"`
+			OOMKilled  bool   `json:"OOMKilled"`
+			ExitCode   int    `json:"ExitCode"`
+			Error      string `json:"Error"`
+			StartedAt  string `json:"StartedAt"`
+			FinishedAt string `json:"FinishedAt"`
+		} `json:"State"`
+	}
+	if err := b.call(ctx, http.MethodGet, "/containers/"+handle.SandboxID+"/json", nil, &inspected); err != nil {
+		if isNotFound(err) {
+			// The container is removed, not merely stopped. The caller's
+			// status vocabulary has a distinct word for that, so this reports
+			// the sentinel rather than an empty detail that would read as a
+			// plain exit.
+			return backend.ExitDetail{}, backend.ErrRuntimeGone
+		}
+		return backend.ExitDetail{}, err
+	}
+	detail := backend.ExitDetail{
+		Running:       inspected.State.Running,
+		OOMKilled:     inspected.State.OOMKilled && !inspected.State.Running,
+		ExitCode:      inspected.State.ExitCode,
+		ExitCodeKnown: !inspected.State.Running,
+		Status:        inspected.State.Status,
+		Error:         inspected.State.Error,
+		RestartCount:  inspected.RestartCount,
+	}
+	if started, err := time.Parse(time.RFC3339Nano, inspected.State.StartedAt); err == nil {
+		detail.StartedAt = started
+	}
+	if finished, err := time.Parse(time.RFC3339Nano, inspected.State.FinishedAt); err == nil {
+		detail.FinishedAt = finished
+	}
+	return detail, nil
 }
 
 // Pause freezes a container's process tree, keeping it resident on this node.
@@ -468,7 +735,17 @@ func (b *Backend) ReadFile(ctx context.Context, handle backend.Handle, path stri
 	raw, err := b.callRaw(ctx, http.MethodGet,
 		"/containers/"+handle.SandboxID+"/archive?path="+urlEncodePath(path), nil)
 	if err != nil {
-		return nil, fmt.Errorf("docker archive get %q: %w", path, err)
+		// The Engine answers 404 both for "this path is not in the container"
+		// and for "this container does not exist". They are different facts to
+		// the caller: one leaves the sandbox usable, the other does not.
+		switch {
+		case isContainerGone(err):
+			return nil, fmt.Errorf("docker archive get %q: %w (docker: %v)", path, backend.ErrRuntimeGone, err)
+		case isArchiveFileMissing(err):
+			return nil, fmt.Errorf("docker archive get %q: %w (docker: %v)", path, backend.ErrPathNotFound, err)
+		default:
+			return nil, fmt.Errorf("docker archive get %q: %w", path, err)
+		}
 	}
 	return extractTarSingle(raw)
 }
@@ -479,23 +756,29 @@ func (b *Backend) ReadFile(ctx context.Context, handle backend.Handle, path stri
 // breaks the old printf-base64 approach for files larger than ~96 KiB (e.g.
 // a large model patch). The data travels as a tar stream in the request body.
 func (b *Backend) WriteFile(ctx context.Context, handle backend.Handle, path string, data []byte) error {
-	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
-	defer cancel()
 	tarBytes, err := singleFileTar(path, data)
 	if err != nil {
 		return fmt.Errorf("docker archive put %q: build tar: %w", path, err)
 	}
 	dir := parentDir(path)
 	// Ensure the directory exists first so the archive upload lands cleanly.
+	//
+	// The command runs on the caller's context, not on the Engine budget that bounds
+	// the upload below. How long a command takes is the command's own business, and
+	// its bounds are the caller's own command timeout and the sandbox's lifetime.
+	// Charging it to the request timeout makes a daemon too busy to start a process
+	// report a stalled mkdir as a dead write, which is a fault in the wrong place.
 	mkdirCmd := "mkdir -p " + shellescape(dir)
-	code, out, execErr := b.execOneShot(ctx, handle, mkdirCmd, "", nil)
+	result, execErr := b.execOneShot(ctx, handle, mkdirCmd, "", nil)
 	if execErr != nil {
 		return fmt.Errorf("docker archive put %q: mkdir: %w", path, execErr)
 	}
-	if code != 0 {
-		return fmt.Errorf("docker archive put %q: mkdir exited %d: %s", path, code, out)
+	if result.ExitCode != 0 {
+		return fmt.Errorf("docker archive put %q: mkdir exited %d: %s", path, result.ExitCode, result.Stderr)
 	}
-	if err := b.putArchive(ctx, handle.SandboxID, dir, tarBytes); err != nil {
+	putCtx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	if err := b.putArchive(putCtx, handle.SandboxID, dir, tarBytes); err != nil {
 		return fmt.Errorf("docker archive put %q: %w", path, err)
 	}
 	return nil
@@ -607,16 +890,11 @@ func (b *Backend) DeleteSnapshot(ctx context.Context, snapshotID string) error {
 	return nil
 }
 
-// Exec runs one command in a sandbox and returns its result.
+// Exec runs one command in a sandbox under the strategy the spec asked for.
 //
 // This is here because a container has no in-sandbox agent to talk to. It is
 // reached through the node agent rather than the control plane, so command
 // traffic still stays node-local.
-func (b *Backend) Exec(ctx context.Context, handle backend.Handle, command string, workdir string, env map[string]string) (int, string, error) {
-	return b.execOneShot(ctx, handle, command, workdir, env)
-}
-
-// ExecWithMode runs a command under the strategy the spec asked for.
 //
 // A persistent shell keeps working directory, exported variables, and an
 // activated environment alive between calls, which is what a multi-turn harness
@@ -624,9 +902,9 @@ func (b *Backend) Exec(ctx context.Context, handle backend.Handle, command strin
 // for a grader step that runs exactly once. The strategy is a property of the
 // workload rather than of the backend, so it travels on the spec and the node
 // passes it here.
-func (b *Backend) ExecWithMode(
+func (b *Backend) Exec(
 	ctx context.Context, handle backend.Handle, execMode, command, workdir string, env map[string]string,
-) (int, string, error) {
+) (backend.ExecResult, error) {
 	if execMode == "persistent" {
 		return b.execPersistent(ctx, handle, command, workdir, env)
 	}
@@ -634,7 +912,7 @@ func (b *Backend) ExecWithMode(
 }
 
 // execOneShot starts a new process per command, holding no state between calls.
-func (b *Backend) execOneShot(ctx context.Context, handle backend.Handle, command string, workdir string, env map[string]string) (int, string, error) {
+func (b *Backend) execOneShot(ctx context.Context, handle backend.Handle, command string, workdir string, env map[string]string) (backend.ExecResult, error) {
 	envList := make([]string, 0, len(env))
 	for key, value := range env {
 		envList = append(envList, key+"="+value)
@@ -655,82 +933,322 @@ func (b *Backend) execOneShot(ctx context.Context, handle backend.Handle, comman
 		ID string `json:"Id"`
 	}
 	if err := b.call(ctx, http.MethodPost, "/containers/"+handle.SandboxID+"/exec", create, &created); err != nil {
-		return 0, "", fmt.Errorf("docker exec create: %w", err)
+		return backend.ExecResult{}, commandError("docker exec create", err)
 	}
 	output, err := b.callRaw(ctx, http.MethodPost, "/exec/"+created.ID+"/start", map[string]any{"Detach": false, "Tty": false})
 	if err != nil {
-		return 0, "", fmt.Errorf("docker exec start: %w", err)
+		return backend.ExecResult{}, commandError("docker exec start", err)
 	}
 	var inspected struct {
 		ExitCode int  `json:"ExitCode"`
 		Running  bool `json:"Running"`
 	}
 	if err := b.call(ctx, http.MethodGet, "/exec/"+created.ID+"/json", nil, &inspected); err != nil {
-		return 0, "", fmt.Errorf("docker exec inspect: %w", err)
+		return backend.ExecResult{}, commandError("docker exec inspect", err)
 	}
-	return inspected.ExitCode, demultiplex(output), nil
+	stdout, stderr, truncated := demultiplexStreams(output)
+	if stoppedExecOutput(stdout, stderr) {
+		// runc/OCI reports a container whose namespaces are gone on the exec's
+		// output stream, not as an Engine error: the API call succeeds, the exec
+		// exits 127, and the text says why. Returning that as a command result
+		// makes a dead sandbox look like a collector that exited 127. It is a
+		// runtime fact, so it takes the same ErrRuntimeGone path as a 409.
+		detail := strings.TrimSpace(strings.TrimSpace(stdout) + " " + strings.TrimSpace(stderr))
+		return backend.ExecResult{}, fmt.Errorf("docker exec: %w: %s", backend.ErrRuntimeGone, detail)
+	}
+	return backend.ExecResult{
+		ExitCode:  inspected.ExitCode,
+		Stdout:    stdout,
+		Stderr:    stderr,
+		Truncated: truncated,
+	}, nil
 }
 
-// demultiplex strips the Engine's stream framing.
+// stoppedExecOutput reports whether the exec's own output is runc saying the
+// container could not be entered.
 //
-// An attached exec without a TTY returns a framed stream: an eight-byte header
-// per chunk, with the payload length in the last four bytes. Returning the raw
-// bytes would put binary headers into a command's output.
-func demultiplex(raw []byte) string {
-	var out bytes.Buffer
+// The Engine returns HTTP 200 for an exec that starts and immediately fails in
+// the runtime; the OCI error text is the only signal. These phrases are runc's
+// stable wording for a container whose init process or namespaces are gone.
+func stoppedExecOutput(stdout, stderr string) bool {
+	text := stdout + "\n" + stderr
+	return strings.Contains(text, "OCI runtime exec failed") ||
+		strings.Contains(text, "cannot exec in a stopped container") ||
+		(strings.Contains(text, "RWLayer of container") && strings.Contains(text, "unexpectedly nil"))
+}
+
+// commandError classifies a failed Engine call.
+//
+// A container that is not running or no longer exists is a fact about the
+// runtime, not a transport fault. The caller must replace the sandbox and the
+// node must stop charging it, so it is reported as ErrRuntimeGone rather than
+// as an indistinguishable "the daemon did not answer".
+func commandError(op string, err error) error {
+	if isContainerGone(err) {
+		return fmt.Errorf("%s: %w (docker: %v)", op, backend.ErrRuntimeGone, err)
+	}
+	return fmt.Errorf("%s: %w", op, err)
+}
+
+// demultiplexStreams separates the Engine's stdout and stderr frames.
+//
+// An attached exec without a TTY returns one framed stream carrying both
+// streams: an eight-byte header per chunk whose first byte names the stream
+// (1 stdout, 2 stderr) and whose last four bytes are the payload length. The
+// order within each stream is preserved; interleaving between them is not
+// recoverable from two separate strings, which is why the result keeps them
+// apart instead of concatenating them.
+func demultiplexStreams(raw []byte) (stdout, stderr string, truncated bool) {
+	var out, errOut bytes.Buffer
+	sawFrame := false
 	for len(raw) >= 8 {
-		size := int(raw[4])<<24 | int(raw[5])<<16 | int(raw[6])<<8 | int(raw[7])
+		sawFrame = true
+		stream := raw[0]
+		size := int(binary.BigEndian.Uint32(raw[4:8]))
 		raw = raw[8:]
 		if size > len(raw) {
+			// A short frame means the stream ended mid-write. Keep what arrived
+			// and tell the caller its output is incomplete rather than silently
+			// returning a truncated answer as if it were whole.
 			size = len(raw)
+			truncated = true
 		}
-		out.Write(raw[:size])
+		if stream == 2 {
+			errOut.Write(raw[:size])
+		} else {
+			out.Write(raw[:size])
+		}
 		raw = raw[size:]
 	}
-	// A daemon that returned unframed bytes is older than the framing; keep them
-	// rather than dropping a command's output.
-	if out.Len() == 0 {
-		return string(raw)
+	if !sawFrame {
+		// A daemon that returned unframed bytes is older than the framing; keep
+		// them rather than dropping a command's output.
+		out.Write(raw)
 	}
-	return out.String()
+	return out.String(), errOut.String(), truncated
 }
 
-// Sweep returns the sandboxes this service owns on the node, from the daemon
-// rather than from a local record.
+// Reconcile returns every sandbox this service owns on this node, with the facts
+// a restarted node needs to charge for it.
 //
 // The daemon is the source of truth: a service that trusted its own list would
-// leak every container it forgot across a restart.
-func (b *Backend) Sweep(ctx context.Context) ([]backend.Handle, error) {
+// leak every container it forgot across a restart. Unclaimed pool inventory comes back
+// marked as such, by name, so the node reclaims it without ever mistaking it for a
+// sandbox -- which is what a label could not express, because a label is immutable and
+// an entry keeps it after it has been claimed.
+func (b *Backend) Reconcile(ctx context.Context) ([]backend.Reconciled, error) {
+	listed, err := b.listOwned(ctx, labelSandbox+"=true", labelOwner+"="+b.cfg.OwnerID)
+	if err != nil {
+		return nil, err
+	}
+	found, err := b.inspectAll(ctx, listed)
+	if err != nil {
+		return nil, err
+	}
+	// A sandbox outside the configured subtree is invisible to the sampler: its memory
+	// counts against the ancestor but not against any ceiling this node enforces. That
+	// is a configuration change with live sandboxes behind it, so it is refused rather
+	// than adopted.
+	if b.cfg.CgroupParent != "" {
+		for _, rec := range found {
+			if rec.Running && !rec.PoolInventory && rec.CgroupParent != b.cfg.CgroupParent {
+				return nil, fmt.Errorf(
+					"container %s is running outside the configured cgroup subtree %q (it is in %q): "+
+						"the sampler does not measure it, so its memory is invisible to this node's "+
+						"ceilings; release it before restarting on the new configuration",
+					rec.Handle.SandboxID, b.cfg.CgroupParent, rec.CgroupParent)
+			}
+		}
+	}
+	return found, nil
+}
+
+// FindByIdempotencyKey returns the sandbox a create with this key already made.
+//
+// A create whose response was lost leaves a container the caller never learned
+// the id of, so a retry has to find it rather than make a second one.
+func (b *Backend) FindByIdempotencyKey(
+	ctx context.Context, key string,
+) (backend.Reconciled, bool, error) {
+	if key == "" {
+		return backend.Reconciled{}, false, nil
+	}
+	listed, err := b.listOwned(ctx,
+		labelSandbox+"=true", labelOwner+"="+b.cfg.OwnerID, labelIdempotency+"="+key)
+	if err != nil {
+		return backend.Reconciled{}, false, err
+	}
+	if len(listed) == 0 {
+		return backend.Reconciled{}, false, nil
+	}
+	found, err := b.inspectOne(ctx, listed[0])
+	if err != nil {
+		return backend.Reconciled{}, false, err
+	}
+	return found, true, nil
+}
+
+// ForeignContainers counts running containers on this daemon that this service does not
+// own.
+//
+// They cannot be inside the sandbox subtree -- nothing but this service sets the parent
+// -- so they add to the ancestor's measured memory without appearing in any ceiling the
+// node enforces. That is worth a warning: the operator is sharing a daemon, and the
+// capacity it costs is invisible.
+func (b *Backend) ForeignContainers(ctx context.Context) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
-	filters := fmt.Sprintf(`{"label":["%s=true","%s=%s"]}`, labelSandbox, labelOwner, b.cfg.OwnerID)
 	var listed []struct {
-		ID     string            `json:"Id"`
 		Labels map[string]string `json:"Labels"`
 	}
-	path := "/containers/json?all=true&filters=" + urlEncode(filters)
+	if err := b.call(ctx, http.MethodGet, "/containers/json", nil, &listed); err != nil {
+		return 0, err
+	}
+	foreign := 0
+	for _, container := range listed {
+		if container.Labels[labelSandbox] != "true" {
+			foreign++
+		}
+	}
+	return foreign, nil
+}
+
+// listOwned lists the container ids this service owns that match every label.
+func (b *Backend) listOwned(ctx context.Context, labels ...string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	filter, err := json.Marshal(map[string][]string{"label": labels})
+	if err != nil {
+		return nil, err
+	}
+	var listed []struct {
+		ID string `json:"Id"`
+	}
+	path := "/containers/json?all=true&filters=" + urlEncode(string(filter))
 	if err := b.call(ctx, http.MethodGet, path, nil, &listed); err != nil {
 		return nil, err
 	}
-	out := make([]backend.Handle, 0, len(listed))
+	out := make([]string, 0, len(listed))
 	for _, container := range listed {
-		out = append(out, backend.Handle{
-			Backend:   b.Name(),
-			SandboxID: container.ID,
-			NodeID:    container.Labels[labelNode],
-		})
+		out = append(out, container.ID)
 	}
 	return out, nil
 }
 
-// Preflight refuses a node whose daemon this service cannot drive.
-//
-// Every check here is something that would otherwise fail inside an episode,
-// where it costs a sample and reads as a flaky rollout rather than as the
-// configuration error it is. The pinned API version is compared against what
-// the daemon will actually serve, and a configured runtime has to exist: both
-// are declared as capabilities, and a capability the node cannot honour is
-// worse than one it never claimed.
+// inspectAll reads every id back, bounded so a node holding many containers does
+// not serialize the work into a slow startup.
+func (b *Backend) inspectAll(ctx context.Context, ids []string) ([]backend.Reconciled, error) {
+	const inspectors = 8
+	out := make([]backend.Reconciled, len(ids))
+	errs := make([]error, len(ids))
+	sem := make(chan struct{}, inspectors)
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			out[i], errs[i] = b.inspectOne(ctx, id)
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			return nil, fmt.Errorf("inspect %s: %w", ids[i], err)
+		}
+	}
+	return out, nil
+}
+
+// inspectOne rebuilds what one container holds from the daemon's own view of it.
+func (b *Backend) inspectOne(ctx context.Context, id string) (backend.Reconciled, error) {
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
+	defer cancel()
+	var inspected struct {
+		ID      string `json:"Id"`
+		Name    string `json:"Name"`
+		Created string `json:"Created"`
+		State   struct {
+			Running    bool   `json:"Running"`
+			OOMKilled  bool   `json:"OOMKilled"`
+			ExitCode   int    `json:"ExitCode"`
+			Status     string `json:"Status"`
+			FinishedAt string `json:"FinishedAt"`
+		} `json:"State"`
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+			Env    []string          `json:"Env"`
+		} `json:"Config"`
+		HostConfig struct {
+			Memory       int64  `json:"Memory"`
+			CpuQuota     int64  `json:"CpuQuota"`
+			CpuPeriod    int64  `json:"CpuPeriod"`
+			CgroupParent string `json:"CgroupParent"`
+		} `json:"HostConfig"`
+	}
+	if err := b.call(ctx, http.MethodGet, "/containers/"+id+"/json", nil, &inspected); err != nil {
+		return backend.Reconciled{}, err
+	}
+	labels := inspected.Config.Labels
+	rec := backend.Reconciled{
+		Name:          inspected.Name,
+		PoolInventory: isPoolInventoryName(inspected.Name),
+		CgroupParent:  inspected.HostConfig.CgroupParent,
+		Handle:        backend.Handle{Backend: b.Name(), SandboxID: id, NodeID: labels[labelNode]},
+		Owner:         labels[backend.OwnerMetadataKey],
+		Class:         labels[labelClass],
+		ExecMode:      labels[labelExecMode],
+		Running:       inspected.State.Running,
+		// The daemon's attribution for a container that is no longer running.
+		// A node that adopts by restart must be able to say why a stopped
+		// container is being reclaimed, not just that it is.
+		OOMKilled: inspected.State.OOMKilled && !inspected.State.Running,
+		ExitCode:  inspected.State.ExitCode,
+		Resources: backend.Resources{
+			MemoryMB: inspected.HostConfig.Memory / (1024 * 1024),
+		},
+	}
+	// CPU is charged in millis and written as a quota against a fixed period, so
+	// reading it back is the same division the create made.
+	if inspected.HostConfig.CpuPeriod > 0 {
+		rec.Resources.CPUCount = float64(inspected.HostConfig.CpuQuota) /
+			float64(inspected.HostConfig.CpuPeriod)
+	}
+	if seconds, err := strconv.ParseInt(labels[labelLifetime], 10, 64); err == nil {
+		rec.Lifetime = time.Duration(seconds) * time.Second
+	}
+	if diskMB, err := strconv.ParseInt(labels[labelDisk], 10, 64); err == nil {
+		rec.Resources.DiskMB = diskMB
+	}
+	if created, err := time.Parse(time.RFC3339Nano, inspected.Created); err == nil {
+		rec.CreatedAt = created
+	}
+	if finished, err := time.Parse(time.RFC3339Nano, inspected.State.FinishedAt); err == nil {
+		rec.FinishedAt = finished
+	}
+	for _, entry := range inspected.Config.Env {
+		if value, found := strings.CutPrefix(entry, "CUDA_VISIBLE_DEVICES="); found {
+			rec.GPUIndices = parseDeviceList(value)
+		}
+	}
+	return rec, nil
+}
+
+// parseDeviceList reads the comma-separated device indices a create wrote.
+func parseDeviceList(value string) []int32 {
+	if value == "" {
+		return nil
+	}
+	out := make([]int32, 0, 1)
+	for _, part := range strings.Split(value, ",") {
+		if index, err := strconv.ParseInt(strings.TrimSpace(part), 10, 32); err == nil {
+			out = append(out, int32(index))
+		}
+	}
+	return out
+}
+
 // Start begins the warm pool's refill and sweep loops.
 //
 // It is separate from New because the pool creates containers, and construction
@@ -753,6 +1271,14 @@ func (b *Backend) WarmPool() WarmPoolReport {
 	return b.pool.Snapshot()
 }
 
+// Preflight refuses a node whose daemon this service cannot drive.
+//
+// Every check here is something that would otherwise fail inside an episode,
+// where it costs a sample and reads as a flaky rollout rather than as the
+// configuration error it is. The pinned API version is compared against what
+// the daemon will actually serve, and a configured runtime has to exist: both
+// are declared as capabilities, and a capability the node cannot honour is
+// worse than one it never claimed.
 func (b *Backend) Preflight(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.RequestTimeout)
 	defer cancel()
@@ -784,7 +1310,37 @@ func (b *Backend) Preflight(ctx context.Context) error {
 				"upgrade the daemon or set backends[].api_version to %s",
 			b.cfg.Socket, version.APIVersion, b.cfg.APIVersion, version.APIVersion)
 	}
+	if err := b.preflightCgroupDriver(ctx); err != nil {
+		return err
+	}
 	return b.preflightRuntime(ctx)
+}
+
+// preflightCgroupDriver refuses a daemon that would not put a container in the
+// configured subtree.
+//
+// Only the cgroupfs driver treats CgroupParent as a path. The systemd driver reads it as
+// a slice name, so the same configuration would place containers somewhere else and the
+// sampler would measure a domain they are not in -- a failure that otherwise shows up as
+// a ceiling that never moves.
+func (b *Backend) preflightCgroupDriver(ctx context.Context) error {
+	if b.cfg.CgroupParent == "" {
+		return nil
+	}
+	var info struct {
+		CgroupDriver string `json:"CgroupDriver"`
+	}
+	if err := b.call(ctx, http.MethodGet, "/info", nil, &info); err != nil {
+		return fmt.Errorf("docker daemon at %s did not report its cgroup driver: %w", b.cfg.Socket, err)
+	}
+	if info.CgroupDriver != "" && info.CgroupDriver != "cgroupfs" {
+		return fmt.Errorf(
+			"this backend sets cgroup_parent %q but the daemon at %s uses the %q cgroup driver, "+
+				"which reads that value as a slice name rather than a path; containers would not land in "+
+				"the sandbox subtree the sampler measures",
+			b.cfg.CgroupParent, b.cfg.Socket, info.CgroupDriver)
+	}
+	return nil
 }
 
 // preflightRuntime refuses a configured runtime the daemon does not have.
@@ -955,6 +1511,55 @@ func isNotFound(err error) bool {
 	return false
 }
 
+// apiErrorDetail returns the Engine status and body behind a wrapped error.
+func apiErrorDetail(err error) (status int, body string, ok bool) {
+	var apiErr *apiError
+	if !asAPIError(err, &apiErr) {
+		return 0, "", false
+	}
+	return apiErr.status, apiErr.body, true
+}
+
+// isContainerGone reports whether the Engine said the container is stopped or
+// no longer exists.
+//
+// Both are 409 or 404 bodies rather than distinct status codes, so the message
+// is the only signal. The two phrases are Docker's own stable wording:
+// "Container <id> is not running" for a stopped container, "cannot exec in a
+// stopped container" from the exec start, and "No such container" for a removed
+// one. A removed container can also answer 500 with a nil writable layer, which
+// is the daemon's storage backend reporting the same fact. A paused container
+// also answers 409, and is deliberately not included: it can be resumed, so it
+// is not gone.
+func isContainerGone(err error) bool {
+	status, body, ok := apiErrorDetail(err)
+	if !ok {
+		return false
+	}
+	lowered := strings.ToLower(body)
+	switch status {
+	case http.StatusConflict:
+		return strings.Contains(lowered, "is not running") ||
+			strings.Contains(lowered, "cannot exec in a stopped container")
+	case http.StatusNotFound:
+		return strings.Contains(lowered, "no such container")
+	case http.StatusInternalServerError:
+		return strings.Contains(lowered, "rwlayer of container") &&
+			strings.Contains(lowered, "unexpectedly nil")
+	}
+	return false
+}
+
+// isArchiveFileMissing reports whether an archive read failed because the path
+// is absent from a container that does exist.
+func isArchiveFileMissing(err error) bool {
+	status, body, ok := apiErrorDetail(err)
+	if !ok || status != http.StatusNotFound {
+		return false
+	}
+	return strings.Contains(strings.ToLower(body), "could not find the file")
+}
+
 func asAPIError(err error, target **apiError) bool {
 	for err != nil {
 		if typed, ok := err.(*apiError); ok {
@@ -974,7 +1579,8 @@ func urlEncode(value string) string {
 	var out strings.Builder
 	for _, r := range value {
 		switch {
-		case r == '{' || r == '}' || r == '[' || r == ']' || r == '"' || r == ',' || r == ':' || r == '=' || r == ' ':
+		case r == '{' || r == '}' || r == '[' || r == ']' || r == '"' || r == ',' ||
+			r == ':' || r == '=' || r == ' ' || r == '\\' || r == '%':
 			fmt.Fprintf(&out, "%%%02X", r)
 		default:
 			out.WriteRune(r)

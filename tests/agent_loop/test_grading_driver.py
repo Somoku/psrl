@@ -13,11 +13,16 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+# A host that exports BASH_ENV makes every non-interactive shell source that file,
+# so profile chatter would contaminate the driver's stdout and exit status.
+_SHELL_ENV = {**os.environ, "BASH_ENV": os.devnull}
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_MODULES = (
@@ -502,6 +507,33 @@ def test_runtime_timeout_preserves_counts() -> None:
     assert result["f2p_total"] == 1, "Timeout must preserve expected counts."
 
 
+def test_runtime_leaves_grading_untimed_when_the_budget_is_none() -> None:
+    """A null grading budget must reach the sandbox as an untimed exec, not a guess."""
+    from types import SimpleNamespace
+
+    from examples.mini_swe.grading.runtime import run_grading
+
+    seen: dict = {}
+
+    class Session:
+        def write_bytes(self, *args):
+            pass
+
+        def exec(self, *args, **kwargs):
+            seen["timeout_s"] = kwargs.get("timeout_s")
+            return SimpleNamespace(exit_code=0)
+
+        def read_bytes(self, path):
+            return json.dumps(
+                {"resolved": True, "f2p_pass": 1, "f2p_total": 1, "p2p_pass": 0, "p2p_total": 0}
+            ).encode()
+
+    result = run_grading(Session(), _plan("pytest"), workdir="/testbed", timeout_s=None)
+
+    assert seen["timeout_s"] is None, "Grading must run untimed when no budget is configured."
+    assert result["resolved"] is True
+
+
 @pytest.mark.parametrize("scenario", ["pass", "missing", "no_python"])
 def test_runtime_command_executes_real_zipapp(tmp_path: Path, monkeypatch, scenario: str) -> None:
     from types import SimpleNamespace
@@ -532,7 +564,12 @@ def test_runtime_command_executes_real_zipapp(tmp_path: Path, monkeypatch, scena
 
         def exec(self, command, *, cwd, timeout_s):
             completed = subprocess.run(
-                ["bash", "-c", command], cwd=cwd, timeout=timeout_s, capture_output=True, text=True
+                ["bash", "-c", command],
+                cwd=cwd,
+                timeout=timeout_s,
+                capture_output=True,
+                text=True,
+                env=_SHELL_ENV,
             )
             return SimpleNamespace(exit_code=completed.returncode, stderr=completed.stderr)
 

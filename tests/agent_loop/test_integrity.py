@@ -223,7 +223,7 @@ def _bare_loop(monkeypatch: pytest.MonkeyPatch):
     loop = _LOOP.__new__(_LOOP)
     calls: dict = {"graded": False}
 
-    async def fake_grade(task, patch, clean_snapshot):  # noqa: ANN001
+    async def fake_grade(task, patch, clean_snapshot, grading_timeout_s):  # noqa: ANN001
         calls["graded"] = True
         return {"resolved": True, "resolved_by": "harness"}
 
@@ -242,7 +242,7 @@ async def test_finalize_runs_patch_check_even_when_trajectory_violated(monkeypat
         integrity={"violated": True, "reasons": ["blocked_repo_web_access"]},
     )
 
-    out = await loop.finalize_harness_task(_task(observation), artifact, None, {})
+    out = await loop.finalize_harness_task(_task(observation), artifact, None, {}, None)
 
     assert calls["graded"] is False
     assert out["grader_result"]["resolved_by"] == "integrity_blocked"
@@ -258,7 +258,7 @@ async def test_finalize_skips_patch_check_for_non_fresh_container(monkeypatch: p
     observation = {"swe_grader": "", "swe_problem": dict(_SWE_PROBLEM)}
     artifact = _ARTIFACT(patch=_PROTECTED_PATCH, integrity={"violated": False, "reasons": []})
 
-    out = await loop.finalize_harness_task(_task(observation), artifact, None, {})
+    out = await loop.finalize_harness_task(_task(observation), artifact, None, {}, None)
 
     assert calls["graded"] is True
     assert out["patch_policy"] == {}

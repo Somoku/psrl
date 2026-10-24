@@ -72,13 +72,10 @@ func TestTheExampleTimingAndSharesValidate(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 
-	spans, err := timing.New(
-		seconds(cfg.Timing.EpisodeDeadlineS),
+	if _, err := timing.New(
 		seconds(cfg.Timing.NodeTTLS),
 		seconds(cfg.Timing.RPCTimeoutS),
-		overrides(cfg.Timing.Overrides),
-	)
-	if err != nil {
+	); err != nil {
 		t.Fatalf("the example's timing contract is invalid: %v", err)
 	}
 
@@ -88,7 +85,7 @@ func TestTheExampleTimingAndSharesValidate(t *testing.T) {
 			Sandboxes: 1 << 20,
 		},
 		Classes:  quotaClasses(cfg),
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	}); err != nil {
 		t.Errorf("the example's fleet quota is invalid: %v", err)
 	}
@@ -103,7 +100,7 @@ func TestTheExampleTimingAndSharesValidate(t *testing.T) {
 		LocalMemCeiling:   cfg.Node.LocalMemCeiling,
 		Overcommit:        cfg.Node.Overcommit,
 		UtilizationTarget: cfg.Node.UtilizationTarget,
-		LeaseTTL:          spans.CapacityLeaseTTL(),
+		LeaseTTL:          timing.OwnerLease,
 	}); err != nil {
 		t.Errorf("the example's node admission is invalid: %v", err)
 	}
@@ -166,3 +163,27 @@ func TestAnUnknownBackendModeIsRejectedWithItsOwnName(t *testing.T) {
 // seconds and overrides mirror what main uses, kept here so the test drives the
 // same conversion rather than a second one that could disagree.
 var _ = time.Second
+
+func TestAWarmPoolEntryDefaultsItsLifetimeToTheNodeDefault(t *testing.T) {
+	// The node resolves a request that states no lifetime to DefaultLifetime before
+	// the backend sees it. An entry created with zero would therefore never match a
+	// request, and the pool would silently never serve a hit.
+	entry := warmPoolTemplate(WarmPoolDeclared{
+		Image: "alpine:latest", MemoryMB: 256, CPUCount: 1, ResourceClass: "rollout",
+	})
+
+	if entry.Lifetime != node.DefaultLifetime {
+		t.Fatalf("warm entry lifetime = %s, want the node default %s", entry.Lifetime, node.DefaultLifetime)
+	}
+}
+
+func TestADeclaredWarmPoolLifetimeIsKept(t *testing.T) {
+	entry := warmPoolTemplate(WarmPoolDeclared{
+		Image: "alpine:latest", MemoryMB: 256, CPUCount: 1, ResourceClass: "rollout",
+		LifetimeS: 7200,
+	})
+
+	if entry.Lifetime != 2*time.Hour {
+		t.Fatalf("warm entry lifetime = %s, want 2h", entry.Lifetime)
+	}
+}

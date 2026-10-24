@@ -5,13 +5,19 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import logging
+import shutil
+import subprocess
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from examples.mini_swe.config import build_runtime_config
 from examples.mini_swe.utils.harness_task import (
-    _HARNESS_PATCH_PATH,
+    _HARNESS_DIAG_NAME,
+    _HARNESS_PATCH_NAME,
     build_harness_prompt,
     collect_git_patch,
 )
@@ -21,8 +27,12 @@ from psrl.sandbox import (
     MountSpec,
     ResourceSpec,
     SandboxCapabilities,
+    SandboxCollectorError,
+    SandboxExitReason,
+    SandboxPathNotFoundError,
     SandboxRef,
     SandboxSession,
+    SandboxSessionLostError,
     SandboxSource,
     SandboxSpec,
     SandboxStatePolicy,
@@ -32,8 +42,10 @@ from psrl.sandbox.backends.docker import DockerBackend
 from psrl.sandbox.backends.docker.policy import DockerPolicyProfile
 from psrl.sandbox.backends.docker.session import DockerSession
 from psrl.workers.agent_loop.harness import (
+    EXIT_TIME_BUDGET_EXCEEDED,
     HarnessCompactionConfig,
     HarnessConfig,
+    HarnessResult,
     HarnessRuntime,
     HarnessTaskContext,
     clean_snapshot_compatible,
@@ -42,6 +54,13 @@ from psrl.workers.agent_loop.harness import (
 from psrl.workers.agent_loop.harness.claude_code import ClaudeCodeHarness
 from psrl.workers.agent_loop.harness.codex import CodexHarness
 from psrl.workers.agent_loop.harness.runtime import executable_path, host_runtime_dir, runtime_mount_spec
+from psrl.workers.agent_loop.loops.mini_swe_harness_agent_loop import MiniSWEHarnessAgentLoop
+
+# Where an episode stages the collector's payload: the harness's own state directory,
+# next to the CLI's logs. Deliberately not /tmp, which is the agent's scratch space.
+_STAGING_DIR = "/root/.psrl-harness"
+_PATCH_PATH = f"{_STAGING_DIR}/{_HARNESS_PATCH_NAME}"
+_DIAG_PATH = f"{_STAGING_DIR}/{_HARNESS_DIAG_NAME}"
 
 
 class FakeSandbox(SandboxSession):
@@ -53,10 +72,21 @@ class FakeSandbox(SandboxSession):
         runtime_available: bool = True,
         block_cli: bool = False,
         cli_exit_code: int = 0,
+        collect_exit_code: int = 0,
+        diag_missing: bool = False,
+        status_value: SandboxStatus = SandboxStatus.RUNNING,
+        status_error: BaseException | None = None,
     ) -> None:
         self.runtime_available = runtime_available
         self.block_cli = block_cli
         self.cli_exit_code = cli_exit_code
+        self.collect_exit_code = collect_exit_code
+        # A missing diagnostics file in a live sandbox is the case that used to be
+        # reported as a lost session; the status is scripted separately so a 137
+        # can be attributed to OOM or to a killed child.
+        self.diag_missing = diag_missing
+        self.status_value = status_value
+        self.status_error = status_error
         self.commands: list[tuple[str, str | None, Mapping[str, str] | None]] = []
         self.writes: dict[str, bytes] = {}
         self.cli_started = asyncio.Event()
@@ -82,8 +112,13 @@ class FakeSandbox(SandboxSession):
         # The prepare probe creates the state dir and checks the mounted CLI.
         if command.startswith("mkdir -p /root/.psrl-harness"):
             return ExecResult(0 if self.runtime_available else 1, "", "" if self.runtime_available else "no such file")
-        if command.startswith("tail -c"):
-            return ExecResult(0, "bounded tail", "")
+        if "ulimit -u" in command:
+            # The failed-collector environment probe: names the missing tool.
+            return ExecResult(0, "cwd=/testbed\npath=/usr/bin\nwc=MISSING\n", "")
+        if _HARNESS_PATCH_NAME in command:
+            # The patch collector. Its diagnostics are read back through the file API,
+            # never from this response (the backend does not carry stderr).
+            return ExecResult(self.collect_exit_code, "", "")
         if "/opt/harness/bin/" in command and self.block_cli:
             self.cli_started.set()
             try:
@@ -96,10 +131,62 @@ class FakeSandbox(SandboxSession):
         return ExecResult(0, "", "")
 
     async def read_bytes(self, path: str) -> bytes:
+        if path not in self.writes:
+            raise SandboxPathNotFoundError(f"{path!r} is not present in the sandbox")
         return self.writes[path]
 
     async def write_bytes(self, path: str, data: bytes) -> None:
         self.writes[path] = data
+
+    async def status(self) -> SandboxStatus:
+        if self.status_error is not None:
+            raise self.status_error
+        return self.status_value
+
+    async def terminate(self) -> None:
+        return None
+
+
+class LocalSession(SandboxSession):
+    """Run the collector's real shell script against a local temporary repository.
+
+    The rest of the harness tests script command results, which cannot catch a
+    shell-level regression in the collector. This session executes the exact
+    command string, so the size caps and the per-file diff loop are exercised.
+    """
+
+    @property
+    def ref(self) -> SandboxRef:
+        return SandboxRef("local", "local")
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities()
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_s: float | None = None,
+    ) -> ExecResult:
+        completed = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd,
+            env=dict(env) if env is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        return ExecResult(completed.returncode, completed.stdout, completed.stderr)
+
+    async def read_bytes(self, path: str) -> bytes:
+        return Path(path).read_bytes()
+
+    async def write_bytes(self, path: str, data: bytes) -> None:
+        Path(path).write_bytes(data)
 
     async def status(self) -> SandboxStatus:
         return SandboxStatus.RUNNING
@@ -168,6 +255,8 @@ async def test_claude_code_uses_session_root_and_bounded_process_output() -> Non
     harness = create_harness(config, sandbox)
 
     await harness.prepare(_runtime())
+    # What the CLI had written to its log before it exited non-zero.
+    sandbox.writes[f"{_STAGING_DIR}/stderr.log"] = b"bounded tail"
     result = await harness.run("fix the bug", _runtime())
 
     assert isinstance(harness, ClaudeCodeHarness)
@@ -204,7 +293,47 @@ async def test_successful_harness_skips_diagnostic_tail_commands() -> None:
     assert result.exit_code == 0
     assert result.stdout_tail == ""
     assert result.stderr_tail == ""
-    assert not any(command.startswith("tail -c") for command, _, _ in sandbox.commands)
+    # Only the prepare probe and the CLI itself: a successful run spends nothing on
+    # diagnostics, and reading them costs no command at all.
+    assert len(sandbox.commands) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_harness_stops_at_the_deadline_and_keeps_partial_output() -> None:
+    """A `keep` loop hands the harness its episode deadline, so the harness stops the CLI.
+
+    The run has to return rather than raise, with `timed_out` set and the output files
+    still pointing at what the CLI had written, because the loop that chose `keep`
+    collects the partial trajectory and grades it.
+    """
+    sandbox = FakeSandbox(block_cli=True)
+    harness = create_harness(HarnessConfig(kind="codex", executable="codex"), sandbox)
+    await harness.prepare(_runtime())
+    # What the CLI had written to its log before the deadline stopped it.
+    sandbox.writes[f"{_STAGING_DIR}/stdout.log"] = b"bounded tail"
+
+    result = await harness.run("fix", _runtime(), deadline_s=0.05)
+
+    assert result.timed_out is True
+    assert result.exit_code == EXIT_TIME_BUDGET_EXCEEDED
+    assert sandbox.cli_cancelled, "the deadline stops the CLI rather than leaving it running"
+    # The deadline stops the CLI; it does not discard what the CLI produced.
+    assert result.stdout_path == "/root/.psrl-harness/stdout.log"
+    assert result.stdout_tail == "bounded tail"
+
+
+@pytest.mark.asyncio
+async def test_the_harness_without_a_deadline_runs_the_cli_to_completion() -> None:
+    # `discard` mode passes no deadline, so the harness never stops the CLI on its own;
+    # the base cancels the whole episode instead.
+    sandbox = FakeSandbox()
+    harness = create_harness(HarnessConfig(kind="codex", executable="codex"), sandbox)
+    await harness.prepare(_runtime())
+
+    result = await harness.run("fix", _runtime(), deadline_s=None)
+
+    assert result.timed_out is False
+    assert result.exit_code == 0
 
 
 @pytest.mark.asyncio
@@ -252,11 +381,35 @@ async def test_failed_trajectory_can_collect_output_after_successful_cli_exit() 
     await harness.prepare(_runtime())
 
     result = await harness.run("fix", _runtime())
+    sandbox.writes[result.stdout_path] = b"stdout diagnostics"
+    sandbox.writes[result.stderr_path] = b"stderr diagnostics"
+
     diagnostic_result = await harness.collect_diagnostics(result)
 
-    assert diagnostic_result.stdout_tail == "bounded tail"
-    assert diagnostic_result.stderr_tail == "bounded tail"
-    assert sum(command.startswith("tail -c") for command, _, _ in sandbox.commands) == 2
+    assert diagnostic_result.stdout_tail == "stdout diagnostics"
+    assert diagnostic_result.stderr_tail == "stderr diagnostics"
+
+
+@pytest.mark.asyncio
+async def test_a_log_tail_is_read_as_a_file_rather_than_run_as_a_command() -> None:
+    """A diagnostic must not be able to cost the episode its sandbox.
+
+    On a one-shot exec a command that stalls is stopped by destroying the container, so
+    reading the tail with `tail -c` left the collection that follows to fail against a
+    sandbox this read had already destroyed. The file API cannot do that.
+    """
+    sandbox = FakeSandbox()
+    harness = create_harness(HarnessConfig(kind="codex", executable="codex"), sandbox)
+    log_path = f"{_STAGING_DIR}/stdout.log"
+    sandbox.writes[log_path] = b"x" * 40_000 + b"THE-TAIL"
+
+    tail = await harness._read_tail(log_path)
+
+    assert tail.endswith("THE-TAIL")
+    assert len(tail) == harness.config.output_tail_chars, "The reported tail stays bounded."
+    assert not any(command.startswith("tail -c") for command, _, _ in sandbox.commands)
+    # An unreadable log still costs only a post mortem, never the episode.
+    assert await harness._read_tail(f"{_STAGING_DIR}/missing.log") == ""
 
 
 @pytest.mark.asyncio
@@ -268,24 +421,292 @@ async def test_patch_collection_reads_the_patch_file_in_full() -> None:
     """
     sandbox = FakeSandbox()
     collected = b"diff --git a/x b/x\n+line\n" * 100_000
-    sandbox.writes[_HARNESS_PATCH_PATH] = collected
+    sandbox.writes[_PATCH_PATH] = collected
 
-    patch = await collect_git_patch(sandbox, "/testbed")
+    patch = await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
 
     script, cwd, _ = sandbox.commands[-1]
     assert cwd == "/testbed"
-    # Staged (index vs base/HEAD) and unstaged (worktree vs index) tracked changes.
-    assert "git diff --cached --binary --submodule=diff --" in script
-    assert "git diff --binary --submodule=diff --" in script
+    # Staged (index vs base/HEAD) and unstaged (worktree vs index) tracked changes,
+    # emitted one bounded diff per file so a large artifact cannot OOM the sandbox.
+    assert "cached=--cached" in script
+    assert "git diff $cached --binary --submodule=diff" in script
+    assert "skipped_tracked" in script
+    assert "patch_capped" in script
     # Untracked files become new-file diffs, but nested repositories are skipped.
     assert "git ls-files --others --exclude-standard" in script
     assert '[ -e "$d/.git" ]' in script
+    # The sandbox runs commands with /bin/sh, where bash's `read -d` silently skipped
+    # every untracked file; the NUL list is consumed with `xargs -0` instead.
+    assert "read -r -d" not in script
+    assert "xargs -0" in script
     # The collector never stages, so a nested repo without a commit cannot break it.
     assert "git add" not in script
     # The patch leaves the sandbox as a file rather than as command output.
-    assert f"out={_HARNESS_PATCH_PATH}" in script
+    assert f"out={_PATCH_PATH}" in script
+    # The staging directory is re-asserted by the collector itself, so a directory the
+    # agent removed cannot turn a collectable patch into a failed collection.
+    assert f"mkdir -p {_STAGING_DIR}" in script
+    # A self-report the caller can read back when the backend reports no stderr.
+    assert f"diag={_DIAG_PATH}" in script
+    assert "command -v" in script
     assert "cat " not in script
     assert patch == collected.decode()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
+@pytest.mark.asyncio
+async def test_collector_skips_an_untracked_file_above_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large untracked artifact is skipped and named, not diffed into the sandbox.
+
+    An unbounded `git diff --binary` on an agent-created file is what turned a
+    collector failure into a sandbox OOM and then into a whole-group replacement.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("one\n")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "base"], cwd=repo, check=True, capture_output=True
+    )
+    (repo / "a.txt").write_text("one\ntwo\n")
+    (repo / "big.bin").write_bytes(b"x" * 4096)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(
+        "examples.mini_swe.utils.harness_task._MAX_UNTRACKED_FILE_BYTES", 1024
+    )
+
+    patch = await collect_git_patch(LocalSession(), str(repo), staging_dir=str(staging))
+
+    assert "+two" in patch
+    assert "big.bin" not in patch
+    diag = (staging / _HARNESS_DIAG_NAME).read_text()
+    assert "skipped_untracked=big.bin" in diag
+    assert "collector=done" in diag
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
+@pytest.mark.asyncio
+async def test_collector_stops_at_the_total_patch_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A patch over the budget fails as a collector fault, not as an OOM.
+
+    The sandbox stays alive; the episode is replaced by the collector's own
+    classification and the diagnostics name the cap.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("one\n")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "base"], cwd=repo, check=True, capture_output=True
+    )
+    (repo / "a.txt").write_text("one\n" + ("two\n" * 4096))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(
+        "examples.mini_swe.utils.harness_task._MAX_PATCH_BYTES", 512
+    )
+
+    with pytest.raises(SandboxCollectorError) as excinfo:
+        await collect_git_patch(LocalSession(), str(repo), staging_dir=str(staging))
+
+    assert "patch_capped=1" in str(excinfo.value)
+    assert "status='running'" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_loss_before_collection_logs_the_runtime_evidence(caplog) -> None:
+    """A lost sandbox leaves the daemon's evidence in the collector log.
+
+    The collector has nothing else to add once the sandbox is gone, so the
+    exception's exit code, finish time and state_error are the post mortem's
+    sandbox-side record.
+    """
+
+    class LostSession(FakeSandbox):
+        async def exec(self, command, **kwargs):
+            raise SandboxSessionLostError(
+                "gone",
+                sandbox_id="sandbox-1",
+                exit_reason=SandboxExitReason.OOM,
+                exit_code=137,
+                finished_at="2026-10-23T11:05:23Z",
+                state_error="status=exited exit_code=137 oom_killed=true",
+            )
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(SandboxSessionLostError):
+            await collect_git_patch(LostSession(), "/testbed", staging_dir=_STAGING_DIR)
+
+    message = "\n".join(record.getMessage() for record in caplog.records)
+    assert "exit_code=137" in message
+    assert "state_error=status=exited exit_code=137 oom_killed=true" in message
+
+
+@pytest.mark.asyncio
+async def test_patch_collection_failure_surfaces_collector_diagnostics() -> None:
+    """A failed collection reports the collector's own diagnostics, not just an exit code.
+
+    The sandbox exec channel does not carry stderr on every backend, so the exit code
+    alone said nothing about which step failed.
+    """
+    sandbox = FakeSandbox(collect_exit_code=127)
+    sandbox.writes[_DIAG_PATH] = b"cwd=/testbed\nwc=MISSING\n"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    message = str(excinfo.value)
+    assert "exit 127" in message
+    assert "cwd='/testbed'" in message
+    assert "wc=MISSING" in message
+
+
+@pytest.mark.asyncio
+async def test_a_sigkill_after_the_sandbox_died_is_an_oom_loss() -> None:
+    """137 plus a sandbox that is no longer running is the kernel killing the sandbox."""
+    sandbox = FakeSandbox(
+        collect_exit_code=137,
+        diag_missing=True,
+        status_value=SandboxStatus.TERMINATED,
+    )
+
+    with pytest.raises(SandboxSessionLostError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.exit_reason is SandboxExitReason.OOM
+
+
+@pytest.mark.asyncio
+async def test_a_sigkill_inside_a_live_sandbox_is_a_collector_fault() -> None:
+    """A killed child is not a lost sandbox: the container is still running and usable."""
+    sandbox = FakeSandbox(
+        collect_exit_code=137,
+        diag_missing=True,
+        status_value=SandboxStatus.RUNNING,
+    )
+
+    with pytest.raises(SandboxCollectorError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.exit_code == 137
+
+
+@pytest.mark.asyncio
+async def test_a_missing_diagnostics_file_in_a_live_sandbox_is_a_collector_fault() -> None:
+    """A live sandbox whose collector never wrote its report did not lose its session.
+
+    The container is still running (the runtime answers `running`), so the
+    failure is the collector's execution environment. Reporting it as a lost
+    session would destroy a healthy sandbox and blame the wrong layer.
+    """
+    sandbox = FakeSandbox(collect_exit_code=128, diag_missing=True)
+
+    with pytest.raises(SandboxCollectorError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.exit_code == 128
+    assert "status='running'" in str(excinfo.value)
+    assert "environment probe" in str(excinfo.value)
+    assert "wc=MISSING" in str(excinfo.value)
+    assert "sandbox='sandbox-1'" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_missing_diagnostics_file_after_the_sandbox_died_is_a_lost_session() -> None:
+    """The same collector failure with a dead sandbox is a lost session."""
+    sandbox = FakeSandbox(
+        collect_exit_code=128,
+        diag_missing=True,
+        status_value=SandboxStatus.TERMINATED,
+    )
+
+    with pytest.raises(SandboxSessionLostError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.exit_reason is SandboxExitReason.CONTAINER_EXITED
+    assert excinfo.value.exit_code == 128
+
+
+@pytest.mark.asyncio
+async def test_a_status_that_reports_the_loss_keeps_its_exit_attribution() -> None:
+    """The service's exit code and finish time are stronger than the collector's."""
+    lost = SandboxSessionLostError(
+        "sandbox is gone",
+        sandbox_id="sb-attributed",
+        exit_reason=SandboxExitReason.OOM,
+        exit_code=137,
+        finished_at="2026-10-22T02:13:07Z",
+    )
+    sandbox = FakeSandbox(
+        collect_exit_code=137,
+        diag_missing=True,
+        status_error=lost,
+    )
+
+    with pytest.raises(SandboxSessionLostError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.sandbox_id == "sandbox-1"
+    assert excinfo.value.exit_reason is SandboxExitReason.OOM
+    assert excinfo.value.exit_code == 137
+    assert excinfo.value.finished_at == "2026-10-22T02:13:07Z"
+    assert "environment probe" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_missing_tools_are_a_collector_fault_with_diagnostics() -> None:
+    """126/127 mean the sandbox could not execute the collector's tools."""
+    sandbox = FakeSandbox(collect_exit_code=127)
+    sandbox.writes[_DIAG_PATH] = b"git=MISSING\nwc=MISSING\n"
+
+    with pytest.raises(SandboxCollectorError) as excinfo:
+        await collect_git_patch(sandbox, "/testbed", staging_dir=_STAGING_DIR)
+
+    assert excinfo.value.exit_code == 127
+    assert "git=MISSING" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_mini_swe_stages_the_patch_in_the_harness_state_dir() -> None:
+    """The mini-SWE collector stages where the harness already owns the directory.
+
+    Not /tmp: that is the scratch space the harness prompt hands to the agent, and a
+    sandbox whose /tmp was gone reported a collectable patch as a failed collection.
+    """
+    loop = MiniSWEHarnessAgentLoop.__new__(MiniSWEHarnessAgentLoop)
+    loop.harness_config = HarnessConfig(kind="codex", executable="codex")
+    sandbox = FakeSandbox()
+    sandbox.writes[_PATCH_PATH] = b"diff --git a/x b/x\n"
+    task = HarnessTaskContext(
+        state=SimpleNamespace(payload={"observation": {"swe_problem": {}}}),
+        prompt="fix",
+        sandbox_spec=SandboxSpec(SandboxSource.image("image")),
+    )
+
+    artifact = await loop.collect_harness_artifact(
+        task,
+        sandbox,
+        SimpleNamespace(workdir="/testbed"),
+        HarnessResult(exit_code=0),
+    )
+
+    script, cwd, _ = sandbox.commands[-1]
+    assert cwd == "/testbed"
+    assert f"out={_PATCH_PATH}" in script
+    assert f"mkdir -p {_STAGING_DIR}" in script
+    assert artifact.patch == "diff --git a/x b/x\n"
 
 
 @pytest.mark.asyncio
@@ -302,10 +723,41 @@ async def test_codex_writes_responses_provider_config_and_uses_session_as_key() 
     assert 'wire_api = "responses"' in codex_config
     assert "requires_openai_auth = false" in codex_config
     assert "supports_websockets = false" in codex_config
+    assert 'model_reasoning_effort = "medium"' in codex_config
+    assert 'model_reasoning_summary = "auto"' in codex_config
+    assert 'model_catalog_json = "/root/.codex/model_catalog.json"' in codex_config
+    assert "enabled = false" in codex_config  # analytics / feedback disabled
+    # Hosted web_search must be off: the gateway rejects its schema and the task
+    # forbids fetching the solution from the web. Must be a top-level key.
+    assert tomllib.loads(codex_config)["web_search"] == "disabled"
     assert harness.build_env(_runtime())["OPENAI_API_KEY"] == "session-1"
     command = harness.build_command("fix", _runtime())
     assert command[0] == "/opt/harness/bin/codex"
     assert command[1:4] == ("exec", "--skip-git-repo-check", "--json")
+
+
+@pytest.mark.asyncio
+async def test_codex_catalog_enables_apply_patch_and_carries_base_instructions() -> None:
+    from psrl.workers.agent_loop.harness.codex import _base_instructions
+
+    sandbox = FakeSandbox()
+    harness = create_harness(
+        HarnessConfig(kind="codex", executable="codex", reasoning_effort="high"),
+        sandbox,
+    )
+
+    await harness.prepare(_runtime())
+
+    catalog = json.loads(sandbox.writes["/root/.codex/model_catalog.json"])
+    assert len(catalog["models"]) == 1
+    entry = catalog["models"][0]
+    assert entry["slug"] == "Qwen/Qwen3"
+    # apply_patch is only exposed when the catalog marks the model freeform.
+    assert entry["apply_patch_tool_type"] == "freeform"
+    assert entry["shell_type"] == "unified_exec"
+    assert entry["default_reasoning_level"] == "high"
+    assert entry["model_messages"]["instructions_template"] == _base_instructions()
+    assert _base_instructions().strip() != ""
 
 
 @pytest.mark.asyncio
@@ -316,8 +768,13 @@ async def test_codex_writes_compaction_threshold_with_context_headroom() -> None
     await harness.prepare(_runtime(10_240, 7_680))
 
     codex_config = sandbox.writes["/root/.codex/config.toml"].decode()
-    assert "model_context_window = 10240" in codex_config
-    assert "model_auto_compact_token_limit = 7680" in codex_config
+    parsed = tomllib.loads(codex_config)
+    # Compaction keys must be top-level, not nested under a preceding table.
+    assert parsed["model_context_window"] == 10240
+    assert parsed["model_auto_compact_token_limit"] == 7680
+    assert parsed["analytics"]["enabled"] is False
+    assert parsed["feedback"]["enabled"] is False
+    assert parsed["model_providers"]["psrl"]["wire_api"] == "responses"
 
 
 @pytest.mark.asyncio
@@ -325,11 +782,28 @@ async def test_prepare_fails_clearly_when_runtime_tree_is_missing() -> None:
     sandbox = FakeSandbox(runtime_available=False)
     config = HarnessConfig(kind="codex", executable="codex")
 
-    with pytest.raises(RuntimeError, match="unavailable in the sandbox"):
+    with pytest.raises(RuntimeError, match="not executable in the sandbox"):
         await create_harness(config, sandbox).prepare(_runtime())
 
     # The explicit probe is the only setup command. There is no install path.
     assert all("npm" not in command for command, _, _ in sandbox.commands)
+
+
+@pytest.mark.asyncio
+async def test_prepare_probes_the_mount_without_running_the_cli() -> None:
+    # Running the CLI once per trajectory put a several-hundred-megabyte read and its
+    # dynamic linking on the critical path of every episode, in the same moment that step
+    # was creating its whole batch of sandboxes. The probe only has to answer what the
+    # mount owns, and whether the binary runs is answered by the first real invocation.
+    sandbox = FakeSandbox()
+    config = HarnessConfig(kind="codex", executable="codex")
+
+    await create_harness(config, sandbox).prepare(_runtime())
+
+    probes = [command for command, _, _ in sandbox.commands if command.startswith("mkdir -p /root/.psrl-harness")]
+    assert len(probes) == 1
+    assert "test -x" in probes[0]
+    assert "--version" not in probes[0]
 
 
 @pytest.mark.asyncio
@@ -490,3 +964,17 @@ def test_docker_session_translates_loopback_callback_through_policy() -> None:
     assert session.resolve_callback_url("https://router.internal/sessions/s1") == (
         "https://router.internal/sessions/s1"
     )
+
+
+def test_the_abort_path_can_name_a_dict_request() -> None:
+    """The loop's request is a dict, and the abort path used to require an attribute.
+
+    `run_with_termination_handling` unpacks the TensorDict before calling `run`,
+    so `request.request_id` raised exactly when the gateway had already aborted
+    the episode -- turning a deliberate abort into a rollout error that refilled
+    the whole group.
+    """
+    from psrl.workers.agent_loop.loops.harness_agent_loop import _request_id_of
+
+    assert _request_id_of({"uid": 7}) == "7"
+    assert _request_id_of({}) == "N/A"

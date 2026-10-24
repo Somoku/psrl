@@ -100,7 +100,8 @@ recipe-specific extras such as a tool-config or agent-config YAML).
 | Knob | Role |
 |---|---|
 | `*.rollout.multi_turn.enable=True` | Switch the rollout from single-turn to multi-turn mode |
-| `*.rollout.multi_turn.max_turns=<N>` | Hard cap on turns per episode |
+| `*.rollout.multi_turn.max_turns=<N>` | Turns per episode: a positive cap, or `-1`/`null` for unlimited (bounded by `trajectory_timeout`). A harness that takes no turn cap ignores it |
+| `*.rollout.agent.trajectory_timeout_action` | What `trajectory_timeout` does when it fires: `discard` (default) cancels the episode and retries it, losing the partial work; `keep` stops the agent at the deadline, then collects and grades the partial patch and trajectory |
 | `*.rollout.agent.env.name=<name>` | Picks the registered `Environment` (e.g. `tool_env`, `mini_swe_env`) |
 | `*.rollout.agent.data.name=<name>` | Picks the registered `AgentData` (e.g. `tool_agent_data`, `mini_swe_agent_data`) |
 | `data.return_raw_chat=True` | Keep raw chat messages so the agent loop can re-format them across turns |

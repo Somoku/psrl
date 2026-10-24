@@ -10,13 +10,16 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	v1 "psrl.dev/sandboxd/api/v1"
 	"psrl.dev/sandboxd/internal/backend"
+	"psrl.dev/sandboxd/internal/node"
 	"psrl.dev/sandboxd/internal/placement"
+	"psrl.dev/sandboxd/internal/timing"
 )
 
 // JSONListener serves the SDK's wire format: a four-byte length then a JSON
@@ -124,6 +127,21 @@ type wireError struct {
 	// task result would corrupt a reward.
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// ExitReason attributes a `session_lost` sandbox (released/reaped_idle/
+	// reaped_lifetime/reclaimed_orphan/oom/exited/runtime_gone) so a post mortem
+	// does not have to guess. Empty when the failure carries no attribution.
+	ExitReason string `json:"exit_reason,omitempty"`
+	// ExitCode is the runtime's exit code, when it observed one. It is a pointer
+	// so "the process exited 0" and "the runtime never reported a code" are not
+	// the same JSON value.
+	ExitCode *int `json:"exit_code,omitempty"`
+	// FinishedAt is when the runtime observed the stop, RFC 3339 in UTC. It is
+	// the clock an operator correlates with the node's cgroup and kernel events.
+	FinishedAt string `json:"finished_at,omitempty"`
+	// StateError is the runtime's own account of the stop, or the inspect error
+	// that made the exit code unknown. A loss with no code is diagnosable only
+	// if this travels with it.
+	StateError string `json:"state_error,omitempty"`
 }
 
 func (j *JSONListener) handle(ctx context.Context, conn net.Conn) {
@@ -172,20 +190,122 @@ func (j *JSONListener) write(conn net.Conn, out reply) {
 
 // classify maps a failure onto the attribution the caller acts on.
 func classify(err error) *wireError {
-	code := "internal"
-	switch status.Code(err) {
-	case codes.FailedPrecondition:
-		code = "capability"
-	case codes.ResourceExhausted:
-		code = "capacity_timeout"
-	case codes.NotFound:
-		code = "session_lost"
-	case codes.Unavailable:
-		code = "transport"
-	case codes.DeadlineExceeded:
-		code = "command_timeout"
+	var code string
+	if wireCode, ok := wireCodeOf(err); ok {
+		// An error's own classification wins over the status code it happens to
+		// carry, because the status vocabulary is too coarse to express the
+		// difference between a missing file and a missing sandbox.
+		code = wireCode
+	} else {
+		code = "internal"
+		switch status.Code(err) {
+		case codes.FailedPrecondition:
+			code = "capability"
+		case codes.ResourceExhausted:
+			code = "capacity_timeout"
+		case codes.OutOfRange:
+			// The request can never fit its class, so retrying cannot help. Distinct
+			// from capacity_timeout, which clears as sandboxes are released.
+			code = "cannot_admit"
+		case codes.NotFound:
+			code = "session_lost"
+		case codes.Unavailable:
+			code = "transport"
+		case codes.DeadlineExceeded:
+			code = "command_timeout"
+		}
 	}
-	return &wireError{Code: code, Message: err.Error()}
+	out := &wireError{Code: code, Message: err.Error(), ExitReason: exitReasonOf(err)}
+	if exitCode, ok := exitCodeOf(err); ok {
+		out.ExitCode = &exitCode
+	}
+	if finished := finishedAtOf(err); !finished.IsZero() {
+		out.FinishedAt = finished.UTC().Format(time.RFC3339Nano)
+	}
+	out.StateError = stateErrorOf(err)
+	return out
+}
+
+// exitReasonOf extracts an attribution from an error that carries one. The
+// concrete type lives in this package (nodeserver.go); the interface keeps the
+// wire layer from depending on it and a wrapped/unrelated error answers "".
+// preserveSessionLost keeps a lost session distinguishable from a transport
+// fault, and reads every other failure as the transport fault it read before.
+//
+// The two need different answers from a caller. A node that did not answer is an
+// infrastructure fault and retrying it is sensible. A session that is gone means
+// the caller's own working directory, exported variables, or whole sandbox went
+// with it, so an infrastructure retry cannot bring it back and the caller has to
+// decide what to do. Only the second carries an attribution, so this passes that
+// one through untouched and covers everything else.
+// preserveSessionLost keeps a typed classification intact across the wire.
+//
+// A lost session and a missing path are different answers: the first replaces
+// the sandbox, the second leaves it usable. Anything that carries its own wire
+// code is passed through untouched; a bare ErrSessionLost is promoted to the
+// lost-session status, and everything else is the transport fault it reads as.
+func preserveSessionLost(err error) error {
+	if _, ok := wireCodeOf(err); ok {
+		return err
+	}
+	switch {
+	case status.Code(err) == codes.NotFound:
+		// Already carries the code and the attribution the wire layer reports.
+		return err
+	case errors.Is(err, backend.ErrSessionLost):
+		return status.Error(codes.NotFound, err.Error())
+	default:
+		return status.Error(codes.Unavailable, err.Error())
+	}
+}
+
+// wireCodeOf reports the caller-facing classification an error carries, if any.
+// It is checked before the gRPC status so an error's own semantics survive
+// every hop, including hops that only preserve a status code.
+func wireCodeOf(err error) (string, bool) {
+	var coded interface{ WireCode() string }
+	if errors.As(err, &coded) {
+		if code := coded.WireCode(); code != "" {
+			return code, true
+		}
+	}
+	return "", false
+}
+
+func exitReasonOf(err error) string {
+	var attributed interface{ ExitReason() string }
+	if errors.As(err, &attributed) {
+		return attributed.ExitReason()
+	}
+	return ""
+}
+
+// exitCodeOf extracts the runtime's exit code when the error carries one. A
+// separate accessor from ExitReason keeps "unknown" distinct from "exited 0".
+func exitCodeOf(err error) (int, bool) {
+	var attributed interface{ ExitCode() (int, bool) }
+	if errors.As(err, &attributed) {
+		return attributed.ExitCode()
+	}
+	return 0, false
+}
+
+// finishedAtOf extracts when the runtime observed the stop, if it did.
+func finishedAtOf(err error) time.Time {
+	var attributed interface{ FinishedAt() time.Time }
+	if errors.As(err, &attributed) {
+		return attributed.FinishedAt()
+	}
+	return time.Time{}
+}
+
+// stateErrorOf extracts the runtime evidence or inspect failure behind a loss.
+func stateErrorOf(err error) string {
+	var attributed interface{ StateError() string }
+	if errors.As(err, &attributed) {
+		return attributed.StateError()
+	}
+	return ""
 }
 
 func (j *JSONListener) dispatch(ctx context.Context, req request) (any, error) {
@@ -198,6 +318,8 @@ func (j *JSONListener) dispatch(ctx context.Context, req request) (any, error) {
 		return j.release(ctx, req.Payload)
 	case "status":
 		return j.status(ctx, req.Payload)
+	case "provision_status":
+		return j.provisionStatus(req.Payload)
 	case "pause":
 		return j.pause(ctx, req.Payload)
 	case "resume":
@@ -212,10 +334,18 @@ func (j *JSONListener) dispatch(ctx context.Context, req request) (any, error) {
 		return j.readBytes(ctx, req.Payload)
 	case "write_bytes":
 		return j.writeBytes(ctx, req.Payload)
+	case "touch":
+		return j.touch(ctx, req.Payload)
+	case "renew_owner":
+		return j.renewOwner(ctx, req.Payload)
 	case "fleet":
 		return j.fleet(ctx)
 	case "quota":
 		return j.quota(ctx)
+	case "diagnostics":
+		return j.diagnostics(ctx)
+	case "contract":
+		return j.contract(ctx)
 	default:
 		return nil, status.Errorf(codes.Unimplemented, "the sandbox service has no method %q", req.Method)
 	}
@@ -249,7 +379,16 @@ type jsonSpec struct {
 	Backend             string                       `json:"backend"`
 	RequiredNodeLabel   string                       `json:"required_node_label"`
 	ForbiddenNodeLabels []string                     `json:"forbidden_node_labels"`
+	LifetimeS           int64                        `json:"lifetime_s"`
 	BackendOptions      map[string]map[string]string `json:"backend_options"`
+	Mounts              []jsonMount                  `json:"mounts"`
+}
+
+// jsonMount is one host path a sandbox must see, on the node-plane wire.
+type jsonMount struct {
+	Source   string `json:"source"`
+	Target   string `json:"target"`
+	ReadOnly bool   `json:"read_only"`
 }
 
 func (s jsonSpec) toProto() *v1.SandboxSpec {
@@ -264,6 +403,9 @@ func (s jsonSpec) toProto() *v1.SandboxSpec {
 		ExecMode:            execModeValue(s.ExecMode),
 		RequiredResumeLevel: resumeLevelValue(s.RequiredResumeLevel),
 		Backend:             s.Backend,
+		RequiredNodeLabel:   s.RequiredNodeLabel,
+		ForbiddenNodeLabels: s.ForbiddenNodeLabels,
+		LifetimeS:           s.LifetimeS,
 		Resources: &v1.Resources{
 			CpuCount: s.Resources.CPUCount,
 			MemoryMb: s.Resources.MemoryMB,
@@ -273,6 +415,11 @@ func (s jsonSpec) toProto() *v1.SandboxSpec {
 	}
 	for _, feature := range s.RequiredFeatures {
 		out.RequiredFeatures = append(out.RequiredFeatures, featureValue(feature))
+	}
+	for _, mount := range s.Mounts {
+		out.Mounts = append(out.Mounts, &v1.Mount{
+			Source: mount.Source, Target: mount.Target, ReadOnly: mount.ReadOnly,
+		})
 	}
 	if len(s.BackendOptions) > 0 {
 		out.BackendOptions = map[string]*v1.BackendOptions{}
@@ -327,9 +474,17 @@ func (j *JSONListener) createdJSON(created *v1.CreateResponse) map[string]any {
 	// control plane. Resolved here rather than carried up from the backend,
 	// because the address belongs to this deployment's topology and the backend
 	// only knows that it has no agent to report.
-	if j.dataPlane != nil && created.GetAgent().GetAddress() == "" {
+	if j.dataPlane != nil {
 		if agent, ok := out["agent"].(map[string]any); ok {
-			agent["data_plane"] = j.dataPlane(created.GetHandle().GetNodeId())
+			address := j.dataPlane(created.GetHandle().GetNodeId())
+			// The node plane is resolved for every sandbox, not only the
+			// agentless ones: an agent-backed sandbox uses it to report activity
+			// its commands never carry to the node, and an agentless one also
+			// uses it as its exec driver.
+			agent["node_plane"] = address
+			if created.GetAgent().GetAddress() == "" {
+				agent["data_plane"] = address
+			}
 		}
 	}
 	return out
@@ -361,6 +516,7 @@ func createdJSON(created *v1.CreateResponse) map[string]any {
 		"agent": map[string]any{
 			"address":             created.GetAgent().GetAddress(),
 			"data_plane":          "",
+			"node_plane":          "",
 			"headers":             created.GetAgent().GetHeaders(),
 			"callback_host_alias": created.GetAgent().GetCallbackHostAlias(),
 			"callback_port":       created.GetAgent().GetCallbackPort(),
@@ -404,6 +560,28 @@ func (j *JSONListener) status(ctx context.Context, raw json.RawMessage) (any, er
 		return nil, err
 	}
 	return map[string]any{"status": statusName(reply.GetStatus())}, nil
+}
+
+// provisionStatus reports a create in flight under its ticket, so a caller with no
+// response yet can tell "still provisioning" from "the request was lost". An
+// unknown ticket is reported as such rather than as a failure, because a create
+// that has not been seen here is not one that failed.
+func (j *JSONListener) provisionStatus(raw json.RawMessage) (any, error) {
+	var payload struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	state, known := j.control.ProvisionState(payload.Ticket)
+	if !known {
+		return map[string]any{"state": "unknown"}, nil
+	}
+	return map[string]any{
+		"state":            state.State,
+		"elapsed_s":        state.Elapsed.Seconds(),
+		"since_progress_s": state.SinceProgress.Seconds(),
+	}, nil
 }
 
 func (j *JSONListener) pause(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -490,11 +668,56 @@ func (j *JSONListener) exec(ctx context.Context, raw json.RawMessage) (any, erro
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, err
 	}
-	code, output, err := j.control.nodes.ExecOn(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
+	result, err := j.control.nodes.ExecOn(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, preserveSessionLost(err)
 	}
-	return map[string]any{"exit_code": code, "stdout": output, "stderr": "", "truncated": false}, nil
+	return map[string]any{
+		"exit_code": result.ExitCode,
+		"stdout":    result.Stdout,
+		"stderr":    result.Stderr,
+		"truncated": result.Truncated,
+	}, nil
+}
+
+// touch refreshes a held sandbox's activity.
+//
+// A node-plane call, like exec: the SDK reports activity for a sandbox whose
+// commands bypass the node, and the node that owns the sandbox is the one with
+// the lifecycle to update. A control-only process holds no sandboxes, so it says
+// so rather than accepting the call silently.
+func (j *JSONListener) touch(_ context.Context, raw json.RawMessage) (any, error) {
+	if j.node == nil {
+		return nil, status.Error(codes.Unimplemented,
+			"no node is configured; this process holds no sandboxes")
+	}
+	var payload handlePayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	j.node.Touch(payload.handle())
+	return map[string]any{"ok": true}, nil
+}
+
+// renewOwner keeps one caller's ownership alive across the fleet.
+//
+// The SDK calls it on a timer: the control plane refreshes the caller's quota and
+// forwards the renewal to every live node, so a node reclaims that caller's
+// sandboxes only once it has really stopped renewing. A failed renewal is retried
+// by the next heartbeat, so a node that is briefly unreachable is not an error.
+func (j *JSONListener) renewOwner(ctx context.Context, raw json.RawMessage) (any, error) {
+	if j.control == nil {
+		return nil, status.Error(codes.Unimplemented,
+			"no control plane is configured; this process cannot renew an owner")
+	}
+	var payload struct {
+		Owner string `json:"owner"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	j.control.RenewOwner(ctx, payload.Owner)
+	return map[string]any{"ok": true}, nil
 }
 
 func (j *JSONListener) readBytes(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -550,6 +773,32 @@ func compactBase64(raw string) string {
 	return string(out)
 }
 
+// headroomMap and classHeadroomMap render headroom for the wire. They take the proto type
+// so a field added to the report is carried without this file naming it again.
+
+func headroomMap(h *v1.Headroom) map[string]any {
+	if h == nil {
+		return nil
+	}
+	return map[string]any{
+		"memory_mb":  h.GetMemoryMb(),
+		"cpu_millis": h.GetCpuMillis(),
+		"gpu_count":  h.GetGpuCount(),
+		"disk_mb":    h.GetDiskMb(),
+	}
+}
+
+func classHeadroomMap(m map[string]*v1.Headroom) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for class, h := range m {
+		out[class] = headroomMap(h)
+	}
+	return out
+}
+
 func (j *JSONListener) fleet(ctx context.Context) (any, error) {
 	report, err := j.control.Fleet(ctx, &v1.Empty{})
 	if err != nil {
@@ -561,6 +810,12 @@ func (j *JSONListener) fleet(ctx context.Context) (any, error) {
 		for _, b := range node.GetBackends() {
 			hosted = append(hosted, b.GetName())
 		}
+		// The ledger travels with the measurement, not instead of it. This handler used to
+		// hand-build a map naming only the utilisation, which silently threw away the
+		// envelope, each class's headroom, and everything added to the report since -- so
+		// no caller could tell a node that was refusing because it was full from one that
+		// was refusing because it was charging too much. Built from the report rather than
+		// enumerated here, so it cannot fall behind the report again.
 		nodes = append(nodes, map[string]any{
 			"node_id":        node.GetNodeId(),
 			"backends":       hosted,
@@ -569,6 +824,11 @@ func (j *JSONListener) fleet(ctx context.Context) (any, error) {
 			"mem_used_pct":   node.GetMemUsedPct(),
 			"gpu_free":       node.GetGpuFree(),
 			"draining":       node.GetDraining(),
+			"envelope":       headroomMap(node.GetEnvelope()),
+			"class_headroom": classHeadroomMap(node.GetClassHeadroom()),
+			"granted":        headroomMap(node.GetGranted()),
+			"observed":       headroomMap(node.GetObserved()),
+			"throttled_pct":  node.GetThrottledPct(),
 		})
 	}
 	return map[string]any{
@@ -597,6 +857,38 @@ func (j *JSONListener) quota(ctx context.Context) (any, error) {
 		}
 	}
 	return map[string]any{"classes": classes}, nil
+}
+
+// diagnostics returns the control plane's own counters and every node's.
+//
+// It exists because the facts an operator needs when the service misbehaves --
+// renewal failures, fan-out latency, stale nodes, runtime-probe outcomes -- were
+// previously only log lines. A plane that reports what it schedules but not
+// whether its own liveness machinery is working is a plane that has to be
+// guessed about exactly when guessing is most expensive.
+func (j *JSONListener) diagnostics(_ context.Context) (any, error) {
+	if j.control == nil {
+		return nil, status.Error(codes.Unimplemented,
+			"no control plane is configured; this process has no fleet diagnostics")
+	}
+	return j.control.Diagnostics(), nil
+}
+
+// contract publishes the mechanism's own timing spans.
+//
+// The SDK used to hardcode a heartbeat interval and a timeout that had to agree
+// with these values; when they drifted, the client reported "the node reclaims
+// after three beats" while the node used a different clock. A client derives its
+// cadence from this instead of restating it.
+func (j *JSONListener) contract(_ context.Context) (any, error) {
+	return map[string]any{
+		"owner_heartbeat_interval_s": timing.OwnerHeartbeatInterval.Seconds(),
+		"owner_silence_ttl_s":        timing.OwnerSilenceTTL.Seconds(),
+		"owner_lease_s":              timing.OwnerLease.Seconds(),
+		"sweep_interval_s":           timing.SweepInterval.Seconds(),
+		"reservation_ttl_s":          timing.ReservationTTL.Seconds(),
+		"runtime_probe_interval_s":   node.DefaultRuntimeProbeInterval.Seconds(),
+	}, nil
 }
 
 // Enum values the SDK sends as names, mapped back explicitly so an unknown one

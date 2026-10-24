@@ -197,6 +197,11 @@ func newDirectRuntime(ctx context.Context, cfg directConfig) (*directRuntime, er
 			MaxIdleConns: 256, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second,
 		}},
 	}
+	if cfg.MaxCreateConcurrency < 0 {
+		return nil, fmt.Errorf(
+			"opensandbox max create concurrency %d is negative, and zero is what means unbounded",
+			cfg.MaxCreateConcurrency)
+	}
 	if cfg.MaxCreateConcurrency > 0 {
 		runtime.createSem = make(chan struct{}, cfg.MaxCreateConcurrency)
 	}
@@ -241,11 +246,11 @@ func (r *directRuntime) features() []string {
 		"background_command",
 		"code_interpreter",
 		"pty",
-		// The runtime's.
+		// The runtime's. No image_on_demand: this service drives a plain container
+		// runtime, which materializes the whole image before the sandbox starts.
 		"freeze",
 		"filesystem_snapshot",
 		"restore",
-		"image_on_demand",
 		"credential_injection",
 		"host_mount",
 	}

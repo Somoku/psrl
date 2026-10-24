@@ -53,7 +53,14 @@ _LIFETIME_RETRY_MAX_S = 30.0
 # code path noticed the stop.
 _STOP_REASONS = {
     "oom_killed": SandboxExitReason.OOM,
-    "removed": SandboxExitReason.UNKNOWN,
+    # The container is gone from the runtime and this session never stopped it, so
+    # something outside the session destroyed it. The node reclaimer is what does
+    # that — it reclaims a sandbox once its owner lease goes stale — and a removal
+    # by hand is indistinguishable from here. Either way the container did not
+    # vanish: it was destroyed deliberately, which `RECLAIMED_ORPHAN` says and
+    # `UNKNOWN` did not. The alternatives are worse: `RELEASED` would claim this
+    # session ended it, which is exactly what did not happen.
+    "removed": SandboxExitReason.RECLAIMED_ORPHAN,
     "exited": SandboxExitReason.FAILED,
 }
 
@@ -391,7 +398,7 @@ class DockerSession(SandboxSession):
         exec_task = asyncio.create_task(self._exec_strategy.run(command, cwd=cwd, env=env, budget=budget))
         watcher = asyncio.create_task(self._watch_container())
         try:
-            result = await self._collect_command(exec_task, watcher, budget.timeout_s)
+            result = await self._collect_command(exec_task, watcher, budget.timeout_s, command=command)
         finally:
             exec_task.cancel()
             watcher.cancel()
@@ -422,6 +429,8 @@ class DockerSession(SandboxSession):
         exec_task: asyncio.Task,
         watcher: asyncio.Task,
         timeout_s: float | None,
+        *,
+        command: str,
     ) -> ExecResult:
         """Await a command, and settle what to do when it does not finish.
 
@@ -441,14 +450,18 @@ class DockerSession(SandboxSession):
             # the lease still owns it, so the command is dropped and the sandbox kept:
             # an episode cancelled mid-turn still has to collect its artifacts, and the
             # lease release is the hard stop.
-            await complete_cleanup(self._abort_command(exec_task, watcher, destroy=False))
+            await complete_cleanup(
+                self._abort_command(exec_task, watcher, destroy=False, command=command, trigger="caller_cancelled")
+            )
             raise
         if watcher in done:
             reason = watcher.result()
-            await complete_cleanup(self._abort_command(exec_task, watcher))
+            await complete_cleanup(
+                self._abort_command(exec_task, watcher, command=command, trigger="container_stopped")
+            )
             raise await self._stopped_error(reason)
         if exec_task not in done:
-            return await complete_cleanup(self._command_overran(exec_task, watcher, timeout_s))
+            return await complete_cleanup(self._command_overran(exec_task, watcher, timeout_s, command=command))
         try:
             with self.backend.metrics.measure("exec"):
                 return exec_task.result()
@@ -457,12 +470,18 @@ class DockerSession(SandboxSession):
             # process may still be running with nobody reading it. A one-shot exec cannot
             # be signalled, so the container has to go: anything it writes would land in
             # the next command's output.
-            await complete_cleanup(self._abort_command(exec_task, watcher))
+            await complete_cleanup(
+                self._abort_command(exec_task, watcher, command=command, trigger="exec_stream_cancelled")
+            )
             raise
         except (TimeoutError, asyncio.TimeoutError) as exc:
-            return await complete_cleanup(self._command_overran(exec_task, watcher, timeout_s, cause=exc))
+            return await complete_cleanup(
+                self._command_overran(exec_task, watcher, timeout_s, cause=exc, command=command)
+            )
         except (aiohttp.ClientError, SandboxTransportError) as exc:
-            reason = await complete_cleanup(self._abort_command(exec_task, watcher, diagnose=True))
+            reason = await complete_cleanup(
+                self._abort_command(exec_task, watcher, diagnose=True, command=command, trigger="transport_error")
+            )
             if reason is not None:
                 raise await self._stopped_error(reason) from exc
             raise
@@ -474,6 +493,7 @@ class DockerSession(SandboxSession):
         timeout_s: float | None,
         *,
         cause: BaseException | None = None,
+        command: str = "",
     ) -> None:
         """Stop an overrunning command, keeping the sandbox when that is possible.
 
@@ -488,7 +508,9 @@ class DockerSession(SandboxSession):
         """
         preserved = await complete_cleanup(self._exec_strategy.abort_running_command())
         if not preserved:
-            reason = await complete_cleanup(self._abort_command(exec_task, watcher, diagnose=True))
+            reason = await complete_cleanup(
+                self._abort_command(exec_task, watcher, diagnose=True, command=command, trigger="command_overran")
+            )
             if reason is not None:
                 raise await self._stopped_error(reason)
         else:
@@ -534,6 +556,8 @@ class DockerSession(SandboxSession):
         *,
         diagnose: bool = False,
         destroy: bool = True,
+        command: str = "",
+        trigger: str = "",
     ) -> str | None:
         """Stop tracking a command, and optionally destroy the sandbox it ran in.
 
@@ -544,6 +568,11 @@ class DockerSession(SandboxSession):
         that cancelled is different. It says nothing about the container, and the sandbox
         is still leased, so destroying it here would pull the filesystem out from under
         work the episode has not finished with.
+
+        Both outcomes are reported, because a destroyed container is what a later command
+        finds as an unexplained "terminated before this command could run": the sandbox id,
+        the command that could not be stopped, and the trigger are the only things that say
+        which abort took an episode's sandbox away, and nothing else records them.
         """
         exec_task.cancel()
         watcher.cancel()
@@ -552,6 +581,14 @@ class DockerSession(SandboxSession):
             return await self._container_stop_reason() if diagnose else None
         finally:
             if destroy:
+                psrl_logger.warning(
+                    "Docker sandbox %s destroyed the sandbox to stop a command (trigger=%s, command=%s). "
+                    "Aborted by:\n%s",
+                    self.sandbox_id,
+                    trigger or "unrecorded",
+                    _describe_command(command) if command else "<unrecorded>",
+                    "".join(traceback.format_stack()[:-1]),
+                )
                 try:
                     await self.terminate()
                 except Exception:

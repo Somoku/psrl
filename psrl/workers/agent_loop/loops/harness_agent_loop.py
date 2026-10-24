@@ -13,11 +13,16 @@ from typing import Any
 from omegaconf import DictConfig
 
 from psrl.sandbox import SandboxFeature, SandboxLease, SandboxSession, SnapshotKind, SnapshotRef, SyncSandboxManager
+from psrl.utils.common.http_utils import (
+    SESSION_TURN_ACCOUNTING_KEY,
+    RequestAbortedByGatewayError,
+)
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.harness import (
+    STOP_REASON_MAX_TURNS,
     Harness,
     HarnessConfig,
-    HarnessExecBudgetExpired,
+    HarnessEpisodeSummary,
     HarnessResult,
     HarnessRuntime,
     HarnessTaskContext,
@@ -31,6 +36,17 @@ from psrl.workers.gen.utils import TokenOutput, rollout_token_budget
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+def _request_id_of(request: Mapping[str, Any]) -> str:
+    """Return the id of the plain dict `run()` receives.
+
+    `run_with_termination_handling` unpacks the TensorDict before calling `run`,
+    so the request here is a dict. An attribute access on the abort path fails
+    exactly when it is needed, turning a deliberate gateway abort into a
+    rollout error that refills the whole group.
+    """
+    return str(request.get("uid", "N/A"))
 
 
 def _raise_if_episode_is_over(lease: SandboxLease | None) -> None:
@@ -72,6 +88,17 @@ def _raise_if_episode_is_over(lease: SandboxLease | None) -> None:
         raise asyncio.CancelledError
 
 
+def _swallow_task_result(task: asyncio.Task) -> None:
+    """Retrieve a detached task's result so its late failure is not logged as unhandled.
+
+    Used when an operation is abandoned rather than awaited: the worker thread keeps
+    running against a sandbox that was just closed, and its eventual exception is
+    expected rather than actionable.
+    """
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.result()
+
+
 class HarnessAgentLoop(SessionAgentLoop):
     """
     Run one task-scoped harness and turn its TITO session into training data.
@@ -85,15 +112,10 @@ class HarnessAgentLoop(SessionAgentLoop):
     # work, so the episode budget starts only once the harness is about to run.
     episode_starts_after_provisioning = True
 
-    @staticmethod
-    def apply_timeout_ladder(harness_config: HarnessConfig, timeouts) -> HarnessConfig:
-        """Return the harness config with its exec budget taken from the shared ladder.
-
-        The episode budget is what stops the harness and reports why, so the harness's own
-        exec timeout only has to outlive it. Deriving it here means a harness can no longer
-        enforce a different episode length than the framework believes it set.
-        """
-        return replace(harness_config, time_budget_s=timeouts.harness_exec_timeout_s)
+    # Set from `rollout.agent.trajectory_timeout_action` in __init__; a class default keeps
+    # a loop built without __init__ (a test) on the discard path.
+    keeps_partial_on_timeout = False
+    _agent_timed_out = False
 
     def __init__(
         self,
@@ -101,7 +123,7 @@ class HarnessAgentLoop(SessionAgentLoop):
         harness: HarnessConfig | DictConfig | Mapping[str, Any],
     ) -> None:
         super().__init__(context=context)
-        self.harness_config = self.apply_timeout_ladder(HarnessConfig.from_value(harness), self.timeouts)
+        self.harness_config = HarnessConfig.from_value(harness)
         self.compaction_budget: tuple[int, int] | None = None
         self.prompt_too_long_limit: int | None = None
         # Set by a task hook when grading never ran, so the completed trajectory is kept
@@ -111,6 +133,18 @@ class HarnessAgentLoop(SessionAgentLoop):
         # admitted, so the manager's capacity breaker can count the fault instead of reading
         # it as a generic grader failure.
         self.grader_capacity_timeout = False
+        # Per-request: set when the episode deadline stopped the agent phase.
+        self._agent_timed_out = False
+        # Per-request: what the harness CLI itself reported about the episode it ran
+        # (its stop reason and its own turn count). None until the harness returns, and
+        # None for a harness whose output carries no such report.
+        self._episode_summary: HarnessEpisodeSummary | None = None
+        self.keeps_partial_on_timeout = self._resolve_timeout_action(
+            context.config.gen_actor_rollout_ref.rollout.agent
+        )
+        # In `keep` mode this loop stops its own agent phase at the deadline and carries
+        # on to collection and grading, so the base must not cancel the episode instead.
+        self.episode_budget_enforced_by_loop = self.keeps_partial_on_timeout
         multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
         if not getattr(multi_turn, "enable", False):
             raise ValueError("Harness training requires rollout.multi_turn.enable=True.")
@@ -121,6 +155,19 @@ class HarnessAgentLoop(SessionAgentLoop):
             )
         if context.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode != "traj":
             raise ValueError("Harness training supports only agent.traj_reward_mode=traj.")
+
+    @staticmethod
+    def _resolve_timeout_action(agent_config) -> bool:
+        """Return whether the episode deadline keeps the partial trajectory.
+
+        ``rollout.agent.trajectory_timeout_action`` is ``discard`` (the episode is
+        cancelled and retried, losing the partial work) or ``keep`` (the agent phase is
+        stopped at the deadline and its patch and trajectory are collected and graded).
+        """
+        action = str(getattr(agent_config, "trajectory_timeout_action", "discard") or "discard").strip()
+        if action not in ("discard", "keep"):
+            raise ValueError(f"rollout.agent.trajectory_timeout_action must be 'discard' or 'keep', got {action!r}.")
+        return action == "keep"
 
     @abstractmethod
     async def prepare_harness_task(self, request: dict) -> HarnessTaskContext:
@@ -138,9 +185,16 @@ class HarnessAgentLoop(SessionAgentLoop):
         sandbox: SandboxSession,
         runtime: HarnessRuntime,
         harness_result: HarnessResult,
+        *,
+        harness_log: bytes | None = None,
     ) -> Any:
         """
         Collect an optional task artifact before the agent sandbox is destroyed.
+
+        ``harness_log`` is the CLI's own output, already read by the lifecycle. A hook
+        that needs it must use these bytes rather than reading the file again, both
+        because the same bytes were just transferred and because a hook that reads a
+        large log twice pays for it on every episode.
         """
         return None
 
@@ -150,9 +204,14 @@ class HarnessAgentLoop(SessionAgentLoop):
         artifact: Any,
         clean_snapshot: SnapshotRef | None,
         timing: dict[str, float],
+        grading_timeout_s: float | None,
     ) -> dict:
         """
         Run optional task evaluation and return task-specific reward fields.
+
+        Grading runs after the episode has released its budget, so it is bounded here
+        instead: ``grading_timeout_s`` is the grading wall clock, or ``None`` for no
+        bound at all.
         """
         return {}
 
@@ -166,14 +225,28 @@ class HarnessAgentLoop(SessionAgentLoop):
         self,
         backend: str | None,
         operation: Callable[[SyncSandboxManager], Any],
+        timeout_s: float | None = None,
     ) -> Any:
-        """
-        Run blocking harness code with cancellation-safe sandbox ownership.
+        """Run blocking harness code with cancellation-safe sandbox ownership.
+
+        ``timeout_s`` bounds the operation at the wall clock. It cannot stop the worker
+        thread, so on expiry the sandbox is closed -- which is what releases the sandbox
+        lease and lets the blocked call fail -- and a ``TimeoutError`` is raised for the
+        caller to classify. That is the only bound a grading phase has left once the
+        episode budget has released it.
         """
         sync_sandbox = self.sandbox_manager.sync(backend=backend)
         operation_task = asyncio.create_task(asyncio.to_thread(operation, sync_sandbox))
         try:
-            return await asyncio.shield(operation_task)
+            if timeout_s is None:
+                return await asyncio.shield(operation_task)
+            return await asyncio.wait_for(asyncio.shield(operation_task), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            await sync_sandbox.aclose()
+            # The worker thread outlives the sandbox it was blocked on. Retrieve its
+            # eventual result so a late failure is not reported as unhandled.
+            operation_task.add_done_callback(_swallow_task_result)
+            raise
         except asyncio.CancelledError:
             await sync_sandbox.aclose()
             with contextlib.suppress(Exception):
@@ -210,6 +283,23 @@ class HarnessAgentLoop(SessionAgentLoop):
         spec = replace(task.sandbox_spec, mounts=(*task.sandbox_spec.mounts, mount))
         return replace(task, sandbox_spec=spec, runtime_mount_target=mount.target)
 
+    def apply_sandbox_lifetime(self, task: HarnessTaskContext) -> HarnessTaskContext:
+        """State the sandbox lifetime on the specs, so a node can reclaim them.
+
+        It is the one thing the caller knows and the node cannot infer: how long a
+        sandbox is meant to work. Without it a node falls back to its own default,
+        which cannot know this rollout's budgets, and a sandbox is reclaimed by a
+        number unrelated to the episode it is running.
+        """
+        lifetime = self.timeouts.sandbox_lifetime_s
+        rollout = replace(task.sandbox_spec, lifetime_timeout_s=lifetime)
+        grader = (
+            replace(task.clean_sandbox_spec, lifetime_timeout_s=lifetime)
+            if task.clean_sandbox_spec is not None
+            else None
+        )
+        return replace(task, sandbox_spec=rollout, clean_sandbox_spec=grader)
+
     def resolve_request_settings(self, request: dict) -> None:
         """Resolve per-request turn budget and context compaction settings."""
         rollout_config = (
@@ -218,7 +308,8 @@ class HarnessAgentLoop(SessionAgentLoop):
             else self.config.gen_actor_rollout_ref.rollout
         )
 
-        self.max_turns = rollout_config.multi_turn.max_turns
+        self.max_turns = self._resolve_turn_limit(rollout_config.multi_turn.max_turns)
+        self._agent_timed_out = False
         context_window = rollout_config.max_model_len or rollout_token_budget(rollout_config)
         if context_window > self.rollout_budget:
             psrl_logger.warning(
@@ -228,6 +319,24 @@ class HarnessAgentLoop(SessionAgentLoop):
             )
         self.compaction_budget = self.harness_config.compaction.resolve(context_window)
         self.prompt_too_long_limit = self.compaction_budget[1] if self.compaction_budget else None
+
+    def _resolve_turn_limit(self, configured: int | float | None) -> int | None:
+        """Return the turn cap to enforce, or None when turns are unlimited.
+
+        A positive number caps the episode's turns; anything else -- null, -1, or
+        any non-positive value -- means no cap, so the episode is bounded by
+        ``rollout.agent.trajectory_timeout`` alone.
+
+        A cap is honoured whichever way this harness can take one: handed to a CLI that
+        takes it, and declared to the session as its turn budget for one that does not.
+        """
+        return None if configured is None or int(configured) < 1 else int(configured)
+
+    def session_turn_budget(self) -> int | None:
+        """Declare the turn cap to the session when this harness's CLI takes none."""
+        if self.max_turns is None or self.harness_config.cli_takes_turn_cap:
+            return None
+        return self.max_turns
 
     async def run(
         self,
@@ -258,6 +367,7 @@ class HarnessAgentLoop(SessionAgentLoop):
         try:
             task = await self.prepare_harness_task(request)
             task = self.attach_runtime_mount(task)
+            task = self.apply_sandbox_lifetime(task)
             timing["task_prepare_s"] = time.perf_counter() - run_start
             prepare_tasks.append(
                 asyncio.create_task(self.sandbox_manager.prepare(task.sandbox_spec, backend=task.backend))
@@ -297,7 +407,7 @@ class HarnessAgentLoop(SessionAgentLoop):
                 model=str(self.model_config.path),
                 context_window_tokens=(self.compaction_budget[0] if self.compaction_budget else None),
                 compaction_token_limit=(self.compaction_budget[1] if self.compaction_budget else None),
-                max_turns=int(self.max_turns) if self.max_turns is not None else None,
+                max_turns=self.max_turns,
             )
             prepare_started = time.perf_counter()
             await harness.prepare(harness_runtime)
@@ -308,47 +418,42 @@ class HarnessAgentLoop(SessionAgentLoop):
             # prepared, and the harness is ready. Only from here on is the wall clock spent
             # on episode work, so this is where the episode budget starts.
             self.arm_episode_budget()
+            # In `keep` mode the harness stops the CLI at the episode deadline and returns
+            # its partial output, which collection and grading below then use. In `discard`
+            # mode the CLI has no deadline of its own; the base cancels the whole episode.
+            agent_deadline_s = self.episode_budget.remaining_s() if self.keeps_partial_on_timeout else None
             harness_started = time.perf_counter()
             try:
-                harness_result = await harness.run(task.prompt, harness_runtime)
-            except HarnessExecBudgetExpired as expired:
-                # The harness exec backstop fired, which means the episode budget did not.
-                # Record the cause: without it the manager can only report that some
-                # exception happened, with no exception to show.
-                self._record_error(expired)
-                psrl_logger.error(
-                    "Harness %s exceeded its %.0fs exec budget for session %s. The exec budget is a "
-                    "backstop for the %.0fs episode budget, so report this: the episode budget should "
-                    "have stopped it first.",
-                    self.harness_config.kind,
-                    self.harness_config.time_budget_s,
-                    session_id,
-                    self.timeouts.episode_timeout_s,
-                )
-                return None, TerminateReason.TRAJECTORY_TIMEOUT
+                harness_result = await harness.run(task.prompt, harness_runtime, deadline_s=agent_deadline_s)
             except TimeoutError as downstream:
-                # Some call inside the episode timed out without the exec budget expiring, so
-                # the sandbox or the daemon behind it is the fault and the episode budget is
-                # not. Reporting TRAJECTORY_TIMEOUT here would misattribute the cause and let
-                # `is_timeout` suppress the retry an infrastructure fault needs.
+                # A call inside the episode timed out. That is the sandbox or the daemon
+                # behind it, not the episode budget: the episode budget never surfaces as a
+                # TimeoutError. Reporting TRAJECTORY_TIMEOUT here would misattribute the
+                # cause and let `is_timeout` suppress the retry an infrastructure fault needs.
                 self._record_error(downstream)
                 psrl_logger.error(
-                    "Harness %s hit an infrastructure timeout for session %s that was not its "
-                    "%.0fs exec budget: %r.",
+                    "Harness %s hit an infrastructure timeout for session %s: %r.",
                     self.harness_config.kind,
                     session_id,
-                    self.harness_config.time_budget_s,
                     downstream,
                 )
                 return None, TerminateReason.DOWNSTREAM_TIMEOUT
             timing["assistant_s"] = time.perf_counter() - harness_started
-            if harness_result.exit_code != 0:
+            self._agent_timed_out = harness_result.timed_out
+            if self._agent_timed_out:
+                psrl_logger.warning(
+                    "Harness %s reached the %.0fs episode budget for session %s; keeping the partial "
+                    "trajectory and grading it (rollout.agent.trajectory_timeout_action=keep).",
+                    self.harness_config.kind,
+                    self.episode_budget.total_s,
+                    session_id,
+                )
+            elif harness_result.exit_code != 0:
                 # The CLI can die without stopping the container, for example when the kernel
                 # OOM-kills it inside the sandbox. The episode continues and is trained, so say
                 # so loudly instead of recording the code as a silent data field.
                 psrl_logger.warning(
-                    "Harness %s exited with code %s for session %s, so the episode ended early. "
-                    "stderr tail: %s",
+                    "Harness %s exited with code %s for session %s, so the episode ended early. stderr tail: %s",
                     self.harness_config.kind,
                     harness_result.exit_code,
                     session_id,
@@ -367,11 +472,18 @@ class HarnessAgentLoop(SessionAgentLoop):
             # breaker that exists to catch a genuinely broken harness.
             _raise_if_episode_is_over(lease)
 
+            # The CLI's own report of the episode is the authority for how many turns it
+            # ran and why it stopped, so it is read once here and handed on to the task
+            # hook, which scans the same bytes for trajectory integrity.
+            harness_log = await self._read_harness_log(lease.session, harness_result)
+            self._episode_summary = harness.episode_summary(harness_log or b"")
+
             artifact = await self.collect_harness_artifact(
                 task,
                 lease.session,
                 harness_runtime,
                 harness_result,
+                harness_log=harness_log,
             )
             await self._capture_resource_metrics(task, lease, timing)
             training_data = await self.get_training_data(session_id)
@@ -381,8 +493,33 @@ class HarnessAgentLoop(SessionAgentLoop):
             await self.delete_session(session_id)
             session_id = None
 
+            # The rollout is over: its sandbox is gone and its patch and TITO trajectory
+            # are collected. The episode budget has no episode work left to bound, so
+            # release it -- grading below is a separate phase with its own budget, and
+            # leaving this clock running would charge a slow grader to the episode.
+            self.episode_budget.release()
+
             if not training_data or any(item["num_turns"] <= 0 or not item["response_ids"] for item in training_data):
                 harness_result = await harness.collect_diagnostics(harness_result)
+                if harness_result.aborted_by_gateway():
+                    # The gateway aborted this episode's model requests, so there is no
+                    # trajectory to collect and there never will be. Raised as an abort
+                    # rather than as a rollout error for three reasons that all matter:
+                    # an abort is deliberate, so the episode is dropped rather than kept --
+                    # `needs_manager_retry()` is false for ABORTED because PSManager has
+                    # already cleared the entry, and asking for a refill here would
+                    # double-count it. What raising it as an abort buys is that the episode
+                    # is not evidence the harness is broken, so it must not feed the
+                    # breaker that exists to catch a genuinely broken CLI.
+                    psrl_logger.info(
+                        "Harness produced no trajectory because the gateway aborted its requests; "
+                        "reporting the episode as aborted rather than failed."
+                    )
+                    raise RequestAbortedByGatewayError(
+                        request_id=_request_id_of(request),
+                        message="gateway aborted the episode's model requests during a turn",
+                    )
+
                 await self._dump_harness_training_data(
                     request,
                     training_data,
@@ -405,6 +542,7 @@ class HarnessAgentLoop(SessionAgentLoop):
                 artifact,
                 clean_snapshot,
                 timing,
+                self.timeouts.grading_timeout_s,
             )
             timing["elapsed_s"] = time.perf_counter() - run_start
             reward_info = self._build_reward_info(
@@ -428,8 +566,7 @@ class HarnessAgentLoop(SessionAgentLoop):
                     reward_info,
                 )
                 raise
-            for output in outputs:
-                output.agent_reward_info = dict(reward_info)
+            self._stamp_reward_info(outputs, training_data, reward_info)
             self.attach_tito_tree_metadata(training_data, outputs)
             output_value: TokenOutput | list[TokenOutput] = outputs[0] if len(outputs) == 1 else outputs
             scored_output = await self.compute_reward_score(output_value, **request)
@@ -441,6 +578,22 @@ class HarnessAgentLoop(SessionAgentLoop):
                 prepare_task.cancel()
             await asyncio.gather(*prepare_tasks, return_exceptions=True)
             await self._cleanup_harness_run(task, session_id, lease, harness, clean_snapshot)
+
+    @staticmethod
+    async def _read_harness_log(sandbox: SandboxSession, harness_result: HarnessResult) -> bytes | None:
+        """Read the harness CLI's own output log, or None when it cannot be read.
+
+        A missing log costs the episode its label, not its trajectory, so the failure is
+        absorbed here: whatever is wrong with the sandbox is reported by the collection
+        that follows, against the sandbox's real state.
+        """
+        if not harness_result.stdout_path:
+            return None
+        try:
+            return await sandbox.read_bytes(harness_result.stdout_path)
+        except Exception:
+            psrl_logger.warning("Could not read the harness output log for episode reporting.", exc_info=True)
+            return None
 
     async def _try_snapshot_clean_sandbox(
         self,
@@ -555,11 +708,16 @@ class HarnessAgentLoop(SessionAgentLoop):
         training_data: list[dict],
         harness_result: HarnessResult,
     ) -> dict:
-        """Build diagnostics that are safe even for an incomplete trajectory."""
-        num_turns = max((item.get("num_turns", 0) for item in training_data), default=0)
+        """Build diagnostics that are safe even for an incomplete trajectory.
+
+        ``num_turns`` is the episode's turn count, not a trajectory's: one session is one
+        episode, and a harness that rewrites its context or runs a subagent leaves its
+        trajectories at different lengths. Put one trajectory's own count here and it is
+        stamped onto all of them and reported as each one's own, which is what the
+        per-trajectory ``trajectory_num_turns`` is for.
+        """
         return {
-            "num_turns": num_turns,
-            "actual_num_turns": num_turns,
+            "num_turns": self._episode_num_turns(training_data),
             "trajectory_count": len(training_data),
             "trajectory_token_lengths": [
                 len(item.get("prompt_ids", [])) + len(item.get("response_ids", [])) for item in training_data
@@ -570,6 +728,60 @@ class HarnessAgentLoop(SessionAgentLoop):
             "harness_exit_code": harness_result.exit_code,
             "harness_stderr_tail": harness_result.stderr_tail if harness_result.exit_code != 0 else "",
         }
+
+    def _episode_num_turns(self, training_data: list[dict]) -> int:
+        """Return how many turns the episode ran.
+
+        Three sources, in the order they can be trusted. The harness's own count, which
+        knows how many turns it ran across a context rewrite. Failing that, the session's
+        accounting of the model calls the parent agent made, which is the same thing
+        counted from outside and is what a session with a declared budget is held to.
+        Failing both, the longest trajectory's count: a reconstruction that cannot see
+        past the last rewrite, so it is short rather than wrong about a session that has
+        no other record.
+        """
+        if self._episode_summary is not None and self._episode_summary.num_turns is not None:
+            return int(self._episode_summary.num_turns)
+        session_main_turns = self._session_main_turns()
+        if session_main_turns is not None:
+            return session_main_turns
+        return max((int(item.get("num_turns") or 0) for item in training_data), default=0)
+
+    def _session_main_turns(self) -> int | None:
+        """Return the parent agent's model calls as the session counted them.
+
+        Read from the session view the loop already fetched. Absent for a session whose
+        router did not report it, which is a session no budget applies to.
+        """
+        snapshot = self.session_snapshot
+        if not isinstance(snapshot, dict):
+            return None
+        accounting = snapshot.get(SESSION_TURN_ACCOUNTING_KEY)
+        if not isinstance(accounting, dict):
+            return None
+        main_turns = accounting.get("main_turns")
+        return int(main_turns) if isinstance(main_turns, int) else None
+
+    def _stamp_reward_info(
+        self,
+        outputs: list["TokenOutput"],
+        training_data: list[dict],
+        reward_info: dict,
+    ) -> None:
+        """Give every output the episode's diagnostics and its own trajectory's count.
+
+        ``num_turns`` is the episode's, and it is also what the returned output carries as
+        its own sample field: everything downstream — the trainer's ``num_turns`` metric and
+        the reward — reads a session as one episode. The trajectory's own count is kept
+        beside it, so that trajectory's log can report the turns it ran.
+        """
+        episode_turns = self._episode_num_turns(training_data)
+        for output, item in zip(outputs, training_data):
+            output.agent_reward_info = {
+                **reward_info,
+                "trajectory_num_turns": int(item.get("num_turns") or 0),
+            }
+            output.num_turns = episode_turns
 
     async def _dump_harness_training_data(
         self,
@@ -589,8 +801,7 @@ class HarnessAgentLoop(SessionAgentLoop):
             return
         try:
             outputs = [self.build_token_output(item) for item in training_data]
-            for output in outputs:
-                output.agent_reward_info = dict(reward_info)
+            self._stamp_reward_info(outputs, training_data, reward_info)
             self.attach_tito_tree_metadata(training_data, outputs)
             output_value: TokenOutput | list[TokenOutput] = outputs[0] if len(outputs) == 1 else outputs
             await self._resolve_version_for_dump(output_value, request)
@@ -646,13 +857,29 @@ class HarnessAgentLoop(SessionAgentLoop):
         a measured zero. When the grader sandbox was never admitted it reports
         `GRADER_CAPACITY_TIMEOUT` instead, which is ungraded for the same reason but also
         tells the manager's capacity breaker that grading is starved rather than broken.
+
+        When the episode deadline stopped the agent under `trajectory_timeout_action=keep`,
+        the partial trajectory is complete and graded, so it reports `AGENT_TIMEOUT`: a
+        success kept for training and counted apart from a naturally finished episode,
+        rather than the `TRAJECTORY_TIMEOUT` that discards and retries.
+
+        The turn cap is reported only when the harness itself said it hit one. The
+        framework's own counts cannot stand in for that: a context rewrite cuts a
+        trajectory in the middle of a run while the CLI's counter keeps going, and a
+        subagent adds turns the CLI does not count against the parent, so a comparison
+        against the configured cap is wrong in both directions.
         """
         if self.grader_capacity_timeout:
             return TerminateReason.GRADER_CAPACITY_TIMEOUT
         if self.grader_unavailable:
             return TerminateReason.VERIFIER_ERROR
+        # The episode deadline stopped the agent, but the partial trajectory was kept and
+        # graded. Reported as its own reason so it is trained rather than retried, and so
+        # it is counted apart from a finished episode in metrics.
+        if self._agent_timed_out:
+            return TerminateReason.AGENT_TIMEOUT
+        if self._episode_summary is not None and self._episode_summary.stop_reason == STOP_REASON_MAX_TURNS:
+            return TerminateReason.MAX_TURNS_EXCEEDED
         if any(len(item["prompt_ids"]) + len(item["response_ids"]) > self.rollout_budget for item in training_data):
             return TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
-        if max(item["num_turns"] for item in training_data) >= self.max_turns:
-            return TerminateReason.MAX_TURNS_EXCEEDED
         return TerminateReason.FINISHED

@@ -108,6 +108,7 @@ from psrl.trainer.ppo.session_loss import agg_session_loss, compute_session_loss
 from psrl.trainer.ppo.utils import (
     PSRL_Role,
     ResourcePoolManager,
+    _compute_staleness_metrics,
     _compute_termination_metrics,
     compute_advantage_for_multi_trajectories,
 )
@@ -128,7 +129,12 @@ from psrl.utils.post_processor import (
 )
 from psrl.utils.ps_mode import has_ps_data_plane, requires_ps_workers, uses_nixl
 from psrl.utils.server.command import Command, CommandType
-from psrl.utils.transferqueue_utils import PayloadState, clear_payload
+from psrl.utils.transferqueue_utils import (
+    RESPONSE_ALIGNED_FIELDS,
+    PayloadState,
+    assert_response_aligned_lengths,
+    clear_payload,
+)
 from psrl.workers.agent_loop.manager import PSRL_AgentLoopManager
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.workers.agent_loop.timeouts import resolve_from_config
@@ -159,11 +165,9 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 def _log_agent_loop_timeouts(config) -> None:
-    """
-    Resolve and report the rollout deadline ladder.
-    """
-    ladder = resolve_from_config(config)
-    psrl_logger.info("Rollout deadlines: %s.", ladder.describe())
+    """Report the rollout's two budgets: episode work and grading."""
+    timeouts = resolve_from_config(config)
+    psrl_logger.info("Rollout budgets: %s.", timeouts.describe())
 
 
 class ReplayBuffer:
@@ -359,6 +363,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.reward_gateways: dict[str, ray.actor.ActorHandle] = {}
         self.reward_gateway_urls: dict[str, str] = {}
         self.reward_model_to_manager = {}
+
+        # Teardown runs on every exit path, and two paths can overlap: a normal
+        # finish and the interrupt that follows it. The flag makes it run once,
+        # because a second pass would touch actors the first one already shut
+        # down.
+        self._components_stopped = False
 
         # Elastic rm
         self.elastic_rm_mode = config.psrl.deployment.elastic_rm.enable
@@ -1967,6 +1977,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 PSRL_AgentLoopWorker.options(
                     name=f"agent_loop_worker_{i}",
                     max_concurrency=max_concurrency_per_worker,
+                    # The metrics group the snapshot read runs in is declared on the actor
+                    # class, because Ray takes concurrency_groups from the decorator and not
+                    # from .options(); see PSRL_AgentLoopWorker.
                     scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=not hard_affinity),
                 ).remote(
                     self.config,
@@ -3476,6 +3489,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             "values",
         ]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        # A producer that gets a length wrong only changes a width here, and the advantage math
+        # reads two fields that were padded apart from each other. `responses` anchors the mask
+        # at the old-log-prob stage, so the mask can anchor the rest without fetching it again.
+        assert_response_aligned_lengths(
+            {n: data[n] for n in RESPONSE_ALIGNED_FIELDS if n in data.keys()},
+            reference="response_mask",
+            stage="advantage",
+        )
         response_mask = data["response_mask"]
 
         # Extract non-tensor uid/parent_id BEFORE calling to_padded_tensor() to avoid
@@ -3534,6 +3555,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 fields.append("rollout_is_weights")
 
         output = {}
+        # `response_to_nested` slices by `response_mask`, so a wider field would be trimmed silently.
+        for field in ("advantages", "returns"):
+            assert data.batch[field].shape[1] == data.batch["response_mask"].shape[1], (
+                f"{field} has {data.batch[field].shape[1]} response positions but response_mask has "
+                f"{data.batch['response_mask'].shape[1]}."
+            )
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
         if self.config.train_actor_rollout_ref.actor.loss_agg_mode == "session-mean-token-mean":
@@ -3646,29 +3673,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         uids = tu.pop(data, "uid") if use_session_mean else None
 
         # Training pads log probabilities to `responses` but slices them by `response_mask`.
-        # Enforce equal row lengths here so drift fails near its source.
-        response_lens = data["responses"].offsets().diff()
-        mask_lens = data["response_mask"].offsets().diff()
-        psrl_logger.info(
-            "[length-contract] old_log_prob stage: rows=%d responses[min=%d max=%d] "
-            "response_mask[min=%d max=%d] equal=%s",
-            len(response_lens),
-            int(response_lens.min()),
-            int(response_lens.max()),
-            int(mask_lens.min()),
-            int(mask_lens.max()),
-            bool(torch.equal(response_lens, mask_lens)),
+        assert_response_aligned_lengths(
+            {"responses": data["responses"], "response_mask": data["response_mask"]},
+            stage="old_log_prob",
         )
-        if not torch.equal(response_lens, mask_lens):
-            bad = (response_lens != mask_lens).nonzero().flatten().tolist()
-            raise AssertionError(
-                f"responses and response_mask disagree on length for {len(bad)} of "
-                f"{len(response_lens)} rows. First offenders (row, responses, mask): "
-                f"{[(int(i), int(response_lens[i]), int(mask_lens[i])) for i in bad[:5]]}. "
-                "Both are written per trajectory by the agent loop and must stay in lockstep, "
-                "because old_log_probs is cut to the mask length while the training forward is "
-                "padded to the responses length."
-            )
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
@@ -3774,7 +3782,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps):
         # Fetch only real samples because schedule-local padding keys can collide after cleanup.
-        real_keys = [key for key, tag in zip(batch.keys, batch.tags) if not tag.get("is_padding", False)]
+        # Read the generation versions here, while `batch` is still the `KVBatchMeta`: the tags
+        # are batch metadata that do not survive the `DataProto` materialization below.
+        real_keys: list[str] = []
+        version_tags: list[int | None] = []
+        for key, tag in zip(batch.keys, batch.tags):
+            if tag.get("is_padding", False):
+                continue
+            real_keys.append(key)
+            version_tags.append(tag.get("version_tag"))
         fields = [
             "prompts",
             "responses",
@@ -3849,6 +3865,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 "training/num_turns/min": num_turns.min(),
             }
         )
+
+        # Staleness of the consumed batch, from the generation versions read off the
+        # `KVBatchMeta` above. The version this step trains on is the buffer it
+        # consumes, `global_steps - 1`, matching `AgentLoopManager.log_buffer`.
+        metrics.update(_compute_staleness_metrics(version_tags, train_version=global_steps - 1))
 
         metrics.update(self._sandbox_capacity_metrics())
 
@@ -4074,22 +4095,54 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 progress_bar.close()
                 break
 
-        # Stop all components
-        self.stop_data_processor()
-        self.stop_agent_loop_manager()
-        self.stop_rollout_coordinator()
-        self.stop_reward_manager()
-        if self.elastic_executor is not None:
-            ray.get(self.elastic_executor.stop_busy_loop.remote())
-            self.elastic_executor = None
-        self.stop_ps_manager()
-        self.stop_sandbox_plane()
-        self._shutdown_dump_executor()
-
-        # Kill all PortScanner actors to free resources.
-        for handle in self.port_scanner_handles.values():
-            ray.kill(handle)
+        self.shutdown_components()
 
         # AGENT(VERL): skip `on_batch_end` processing in PSRL.
 
         psrl_logger.info("Training completed successfully!")
+
+    def shutdown_components(self) -> None:
+        """Stop every component of the data pipeline, at most once.
+
+        Runs when training finishes and when it is interrupted, so a device that
+        stops early — an exception, a ctrl-c, a SIGTERM — still releases the
+        sandboxes the agent loop workers are holding. Nothing else can: a
+        sandbox's own lifetime is a backstop measured in hours, and until it
+        expires the containers stay up holding capacity.
+
+        Each step is isolated because the reason to run them at all is that the
+        ones after a failure still run. A teardown that stopped at its first
+        error would strand exactly the sandboxes this exists to release.
+        """
+        if self._components_stopped:
+            return
+        self._components_stopped = True
+
+        steps = (
+            ("data processor", self.stop_data_processor),
+            ("agent loop manager", self.stop_agent_loop_manager),
+            ("rollout coordinator", self.stop_rollout_coordinator),
+            ("reward manager", self.stop_reward_manager),
+            ("elastic executor", self._stop_elastic_executor),
+            ("ps manager", self.stop_ps_manager),
+            ("sandbox plane", self.stop_sandbox_plane),
+            ("dump executor", self._shutdown_dump_executor),
+        )
+        for name, step in steps:
+            try:
+                step()
+            except Exception:
+                psrl_logger.warning(f"Shutting down the {name} failed; continuing teardown.", exc_info=True)
+
+        # Kill all PortScanner actors to free resources.
+        for handle in self.port_scanner_handles.values():
+            try:
+                ray.kill(handle)
+            except Exception:
+                psrl_logger.warning("Could not kill a PortScanner actor during teardown.", exc_info=True)
+
+    def _stop_elastic_executor(self) -> None:
+        """Stop the elastic reward-model executor, if this run built one."""
+        if self.elastic_executor is not None:
+            ray.get(self.elastic_executor.stop_busy_loop.remote())
+            self.elastic_executor = None

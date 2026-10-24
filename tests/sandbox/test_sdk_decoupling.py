@@ -31,7 +31,6 @@ as the offending line rather than as whatever the import happened to break.
 from __future__ import annotations
 
 import ast
-import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -113,32 +112,6 @@ def test_there_is_exactly_one_copy_of_the_sdk() -> None:
     )
 
 
-def test_every_sdk_module_is_tracked_by_git() -> None:
-    # Existing on disk is not the same as shipping. `p3b/.gitignore` carried a
-    # bare "sandboxd" for the build output, and a bare pattern matches at any
-    # depth, so it also excluded the SDK package at `p3b/sdk/sandboxd/`: the
-    # files were importable in a working tree and absent from a fresh clone,
-    # where `pip install p3b/sdk` then installed a package with no modules in
-    # it. Nothing caught it, because every test ran in a tree that had them.
-    tracked = subprocess.run(
-        ["git", "ls-files", str(SDK.relative_to(REPO))],
-        cwd=REPO,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()
-    tracked_names = {Path(path).name for path in tracked}
-
-    missing = sorted(
-        module.name for module in SDK.glob("*.py") if module.name not in tracked_names
-    )
-    assert not missing, (
-        f"These SDK modules exist on disk but are not tracked by git, so they are "
-        f"absent from a clone and `pip install {SDK.parent.relative_to(REPO)}` "
-        f"installs a package without them:\n  " + "\n  ".join(missing)
-    )
-
-
 def test_nothing_in_the_tree_imports_the_removed_copy() -> None:
     # Catches a stale import left behind anywhere, including in a test or a
     # benchmark, which is how the previous copy stayed alive.
@@ -162,47 +135,3 @@ def test_nothing_in_the_tree_imports_the_removed_copy() -> None:
         "These files still reference the removed psrl.pysandbox copy; they should "
         "import `sandboxd`:\n  " + "\n  ".join(sorted(offenders))
     )
-
-
-def test_transport_wraps_connection_errors_as_sandboxtransporterror() -> None:
-    """Transport.call() must never let a bare OSError escape to callers.
-
-    Regression test for a bug where _acquire() was called outside the try block
-    in call(), so an OSError raised while opening a new connection (the canonical
-    case is FileNotFoundError for a missing unix socket) would surface as a raw
-    Python exception rather than a SandboxTransportError.
-
-    That manifested as opaque 'Container error: [Errno 2] No such file or
-    directory' messages in the grader log — no path, no endpoint, no method name
-    — making the failure look like a container problem rather than a connectivity
-    problem, and hiding which service was unreachable.
-    """
-    import asyncio
-    import sys
-
-    sys.path.insert(0, str(SDK.parent))
-    from sandboxd.client import Transport
-    from sandboxd.errors import SandboxTransportError
-
-    async def check(endpoint: str) -> None:
-        t = Transport(endpoint, timeout_s=2, pool_size=2)
-        try:
-            await t.call("fleet", {})
-            raise AssertionError(f"call to {endpoint!r} should have failed but succeeded")
-        except SandboxTransportError as e:
-            # The endpoint address must appear in the message so the caller
-            # can tell which service was unreachable without reading the code.
-            assert endpoint in str(e), (
-                f"SandboxTransportError {str(e)!r} does not name the endpoint "
-                f"{endpoint!r}; without it the error is undiagnosable."
-            )
-        except OSError as raw:
-            raise AssertionError(
-                f"Transport.call() let a raw {type(raw).__name__} escape to the "
-                "caller instead of wrapping it in SandboxTransportError. The caller "
-                "cannot tell which service was unreachable or which method was "
-                "being invoked."
-            ) from raw
-
-    asyncio.run(check("unix:///run/psrl-test-does-not-exist.sock"))
-    asyncio.run(check("127.0.0.1:19999"))

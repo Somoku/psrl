@@ -99,13 +99,19 @@ message SandboxSpec {
   // naming a backend this deployment does not run is an error, not a no-op.
   map<string, BackendOptions> backend_options = 19;
 
-  // Where this sandbox may and may not run. A required label pins it to a class
-  // of node, and a forbidden label keeps it off one. They are separate
-  // constraints because neither implies the other: a dedicated request names
-  // where it must go, and a request that must not share a trainer's machine
-  // names where it must not, which holds even when no node is labelled for it.
+  // Where this sandbox may and may not run. A required label pins it to a
+  // specific class of node. A forbidden label keeps it off a class of node.
+  // Neither implies the other: a dedicated request names where it must go, and
+  // a request that must not share a trainer's memory names where it must not.
   string required_node_label = 20;
   repeated string forbidden_node_labels = 21;
+
+  // How long the sandbox may exist, in seconds, counted from creation. The
+  // caller states it because it knows what the sandbox is for: an episode's
+  // work, plus whatever grading follows it, plus a margin. Zero means the node's
+  // default. The node reclaims by this, so a caller that dies or forgets still
+  // leaves nothing running.
+  int64 lifetime_s = 22;
 }
 
 message BackendOptions {
@@ -367,6 +373,10 @@ enum ExitReason {
   OOM = 4;
   RECLAIMED_ORPHAN = 5;
   FAILED = 6;
+  // The container stopped for a reason other than OOM.
+  CONTAINER_EXITED = 7;
+  // The runtime no longer has the container at all.
+  CONTAINER_RUNTIME_GONE = 8;
 }
 
 message DiagnosticsResponse {
@@ -409,16 +419,35 @@ message CreateOnRequest {
   string lease_id = 1;
   SandboxSpec spec = 2;
   string callback_target = 3;
+  // Which of the node's runtimes provisions this sandbox. Routing resolved it
+  // from the spec's requirements, and it is carried rather than re-derived: a
+  // node that guessed could serve a full-state resume from a container.
+  string backend = 4;
+}
+
+// One runtime a node hosts, with what it can actually grant.
+//
+// Capability is per runtime rather than per node, because one machine can run a
+// container daemon and a microVM node side by side, and only one of them can
+// carry a live process to another host.
+message BackendView {
+  string name = 1;
+  repeated Feature features = 2;
+  ResumeLevel resume_level = 3;
+  bool host_mounts = 4;
 }
 
 // One node's view, collected by Monitor and read by Placement.
 message NodeView {
   string node_id = 1;
-  string backend = 2;
 
   // What each class could be granted now. A request is compared against its own
   // class, never against the envelope remainder: a borrower may not take another
   // class's unmet guarantee, so the remainder overstates what a class can get.
+  //
+  // Node level rather than per runtime, because the runtimes share one machine:
+  // a microVM and a container on the same host draw on the same memory, and
+  // accounting them apart would admit twice what the node has.
   map<string, Headroom> class_headroom = 3;
   Headroom envelope = 4;
 
@@ -436,11 +465,26 @@ message NodeView {
   // against it would over-commit the host.
   bool draining = 12;
   // Placement filters on these, so they have to cross: a spec that names a host
-  // path is not portable to a node without one, and a resume requirement must be
-  // refused rather than served at a weaker level.
-  bool host_mounts = 13;
-  repeated Feature features = 14;
-  ResumeLevel resume_level = 15;
+  // path is not portable to a runtime without one, and a resume requirement must
+  // be refused rather than served at a weaker level.
+  repeated BackendView backends = 16;
+
+  // What the node has promised, and what it measures. Published together with the
+  // utilisation above because the utilisation alone cannot answer the question an
+  // admission controller is judged on: is it refusing because the machine is full, or
+  // because it is charging more than the sandboxes use? Those look identical from the
+  // measured side and are opposites in what to do about them, so a scheduler, an
+  // operator, and a test all need both numbers on the same row.
+  Headroom granted = 17;
+  Headroom observed = 18;
+  // Share of the interval the sandboxes spent stopped for exceeding their CPU quota.
+  // This is the feedback term that withdraws CPU overcommit, so it has to be visible
+  // wherever the envelope is: otherwise a node that has stopped expanding looks
+  // exactly like one that never could.
+  double throttled_pct = 19;
+
+  reserved 2, 13, 14, 15;
+  reserved "backend", "host_mounts", "features", "resume_level";
 }
 
 message Headroom {
@@ -451,12 +495,13 @@ message Headroom {
 }
 
 message SweepReport {
-  repeated string paused = 1;
-  repeated string reaped_idle = 2;
   repeated string reaped_lifetime = 3;
   repeated string reclaimed_orphan = 4;
   int32 skipped_busy = 5;
   int32 failures = 6;
+
+  reserved 1, 2;
+  reserved "paused", "reaped_idle";
 }
 
 // ---------------------------------------------------------------------------

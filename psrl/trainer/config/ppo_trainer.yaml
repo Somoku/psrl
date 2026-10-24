@@ -94,6 +94,16 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
+  # Restrict the samples an advantage is measured against to the ones carrying a
+  # measurement. A row that trains no tokens (an episode no verifier scored, one the
+  # rollout masked as budget-truncated, or a padding row) holds a placeholder reward, and
+  # a placeholder in a group mean or standard deviation moves every sibling's advantage by
+  # an amount that says nothing about the task. Off by default: the group statistics then
+  # read the whole group, which is what a run without masked samples does anyway. A group
+  # left with fewer than two measured samples gets a zero advantage rather than an absolute
+  # reward, and belongs in the group-level dynamic-sampling filter to be replaced.
+  group_baseline_valid_only: False
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 

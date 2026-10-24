@@ -8,3 +8,4 @@ bin/
 
 # go workspace artifacts
 vendor/
+load_timeline.tsv

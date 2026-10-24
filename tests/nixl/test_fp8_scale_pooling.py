@@ -20,6 +20,7 @@ import torch
 from psrl.utils.nixl.block_fp8 import SCALE_SUFFIX
 from psrl.utils.nixl.client import NIXLStorageClient
 from psrl.utils.nixl.nixl_spec import NIXLSharding
+from psrl.utils.quantization import resolve_quantization_plan, quantizer_for_plan
 
 pytestmark = pytest.mark.cpu_test
 
@@ -30,12 +31,11 @@ SHAPES = {
 
 
 class _Client:
-    """Just the parts `_derive_block_scales` reads."""
+    """Just the parts `_derive_aux_parameters` reads."""
 
-    _fp8_block = (128, 128)
-    _tile_of = NIXLStorageClient._tile_of
+    _quantizer = quantizer_for_plan(resolve_quantization_plan({"scheme": "fp8"}))
     _assert_whole_tiles = staticmethod(NIXLStorageClient._assert_whole_tiles)
-    _derive_block_scales = NIXLStorageClient._derive_block_scales
+    _derive_aux_parameters = NIXLStorageClient._derive_aux_parameters
 
 
 def _sharding() -> NIXLSharding:
@@ -47,7 +47,7 @@ def test_every_scale_shard_is_a_view_of_one_allocation():
     sharding = {key: _sharding() for key in SHAPES}
     sharding.update({key + SCALE_SUFFIX: _sharding() for key in SHAPES})
 
-    derived = _Client()._derive_block_scales(state, sharding)
+    derived = _Client()._derive_aux_parameters(state, sharding)
 
     scales = [derived[key + SCALE_SUFFIX] for key in SHAPES]
     assert [tuple(s.shape) for s in scales] == [(2, 2), (3, 4)]
@@ -63,7 +63,7 @@ def test_the_windows_do_not_overlap():
     sharding = {key: _sharding() for key in SHAPES}
     sharding.update({key + SCALE_SUFFIX: _sharding() for key in SHAPES})
 
-    derived = _Client()._derive_block_scales(state, sharding)
+    derived = _Client()._derive_aux_parameters(state, sharding)
     first = derived[next(iter(SHAPES)) + SCALE_SUFFIX]
     second = derived[list(SHAPES)[1] + SCALE_SUFFIX]
     first.fill_(1.0)

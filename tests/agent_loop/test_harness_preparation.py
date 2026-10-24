@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock
 import pytest
 from psrl.sandbox import SandboxManager, SandboxSource, SandboxSpec
 from psrl.sandbox.backends.docker import DockerBackend
-from psrl.workers.agent_loop.harness import HarnessTaskContext
+from psrl.workers.agent_loop.harness import HarnessResult, HarnessTaskContext
 from psrl.workers.agent_loop.loops.budget import EpisodeBudget
-from psrl.workers.agent_loop.timeouts import resolve_agent_loop_timeouts
+from psrl.workers.agent_loop.timeouts import resolve_rollout_timeouts
 from tests.sandbox.test_docker_backend import FakeDockerEngine
 
 pytestmark = pytest.mark.cpu_test
@@ -55,20 +55,28 @@ async def test_grader_preparation_overlaps_rollout_without_allocating_a_grader(h
         clean_sandbox_spec=SandboxSpec(SandboxSource.image("grader")),
     )
 
-    async def run_harness(*args):
+    async def run_harness(*args, **kwargs):
         await asyncio.wait_for(started.wait(), timeout=1)
         assert not finish.is_set(), "Rollout must start before grader preparation finishes."
         assert len(manager._leases) == 1, "Speculative preparation must not reserve grader capacity."
         assert engine.config["Image"] == "rollout", "Only the rollout container should exist."
         finish.set()
-        return SimpleNamespace(exit_code=0, stderr_tail="")
+        return HarnessResult(exit_code=0)
 
-    harness = SimpleNamespace(prepare=AsyncMock(), run=run_harness, abort=AsyncMock())
+    harness = SimpleNamespace(
+        prepare=AsyncMock(),
+        run=run_harness,
+        abort=AsyncMock(),
+        # The lifecycle reads the CLI's own episode report from the harness.
+        episode_summary=lambda log_bytes: None,
+    )
     monkeypatch.setattr(harness_module, "create_harness", lambda *args: harness)
     loop = harness_module.HarnessAgentLoop.__new__(harness_module.HarnessAgentLoop)
     # Mirrors `AgentLoopBase.__init__`, which `__new__` skipped.
     loop.episode_budget = EpisodeBudget(None, starts_after_provisioning=True)
-    loop.timeouts = resolve_agent_loop_timeouts(None, None)
+    loop.timeouts = resolve_rollout_timeouts(None, None)
+    # Mirrors `SessionAgentLoop.__init__`: the session view this loop counts turns from.
+    loop.session_snapshot = None
     # The base class is stubbed out for this module, so borrow the real arming hook.
     loop.arm_episode_budget = loop.episode_budget.arm
     output = SimpleNamespace()
@@ -117,7 +125,9 @@ async def test_cancelled_session_setup_cancels_preparation_and_cleans_task(harne
     loop = harness_module.HarnessAgentLoop.__new__(harness_module.HarnessAgentLoop)
     # Mirrors `AgentLoopBase.__init__`, which `__new__` skipped.
     loop.episode_budget = EpisodeBudget(None, starts_after_provisioning=True)
-    loop.timeouts = resolve_agent_loop_timeouts(None, None)
+    loop.timeouts = resolve_rollout_timeouts(None, None)
+    # Mirrors `SessionAgentLoop.__init__`: the session view this loop counts turns from.
+    loop.session_snapshot = None
     # The base class is stubbed out for this module, so borrow the real arming hook.
     loop.arm_episode_budget = loop.episode_budget.arm
     task = HarnessTaskContext(state=None, prompt="fix", sandbox_spec=SandboxSpec(SandboxSource.image("rollout")))
@@ -138,4 +148,70 @@ async def test_cancelled_session_setup_cancels_preparation_and_cleans_task(harne
         await running
 
     assert cancelled.is_set(), "Task cancellation must cancel the preparation waiter."
-    loop.close_harness_task.assert_awaited_once_with(task)
+    loop.close_harness_task.assert_awaited_once()
+    cleaned = loop.close_harness_task.await_args.args[0]
+    assert cleaned.sandbox_spec.lifetime_timeout_s == loop.timeouts.sandbox_lifetime_s, (
+        "The task the loop cleans up carries the sandbox lifetime it derived."
+    )
+
+
+async def test_the_rollout_and_grader_specs_get_the_sandbox_lifetime(harness_module) -> None:
+    """A sandbox is reclaimed by a lifetime the caller states, so the loop must state it."""
+    from psrl.workers.agent_loop.timeouts import LIFETIME_SLACK_S
+
+    loop = harness_module.HarnessAgentLoop.__new__(harness_module.HarnessAgentLoop)
+    loop.timeouts = resolve_rollout_timeouts(3600, 900)
+    task = HarnessTaskContext(
+        state=None,
+        prompt="fix",
+        sandbox_spec=SandboxSpec(SandboxSource.image("rollout")),
+        clean_sandbox_spec=SandboxSpec(SandboxSource.image("grader")),
+    )
+
+    out = loop.apply_sandbox_lifetime(task)
+
+    expected = 3600 + 900 + LIFETIME_SLACK_S
+    assert out.sandbox_spec.lifetime_timeout_s == expected
+    assert out.clean_sandbox_spec.lifetime_timeout_s == expected
+    # The original is left alone; the loop works on the copy.
+    assert task.sandbox_spec.lifetime_timeout_s is None
+
+
+async def test_grading_operation_past_its_budget_releases_the_sandbox(harness_module) -> None:
+    """A grading phase past its budget must abort rather than hang.
+
+    The worker thread cannot be killed, so expiry closes the sandbox -- which is what
+    unblocks the thread -- and surfaces a ``TimeoutError`` for the task to report the
+    episode as ungraded.
+    """
+    import time
+
+    class SlowSandbox:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class Manager:
+        def __init__(self) -> None:
+            self.sandbox = SlowSandbox()
+
+        def sync(self, backend=None):  # noqa: ANN001
+            return self.sandbox
+
+    loop = harness_module.HarnessAgentLoop.__new__(harness_module.HarnessAgentLoop)
+    loop.sandbox_manager = Manager()
+
+    def operation(sync_sandbox):
+        # A blocked worker thread that only ends once the sandbox is closed under it.
+        deadline = time.monotonic() + 5
+        while not sync_sandbox.closed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return "late"
+
+    with pytest.raises(TimeoutError):
+        await loop._run_sync_sandbox_operation(None, operation, timeout_s=0.05)
+
+    assert loop.sandbox_manager.sandbox.closed, "Expiry must close the sandbox to unblock the worker."
+    await asyncio.sleep(0.1)  # let the detached thread drain before the loop closes

@@ -329,6 +329,23 @@ _OVERLONG_MARKERS = (
 # Must match SMG `PROMPT_OVERFLOW_ERROR_CODE` / servicer trailing metadata.
 _PROMPT_OVERFLOW_ERROR_CODE = "prompt_overflow"
 
+# A session's model-call budget, declared when the session is created by a harness
+# whose CLI takes no turn cap of its own. The session router holds the session to it,
+# because for such a CLI the router is the only component that sees each model call.
+SESSION_TURN_BUDGET_HEADER = "x-psrl-max-turns"
+
+# The code the session router returns once a declared budget is spent. It travels in
+# the error body rather than only in a header because the harness CLI echoes an error
+# body verbatim into its own output, which is where the framework reads an episode's
+# stop reason from.
+SESSION_TURN_BUDGET_ERROR_CODE = "session_turn_budget_exhausted"
+
+# The key under which the session router reports its own turn accounting inside a
+# session view. One key of its own rather than top-level fields, because the rest of the
+# view is the gateway's: a caller reading trajectories must not find two schemas in one
+# body.
+SESSION_TURN_ACCOUNTING_KEY = "psrl_turn_accounting"
+
 
 class PromptOverflowError(Exception):
     """vLLM / SMG rejected a prompt that exceeds max_model_len.

@@ -117,17 +117,25 @@ heterogeneous_rollout:
 # per node in `agent.node_ips`, and every agent loop worker places its sandboxes through
 # them. A node agent owns its node's Docker daemon and its capacity envelope, so `capacity.*`
 # is enforced where the containers actually run.
+#
+# The spans below are how fast this fleet notices a node or an owner has gone away. They are
+# the mechanism's own defaults, not episode deadlines: a sandbox's lifetime is stated on its
+# create, and a queue wait is answered by admission rather than by a deadline here.
 sandbox_placement:
 
   # Off uses the local backend each worker already runs. On, the fleet is `agent.node_ips`
   # when it names one and every alive node otherwise, which shares nodes with the trainer:
   # each node still admits against its own envelope, so name the fleet to keep sandboxes
   # off the GPU nodes.
+  # Off: p3b's control plane owns placement and admission across its node agents,
+  # so the rollout must not run a second scheduler over the same machines. On: the
+  # Python/Ray placement plane, for a deployment that drives the in-process
+  # backends without p3b.
   enabled: False
 
   # The backend the fleet runs, which is also the placement filter and the name a task asks
   # for. It has to be a name the nodes advertise.
-  backend_name: docker
+  backend_name: p3b
 
   # A node that has missed this long is drained rather than trusted.
   node_ttl_s: 120.0

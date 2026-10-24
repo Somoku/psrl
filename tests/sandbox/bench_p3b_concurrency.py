@@ -1,137 +1,83 @@
-"""Concurrency stress test for the p3b sandbox service.
+"""Concurrency benchmark: p3b service vs Python sandbox theoretical throughput.
 
-Creates N sandboxes concurrently, runs a command in each, measures total time
-and per-sandbox latency, and compares throughput against the Python sandbox
-theoretical capacity on the same node.
-
-Usage:
-    SANDBOXD_ENDPOINT=unix:///run/sandboxd.sock python bench_p3b_concurrency.py
+Measures create+exec+release latency under increasing concurrency levels,
+then compares to the Python sandbox's per-worker envelope ceiling.
 """
-from __future__ import annotations
-
 import asyncio
 import os
 import statistics
 import sys
 import time
 
-from sandboxd import SandboxClient, SandboxSpec, Source, Resources
+from sandboxd import Resources, SandboxClient, SandboxSpec, Source
 
-ENDPOINT = os.environ.get("SANDBOXD_ENDPOINT", "unix:///run/sandboxd.sock")
-# Use 256 MB per sandbox so we can fit many concurrently; PSRL default is 2048 MB.
-# We test both so the comparison is fair.
-SANDBOX_MEMORY_MB = int(os.environ.get("SANDBOX_MEMORY_MB", "256"))
-RESOURCE_CLASS = os.environ.get("RESOURCE_CLASS", "rollout")
+# The endpoint is a deployment argument, never a repository setting: a benchmark
+# that only runs against a local socket cannot measure a fleet.
+ENDPOINT = os.environ.get("PSRL_BENCH_ENDPOINT", "unix:///run/sandboxd.sock")
+if len(sys.argv) > 1:
+    ENDPOINT = sys.argv[1]
+IMAGE = "alpine:latest"
+MEM_MB = 256   # 256 MB per sandbox — same as psrl live test default
+CONCURRENCY_LEVELS = [8, 16, 32, 64]
 
 
-async def one_sandbox(client: SandboxClient, idx: int, memory_mb: int) -> tuple[int, float, float, str]:
-    """Create, exec one command, release. Returns (idx, create_s, exec_s, output)."""
+async def one_sandbox(client: SandboxClient, idx: int) -> float:
+    """Create, exec, release one sandbox. Return wall-clock seconds for create."""
+    t0 = time.perf_counter()
     spec = SandboxSpec(
-        source=Source.image("alpine:latest"),
-        resources=Resources(memory_mb=memory_mb, cpu_count=1),
-        resource_class=RESOURCE_CLASS,
+        source=Source.image(IMAGE),
+        resources=Resources(memory_mb=MEM_MB, cpu_count=1),
+        resource_class="rollout",
     )
-    t0 = time.monotonic()
     async with await client.create(spec) as sb:
-        create_s = time.monotonic() - t0
-        t1 = time.monotonic()
-        result = await sb.exec(f"echo hello-from-{idx}")
-        exec_s = time.monotonic() - t1
-    return idx, create_s, exec_s, result.stdout.strip()
+        create_ms = (time.perf_counter() - t0) * 1000
+        result = await sb.exec("echo bench-ok")
+        assert result.exit_code == 0 and "bench-ok" in result.stdout
+    return create_ms
 
 
-async def burst(n: int, memory_mb: int) -> dict:
-    """Launch N sandboxes concurrently and collect results."""
-    async with SandboxClient(ENDPOINT) as client:
-        t0 = time.monotonic()
-        tasks = [asyncio.create_task(one_sandbox(client, i, memory_mb)) for i in range(n)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        total_s = time.monotonic() - t0
+async def run_level(n: int) -> dict:
+    """Create n sandboxes concurrently, each running one command."""
+    client = SandboxClient(ENDPOINT)
+    t_wall = time.perf_counter()
+    times = await asyncio.gather(*[one_sandbox(client, i) for i in range(n)], return_exceptions=True)
+    elapsed = time.perf_counter() - t_wall
+    await client.close()
 
-    errors = [r for r in results if isinstance(r, Exception)]
-    ok = [r for r in results if not isinstance(r, Exception)]
-    create_times = [r[1] for r in ok]
-    exec_times   = [r[2] for r in ok]
-
+    ok = [t for t in times if isinstance(t, float)]
+    errs = [t for t in times if not isinstance(t, float)]
     return {
         "n": n,
-        "memory_mb": memory_mb,
-        "succeeded": len(ok),
-        "failed": len(errors),
-        "errors": [str(e) for e in errors[:3]],
-        "total_wall_s": round(total_s, 3),
-        "throughput_per_s": round(len(ok) / total_s, 2),
-        "create_p50_ms": round(statistics.median(create_times) * 1000, 1) if create_times else None,
-        "create_p95_ms": round(sorted(create_times)[int(len(create_times)*0.95)] * 1000, 1) if create_times else None,
-        "create_max_ms": round(max(create_times) * 1000, 1) if create_times else None,
-        "exec_p50_ms":   round(statistics.median(exec_times) * 1000, 1) if exec_times else None,
+        "ok": len(ok),
+        "errs": len(errs),
+        "errors": [repr(e) for e in errs[:3]],
+        "elapsed_s": round(elapsed, 2),
+        "throughput": round(len(ok) / elapsed, 2) if elapsed > 0 else 0,
+        "p50_ms": round(statistics.median(ok), 0) if ok else 0,
+        "p95_ms": round(sorted(ok)[int(len(ok) * 0.95)] if len(ok) > 1 else ok[0], 0) if ok else 0,
     }
 
 
-def python_sandbox_capacity(node_mem_mb: int, utilization: float, guaranteed_share: float, per_sb_mb: int) -> int:
-    """
-    Python sandbox per-worker capacity estimate.
-    Each worker has its own node envelope; the rollout class gets guaranteed_share of it.
-    """
-    usable = node_mem_mb * utilization * guaranteed_share
-    return int(usable / per_sb_mb)
-
-
 async def main():
-    node_mem_mb = 2265 * 1024   # 2265 GB
+    # Python sandbox theoretical capacity on this node (2265 GB, util=0.8, rollout=0.45)
+    node_mem_mb = 2265 * 1024
+    py_capacity = int(node_mem_mb * 0.8 * 0.45 / MEM_MB)
+    print(f"\nPython sandbox per-worker capacity at {MEM_MB} MB/sandbox: {py_capacity} sandboxes")
+    print(f"p3b fleet capacity at {MEM_MB} MB/sandbox: {int(960_000 * 0.45 / MEM_MB)} sandboxes (from deploy.json)\n")
+    print(f"{'Concurrency':>12} {'OK/Total':>10} {'Elapsed':>9} {'Throughput':>12} {'p50 ms':>9} {'p95 ms':>9}")
+    print("-" * 68)
 
-    print(f"\n=== p3b Concurrency Benchmark ===")
-    print(f"Endpoint:      {ENDPOINT}")
-    print(f"Image:         alpine:latest")
-    print(f"Resource class: {RESOURCE_CLASS}")
-    print()
+    for n in CONCURRENCY_LEVELS:
+        result = await run_level(n)
+        print(f"{result['n']:>12} {result['ok']:>4}/{result['n']:<5} "
+              f"{result['elapsed_s']:>8.1f}s {result['throughput']:>11.2f}/s "
+              f"{result['p50_ms']:>8.0f}ms {result['p95_ms']:>8.0f}ms")
+        for error in result["errors"]:
+            print(f"    error: {error}")
 
-    # Python sandbox theoretical capacity for comparison
-    py_cap_256  = python_sandbox_capacity(node_mem_mb, 0.8, 0.45, 256)
-    py_cap_2048 = python_sandbox_capacity(node_mem_mb, 0.8, 0.45, 2048)
-    print(f"Python sandbox theoretical capacity (per worker, same node):")
-    print(f"  @256 MB/sandbox:  {py_cap_256} sandboxes")
-    print(f"  @2048 MB/sandbox: {py_cap_2048} sandboxes")
-    print()
-
-    concurrencies = [int(x) for x in os.environ.get("CONCURRENCIES", "8,16,32,64").split(",")]
-
-    all_results = []
-    for n in concurrencies:
-        mem = SANDBOX_MEMORY_MB
-        print(f"--- {n} concurrent sandboxes @ {mem} MB each ---", flush=True)
-        r = await burst(n, mem)
-        all_results.append(r)
-        print(f"  succeeded:      {r['succeeded']}/{r['n']}")
-        print(f"  total wall:     {r['total_wall_s']}s")
-        print(f"  throughput:     {r['throughput_per_s']} sandboxes/s")
-        print(f"  create p50/p95/max: {r['create_p50_ms']} / {r['create_p95_ms']} / {r['create_max_ms']} ms")
-        print(f"  exec   p50:     {r['exec_p50_ms']} ms")
-        if r['failed']:
-            print(f"  ERRORS ({r['failed']}):  {r['errors']}")
-        print()
-
-    print("=== Summary ===")
-    print(f"{'N':>6}  {'mem':>6}  {'ok':>5}  {'wall_s':>7}  {'tput/s':>7}  {'cr_p50':>7}  {'cr_p95':>7}")
-    for r in all_results:
-        print(f"{r['n']:>6}  {r['memory_mb']:>6}  {r['succeeded']:>5}  "
-              f"{r['total_wall_s']:>7.2f}  {r['throughput_per_s']:>7.2f}  "
-              f"{r['create_p50_ms']:>7}  {r['create_p95_ms']:>7}")
-
-    print()
-    best = max(all_results, key=lambda r: r['succeeded'])
-    print(f"p3b fleet admission capacity (fleet-wide ledger, single service):")
-    print(f"  Max concurrent succeeded: {best['succeeded']} @ {best['memory_mb']} MB each")
-    fleet_cap_256  = python_sandbox_capacity(node_mem_mb, 0.8, 0.45, 256) * 1  # per-worker only
-    print(f"  vs Python sandbox per-worker capacity @ 256 MB: {py_cap_256}")
-    print(f"  vs Python sandbox per-worker capacity @ 2048 MB: {py_cap_2048}")
-    print()
-    print("Key difference: p3b uses a single fleet ledger shared across ALL workers.")
-    print("Python sandbox gives each worker its own node envelope independently.")
-    print("With M workers, Python sandbox total capacity = M × per-worker capacity,")
-    print("but each worker sees only its own share and cannot borrow across workers.")
-    print("p3b admission is global: the whole fleet quota is available to any worker.")
+    print("\nNOTE: Create latency dominated by Docker container start (~1s).")
+    print("p3b throughput advantage is in fleet-wide quota accounting across workers,")
+    print("not in single-node throughput vs Python sandbox on the same node.")
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())

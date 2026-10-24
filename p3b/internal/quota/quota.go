@@ -220,6 +220,23 @@ func (l *Ledger) headroomLocked(class string) Amount {
 	}
 }
 
+// CanEverAdmit reports whether this class could hold an amount at all, ignoring
+// what is running now.
+//
+// A request larger than the class's whole share cannot be admitted by waiting:
+// the share's ceiling is something no release can raise. Waiting on it is a
+// livelock with a configuration cause, so a caller refuses it definitively
+// instead of queueing forever.
+func (l *Ledger) CanEverAdmit(class string, amount Amount) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	share, declared := l.cfg.Classes[class]
+	if !declared || share.Max == 0 {
+		return amount.FitsIn(l.cfg.Total)
+	}
+	return amount.FitsIn(l.cfg.Total.Scale(share.Max))
+}
+
 // reservedForOthersLocked returns capacity held out of this class's reach.
 //
 // Only a class with a request *queued* reserves anything. Reserving against a
@@ -304,6 +321,30 @@ func (l *Ledger) Release(id string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.releaseLocked(id)
+}
+
+// Reprice changes what an existing grant is charged.
+//
+// A grant is charged what its class cost when it was admitted, and a class's cost is a
+// measurement that keeps moving. Without this the fleet's ledger and the nodes' ledgers
+// drift apart: the nodes reprice their reservations as they measure, while the fleet
+// keeps granting against the admission-time number. The fleet then promises capacity no
+// node will honour -- it admits, the node refuses, the caller sees exhaustion rather than
+// waiting -- and it keeps doing so until the sandboxes it charged too little for finish.
+//
+// Repricing cannot fail. The grant exists, so the memory is spent whether or not the
+// ledger has room for the correction; refusing to record it would understate the fleet
+// and repeat the mistake on the next request. It may drive headroom to zero, which is the
+// honest answer.
+func (l *Ledger) Reprice(id string, amount Amount) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	g, ok := l.grants[id]
+	if !ok {
+		return
+	}
+	l.used[g.class] = l.used[g.class].Sub(g.amount).Add(amount)
+	g.amount = amount
 }
 
 func (l *Ledger) releaseLocked(id string) {

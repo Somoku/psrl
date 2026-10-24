@@ -303,15 +303,24 @@ class TestTheProgressThreadIsOnWhenTrainRanksServeReads:
     def test_direct_supply_forces_the_thread_on(self):
         source = _source("psrl/workers/train/engine_train_worker.py")
 
-        assert "serves_direct_reads or not self.psrl_config.checkpoint.use_dcp_save" in source
+        assert (
+            "enable_prog_thread = serves_direct_reads or "
+            "self.psrl_config.checkpoint.use_dcp_save"
+        ) in source
 
-    def test_the_conflicting_combination_is_refused(self):
-        """DCP wants it off, direct supply wants it on; picking silently hides the gap."""
+    def test_dcp_save_no_longer_turns_the_thread_off(self):
+        """The old refusal is gone because the nvrx writer is spawn-based.
+
+        A forked writer inherited the parent's UCX / NIXL context, so saving forced the
+        progress thread off. The nvrx persistent worker is spawned and shares neither, so
+        DCP save and direct reads can both hold the thread on.
+        """
         source = _source("psrl/utils/config.py")
         at = source.index('if config.psrl.ps_mode == "nixl_direct":')
         block = source[at : at + 3000]
 
-        assert "use_dcp_save" in block
+        assert "assert not config.psrl.checkpoint.use_dcp_save" not in block
+        assert "spawn" in block
 
     def test_the_rule_lives_where_the_whole_config_is_visible(self):
         """The worker sees only its own actor config, so it cannot ask about saving.
@@ -325,17 +334,16 @@ class TestTheProgressThreadIsOnWhenTrainRanksServeReads:
 
         assert "self.config.trainer.save_freq" not in worker
 
-    def test_saving_works_through_the_per_rank_manager(self):
+    def test_saving_works_with_dcp_under_direct_supply(self):
         """Direct supply must not force `save_freq=-1`: 65 of 75 example scripts save.
 
-        `use_dcp_save=False` is mandatory here (the progress thread has to stay up), so
-        without a non-dist saver every saving script would be unrunnable under direct
-        supply -- and the failure would land at the first `save_freq` boundary, hours in.
+        DCP save is compatible with direct reads now; the progress thread stays on, and
+        the nvrx writer does not inherit the parent's UCX / NIXL context.
         """
         worker = _source("psrl/workers/train/engine_train_worker.py")
 
-        assert "_maybe_use_per_rank_checkpointing" in worker
-        assert "PSRL_PerRankMegatronCheckpointManager" in worker
+        assert "self.psrl_config.checkpoint.use_dcp_save" in worker
+        assert "serves_direct_reads" in worker
 
     def test_the_resharding_cost_is_written_down(self):
         """Per-rank files cannot be resumed at a different world size; that must be said."""
@@ -344,11 +352,7 @@ class TestTheProgressThreadIsOnWhenTrainRanksServeReads:
         assert "resharded" in manager or "world size" in manager
 
     def test_the_example_script_sets_a_runnable_combination(self):
-        """`use_dcp_save=False` is mandatory under direct supply, so the script must set it.
-
-        `save_freq` is deliberately *not* pinned: per-rank checkpointing makes saving
-        work, and the script leaves it overridable so a run can exercise that path.
-        """
+        """The direct-supply script pins DCP off; the runnable value is still overridable."""
         script = _source("examples/grpo_trainer/qwen3_8b_megatron_direct.sh")
 
         assert "psrl.ps_mode=nixl_direct" in script

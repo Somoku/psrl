@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -23,9 +24,15 @@ _REPO_ROOT = Path(__file__).parents[2]
 
 # --- Shell helpers (run real git in a temp repo) ---
 
+# A host that exports BASH_ENV makes every non-interactive shell source that file
+# before the command, so profile chatter would contaminate the output we parse.
+_SHELL_ENV = {**os.environ, "BASH_ENV": os.devnull}
+
 
 def _git(cwd: Path, command: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["bash", "-lc", command], cwd=cwd, capture_output=True, text=True)
+    return subprocess.run(
+        ["bash", "-c", command], cwd=cwd, capture_output=True, text=True, env=_SHELL_ENV
+    )
 
 
 def _make_repo(tmp_path: Path, *, leaked_branch: bool, remote: bool) -> Path:
@@ -203,6 +210,7 @@ def _run_shell_function(body: str, name: str, argument: str) -> str:
         ["bash", "-c", f'{body}\n{name} "$1"', "--", argument],
         capture_output=True,
         text=True,
+        env=_SHELL_ENV,
     )
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()

@@ -23,7 +23,7 @@ var _ = (*node.Admission)(nil)
 // fakeNodeServer is a minimal Node whose Admit always admits and CreateOn
 // always succeeds. It is enough to prove the wire protocol without a real runtime.
 type fakeNodeServer struct {
-	nodeID string
+	nodeID      string
 	admitCalls  int
 	createCalls int
 	execCalls   int
@@ -152,7 +152,7 @@ func fakeDispatch(req request) any {
 // reply parsed, leaseID and admitted flag returned correctly.
 func TestRemoteNodeClientAdmit(t *testing.T) {
 	addr := startFakeJSONNodeServer(t)
-	client := NewRemoteNodeClient(addr, 5*time.Second)
+	client := NewRemoteNodeClient(addr, 5*time.Second, 5*time.Second)
 
 	leaseID, gpus, refusal, err := client.admit(context.Background(), backend.Spec{ResourceClass: "default"})
 	if err != nil {
@@ -169,7 +169,7 @@ func TestRemoteNodeClientAdmit(t *testing.T) {
 
 func TestRemoteNodeClientCreateOn(t *testing.T) {
 	addr := startFakeJSONNodeServer(t)
-	client := NewRemoteNodeClient(addr, 5*time.Second)
+	client := NewRemoteNodeClient(addr, 5*time.Second, 5*time.Second)
 
 	created, err := client.createOn(context.Background(), "lease-1", "docker", backend.Spec{}, "")
 	if err != nil {
@@ -182,7 +182,7 @@ func TestRemoteNodeClientCreateOn(t *testing.T) {
 
 func TestRemoteNodeClientReleaseOn(t *testing.T) {
 	addr := startFakeJSONNodeServer(t)
-	client := NewRemoteNodeClient(addr, 5*time.Second)
+	client := NewRemoteNodeClient(addr, 5*time.Second, 5*time.Second)
 	handle := backend.Handle{Backend: "docker", SandboxID: "sb-1", NodeID: "n1"}
 	if err := client.releaseOn(context.Background(), handle); err != nil {
 		t.Fatalf("release_on: %v", err)
@@ -191,7 +191,7 @@ func TestRemoteNodeClientReleaseOn(t *testing.T) {
 
 func TestRemoteNodeClientStatusOn(t *testing.T) {
 	addr := startFakeJSONNodeServer(t)
-	client := NewRemoteNodeClient(addr, 5*time.Second)
+	client := NewRemoteNodeClient(addr, 5*time.Second, 5*time.Second)
 	handle := backend.Handle{Backend: "docker", SandboxID: "sb-1", NodeID: "n1"}
 	state, err := client.statusOn(context.Background(), handle)
 	if err != nil {
@@ -204,20 +204,20 @@ func TestRemoteNodeClientStatusOn(t *testing.T) {
 
 func TestRemoteNodeClientExecOn(t *testing.T) {
 	addr := startFakeJSONNodeServer(t)
-	client := NewRemoteNodeClient(addr, 5*time.Second)
+	client := NewRemoteNodeClient(addr, 5*time.Second, 5*time.Second)
 	handle := backend.Handle{Backend: "docker", SandboxID: "sb-1", NodeID: "n1"}
-	code, output, err := client.execOn(context.Background(), handle, "echo hello", "", nil)
+	result, err := client.execOn(context.Background(), handle, "echo hello", "", nil)
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
-	if code != 0 || output != "hello" {
-		t.Errorf("exec: got code=%d output=%q, want 0/hello", code, output)
+	if result.ExitCode != 0 || result.Stdout != "hello" {
+		t.Errorf("exec: got code=%d output=%q, want 0/hello", result.ExitCode, result.Stdout)
 	}
 }
 
 func TestRemoteNodeClientReadBytesOn(t *testing.T) {
 	addr := startFakeJSONNodeServer(t)
-	client := NewRemoteNodeClient(addr, 5*time.Second)
+	client := NewRemoteNodeClient(addr, 5*time.Second, 5*time.Second)
 	handle := backend.Handle{Backend: "docker", SandboxID: "sb-1", NodeID: "n1"}
 	data, err := client.readBytesOn(context.Background(), handle, "/tmp/f")
 	if err != nil {
@@ -230,7 +230,7 @@ func TestRemoteNodeClientReadBytesOn(t *testing.T) {
 
 func TestRemoteNodeClientReport(t *testing.T) {
 	addr := startFakeJSONNodeServer(t)
-	client := NewRemoteNodeClient(addr, 5*time.Second)
+	client := NewRemoteNodeClient(addr, 5*time.Second, 5*time.Second)
 	wire, err := client.report(context.Background())
 	if err != nil {
 		t.Fatalf("report: %v", err)
@@ -253,8 +253,8 @@ func TestFleetNodeClientRoutesToCorrectNode(t *testing.T) {
 	addr1 := startFakeJSONNodeServer(t)
 	addr2 := startFakeJSONNodeServer(t)
 	fleet := NewFleetNodeClient(map[string]*RemoteNodeClient{
-		"n1": NewRemoteNodeClient(addr1, 5*time.Second),
-		"n2": NewRemoteNodeClient(addr2, 5*time.Second),
+		"n1": NewRemoteNodeClient(addr1, 5*time.Second, 5*time.Second),
+		"n2": NewRemoteNodeClient(addr2, 5*time.Second, 5*time.Second),
 	})
 
 	// n2's sandbox — must reach n2
@@ -270,7 +270,7 @@ func TestFleetNodeClientRoutesToCorrectNode(t *testing.T) {
 
 func TestFleetNodeClientRefusesUnknownNode(t *testing.T) {
 	fleet := NewFleetNodeClient(map[string]*RemoteNodeClient{
-		"n1": NewRemoteNodeClient("127.0.0.1:1", 1*time.Second),
+		"n1": NewRemoteNodeClient("127.0.0.1:1", 1*time.Second, 1*time.Second),
 	})
 	handle := backend.Handle{Backend: "docker", SandboxID: "sb-1", NodeID: "nowhere"}
 	_, err := fleet.StatusOn(context.Background(), handle)
@@ -281,9 +281,9 @@ func TestFleetNodeClientRefusesUnknownNode(t *testing.T) {
 
 func TestFleetNodeClientNodesAreSorted(t *testing.T) {
 	fleet := NewFleetNodeClient(map[string]*RemoteNodeClient{
-		"n3": NewRemoteNodeClient("127.0.0.1:1", 1*time.Second),
-		"n1": NewRemoteNodeClient("127.0.0.1:2", 1*time.Second),
-		"n2": NewRemoteNodeClient("127.0.0.1:3", 1*time.Second),
+		"n3": NewRemoteNodeClient("127.0.0.1:1", 1*time.Second, 1*time.Second),
+		"n1": NewRemoteNodeClient("127.0.0.1:2", 1*time.Second, 1*time.Second),
+		"n2": NewRemoteNodeClient("127.0.0.1:3", 1*time.Second, 1*time.Second),
 	})
 	ids := fleet.order
 	if !sort.StringsAreSorted(ids) {
@@ -296,13 +296,13 @@ func TestFleetNodeClientNodesAreSorted(t *testing.T) {
 func TestPollFleetPublishesNodeViews(t *testing.T) {
 	addr := startFakeJSONNodeServer(t)
 	fleet := NewFleetNodeClient(map[string]*RemoteNodeClient{
-		"n1": NewRemoteNodeClient(addr, 5*time.Second),
+		"n1": NewRemoteNodeClient(addr, 5*time.Second, 5*time.Second),
 	})
 
 	m := monitor.New(60 * time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go fleet.PollFleet(ctx, m, 20*time.Millisecond)
+	go fleet.PollFleet(ctx, m, 20*time.Millisecond, nil)
 
 	deadline := time.Now().Add(2 * time.Second)
 	var views []placement.NodeView
@@ -386,3 +386,39 @@ func TestNodeViewWireRoundtrip(t *testing.T) {
 // Stub types so the LocalNodeClient nil-check compiles without needing real
 // node.Admission / node.Lifecycle plumbing.
 var _ = (*node.Admission)(nil)
+
+// A node that accepts the connection and then never answers must not hold the
+// control plane. Dialing is not the only step that can stall, so the whole
+// exchange is bounded rather than only the connect.
+func TestANodePlaneCallTimesOutAgainstASilentPeer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	release := make(chan struct{})
+	defer close(release)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-release
+	}()
+
+	client := NewRemoteNodeClient(ln.Addr().String(), 200*time.Millisecond, 200*time.Millisecond)
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.report(context.Background())
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a silent peer must not read as a successful report")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call never returned, so a node-plane exchange is not bounded")
+	}
+}

@@ -510,6 +510,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git -C ${PSRL_HOME} checkout ${PSRL_COMMIT} && \
     cd ${PSRL_HOME} && \
     uv pip install --no-build-isolation -e . && \
+    uv pip install --no-build-isolation -e p3b/sdk && \
+    make -C p3b install && \
     python -c \
         "from importlib.metadata import entry_points, version; import vllm_patches; \
         version('vllm-psrl-patches'); assert any( \
@@ -524,7 +526,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         "import torch; expected='${expected_cuda}'; assert torch.version.cuda == expected, \
         f'Expected PyTorch CUDA {expected}, got {torch.version.cuda}.'" && \
     python -c "import psrl, smg.router, torch, transfer_queue, verl, vllm, vllm_patches, deep_gemm" && \
-    python -c "import lmcache, nixl, torch_memory_saver" && \
+    python -c "import lmcache, nixl, sandboxd, torch_memory_saver" && \
     python -c "from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue; print('nvrx OK')"
 
 RUN --mount=type=cache,target=/root/.cache/uv \

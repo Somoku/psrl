@@ -159,6 +159,13 @@ The standalone service shape: a cluster control plane with a fleet monitor, one 
 per node owning lifecycle and reclamation, and a Python SDK as the only caller surface.
 :::
 
+:::{grid-item-card} {octicon}`zap;1.5em` Sandbox Optimization
+:link: sandbox_optimization
+:link-type: doc
+
+Measured sandbox cost, capacity envelopes, elastic admission and warm pools.
+:::
+
 :::{grid-item-card} {octicon}`cpu;1.5em` Quantized Weight Transport
 :link: quantized_weight_transport
 :link-type: doc
@@ -208,6 +215,7 @@ sandbox_agentenv
 sandbox_opensandbox
 sandbox_snapshot_store
 sandbox_service
+sandbox_optimization
 quantized_weight_transport
 score_centering
 score_centering_zh

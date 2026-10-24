@@ -2,12 +2,30 @@
 Utility helpers for working with TransferQueue's KVBatchMeta.
 """
 
+import logging
 from collections import Counter
+from collections.abc import Mapping
 from enum import Enum
 from typing import Any
 
+import torch
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
+
+psrl_logger = logging.getLogger(__file__)
+
+# Fields indexed by a position within the trajectory's response. They describe the same
+# tokens from different angles, so a row's length is one fact they must all agree on.
+RESPONSE_ALIGNED_FIELDS = (
+    "response_mask",
+    "loss_mask",
+    "rm_scores",
+    "rollout_log_probs",
+    "old_log_probs",
+    "entropy",
+    "ref_log_prob",
+    "values",
+)
 
 
 class PayloadState(Enum):
@@ -32,6 +50,124 @@ def request_payload_keys(request_id: int, n_trajectory: int) -> list[str]:
     if n_trajectory == 1:
         return [str(request_id)]
     return [f"{request_id}_{i}" for i in range(n_trajectory)]
+
+
+def response_lengths(field: torch.Tensor | list | tuple | None) -> torch.Tensor | None:
+    """
+    Return each row's token count for a response-aligned field, or None when unreadable.
+
+    A response-aligned field is stored ragged, so a row's length is the gap between its
+    offsets. A field that arrives as an already padded rectangle cannot report a per-row
+    length. Its width is a batch maximum, and a worker output padded to `responses` is
+    legitimately wider than the mask, so such a field returns None instead of a guess.
+
+    Args:
+        field (torch.Tensor | list | tuple | None): A batch field read from the transfer queue.
+
+    Returns:
+        torch.Tensor | None: Per-row lengths, or None when the field cannot supply them.
+    """
+    if field is None:
+        return None
+    if hasattr(field, "offsets"):
+        return field.offsets().diff()
+    if isinstance(field, torch.Tensor):
+        if field.dim() == 1:
+            return torch.tensor([field.numel()])
+        return None
+    if isinstance(field, (list, tuple)):
+        return torch.tensor([int(element.numel()) for element in field])
+    return None
+
+
+def _uniform_width(field: Any) -> int | None:
+    """Return a field's width when it arrives as one padded rectangle, else None."""
+    if isinstance(field, torch.Tensor) and not hasattr(field, "offsets") and field.dim() == 2:
+        return int(field.shape[1])
+    return None
+
+
+def assert_response_aligned_lengths(
+    fields: Mapping[str, Any],
+    *,
+    reference: str = "responses",
+    stage: str,
+) -> torch.Tensor | None:
+    """
+    Fail unless every response-aligned field has the same per-row length as `reference`.
+
+    A batch pads each field on its own (`TensorDict.to_padded_tensor` pads a field to that
+    field's own maximum), so a length that one producer gets wrong stays invisible until it
+    changes a tensor's width far downstream. Comparing the whole set here makes such a
+    producer fail at the boundary that crossed it, naming the field.
+
+    A field that shares one width across the batch cannot report per-row lengths, so only its
+    width is checked against the longest response. A worker output padded to `responses` is
+    legitimately wider than the mask and passes.
+
+    Args:
+        fields (Mapping[str, Any]): Batch fields by name, as read from the transfer queue.
+            A field that is absent is skipped.
+        reference (str): The field carrying the authoritative response length.
+        stage (str): The pipeline stage, for the log line and the error message.
+
+    Returns:
+        torch.Tensor | None: The reference's per-row lengths, or None when it is unreadable.
+
+    Raises:
+        AssertionError: If the reference is unreadable, a field has a different row count,
+            a padded field is narrower than the longest response, or a field disagrees with
+            the reference on per-row length.
+    """
+    reference_lengths = response_lengths(fields.get(reference))
+    if reference_lengths is None:
+        raise AssertionError(
+            f"[length-contract] stage={stage}: reference field {reference!r} is missing or its per-row "
+            f"length cannot be read, so the contract cannot be checked. Fields: {sorted(fields)}."
+        )
+    if reference_lengths.numel() == 0:
+        return reference_lengths
+    longest = int(reference_lengths.max())
+
+    offenders: dict[str, list[tuple[int, int, int]]] = {}
+    truncated: dict[str, tuple[int, int]] = {}
+    for name, field in fields.items():
+        if name == reference:
+            continue
+        lengths = response_lengths(field)
+        if lengths is None:
+            width = _uniform_width(field)
+            if width is not None and width < longest:
+                truncated[name] = (width, longest)
+            continue
+        if lengths.numel() != reference_lengths.numel():
+            raise AssertionError(
+                f"[length-contract] stage={stage}: field {name!r} has {lengths.numel()} rows but "
+                f"{reference!r} has {reference_lengths.numel()}."
+            )
+        divergent = (lengths != reference_lengths).nonzero().flatten().tolist()
+        if divergent:
+            offenders[name] = [(int(row), int(reference_lengths[row]), int(lengths[row])) for row in divergent[:5]]
+
+    psrl_logger.debug(
+        f"[length-contract] stage={stage}: rows={reference_lengths.numel()} reference={reference} "
+        f"min={int(reference_lengths.min())} max={longest} offenders={sorted(offenders)} "
+        f"truncated={sorted(truncated)}."
+    )
+    if truncated:
+        raise AssertionError(
+            f"[length-contract] stage={stage}: {len(truncated)} field(s) are narrower than the longest "
+            f"response, each value being (field width, longest {reference}): {truncated}. Such a field was "
+            "built from a length other than the response's own, so at least one row's reward or mask "
+            "cannot be aligned."
+        )
+    if offenders:
+        raise AssertionError(
+            f"[length-contract] stage={stage}: {len(offenders)} field(s) disagree with {reference!r} on "
+            f"per-row length, each value being (row, {reference}, field): {offenders}. Every response-aligned "
+            "field is indexed by position within the response, so they must share one length per row."
+        )
+    return reference_lengths
 
 
 def _require_terminal_state(state: PayloadState) -> None:

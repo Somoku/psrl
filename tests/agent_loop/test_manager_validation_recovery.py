@@ -23,17 +23,9 @@ import pytest
 from omegaconf import OmegaConf
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 from psrl.workers.agent_loop.manager import BoundedIdSet, PSRL_AgentLoopManager
-from psrl.workers.agent_loop.timeouts import AgentLoopTimeouts
 from verl.utils import tensordict_utils as tu
 
 pytestmark = pytest.mark.cpu_test
-
-# The capacity diagnosis names the admission deadline, so the stub ladder has to carry one.
-_STUB_TIMEOUTS = AgentLoopTimeouts(
-    episode_timeout_s=7200.0,
-    setup_allowance_s=900.0,
-    admission_timeout_s=1800.0,
-)
 
 _BORROWED = (
     "_buffer_wait_progress",
@@ -49,6 +41,10 @@ _BORROWED = (
     "_retry_validation_group",
     "_forget_validation_group",
     "_retain_val_round_prompts",
+    "_refill_member",
+    "_member_prompt_row",
+    "_active_rollout_n",
+    "_retain_train_round_prompts",
     "set_val_buffer_size",
     "_refill_breaker_error",
     "_raise_if_refill_breaker_tripped",
@@ -92,10 +88,12 @@ class FakeManager:
         self.val_retry_limit = val_retry_limit
         self._val_attempts: dict[int, int] = {}
         self._val_round_prompts: dict = {}
+        self._train_round_prompts: dict = {}
+        self._train_member_attempts: dict[int, int] = {}
+        self.train_member_retry_limit = 3
         self.curr_ps_version_tag = 0
         self.refill_failure_threshold = refill_threshold
         self.capacity_failure_threshold = capacity_threshold
-        self.timeouts = _STUB_TIMEOUTS
         self.buffer_wait_log_interval_s = 0.05
 
         self._failed_train_group_ids: BoundedIdSet = BoundedIdSet(1024)
@@ -135,6 +133,7 @@ class FakeManager:
         self.ps_manager_handle.ensure_train_buffer_exists.remote = AsyncMock(return_value=None)
         self.ps_manager_handle.readmit_requests.remote = AsyncMock(return_value=None)
         self.ps_manager_handle.update_request_status.remote = AsyncMock(return_value=True)
+        self.ps_manager_handle.is_request_aborted.remote = AsyncMock(return_value=True)
 
         # A refill that dispatches nothing trips the breaker, which would mask the
         # assertions, so every test refills successfully unless it says otherwise.
@@ -148,9 +147,10 @@ class FakeManager:
         """Stand in for the TQ payload purge, which needs a live TransferQueue."""
         return self.rollout_request_tracker.pop(parent_id, [])
 
-    async def _inner_dispatch_data(self, data, is_validate: bool = False):
+    async def _inner_dispatch_data(self, data, is_validate: bool = False, *, retain_prompts: bool = True):
         """Record a dispatch instead of fanning out to Ray workers."""
         self.dispatched.append((tu.get(data, "uid"), is_validate))
+        return len(data)
 
     async def _flush_ready_buffer(self, buffer_id: int, is_validate: bool) -> bool:
         """Record a flush instead of assembling a batch from a live TransferQueue."""
@@ -199,11 +199,6 @@ class TestNothingExpiresOnACoordinationTimer:
             assert not hasattr(PSRL_AgentLoopManager, attribute), (
                 f"{attribute!r} reintroduces a coordination-side deadline; the rollout owns them."
             )
-
-    def test_the_ladder_carries_no_deadline_shorter_than_the_episode(self):
-        for field in ("entry_stall_timeout_s", "heartbeat_interval_s"):
-            assert not hasattr(_STUB_TIMEOUTS, field)
-        assert _STUB_TIMEOUTS.child_deadline_s > _STUB_TIMEOUTS.episode_timeout_s
 
 
 class TestValidationRecovery:

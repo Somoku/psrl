@@ -181,7 +181,6 @@ class RewardLoopWorker:
     async def _run_reward_loop(self, request: TensorDict):
         result = None
         error = None
-        response_len = 1
 
         uid = tu.get(request, "uid")[0]
         request_keys = tu.get(request, "request_keys")[0]
@@ -190,14 +189,11 @@ class RewardLoopWorker:
 
         try:
             reward_data = await asyncio.get_event_loop().run_in_executor(None, self.pre_process, request)
-            response_len = reward_data["responses"].shape[-1]
-            if response_len == 0:
+            if reward_data["responses"].shape[-1] == 0:
                 psrl_logger.error(
-                    "reward_worker: response_len=0 for uid=%s keys=%s, prompts_shape=%s, responses_shape=%s",
-                    uid,
-                    request_keys,
-                    reward_data["prompts"].shape,
-                    reward_data["responses"].shape,
+                    f"reward_worker: Got a response of zero length for uid={uid} keys={request_keys}, "
+                    f"prompts_shape={reward_data['prompts'].shape}, "
+                    f"responses_shape={reward_data['responses'].shape}."
                 )
 
             result = await self._compute_score(reward_data)
@@ -216,7 +212,6 @@ class RewardLoopWorker:
             "attempt_id": attempt_id,
             "result": result,
             "error": error,
-            "response_len": response_len,
             "worker_id": self.worker_id,
         }
 

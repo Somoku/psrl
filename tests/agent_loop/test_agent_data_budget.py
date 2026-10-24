@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
+from psrl.utils.sampler_distribution import SamplerCapture
 from psrl.workers.agent_loop.agent_data import ConversationAgentData
 from psrl.workers.agent_loop.agent_data.base import SessionData, Trajectory
 from psrl.workers.gen.utils import rollout_token_budget
@@ -26,6 +27,7 @@ def test_rollout_token_budget_reads_an_omegaconf_node() -> None:
 def _agent_data(trajectories: list[Trajectory]) -> ConversationAgentData:
     data = ConversationAgentData.__new__(ConversationAgentData)
     data.session_data = SessionData(request_id=1, trajectories=trajectories)
+    data.sampler_capture = SamplerCapture()
     data.config = SimpleNamespace(
         gen_actor_rollout_ref=SimpleNamespace(
             rollout=SimpleNamespace(

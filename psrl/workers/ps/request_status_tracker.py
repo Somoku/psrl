@@ -317,13 +317,25 @@ class RequestStatusTracker:
             self._status_to_request_ids[status[i]].add(req_id)
 
     @_state_locked
+    def is_request_aborted(self, request_id: int) -> bool:
+        """Report whether a request is marked for abortion.
+
+        A member-level refill keeps the same request id, so the manager has to
+        distinguish "this attempt failed and its worker aborted it" from "a
+        refill of it is already in flight"; the abort record is exactly that
+        distinction, and `readmit_requests` is what clears it.
+        """
+        return request_id in self._abort_request_ids
+
+    @_state_locked
     def readmit_requests(self, request_ids: list[int] | int, is_validate: bool = False) -> None:
         """Clear an abort record so the same request ids may be dispatched again.
 
         Aborting a group marks every child id, and a marked id is rejected on its next
-        status update. Re-running the same prompt therefore needs its ids released first,
-        which only the validation retry path wants: it re-runs the identical task to keep
-        the evaluation set fixed, where a training refill takes a fresh prompt and fresh ids.
+        status update. Re-running the same task therefore needs its ids released first.
+        Validation uses it to keep the evaluation set fixed; a training member refill
+        uses it to keep the failed child's id, and with it the group's expected id set
+        intact, while the siblings and their completed work stay in place.
 
         Done in one locked step rather than as a remove followed by an add, because in
         between the two the ids exist in neither map and a concurrent status update would
@@ -658,12 +670,28 @@ class RequestStatusTracker:
         assert version >= 0, "Version must be a non-negative integer."
 
         abort_request_ids = set()
+        lowest_still_running = None
         for req_id, info in self._request_infos.items():
             if req_id in self._abort_request_ids:
                 continue
-            if not info.is_validate and info.model_version == version:
+            if info.is_validate:
+                continue
+            if info.model_version == version:
                 abort_request_ids.add(req_id)
-        self._running_min_version = max(self._running_min_version, version + 1)
+            elif lowest_still_running is None or info.model_version < lowest_still_running:
+                lowest_still_running = info.model_version
+        # Advance the floor on evidence, not on the decision.
+        #
+        # Declaring "everything running is past this version" at the moment we decide to
+        # retire it is an assertion about a migration that has not been observed. If any
+        # tracked request is still on this version or an older one, the floor stays where
+        # the evidence puts it -- otherwise the tracker and the gateway disagree about
+        # which requests exist, and the requests the tracker has forgotten are exactly the
+        # ones the gateway then aborts with nobody accounting for them.
+        if lowest_still_running is None or lowest_still_running > version:
+            self._running_min_version = max(self._running_min_version, version + 1)
+        elif lowest_still_running < self._running_min_version:
+            self._running_min_version = lowest_still_running
         return abort_request_ids
 
     def update_request_version(self, request_id: list[int] | int, new_version: int):

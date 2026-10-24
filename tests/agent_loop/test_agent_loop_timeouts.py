@@ -1,122 +1,67 @@
-"""The rollout deadline ladder: one user-facing knob, every internal deadline derived.
+"""The rollout budgets: one number for agent work, a second for grading.
 
-These numbers used to be configured independently, and a shipped recipe had the harness
-allowed two hours while the manager declared an entry dead after one, so healthy long
-episodes were abandoned. The ladder is now the only place they are decided, and it holds
-only deadlines the rollout itself enforces: a coordination-side timer that expires before
-the work it watches is the same bug in a new place.
+These were once a derived ladder, which was a way of keeping several nested deadlines
+consistent. With sandbox admission and provisioning no longer charged to the episode
+there is nothing left to nest: the episode budget is one number, grading is a second and
+may be unset, and the rest is the sandbox service's own business.
 """
 
 import pytest
-from psrl.workers.agent_loop.harness import HarnessConfig
-from psrl.workers.agent_loop.loops.harness_agent_loop import HarnessAgentLoop
 from psrl.workers.agent_loop.timeouts import (
-    DEFAULT_EPISODE_TIMEOUT_S,
-    AgentLoopTimeouts,
-    resolve_agent_loop_timeouts,
+    DEFAULT_TRAJECTORY_TIMEOUT_S,
+    LIFETIME_SLACK_S,
+    resolve_rollout_timeouts,
 )
 
 pytestmark = pytest.mark.cpu_test
 
 
-def test_the_episode_budget_is_the_only_required_number() -> None:
-    ladder = resolve_agent_loop_timeouts(3600, 900)
-
-    assert ladder.episode_timeout_s == 3600
-    assert ladder.admission_timeout_s == 900
-    # Everything else is derived, and the derivations are ordered.
-    assert ladder.setup_timeout_s > ladder.admission_timeout_s
-    assert ladder.harness_exec_timeout_s > ladder.episode_timeout_s
-    assert ladder.child_deadline_s > ladder.harness_exec_timeout_s
+def test_the_trajectory_budget_is_the_episode_number() -> None:
+    assert resolve_rollout_timeouts(3600, None).trajectory_timeout_s == 3600
 
 
-def test_a_null_episode_budget_selects_the_default_rather_than_no_limit() -> None:
+def test_a_null_trajectory_budget_selects_the_default_rather_than_no_limit() -> None:
     """A rollout with no bound cannot be told apart from a wedged one."""
-    assert resolve_agent_loop_timeouts(None, None).episode_timeout_s == DEFAULT_EPISODE_TIMEOUT_S
+    assert resolve_rollout_timeouts(None, None).trajectory_timeout_s == DEFAULT_TRAJECTORY_TIMEOUT_S
 
 
-def test_no_deadline_is_shorter_than_the_episode_it_bounds() -> None:
-    """Nothing in the ladder may cut an episode off before its own budget runs out.
-
-    A coordination-side threshold shorter than the episode is what killed healthy
-    validation rollouts at 360s of silence against a 7200s budget. Every deadline here
-    now sits at or beyond the episode.
-    """
-    for episode in (600, 7200):
-        ladder = resolve_agent_loop_timeouts(episode, None)
-        assert ladder.harness_exec_timeout_s > ladder.episode_timeout_s
-        assert ladder.child_deadline_s > ladder.episode_timeout_s
+def test_a_null_grading_budget_means_grading_is_not_timed() -> None:
+    assert resolve_rollout_timeouts(3600, None).grading_timeout_s is None
+    assert resolve_rollout_timeouts(3600, 900).grading_timeout_s == 900
 
 
-def test_the_harness_exec_budget_is_derived_from_the_episode_budget() -> None:
-    ladder = resolve_agent_loop_timeouts(1800, None)
-    config = HarnessConfig(kind="claude_code", executable="claude")
-
-    resolved = HarnessAgentLoop.apply_timeout_ladder(config, ladder)
-
-    assert resolved.time_budget_s == ladder.harness_exec_timeout_s
-    assert resolved.time_budget_s > ladder.episode_timeout_s
-    # The harness's own cap can no longer disagree with the episode budget.
-    assert config.time_budget_s != resolved.time_budget_s
+@pytest.mark.parametrize("episode", [0, -5])
+def test_a_non_positive_trajectory_budget_is_refused(episode: float) -> None:
+    with pytest.raises(ValueError, match="trajectory_timeout"):
+        resolve_rollout_timeouts(episode, None)
 
 
-@pytest.mark.parametrize(
-    ("episode", "admission", "expected"),
-    [
-        (0, None, "must be greater than zero"),
-        (-5, None, "must be greater than zero"),
-    ],
-)
-def test_contradictory_configurations_are_refused(
-    episode: float,
-    admission: float | None,
-    expected: str,
-) -> None:
-    with pytest.raises(ValueError, match=expected):
-        resolve_agent_loop_timeouts(episode, admission)
+@pytest.mark.parametrize("grading", [0, -5])
+def test_a_non_positive_grading_budget_is_refused(grading: float) -> None:
+    with pytest.raises(ValueError, match="grading_timeout"):
+        resolve_rollout_timeouts(3600, grading)
 
 
-def test_the_ladder_describes_itself_for_the_startup_log() -> None:
-    described = resolve_agent_loop_timeouts(7200, 1800).describe()
+def test_the_budgets_describe_themselves_for_the_startup_log() -> None:
+    described = resolve_rollout_timeouts(7200, 900).describe()
 
-    assert "episode=7200s" in described
-    assert "admission<=1800s" in described
-    assert "harness_exec<=" in described
-
-
-def test_an_admission_wait_that_outlasts_the_episode_is_refused() -> None:
-    """A request that queues longer than it would work is a capacity fault, not a wait.
-
-    This was a warning once, which meant a misconfigured node reported the inversion as a
-    slow trickle of capacity timeouts hours into a run instead of at startup. Raising the
-    deadline past the work it precedes cannot fix it either: a node that cannot admit
-    inside one episode cannot admit inside two.
-    """
-    with pytest.raises(ValueError, match="longer waiting for a sandbox than working"):
-        resolve_agent_loop_timeouts(600, 5000)
-
-    # Equal is refused too: the queue would consume the entire budget before work began.
-    with pytest.raises(ValueError, match="longer waiting for a sandbox than working"):
-        resolve_agent_loop_timeouts(600, 600)
-
-    # Just inside the budget stays legal, so the check bounds the ladder without
-    # narrowing the range an operator can actually use.
-    ladder = resolve_agent_loop_timeouts(600, 599)
-    assert ladder.admission_timeout_s == 599
-    assert ladder.child_deadline_s > 599
+    assert "trajectory=7200s" in described
+    assert "grading=900s" in described
+    assert "unbounded" in resolve_rollout_timeouts(7200, None).describe()
 
 
-def test_zero_valued_fields_are_rejected_by_the_value_object() -> None:
-    with pytest.raises(ValueError, match="setup_allowance_s"):
-        AgentLoopTimeouts(episode_timeout_s=1, setup_allowance_s=0, admission_timeout_s=0)
+def test_the_sandbox_lifetime_covers_agent_work_grading_and_margin() -> None:
+    """The node reclaims a sandbox by this, so it must cover everything the sandbox is for."""
+    timed = resolve_rollout_timeouts(3600, 900)
+    assert timed.sandbox_lifetime_s == 3600 + 900 + LIFETIME_SLACK_S
+
+    # Grading untimed means the sandbox has to outlive the episode and the margin.
+    untimed = resolve_rollout_timeouts(3600, None)
+    assert untimed.sandbox_lifetime_s == 3600 + LIFETIME_SLACK_S
 
 
-def test_the_shipped_configs_resolve_to_a_consistent_ladder() -> None:
-    """Guard the shipped pair against drifting apart again.
-
-    The recipe that motivated this had the harness allowed two hours while the manager
-    declared an entry dead after one, because each number was written by hand.
-    """
+def test_the_shipped_config_resolves_to_the_configured_budgets() -> None:
+    """Guard the shipped recipe: the two roots read the keys an operator sets."""
     from pathlib import Path
 
     import yaml
@@ -124,16 +69,39 @@ def test_the_shipped_configs_resolve_to_a_consistent_ladder() -> None:
     from psrl.workers.agent_loop.timeouts import resolve_from_config
 
     rollout = yaml.safe_load(Path("psrl/trainer/config/rollout/psrl_rollout.yaml").read_text())
-    agentic = yaml.safe_load(Path("psrl/trainer/config/psrl/agentic_rl.yaml").read_text())
-    config = OmegaConf.create(
-        {
-            "gen_actor_rollout_ref": {"rollout": {"agent": rollout["agent"]}},
-            "psrl": {"agentic_rl": agentic},
-        }
-    )
+    config = OmegaConf.create({"gen_actor_rollout_ref": {"rollout": {"agent": rollout["agent"]}}})
 
-    ladder = resolve_from_config(config)
+    timeouts = resolve_from_config(config)
 
-    assert ladder.episode_timeout_s == rollout["agent"]["trajectory_timeout"]
-    assert ladder.admission_timeout_s == rollout["agent"]["sandbox"]["capacity"]["acquire_timeout_s"]
-    assert ladder.harness_exec_timeout_s > ladder.episode_timeout_s
+    assert timeouts.trajectory_timeout_s == rollout["agent"]["trajectory_timeout"]
+    # The shipped default leaves grading untimed.
+    assert rollout["agent"]["grading_timeout"] is None
+    assert timeouts.grading_timeout_s is None
+
+
+def test_the_shipped_rollout_config_instantiates_into_its_dataclasses() -> None:
+    """Guard the shipped rollout config against drifting from its dataclass schema.
+
+    The trainer instantiates `rollout` with Hydra, which passes every yaml key to the
+    dataclass constructor as a keyword argument, recursively. A key the dataclass does
+    not declare fails the whole run at startup with `unexpected keyword argument` --
+    which is exactly how `agent.grading_timeout` reached the yaml but not
+    `AgentLoopConfig`. Instantiating the shipped block here catches that drift for
+    every nested config, not just the one that happened to break.
+    """
+    from pathlib import Path
+
+    import yaml
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf
+    from psrl.workers.config.rollout import RolloutConfig
+
+    rollout = yaml.safe_load(Path("psrl/trainer/config/rollout/psrl_rollout.yaml").read_text())
+    # `defaults` is Hydra composition metadata, consumed before a target is called.
+    rollout.pop("defaults", None)
+
+    config = instantiate(OmegaConf.create(rollout))
+
+    assert isinstance(config, RolloutConfig)
+    assert config.agent.trajectory_timeout == rollout["agent"]["trajectory_timeout"]
+    assert config.agent.grading_timeout == rollout["agent"]["grading_timeout"]

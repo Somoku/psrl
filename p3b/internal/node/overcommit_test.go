@@ -90,7 +90,7 @@ func TestWithoutOvercommitTheEnvelopeIsTheDeclaredOne(t *testing.T) {
 	cfg.Overcommit = 0
 	cfg.UtilizationTarget = 0
 	gate := newOvercommitGate(t, cfg)
-	gate.SetPressure(Pressure{MemUsedPct: 0.1})
+	gate.SetPressure(Pressure{MemUsedPct: 0.1, Valid: true})
 
 	if got := gate.Headroom("default").MemoryMB; got != 1000 {
 		t.Errorf("headroom with overcommit off is %d, want the declared 1000", got)
@@ -104,7 +104,7 @@ func TestAnIdleNodeExpandsToTheFullMultiple(t *testing.T) {
 	// Measurement just above zero means the node is almost empty, so essentially
 	// the whole configured multiple is available.
 	gate := newOvercommitGate(t, overcommitConfig())
-	gate.SetPressure(Pressure{MemUsedPct: 0.01})
+	gate.SetPressure(Pressure{MemUsedPct: 0.01, Valid: true})
 
 	// headroomFraction = (0.8 - 0.01) / 0.8 = 0.9875; scale = 1 + 1.0*0.9875
 	if got := gate.Headroom("default").MemoryMB; got < 1950 || got > 1990 {
@@ -117,7 +117,7 @@ func TestAtTheTargetTheExpansionIsFullyWithdrawn(t *testing.T) {
 	// admits exactly its declared envelope, so the overcommit cannot push
 	// measurement past the point the operator chose.
 	gate := newOvercommitGate(t, overcommitConfig())
-	gate.SetPressure(Pressure{MemUsedPct: 0.8})
+	gate.SetPressure(Pressure{MemUsedPct: 0.8, Valid: true})
 
 	if got := gate.Headroom("default").MemoryMB; got != 1000 {
 		t.Errorf("at the utilization target headroom is %d, want the declared 1000", got)
@@ -132,7 +132,7 @@ func TestAboveTheTargetNeverShrinksBelowTheDeclaredEnvelope(t *testing.T) {
 	// pressure ceiling is what refuses an overloaded node, not a shrinking
 	// envelope, because shrinking would also revoke capacity already granted.
 	gate := newOvercommitGate(t, overcommitConfig())
-	gate.SetPressure(Pressure{MemUsedPct: 0.88})
+	gate.SetPressure(Pressure{MemUsedPct: 0.88, Valid: true})
 
 	if got := gate.Headroom("default").MemoryMB; got != 1000 {
 		t.Errorf("above the target headroom is %d, want the declared 1000 as a floor", got)
@@ -144,7 +144,7 @@ func TestTheExpansionWithdrawsProportionally(t *testing.T) {
 	// over-admitting and refusing. Halfway to the target must give half the
 	// expansion.
 	gate := newOvercommitGate(t, overcommitConfig())
-	gate.SetPressure(Pressure{MemUsedPct: 0.4})
+	gate.SetPressure(Pressure{MemUsedPct: 0.4, Valid: true})
 
 	// headroomFraction = (0.8 - 0.4) / 0.8 = 0.5; scale = 1 + 1.0*0.5 = 1.5
 	if got := gate.Headroom("default").MemoryMB; got != 1500 {
@@ -153,17 +153,29 @@ func TestTheExpansionWithdrawsProportionally(t *testing.T) {
 }
 
 func TestAnUnreadableMeasurementDoesNotExpand(t *testing.T) {
-	// A pressure reader that found no cgroup hierarchy reports zero. Reading that
-	// as "idle, expand freely" would overcommit a node whose usage is unknown,
-	// which is the one case where the envelope is all the information there is.
+	// A reader whose files vanished, or a sampler that stopped, reports no usable
+	// sample. Reading that as "idle, expand freely" would overcommit a node whose
+	// usage is unknown, which is the one case where the envelope is all the
+	// information there is.
 	gate := newOvercommitGate(t, overcommitConfig())
-	gate.SetPressure(Pressure{MemUsedPct: 0})
+	gate.SetPressure(Pressure{Valid: false})
 
 	if got := gate.Headroom("default").MemoryMB; got != 1000 {
 		t.Errorf("with no measurement headroom is %d, want the declared 1000", got)
 	}
 	if factor := gate.Overcommitted(); factor != 1 {
 		t.Errorf("with no measurement the overcommit factor is %.3f, want 1", factor)
+	}
+}
+
+func TestAValidEmptyDomainExpandsFully(t *testing.T) {
+	// The converse of the test above: a domain that is genuinely empty is the case
+	// the overcommit exists for, so a *valid* zero must reach the full multiple.
+	gate := newOvercommitGate(t, overcommitConfig())
+	gate.SetPressure(Pressure{MemUsedPct: 0, Valid: true})
+
+	if got := gate.Headroom("default").MemoryMB; got != 2000 {
+		t.Errorf("an empty domain reports %d MB, want the full multiple 2000 (1000 x 2)", got)
 	}
 }
 
@@ -177,7 +189,7 @@ func TestOnlyMemoryExpands(t *testing.T) {
 	cfg := overcommitConfig()
 	cfg.GPUIndices = []int32{0, 1}
 	gate := newOvercommitGate(t, cfg)
-	gate.SetPressure(Pressure{MemUsedPct: 0.01})
+	gate.SetPressure(Pressure{MemUsedPct: 0.01, Valid: true})
 
 	headroom := gate.Headroom("default")
 	if headroom.MemoryMB <= 1000 {
@@ -203,14 +215,14 @@ func TestOvercommitAdmitsWhatTheDeclaredEnvelopeWouldRefuse(t *testing.T) {
 	// The whole point: a request that does not fit the declared envelope is
 	// admitted when measurement says the reservations ahead of it are overstated.
 	gate := newOvercommitGate(t, overcommitConfig())
-	gate.SetPressure(Pressure{MemUsedPct: 0.1})
+	gate.SetPressure(Pressure{MemUsedPct: 0.1, Valid: true})
 
 	// Fill the declared envelope exactly.
-	if _, _, ok := gate.Admit("default", "owner-a", Resources{MemoryMB: 1000}); !ok {
+	if _, _, ok := gate.Reserve("default", "owner-a", Resources{MemoryMB: 1000}); !ok {
 		t.Fatal("the first request must fit the declared envelope")
 	}
 	// This one only fits because of the expansion.
-	if _, refusal, ok := gate.Admit("default", "owner-b", Resources{MemoryMB: 500}); !ok {
+	if _, refusal, ok := gate.Reserve("default", "owner-b", Resources{MemoryMB: 500}); !ok {
 		t.Fatalf("a request beyond the declared envelope was refused (%s) while the node measured 10%% used; "+
 			"this is exactly the density overcommit exists to recover", refusal)
 	}
@@ -219,9 +231,9 @@ func TestOvercommitAdmitsWhatTheDeclaredEnvelopeWouldRefuse(t *testing.T) {
 func TestOvercommitStillRefusesBeyondTheExpandedEnvelope(t *testing.T) {
 	// The expansion is a bound, not an absence of one.
 	gate := newOvercommitGate(t, overcommitConfig())
-	gate.SetPressure(Pressure{MemUsedPct: 0.1})
+	gate.SetPressure(Pressure{MemUsedPct: 0.1, Valid: true})
 
-	if _, refusal, ok := gate.Admit("default", "owner", Resources{MemoryMB: 5000}); ok {
+	if _, refusal, ok := gate.Reserve("default", "owner", Resources{MemoryMB: 5000}); ok {
 		t.Fatalf("a request of 5000 MB was admitted against a ~1987 MB expanded envelope (refusal %q)", refusal)
 	}
 }
@@ -231,9 +243,9 @@ func TestThePressureCeilingStillRefusesAnOvercommittedNode(t *testing.T) {
 	// A node past its memory ceiling refuses regardless of how much expanded
 	// envelope is left, which is what stops the feature from driving a node to OOM.
 	gate := newOvercommitGate(t, overcommitConfig())
-	gate.SetPressure(Pressure{MemUsedPct: 0.95}) // above LocalMemCeiling of 0.9
+	gate.SetPressure(Pressure{MemUsedPct: 0.95, Valid: true}) // above LocalMemCeiling of 0.9
 
-	if _, refusal, ok := gate.Admit("default", "owner", Resources{MemoryMB: 1}); ok {
+	if _, refusal, ok := gate.Reserve("default", "owner", Resources{MemoryMB: 1}); ok {
 		t.Fatal("a node above its memory pressure ceiling must refuse even under overcommit")
 	} else if refusal != RefusedPressure {
 		t.Errorf("refusal is %q, want %q", refusal, RefusedPressure)
@@ -248,7 +260,7 @@ func TestClassCeilingsStayRelativeToTheDeclaredEnvelope(t *testing.T) {
 	cfg := overcommitConfig()
 	cfg.Classes = map[string]ClassShare{"capped": {Guaranteed: 0.25, Max: 0.5}}
 	gate := newOvercommitGate(t, cfg)
-	gate.SetPressure(Pressure{MemUsedPct: 0.01})
+	gate.SetPressure(Pressure{MemUsedPct: 0.01, Valid: true})
 
 	if got := gate.Headroom("capped").MemoryMB; got != 500 {
 		t.Errorf("a class capped at half the machine reports %d MB, want 500 even under a 2x expansion", got)
@@ -262,7 +274,7 @@ func TestTheSnapshotReportsBothEnvelopes(t *testing.T) {
 	// bound: the bound is in the config file and the resolved value is the only
 	// thing that explains a refusal.
 	gate := newOvercommitGate(t, overcommitConfig())
-	gate.SetPressure(Pressure{MemUsedPct: 0.4})
+	gate.SetPressure(Pressure{MemUsedPct: 0.4, Valid: true})
 
 	report := gate.Snapshot()
 	if report.Envelope.MemoryMB != 1000 {
@@ -281,9 +293,9 @@ func TestTheReportedFactorTracksMeasurement(t *testing.T) {
 	// the moment of the report, which is what makes it diagnostic.
 	gate := newOvercommitGate(t, overcommitConfig())
 
-	gate.SetPressure(Pressure{MemUsedPct: 0.2})
+	gate.SetPressure(Pressure{MemUsedPct: 0.2, Valid: true})
 	loaded := gate.Overcommitted()
-	gate.SetPressure(Pressure{MemUsedPct: 0.6})
+	gate.SetPressure(Pressure{MemUsedPct: 0.6, Valid: true})
 	heavier := gate.Overcommitted()
 
 	if !(heavier < loaded) {

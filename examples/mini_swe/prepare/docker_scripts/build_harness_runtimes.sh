@@ -21,7 +21,7 @@
 # Pinned versions (single source of truth, bump here to upgrade):
 #   Claude Code 2.1.233 (linux-x64)
 #
-#   Codex 0.154.0 (linux-x64)
+#   Codex 0.160.1 (linux-x64)
 # Both come from the npm registry as platform packages. NPM_REGISTRY defaults to
 #
 # registry.npmjs.org. Point it at a mirror (e.g. https://mirrors.tencent.com/npm)
@@ -39,9 +39,10 @@ CLAUDE_CODE_PLATFORM="${CLAUDE_CODE_PLATFORM:-linux-x64}"
 # sha256 of the linux-x64 native binary published in the 2.1.233 manifest.
 CLAUDE_CODE_SHA256="${CLAUDE_CODE_SHA256:-55d281096f57d411ebbdd94dbf5e9ff3accb7c05713e37348c2c11d4b83bf9d9}"
 
-CODEX_VERSION="${CODEX_VERSION:-0.154.0}"
+CODEX_VERSION="${CODEX_VERSION:-0.160.1}"
 CODEX_PLATFORM="${CODEX_PLATFORM:-linux-x64}"
-CODEX_SHA256="${CODEX_SHA256:-}"
+# sha256 of the native binary at vendor/<triple>/bin/codex in the 0.160.1 manifest.
+CODEX_SHA256="${CODEX_SHA256:-f34a4d2301892ae96c90097786bfe5dc269f187b6f69faf42a7b357b8c081e35}"
 
 work=""
 cleanup() { [ -n "$work" ] && rm -rf "$work"; }

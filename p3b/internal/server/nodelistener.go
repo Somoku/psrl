@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -17,7 +16,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	v1 "psrl.dev/sandboxd/api/v1"
-	"psrl.dev/sandboxd/internal/backend"
 	"psrl.dev/sandboxd/internal/placement"
 )
 
@@ -145,6 +143,8 @@ func (n *NodeListener) dispatch(ctx context.Context, req request) (any, error) {
 		return n.createOn(ctx, req.Payload)
 	case "release_on":
 		return n.releaseOn(ctx, req.Payload)
+	case "renew_owner":
+		return n.renewOwner(ctx, req.Payload)
 	case "status_on":
 		return n.statusOn(ctx, req.Payload)
 	case "exec":
@@ -170,6 +170,20 @@ func (n *NodeListener) admit(ctx context.Context, raw json.RawMessage) (any, err
 	resp, err := n.node.Admit(ctx, &v1.AdmitRequest{Spec: payload.Spec.toProto()})
 	if err != nil {
 		return nil, err
+	}
+	if !resp.GetAdmitted() {
+		// A refusal is the node's ledger answering for itself, and it is the only
+		// record of why a class could not get in. Without it the reason a grading wave
+		// never landed has to be reconstructed from a caller's timeout, and "the node
+		// was full" and "the node believes it is full" look identical from there.
+		//
+		// The headroom is logged with the refusal because it is what distinguishes
+		// them: a node refusing with headroom it cannot use is a ledger that has
+		// charged capacity to nothing, which no amount of waiting will clear.
+		headroom := n.node.admission.Headroom(payload.Spec.ResourceClass)
+		n.log.Warn("this node refused a sandbox",
+			"class", payload.Spec.ResourceClass, "reason", resp.GetRefusal(),
+			"headroom_memory_mb", headroom.MemoryMB, "headroom_cpu_millis", headroom.CPUMillis)
 	}
 	return map[string]any{
 		"admitted":    resp.GetAdmitted(),
@@ -212,6 +226,21 @@ func (n *NodeListener) releaseOn(ctx context.Context, raw json.RawMessage) (any,
 	return map[string]any{}, nil
 }
 
+// renewOwner keeps an owner's sandboxes from being reclaimed as orphans while it
+// is still running. The renewal is a no-op for an owner this node never admitted,
+// so a control plane that fans one heartbeat out to every node costs the nodes
+// nothing they did not already know.
+func (n *NodeListener) renewOwner(_ context.Context, raw json.RawMessage) (any, error) {
+	var payload struct {
+		Owner string `json:"owner"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	n.node.RenewOwner(payload.Owner)
+	return map[string]any{"ok": true}, nil
+}
+
 func (n *NodeListener) statusOn(ctx context.Context, raw json.RawMessage) (any, error) {
 	var payload handlePayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -234,11 +263,16 @@ func (n *NodeListener) exec(ctx context.Context, raw json.RawMessage) (any, erro
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, err
 	}
-	code, output, err := n.node.Exec(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
+	result, err := n.node.Exec(ctx, payload.handle(), payload.Command, payload.Cwd, payload.Env)
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, preserveSessionLost(err)
 	}
-	return map[string]any{"exit_code": code, "stdout": output, "stderr": "", "truncated": false}, nil
+	return map[string]any{
+		"exit_code": result.ExitCode,
+		"stdout":    result.Stdout,
+		"stderr":    result.Stderr,
+		"truncated": result.Truncated,
+	}, nil
 }
 
 // readBytes fetches one file out of a sandbox.
@@ -256,23 +290,11 @@ func (n *NodeListener) readBytes(ctx context.Context, raw json.RawMessage) (any,
 		return nil, err
 	}
 	handle := payload.handle()
-	if hosted, hosts := n.node.hosted(handle.Backend); hosts {
-		if files, ok := hosted.(backend.FileHandler); ok {
-			data, err := files.ReadFile(ctx, handle, payload.Path)
-			if err != nil {
-				return nil, status.Errorf(codes.NotFound, "reading %q: %v", payload.Path, err)
-			}
-			return map[string]any{"data": base64.StdEncoding.EncodeToString(data)}, nil
-		}
-	}
-	code, output, err := n.node.Exec(ctx, handle, fmt.Sprintf("base64 %q", payload.Path), "", nil)
+	data, err := n.node.ReadBytes(ctx, handle, payload.Path)
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, preserveSessionLost(err)
 	}
-	if code != 0 {
-		return nil, status.Errorf(codes.NotFound, "reading %q exited %d", payload.Path, code)
-	}
-	return map[string]any{"data": compactBase64(output)}, nil
+	return map[string]any{"data": base64.StdEncoding.EncodeToString(data)}, nil
 }
 
 // writeBytes puts one file into a sandbox.
@@ -290,26 +312,12 @@ func (n *NodeListener) writeBytes(ctx context.Context, raw json.RawMessage) (any
 		return nil, err
 	}
 	handle := payload.handle()
-	if hosted, hosts := n.node.hosted(handle.Backend); hosts {
-		if files, ok := hosted.(backend.FileHandler); ok {
-			decoded, err := base64.StdEncoding.DecodeString(payload.Data)
-			if err != nil {
-				return nil, status.Errorf(codes.InvalidArgument, "writing %q: %v", payload.Path, err)
-			}
-			if err := files.WriteFile(ctx, handle, payload.Path, decoded); err != nil {
-				return nil, status.Errorf(codes.FailedPrecondition, "writing %q: %v", payload.Path, err)
-			}
-			return map[string]any{}, nil
-		}
-	}
-	command := fmt.Sprintf("mkdir -p \"$(dirname %q)\" && printf %%s %q | base64 -d > %q",
-		payload.Path, payload.Data, payload.Path)
-	code, output, err := n.node.Exec(ctx, handle, command, "", nil)
+	decoded, err := base64.StdEncoding.DecodeString(payload.Data)
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, status.Errorf(codes.InvalidArgument, "writing %q: %v", payload.Path, err)
 	}
-	if code != 0 {
-		return nil, status.Errorf(codes.FailedPrecondition, "writing %q exited %d: %s", payload.Path, code, output)
+	if err := n.node.WriteBytes(ctx, handle, payload.Path, decoded); err != nil {
+		return nil, preserveSessionLost(err)
 	}
 	return map[string]any{}, nil
 }
@@ -327,32 +335,49 @@ func (n *NodeListener) report(_ context.Context) (any, error) {
 // nodeViewWire is the over-the-wire shape of a NodeView. It uses slices for the
 // set fields because map[string]struct{} does not serialize as JSON.
 type nodeViewWire struct {
-	NodeID          string              `json:"node_id"`
-	Backends        []backendCapWire    `json:"backends"`
-	Envelope        headroomWire        `json:"envelope"`
-	ClassHeadroom   map[string]headroomWire `json:"class_headroom"`
-	LiveSandboxes   int                 `json:"live_sandboxes"`
-	CPUUsedPct      float64             `json:"cpu_used_pct"`
-	MemUsedPct      float64             `json:"mem_used_pct"`
-	GPUFree         int32               `json:"gpu_free"`
-	Draining        bool                `json:"draining"`
-	ImageDigests    []string            `json:"image_digests"`
-	ImageReferences []string            `json:"image_references"`
-	Labels          []string            `json:"labels"`
+	NodeID                string                  `json:"node_id"`
+	Backends              []backendCapWire        `json:"backends"`
+	Envelope              headroomWire            `json:"envelope"`
+	ClassHeadroom         map[string]headroomWire `json:"class_headroom"`
+	LiveSandboxes         int                     `json:"live_sandboxes"`
+	CPUUsedPct            float64                 `json:"cpu_used_pct"`
+	MemUsedPct            float64                 `json:"mem_used_pct"`
+	GPUFree               int32                   `json:"gpu_free"`
+	Draining              bool                    `json:"draining"`
+	ClassReserveMB        map[string]int64        `json:"class_reserve_mb"`
+	ClassReserveCPUMillis map[string]int64        `json:"class_reserve_cpu_millis"`
+	// What the node promised and what it measured, carried across with the utilisation:
+	// see Control.Fleet for why the two have to travel together.
+	Granted         headroomWire `json:"granted"`
+	Observed        headroomWire `json:"observed"`
+	ThrottledPct    float64      `json:"throttled_pct"`
+	ImageDigests    []string     `json:"image_digests"`
+	ImageReferences []string     `json:"image_references"`
+	Labels          []string     `json:"labels"`
+
+	// Inventory is the node's own sandbox list for quota reconciliation. An
+	// older node omits it, and InventoryReported is then false: a zero value
+	// must never be read as "this node holds nothing".
+	ReportSeq          uint64             `json:"report_seq"`
+	InventoryReported  bool               `json:"inventory_reported"`
+	InventoryTruncated bool               `json:"inventory_truncated"`
+	LiveSandboxIDs     []string           `json:"live_sandbox_ids"`
+	LiveOwners         []string           `json:"live_owners"`
+	Diagnostics        map[string]float64 `json:"diagnostics"`
 }
 
 type backendCapWire struct {
-	Name        string            `json:"name"`
-	Features    []string          `json:"features"`
-	ResumeLevel string            `json:"resume_level"`
-	HostMounts  bool              `json:"host_mounts"`
+	Name        string   `json:"name"`
+	Features    []string `json:"features"`
+	ResumeLevel string   `json:"resume_level"`
+	HostMounts  bool     `json:"host_mounts"`
 }
 
 type headroomWire struct {
-	MemoryMB  int64   `json:"memory_mb"`
-	CPUMillis int64   `json:"cpu_millis"`
-	GPUCount  int32   `json:"gpu_count"`
-	DiskMB    int64   `json:"disk_mb"`
+	MemoryMB  int64 `json:"memory_mb"`
+	CPUMillis int64 `json:"cpu_millis"`
+	GPUCount  int32 `json:"gpu_count"`
+	DiskMB    int64 `json:"disk_mb"`
 }
 
 func nodeViewToWire(view placement.NodeView) nodeViewWire {
@@ -367,7 +392,20 @@ func nodeViewToWire(view placement.NodeView) nodeViewWire {
 			MemoryMB: view.Envelope.MemoryMB, CPUMillis: view.Envelope.CPUMillis,
 			GPUCount: view.Envelope.GPUCount, DiskMB: view.Envelope.DiskMB,
 		},
-		ClassHeadroom: make(map[string]headroomWire, len(view.ClassHeadroom)),
+		ClassHeadroom:         make(map[string]headroomWire, len(view.ClassHeadroom)),
+		ClassReserveMB:        view.ClassReserveMB,
+		ClassReserveCPUMillis: view.ClassReserveCPUMillis,
+		Granted: headroomWire{MemoryMB: view.Granted.MemoryMB, CPUMillis: view.Granted.CPUMillis,
+			GPUCount: view.Granted.GPUCount, DiskMB: view.Granted.DiskMB},
+		Observed: headroomWire{MemoryMB: view.Observed.MemoryMB, CPUMillis: view.Observed.CPUMillis,
+			GPUCount: view.Observed.GPUCount, DiskMB: view.Observed.DiskMB},
+		ThrottledPct:       view.ThrottledPct,
+		ReportSeq:          view.ReportSeq,
+		InventoryReported:  view.InventoryReported,
+		InventoryTruncated: view.InventoryTruncated,
+		LiveSandboxIDs:     view.LiveSandboxIDs,
+		LiveOwners:         view.LiveOwners,
+		Diagnostics:        view.Diagnostics,
 	}
 	for class, h := range view.ClassHeadroom {
 		w.ClassHeadroom[class] = headroomWire{
@@ -395,17 +433,30 @@ func nodeViewToWire(view placement.NodeView) nodeViewWire {
 
 func nodeViewFromWire(w nodeViewWire) placement.NodeView {
 	view := placement.NodeView{
-		NodeID:          w.NodeID,
-		SeenAt:          time.Now(),
-		LiveSandboxes:   w.LiveSandboxes,
-		CPUUsedPct:      w.CPUUsedPct,
-		MemUsedPct:      w.MemUsedPct,
-		GPUFree:         w.GPUFree,
-		Draining:        w.Draining,
-		ClassHeadroom:   make(map[string]placement.Headroom, len(w.ClassHeadroom)),
-		ImageDigests:    make(map[string]struct{}, len(w.ImageDigests)),
-		ImageReferences: make(map[string]struct{}, len(w.ImageReferences)),
-		Labels:          make(map[string]struct{}, len(w.Labels)),
+		NodeID:                w.NodeID,
+		SeenAt:                time.Now(),
+		LiveSandboxes:         w.LiveSandboxes,
+		CPUUsedPct:            w.CPUUsedPct,
+		MemUsedPct:            w.MemUsedPct,
+		GPUFree:               w.GPUFree,
+		Draining:              w.Draining,
+		ClassHeadroom:         make(map[string]placement.Headroom, len(w.ClassHeadroom)),
+		ClassReserveMB:        w.ClassReserveMB,
+		ClassReserveCPUMillis: w.ClassReserveCPUMillis,
+		Granted: placement.Headroom{MemoryMB: w.Granted.MemoryMB, CPUMillis: w.Granted.CPUMillis,
+			GPUCount: w.Granted.GPUCount, DiskMB: w.Granted.DiskMB},
+		Observed: placement.Headroom{MemoryMB: w.Observed.MemoryMB, CPUMillis: w.Observed.CPUMillis,
+			GPUCount: w.Observed.GPUCount, DiskMB: w.Observed.DiskMB},
+		ThrottledPct:       w.ThrottledPct,
+		ImageDigests:       make(map[string]struct{}, len(w.ImageDigests)),
+		ImageReferences:    make(map[string]struct{}, len(w.ImageReferences)),
+		Labels:             make(map[string]struct{}, len(w.Labels)),
+		ReportSeq:          w.ReportSeq,
+		InventoryReported:  w.InventoryReported,
+		InventoryTruncated: w.InventoryTruncated,
+		LiveSandboxIDs:     w.LiveSandboxIDs,
+		LiveOwners:         w.LiveOwners,
+		Diagnostics:        w.Diagnostics,
 		Envelope: placement.Headroom{
 			MemoryMB: w.Envelope.MemoryMB, CPUMillis: w.Envelope.CPUMillis,
 			GPUCount: w.Envelope.GPUCount, DiskMB: w.Envelope.DiskMB,

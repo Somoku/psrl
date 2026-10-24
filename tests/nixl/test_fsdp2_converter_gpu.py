@@ -31,6 +31,12 @@ from pathlib import Path
 import pytest
 import torch
 
+# torchrun executes this file as a script, so the interpreter's first path entry is
+# `tests/nixl`, not the repository root, and `tests.nixl` would not import.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from tests.nixl.conftest import MODEL_ROOT
 
 MODEL_PATH = MODEL_ROOT / "Qwen2.5-0.5B-Instruct"
@@ -190,7 +196,15 @@ def test_fsdp2_conversion_preserves_coordinates(world_size):
         capture_output=True,
         text=True,
         timeout=900,
-        cwd=str(Path(__file__).resolve().parents[2]),
+        cwd=str(_REPO_ROOT),
+        # The workers run this file as a script, so `tests.nixl` is not importable
+        # unless the repository root is on their path.
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                filter(None, (str(_REPO_ROOT), os.environ.get("PYTHONPATH")))
+            ),
+        },
     )
     if result.returncode != 0:
         pytest.fail(

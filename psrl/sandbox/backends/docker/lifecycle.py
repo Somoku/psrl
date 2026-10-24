@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import atexit
 import logging
-import os
-import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -17,6 +15,9 @@ from psrl.sandbox.backends.docker.cli import (
     force_remove_containers_by_label,
 )
 from psrl.sandbox.reclaimer import (
+    DEFAULT_GC_INTERVAL_S,
+    DEFAULT_HEARTBEAT_DIR,
+    DEFAULT_LEASE_TTL_S,
     NodeReclaimer,
     remove_owner_heartbeat,
     spawn_node_reclaimer,
@@ -25,17 +26,29 @@ from psrl.sandbox.reclaimer import (
 
 psrl_logger = logging.getLogger(__file__)
 
-_DEFAULT_HEARTBEAT_DIR = os.path.join(tempfile.gettempdir(), "psrl-sandbox-heartbeats")
+# How many heartbeats an owner may miss before the node treats it as gone and
+# reclaims everything it holds. The budget exists because a heartbeat can be late
+# for reasons that are not death: a starved writer thread, a filesystem hiccup, a
+# host under memory pressure. Too few and a live worker loses live sandboxes — the
+# failure is not "a container lingers", it is "an episode dies mid-command" — so the
+# floor is generous and a config may only raise the count.
+_MIN_LEASE_TTL_BEATS = 8
 
 
 @dataclass(frozen=True)
 class DockerLifecycleConfig:
     """Configuration for graceful cleanup and node-level crash recovery."""
 
-    heartbeat_dir: str = _DEFAULT_HEARTBEAT_DIR
-    lease_ttl_s: float = 120.0
-    heartbeat_interval_s: float = 30.0
-    gc_interval_s: float = 30.0
+    heartbeat_dir: str = DEFAULT_HEARTBEAT_DIR
+    # The tolerance is beats, not seconds: lease_ttl_s must cover
+    # `_MIN_LEASE_TTL_BEATS` of them, so a worker survives a run of late beats
+    # instead of being reclaimed for one. Raising `lease_ttl_s` is bounded from
+    # above by the node's capacity lease — a sandbox lease that outlives the
+    # capacity reservation frees memory while the container still holds it — so
+    # the tolerance is widened by beating more often, not by waiting longer.
+    lease_ttl_s: float = DEFAULT_LEASE_TTL_S
+    heartbeat_interval_s: float = 15.0
+    gc_interval_s: float = DEFAULT_GC_INTERVAL_S
     gc_idle_exit_cycles: int = 10
     gc_enabled: bool = True
     # A stopped container is reaped despite a live owner once it stays stopped this long.
@@ -53,6 +66,13 @@ class DockerLifecycleConfig:
             raise ValueError("Docker heartbeat_interval_s and lease_ttl_s must be greater than zero.")
         if self.heartbeat_interval_s >= self.lease_ttl_s:
             raise ValueError("Docker heartbeat_interval_s must be smaller than lease_ttl_s.")
+        if self.lease_ttl_s < _MIN_LEASE_TTL_BEATS * self.heartbeat_interval_s:
+            raise ValueError(
+                f"Docker lease_ttl_s ({self.lease_ttl_s:g}s) must cover at least {_MIN_LEASE_TTL_BEATS} heartbeats "
+                f"of {self.heartbeat_interval_s:g}s ({_MIN_LEASE_TTL_BEATS * self.heartbeat_interval_s:g}s). A "
+                "shorter budget reclaims a worker's sandboxes because a heartbeat was late, not because the "
+                "worker was gone."
+            )
         if self.gc_interval_s < 1 or self.gc_idle_exit_cycles < 1:
             raise ValueError("Docker gc_interval_s and gc_idle_exit_cycles must be at least one.")
         if self.stopped_grace_s <= self.gc_interval_s:
@@ -100,6 +120,7 @@ class DockerLifecycle:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
+        self._gc_thread: threading.Thread | None = None
         self._gc_process = None
         self._next_gc_probe = 0.0
         self._startup_swept = False
@@ -116,10 +137,22 @@ class DockerLifecycle:
             if not self._atexit_registered:
                 atexit.register(self.close)
                 self._atexit_registered = True
-            if not self.config.gc_enabled:
-                return
+            # The lease is written whether or not this process also supervises a
+            # collector: it is what tells every other worker's collector that this
+            # worker is alive, and a run that only writes it while collecting would
+            # look dead to the first collector that shares the directory.
             if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive():
-                write_owner_heartbeat(self.config.heartbeat_dir, self.owner_id)
+                try:
+                    write_owner_heartbeat(self.config.heartbeat_dir, self.owner_id)
+                except Exception:
+                    # A lease that could not be written yet is not a reason to refuse
+                    # the lifecycle: the loop retries on the next beat, and refusing
+                    # here would leave the worker with no heartbeat at all.
+                    psrl_logger.warning(
+                        f"Could not write the initial Docker owner lease for {self.owner_id!r}; "
+                        "the heartbeat will retry.",
+                        exc_info=True,
+                    )
                 self._stop_event.clear()
                 self._heartbeat_thread = threading.Thread(
                     target=self._heartbeat_loop,
@@ -127,6 +160,15 @@ class DockerLifecycle:
                     daemon=True,
                 )
                 self._heartbeat_thread.start()
+            if not self.config.gc_enabled:
+                return
+            if self._gc_thread is None or not self._gc_thread.is_alive():
+                self._gc_thread = threading.Thread(
+                    target=self._gc_loop,
+                    name="psrl-docker-gc",
+                    daemon=True,
+                )
+                self._gc_thread.start()
             self._reclaim_previous_run()
             self._ensure_gc()
 
@@ -202,16 +244,41 @@ class DockerLifecycle:
         self._next_gc_probe = now + self.config.gc_interval_s
 
     def _heartbeat_loop(self) -> None:
-        """Refresh the worker lease independently of the asyncio event loop."""
+        """Refresh the worker lease until this lifecycle closes.
+
+        Liveness is the one thing this loop must not lose: the node's collector
+        destroys every container whose owner lease has gone stale, so a heartbeat that
+        stops while its worker is alive reclaims live sandboxes. Every failure is
+        therefore absorbed and retried on the next beat, and the only way out is
+        `close`. It is a thread of its own rather than a task on the worker's event
+        loop, so work that blocks the loop cannot take the lease down with it.
+        """
         while not self._stop_event.wait(self.config.heartbeat_interval_s):
             try:
                 write_owner_heartbeat(self.config.heartbeat_dir, self.owner_id)
+            except Exception:
+                psrl_logger.warning(
+                    f"Could not refresh Docker owner lease {self.owner_id!r}; retrying on the next heartbeat.",
+                    exc_info=True,
+                )
+        psrl_logger.info(f"Docker owner lease heartbeat stopped for {self.owner_id!r}.")
+
+    def _gc_loop(self) -> None:
+        """Keep a node collector alive, separately from the lease heartbeat.
+
+        Supervision runs in its own thread because spawning a collector can fail in
+        ways the lease must not inherit: the two share nothing but the config, and a
+        failed spawn is not a reason to stop saying this worker is alive.
+        """
+        while not self._stop_event.wait(self.config.gc_interval_s):
+            try:
                 with self._lock:
                     if self._closed:
                         return
                     self._ensure_gc()
-            except (OSError, RuntimeError) as exc:
-                psrl_logger.warning(f"Could not refresh Docker owner lease {self.owner_id!r}: {exc}.")
+            except Exception:
+                psrl_logger.warning("Could not keep the Docker sandbox collector alive.", exc_info=True)
+        psrl_logger.info("Docker sandbox collector supervision stopped.")
 
     def close(self) -> None:
         """Remove owned containers and stop the worker heartbeat exactly once."""
@@ -224,10 +291,13 @@ class DockerLifecycle:
             self._stop_event.set()
             heartbeat_thread = self._heartbeat_thread
             self._heartbeat_thread = None
+            gc_thread = self._gc_thread
+            self._gc_thread = None
         # Join the writer before removing the lease, or a heartbeat already in flight
         # recreates the file and leaves a live-looking lease for a dead owner.
-        if heartbeat_thread is not None and heartbeat_thread is not threading.current_thread():
-            heartbeat_thread.join(timeout=1.0)
+        for thread in (heartbeat_thread, gc_thread):
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=1.0)
         force_remove_containers_by_label(
             "psrl.actor_id",
             self.owner_id,

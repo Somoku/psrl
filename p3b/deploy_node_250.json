@@ -1,0 +1,65 @@
+{
+  "role": "node",
+  "node_listen": "0.0.0.0:9090",
+  "timing": {
+    "node_ttl_s": 120,
+    "rpc_timeout_s": 60
+  },
+  "node": {
+    "memory_mb": 1100000,
+    "cpu_millis": 256000,
+    "disk_mb": 4000000,
+    "gpu_indices": [],
+    "local_cpu_ceiling": 0.95,
+    "local_mem_ceiling": 0.9,
+    "overcommit": 1.5,
+    "utilization_target": 0.75,
+    "cgroup_parent": "psrl-sandboxes",
+    "sample_interval_s": 5,
+    "sandbox_memory_safety": 0.05,
+    "elastic": {
+      "enabled": true,
+      "growth_margin": 0.25,
+      "min_cpu_millis": 100,
+      "min_limit_mb": 256,
+      "min_reserve_cpu_millis": 250,
+      "min_reserve_mb": 512,
+      "percentile": 95,
+      "release_margin_cpu_millis": 250,
+      "release_margin_mb": 256,
+      "restore_below": 0.6,
+      "sample_interval_s": 5,
+      "shrink_above": 0.85,
+      "shrink_after": 3,
+      "shrink_step": 0.25,
+      "growth_horizon_s": 60,
+      "start_limit_mb": 12288,
+      "command_burst_mb": 4096,
+      "limit_sample_interval_s": 0.2,
+      "reap_foreign": false
+    },
+    "admission_reserve": 0.1
+  },
+  "classes": {
+    "rollout": {
+      "guaranteed_share": 0.45
+    },
+    "grader": {
+      "guaranteed_share": 0.45
+    }
+  },
+  "backends": [
+    {
+      "type": "docker",
+      "mode": "direct",
+      "socket": "/var/run/docker.sock",
+      "api_version": "v1.40",
+      "max_create_concurrency": 64,
+      "mount_allowlist": [
+        "/shared/psrl/harness-runtimes"
+      ]
+    }
+  ],
+  "default_backend": "docker",
+  "node_id": "node-250"
+}

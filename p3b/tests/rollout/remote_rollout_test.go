@@ -91,8 +91,8 @@ func call(t *testing.T, address, method string, payload map[string]any) map[stri
 	}
 
 	request := map[string]any{"method": method}
-	for key, value := range payload {
-		request[key] = value
+	if payload != nil {
+		request["payload"] = payload
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -117,14 +117,23 @@ func call(t *testing.T, address, method string, payload map[string]any) map[stri
 	if _, err := io_ReadFull(conn, reply); err != nil {
 		t.Fatalf("read %s reply body: %v", method, err)
 	}
-	var decoded map[string]any
-	if err := json.Unmarshal(reply, &decoded); err != nil {
+	var envelope struct {
+		Result map[string]any `json:"result"`
+		Error  *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(reply, &envelope); err != nil {
 		t.Fatalf("decode %s reply: %v (raw: %s)", method, err, truncate(string(reply)))
 	}
-	if errText, failed := decoded["error"].(string); failed && errText != "" {
-		t.Fatalf("%s failed on the node: %s", method, errText)
+	if envelope.Error != nil {
+		t.Fatalf("%s failed on the node: %s: %s", method, envelope.Error.Code, envelope.Error.Message)
 	}
-	return decoded
+	if envelope.Result == nil {
+		return map[string]any{}
+	}
+	return envelope.Result
 }
 
 // io_ReadFull is io.ReadFull, named so the import list stays minimal and the
@@ -156,6 +165,18 @@ type nodeProcess struct {
 	address string
 	cmd     *exec.Cmd
 	logPath string
+	// configPath is kept so a test can bring the same node back up where it was.
+	configPath string
+}
+
+// stop kills the node and waits for it, so a test can restart it.
+func (p *nodeProcess) stop(t *testing.T) {
+	t.Helper()
+	if p.cmd.Process == nil {
+		return
+	}
+	_ = p.cmd.Process.Kill()
+	_, _ = p.cmd.Process.Wait()
 }
 
 // freePort asks the kernel for a port and releases it, so the config can name a
@@ -171,7 +192,8 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// startNode writes a node-role configuration and starts sandboxd against it.
+// startNode writes a node-role configuration and starts sandboxd against it on a
+// port the kernel gives it.
 //
 // Overcommit is enabled deliberately: the node reads its own cgroup hierarchy to
 // resolve the effective envelope, and a node that found no hierarchy admits at the
@@ -179,55 +201,14 @@ func freePort(t *testing.T) int {
 // reports which one it reached rather than assuming either.
 func startNode(t *testing.T, binary, workDir, nodeID string, overcommit float64) *nodeProcess {
 	t.Helper()
-	port := freePort(t)
-	address := fmt.Sprintf("127.0.0.1:%d", port)
+	return startNodeAt(t, binary, workDir, nodeID, fmt.Sprintf("127.0.0.1:%d", freePort(t)), overcommit)
+}
 
-	config := map[string]any{
-		"role":        "node",
-		"node_listen": address,
-		"node_id":     nodeID,
-		"timing": map[string]any{
-			"episode_deadline_s": 1800.0,
-			"node_ttl_s":         120.0,
-			"rpc_timeout_s":      60.0,
-		},
-		"node": map[string]any{
-			"memory_mb":         4096,
-			"cpu_millis":        4000,
-			"disk_mb":           20000,
-			"local_mem_ceiling": 0.95,
-			"overcommit":        overcommit,
-			// Below the ceiling, which the configuration validator enforces.
-			"utilization_target": 0.85,
-		},
-		"classes": map[string]any{
-			"default": map[string]any{"guaranteed_share": 0.5, "max_share": 1.0},
-		},
-		"backends": []any{
-			map[string]any{
-				"type":   "docker",
-				"mode":   "direct",
-				"socket": dockerSocket(),
-			},
-		},
-		"default_backend": "docker",
-		"owner_id":        "psrl-rollout-test",
-	}
-	if overcommit <= 1 {
-		// An unset target with overcommit off is valid, and leaving the target in
-		// would not be exercising the off path.
-		delete(config["node"].(map[string]any), "utilization_target")
-		delete(config["node"].(map[string]any), "overcommit")
-	}
-
-	configPath := filepath.Join(workDir, nodeID+".json")
-	encoded, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		t.Fatalf("marshal config: %v", err)
-	}
-	if err := os.WriteFile(configPath, encoded, 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+// startNodeAt starts a node on a stated address, so a test can bring the same
+// node back up where it was.
+func startNodeAt(t *testing.T, binary, workDir, nodeID, address string, overcommit float64) *nodeProcess {
+	t.Helper()
+	configPath := writeNodeConfig(t, workDir, nodeID, address, overcommit)
 
 	logPath := filepath.Join(workDir, nodeID+".log")
 	logFile, err := os.Create(logPath)
@@ -241,7 +222,9 @@ func startNode(t *testing.T, binary, workDir, nodeID string, overcommit float64)
 		t.Fatalf("start node %s: %v", nodeID, err)
 	}
 
-	proc := &nodeProcess{nodeID: nodeID, address: address, cmd: cmd, logPath: logPath}
+	proc := &nodeProcess{
+		nodeID: nodeID, address: address, cmd: cmd, logPath: logPath, configPath: configPath,
+	}
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
@@ -257,6 +240,64 @@ func startNode(t *testing.T, binary, workDir, nodeID string, overcommit float64)
 
 	waitForListener(t, address, proc)
 	return proc
+}
+
+func writeNodeConfig(t *testing.T, workDir, nodeID, address string, overcommit float64) string {
+	t.Helper()
+	config := map[string]any{
+		"role":        "node",
+		"node_listen": address,
+		"node_id":     nodeID,
+		"timing": map[string]any{
+			"node_ttl_s":    120.0,
+			"rpc_timeout_s": 60.0,
+		},
+		"node": map[string]any{
+			"memory_mb":          4096,
+			"cpu_millis":         4000,
+			"disk_mb":            20000,
+			"local_mem_ceiling":  0.95,
+			"overcommit":         overcommit,
+			"utilization_target": 0.85,
+			// A subtree of its own: a test that shared the deployment's default
+			// subtree would rewrite the limit of a service already running on
+			// the same host.
+			"cgroup_parent": "psrl-rollout-" + nodeID,
+		},
+		"classes": map[string]any{
+			"default": map[string]any{"guaranteed_share": 0.5, "max_share": 1.0},
+		},
+		"backends": []any{
+			map[string]any{
+				"type":   "docker",
+				"mode":   "direct",
+				"socket": dockerSocket(),
+			},
+		},
+		"default_backend": "docker",
+		// One daemon owner per node id, so a test's containers are its own and a
+		// leftover from an earlier run is not silently adopted as if this run had
+		// created it.
+		"owner_id": "psrl-rollout-" + nodeID,
+	}
+	if overcommit <= 1 {
+		// An unset target with overcommit off is valid, and leaving the target in
+		// would not be exercising the off path. Overcommit itself is still
+		// stated as exactly 1: zero is not "off", it is a subtree smaller than
+		// the envelope, which the domain refuses.
+		config["node"].(map[string]any)["overcommit"] = 1.0
+		delete(config["node"].(map[string]any), "utilization_target")
+	}
+
+	configPath := filepath.Join(workDir, nodeID+".json")
+	encoded, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, encoded, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return configPath
 }
 
 // waitForListener blocks until the node answers, or fails with its log.
@@ -300,13 +341,12 @@ func buildSandboxd(t *testing.T) string {
 
 func baseSpec(workflowID, execMode string) map[string]any {
 	return map[string]any{
-		"source_kind":      "image",
-		"source_reference": rolloutImage(),
-		"resources":        map[string]any{"memory_mb": 256, "cpu_count": 0.5},
-		"resource_class":   "default",
-		"workflow_id":      workflowID,
-		"exec_mode":        execMode,
-		"workdir":          "/",
+		"source":         map[string]any{"kind": "image", "reference": rolloutImage()},
+		"resources":      map[string]any{"memory_mb": 256, "cpu_count": 0.5},
+		"resource_class": "default",
+		"workflow_id":    workflowID,
+		"exec_mode":      execMode,
+		"workdir":        "/",
 	}
 }
 
@@ -338,16 +378,17 @@ func place(t *testing.T, address string, spec map[string]any) (sandboxID, nodeID
 	return sandboxID, nodeID
 }
 
-func handleOf(backendName, sandboxID, nodeID string) map[string]any {
-	return map[string]any{"backend": backendName, "sandbox_id": sandboxID, "node_id": nodeID}
+// handleFields are the handle fields the node-plane methods read, flat rather
+// than nested: a payload that names a handle carries its fields directly.
+func handleFields(sandboxID, nodeID string) map[string]any {
+	return map[string]any{"backend": "docker", "sandbox_id": sandboxID, "node_id": nodeID}
 }
 
 func execOn(t *testing.T, address, sandboxID, nodeID, command string) (int, string) {
 	t.Helper()
-	reply := call(t, address, "exec", map[string]any{
-		"handle":  handleOf("docker", sandboxID, nodeID),
-		"command": command,
-	})
+	payload := handleFields(sandboxID, nodeID)
+	payload["command"] = command
+	reply := call(t, address, "exec", payload)
 	code := 0
 	if raw, present := reply["exit_code"].(float64); present {
 		code = int(raw)
@@ -358,14 +399,24 @@ func execOn(t *testing.T, address, sandboxID, nodeID, command string) (int, stri
 
 func release(t *testing.T, address, sandboxID, nodeID string) {
 	t.Helper()
-	call(t, address, "release_on", map[string]any{"handle": handleOf("docker", sandboxID, nodeID)})
+	call(t, address, "release_on", handleFields(sandboxID, nodeID))
 }
 
 func statusOf(t *testing.T, address, sandboxID, nodeID string) string {
 	t.Helper()
-	reply := call(t, address, "status_on", map[string]any{"handle": handleOf("docker", sandboxID, nodeID)})
+	reply := call(t, address, "status_on", handleFields(sandboxID, nodeID))
 	state, _ := reply["status"].(string)
 	return state
+}
+
+// removeContainer removes a container through the daemon, for a cleanup that
+// cannot go through a node process.
+func removeContainer(t *testing.T, sandboxID string) {
+	t.Helper()
+	if sandboxID == "" {
+		return
+	}
+	_ = exec.Command("docker", "rm", "-f", sandboxID).Run()
 }
 
 // containerExists asks the daemon directly.
@@ -548,22 +599,79 @@ func TestTwoNodesHoldTheirOwnSandboxes(t *testing.T) {
 	}
 }
 
+// TestANodeAdoptsItsContainersAcrossARestart is the reclaim-across-a-restart
+// criterion, verified where it can only be verified: with a real process and a
+// daemon that outlives it.
+//
+// A node that started empty would hand out memory its own containers are
+// already holding, and would never surface the sandbox to the caller that still
+// owns it. Both are invisible to an in-process test, where the lifecycle and the
+// daemon die together.
+func TestANodeAdoptsItsContainersAcrossARestart(t *testing.T) {
+	binary := buildSandboxd(t)
+	workDir := t.TempDir()
+	first := startNode(t, binary, workDir, "rollout-node-restart", 0)
+	empty := defaultClassMemory(t, first.address)
+
+	sandboxID, nodeID := place(t, first.address, baseSpec("wf-restart", "one_shot"))
+	t.Cleanup(func() {
+		// The container must not outlive the test whatever happened, and by now the
+		// node that owns it may be gone, so the daemon is asked directly.
+		removeContainer(t, sandboxID)
+	})
+	before := defaultClassMemory(t, first.address)
+	if empty-before != 256 {
+		t.Fatalf("the create charged %dMB, want 256MB", empty-before)
+	}
+
+	first.stop(t)
+	// The same node, same address, same owner, same daemon: everything except the
+	// process is what the previous run left.
+	second := startNodeAt(t, binary, workDir, "rollout-node-restart", first.address, 0)
+
+	// The adopted sandbox is owned and charged, so the node did not forget what it
+	// was holding.
+	after := defaultClassMemory(t, second.address)
+	if after != before {
+		t.Fatalf("the restarted node reports %dMB of headroom against %dMB before, "+
+			"want the adopted sandbox's 256MB still charged", after, before)
+	}
+	if state := statusOf(t, second.address, sandboxID, nodeID); state != "running" {
+		t.Fatalf("the restarted node reports %q for a sandbox the daemon still runs", state)
+	}
+	if !containerExists(t, sandboxID) {
+		t.Fatal("the restart replaced the container rather than adopting it")
+	}
+
+	// And the adopted sandbox is fully usable: a caller's next command reaches the
+	// same container it was using before.
+	if code, stdout := execOn(t, second.address, sandboxID, nodeID, "echo adopted-ok"); code != 0 ||
+		!strings.Contains(stdout, "adopted-ok") {
+		t.Fatalf("the adopted sandbox did not run a command: code %d, stdout %q", code, stdout)
+	}
+
+	release(t, second.address, sandboxID, nodeID)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && containerExists(t, sandboxID) {
+		time.Sleep(500 * time.Millisecond)
+	}
+	if containerExists(t, sandboxID) {
+		t.Error("the container survived a release from the restarted node")
+	}
+}
+
 // TestTheNodeReportsWhatItWillAdmit verifies the report the fleet view is built from.
 func TestTheNodeReportsWhatItWillAdmit(t *testing.T) {
 	binary := buildSandboxd(t)
 	node := startNode(t, binary, t.TempDir(), "rollout-node-report", 0)
 
 	reported := call(t, node.address, "report", nil)
-	view, ok := reported["view"].(map[string]any)
-	if !ok {
-		t.Fatalf("report returned no view: %v", reported)
-	}
-	if id, _ := view["node_id"].(string); id != "rollout-node-report" {
+	if id, _ := reported["node_id"].(string); id != "rollout-node-report" {
 		t.Errorf("the report names node %q, want rollout-node-report", id)
 	}
 	// A node that reports no class headroom gives placement nothing to compare a
 	// request against, so every placement decision would be a guess.
-	headroom, present := view["class_headroom"].(map[string]any)
+	headroom, present := reported["class_headroom"].(map[string]any)
 	if !present || len(headroom) == 0 {
 		t.Error("the report carries no per-class headroom, so placement has nothing to compare against")
 	}
@@ -621,13 +729,9 @@ func TestOvercommitExpandsAdmissionOnALightlyLoadedNode(t *testing.T) {
 func defaultClassMemory(t *testing.T, address string) int64 {
 	t.Helper()
 	reported := call(t, address, "report", nil)
-	view, ok := reported["view"].(map[string]any)
+	headroom, ok := reported["class_headroom"].(map[string]any)
 	if !ok {
-		t.Fatalf("report returned no view: %v", reported)
-	}
-	headroom, ok := view["class_headroom"].(map[string]any)
-	if !ok {
-		t.Fatalf("report returned no class headroom: %v", view)
+		t.Fatalf("report returned no class headroom: %v", reported)
 	}
 	class, ok := headroom["default"].(map[string]any)
 	if !ok {

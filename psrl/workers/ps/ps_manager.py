@@ -677,7 +677,13 @@ class PSManager(RequestStatusTracker):
             all_requests_of_entry = entry_info.get_all_request_relative_ids()
             rest_requests_of_entry = set(all_requests_of_entry) - set(abort_request_idxs)
             if abort_group and len(rest_requests_of_entry) < self.alg_rollout_n:
-                abort_request_ids = abort_request_ids.union(set(rest_requests_of_entry))
+                # `rest_requests_of_entry` holds relative indices; the abort set
+                # holds absolute request ids. Mixing the two made the group-abort
+                # branch clear the entry while aborting only the child that
+                # triggered it, leaving the siblings RUNNING without a reservation.
+                abort_request_ids = abort_request_ids.union(
+                    {prompt_id * self.rollout_n + idx for idx in rest_requests_of_entry}
+                )
                 clear_entries.append(entry_info.prompt_id)
                 psrl_logger.info(f"Abort entire entry: (buffer {buffer_id}, entry {entry_id}) for prompt {prompt_id}")
             else:
@@ -690,6 +696,14 @@ class PSManager(RequestStatusTracker):
                     entry_info.rollout_instance_id = [entry_info.rollout_instance_id[i] for i in update_idxs]
                 if isinstance(entry_info.model_version, list):
                     entry_info.model_version = [entry_info.model_version[i] for i in update_idxs]
+                # Every per-request list is indexed by the same position as
+                # request_idx. Dropping only request_idx left n_trajectory longer
+                # than the entry, so the refill's payload keys and the entry's
+                # key count disagreed.
+                if isinstance(entry_info.n_trajectory, list) and len(
+                    entry_info.n_trajectory
+                ) == len(entry_info.request_idx):
+                    entry_info.n_trajectory = [entry_info.n_trajectory[i] for i in update_idxs]
                 psrl_logger.info(
                     f"Aborted requests from buffer {buffer_id}, entry {entry_id}, prompt {prompt_id}. "
                     f"Old request indices: {entry_info.request_idx}. "
@@ -761,11 +775,26 @@ class PSManager(RequestStatusTracker):
                 f"Checking abort for version: {version_to_abort}. "
                 f"Required buffer range: {buffer_range}. Ready buffers: {ready_buffer_ids}."
             )
-            if buffer_range.issubset(ready_buffer_ids):
-                curr_abort_versions.add(version_to_abort)
-                self.check_abort_versions.discard(version_to_abort)
-            else:
+            # A version's requests are disposable only once its own buffer no longer needs
+            # them, and `buffer_range` does not always say so: when the instance has moved
+            # past the version's whole window the range is empty and `issubset` answers
+            # true for nothing at all. Retiring a version whose buffer is still pending
+            # kills the only work that can complete it -- the buffer can never fill, the
+            # trainer waits forever, and every refill lands in a window that is retired as
+            # soon as it starts.
+            #
+            # Consumed buffers are deleted from the inventory, so "not ready" here means
+            # precisely what is needed: the buffer exists and the trainer is waiting on it.
+            if version_to_abort in self.staleness_inventory.get_buffers_not_ready():
+                psrl_logger.info(
+                    f"Not aborting version {version_to_abort}: its buffer is still not ready, "
+                    f"so its running requests are the ones that will complete it."
+                )
                 break
+            if not buffer_range.issubset(ready_buffer_ids):
+                break
+            curr_abort_versions.add(version_to_abort)
+            self.check_abort_versions.discard(version_to_abort)
 
         psrl_logger.info(
             f"Aborting versions: {curr_abort_versions}. Trigger buffer: {buffer_id}. The buffer is ready."

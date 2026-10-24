@@ -78,7 +78,9 @@ multi_turn:
   # Enable multi-turn tool interactions and use the compatible rollout backend.
   enable: False
 
-  # null for no limit (default max_length // 3)
+  # Turns per episode. A positive number caps the episode; null or -1 leaves turns
+  # unlimited, so only `rollout.agent.trajectory_timeout` bounds it. The codex
+  # harness takes no turn cap of its own and ignores any value here.
   max_turns: null
 
   # Native `Tool` configuration for stateful lifecycle hooks or custom rewards.
@@ -142,9 +144,21 @@ agent:
     # Class name of the custom async server class (e.g. AsyncvLLMServer).
     name: null
 
-  # Episode seconds after provisioning, including turns, patch collection, and grading.
-  # Other deadlines derive from this budget. Null uses the default.
+  # Episode seconds of agent work, starting once the sandbox is provisioned. Sandbox
+  # admission and provisioning are excluded: they are scheduling latency, bounded by the
+  # sandbox service's own liveness rather than by a deadline here. Null uses the default.
   trajectory_timeout: 7200
+
+  # Seconds grading may run after the episode. Kept apart from the episode budget because
+  # grading is a separate phase an operator often wants a different answer for. Null means
+  # grading is not timed.
+  grading_timeout: null
+
+  # What a harness does when `trajectory_timeout` expires. `discard` cancels the episode
+  # and retries it, losing the partial work. `keep` stops the agent at the deadline and
+  # collects and grades whatever patch and trajectory it produced, training the partial
+  # rollout instead of discarding it. Applies to harness training only.
+  trajectory_timeout_action: discard
 
   # Environment configuration for the agent loop.
   env:
@@ -170,7 +184,14 @@ agent:
     # runtime objects such as Docker clients and metrics locks never enter `RolloutConfig`.
     _recursive_: false
 
-    default_backend: docker
+    default_backend: p3b
+
+    # How long one create waits for room before it is reported as a capacity fault. The
+    # refused request is the one that made a sandbox share full, and a share clears as its
+    # sandboxes are released, so waiting is what turns a burst that outruns the fleet into
+    # a slower phase instead of episodes whose grader never ran. It binds every backend,
+    # including one that keeps its own ledger and therefore refuses rather than queues.
+    capacity_wait_s: 600
 
     # One node envelope shared by every Docker sandbox on that node. Null uses the node's
     # cgroup/machine limit and utilization is the sole safety margin.
@@ -210,68 +231,48 @@ agent:
         grader:
           guaranteed_share: 0.45
 
-      # Maximum admission wait in seconds. The agent loop refuses a deadline at or above
-      # `trajectory_timeout`, because a request that queues longer than it would work is a
-      # capacity fault rather than a wait. Null waits indefinitely.
-      acquire_timeout_s: 3600
-
-    # Idle windows derive from the one number an operator can estimate: episode length.
-    # The pause, reap, and lifetime windows follow in order, or are asserted if named directly.
-    # One number an operator can estimate. Every window the module enforces -- the idle
-    # pause, the idle reap, the absolute lifetime, the admission deadline, the capacity
-    # lease and its heartbeat, the reservation TTL and its renewal, and the reclamation
-    # sweep -- is derived from these and asserted in one place, so an ordering cannot be
-    # configured wrongly. Leave `episode_deadline_s` unset to run without idle windows.
-    #
-    # A deployment that needs a specific window sets it under `overrides`, and the
-    # orderings are still asserted against it.
-    timing:
-      episode_deadline_s: null
-      node_ttl_s: 120.0
-      rpc_timeout_s: 60.0
-
     backends:
 
-      # The p3b sandbox service. Switch to it with `default_backend: p3b`.
-      #
-      # Choose it over `docker` when more than one worker shares a fleet: the
-      # service holds one quota ledger across every node and backend it drives,
-      # so a class guarantee bounds the whole run rather than each worker's own
-      # node. A single-worker deployment gains nothing from the hop and should
-      # stay on `docker`.
+      # The p3b sandbox service. It is the default backend: the service's
+      # control plane owns placement, admission, and reclamation across its
+      # node agents, so every worker shares one ledger instead of each worker
+      # bounding only its own machine.
       #
       # The service must already be listening before a worker starts — the
-      # backend connects on its first create and a missing socket is a startup
+      # backend connects on its first create and a missing endpoint is a startup
       # error, not a retry. `p3b/README.md` carries the deployment steps.
       p3b:
         _target_: psrl.sandbox.backends.P3bBackend
 
-        # Where the SDK reaches the service. A service per node uses this unix
-        # socket; one shared control plane over several nodes is reached by
-        # host:port instead, and that is the deployment which makes this backend
-        # worth the hop — every worker charges one ledger and placement compares
-        # every node rather than each worker seeing only its own.
-        #
-        # Override per deployment rather than editing this default:
+        # Where the SDK reaches the control plane. The default names a control
+        # host the deployment supplies; override it per deployment rather than
+        # editing this value:
         #   actor_rollout_ref.rollout.sandbox.backends.p3b.endpoint=<host>:9000
-        endpoint: unix:///run/sandboxd.sock
+        # The environment variable is the deployment-wide form of the same
+        # override.
+        endpoint: ${oc.env:PSRL_P3B_ENDPOINT,p3b-control:9000}
 
         # The class a sandbox is charged to when its spec names none. The
         # service's own `classes` block has to declare this same name, or every
         # create is refused for a class it was never given a share of.
         resource_class: rollout
 
-        # Bounds a control call — a create, a release, a report. Never a command:
-        # a command carries its own budget, because its duration is the work.
-        #
-        # Covers a create's worst case rather than its median. A create may pull a
-        # cold image and may try several nodes before one admits, so a budget set
-        # to the median turns a slow-but-healthy create into a reported service
-        # fault.
-        control_timeout_s: 300
-
       docker:
         _target_: psrl.sandbox.backends.DockerBackend
+
+        # Concurrent create+start pairs in flight to this node's daemon. Zero leaves it
+        # unbounded, which is only right where nothing else shares the node.
+        #
+        # The rollout admits a whole step's sandboxes at once, and past a handful of
+        # concurrent creates the daemon's queue grows: measured on an otherwise idle node,
+        # 8 concurrent creates took 3.3s each, 32 took 7.2s, and 64 took 10.7s at the median
+        # and 20.8s at the p95, while an exec on an unrelated container went from 90ms to
+        # 295ms. The node was at 96% iowait, so the pair is waiting on storage metadata, not
+        # on CPU, and no amount of memory or networking tuning shortens that queue. Bounding
+        # the pair is what keeps it short for everyone else, and it is also the pace at which
+        # a warm pool refills. Sixteen is the value p3b's `max_create_concurrency` documents
+        # for the same reason.
+        create_concurrency: 16
 
         # One exec interface, two strategies. An interactive shell agent keeps a login
         # shell, because its actions are single commands whose `cd`, `source`, and

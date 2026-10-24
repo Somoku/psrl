@@ -70,6 +70,49 @@ func (m *Monitor) Report(view placement.NodeView) {
 	m.rebuildLocked()
 }
 
+// ClassReserveMB is the per-sandbox memory charge the live nodes published for a class,
+// and whether any of them published one.
+//
+// The largest of them, not the smallest: each node states what a sandbox costs *it*, and
+// charging the least optimistic is the direction that cannot over-admit a fleet whose
+// nodes priced themselves differently. No node publishing means the deployment has not
+// enabled elastic pricing, and the caller keeps charging the request's maximum.
+func (m *Monitor) ClassReserveMB(class string) (int64, bool) {
+	return m.largestPublished(class, func(view placement.NodeView) map[string]int64 {
+		return view.ClassReserveMB
+	})
+}
+
+// ClassReserveCPUMillis is the same question about CPU, in millicores.
+func (m *Monitor) ClassReserveCPUMillis(class string) (int64, bool) {
+	return m.largestPublished(class, func(view placement.NodeView) map[string]int64 {
+		return view.ClassReserveCPUMillis
+	})
+}
+
+// largestPublished takes the largest reserve any live node published for a class.
+func (m *Monitor) largestPublished(class string, published func(placement.NodeView) map[string]int64) (int64, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	now := m.now()
+	var largest int64
+	known := false
+	for _, view := range m.view {
+		if m.nodeTTL > 0 && now.Sub(view.SeenAt) > m.nodeTTL {
+			continue
+		}
+		reserve, stated := published(view)[class]
+		if !stated || reserve <= 0 {
+			continue
+		}
+		if !known || reserve > largest {
+			largest = reserve
+		}
+		known = true
+	}
+	return largest, known
+}
+
 // Forget drops a node, for an agent that is shutting down cleanly. Waiting for
 // its TTL would send work to a node that has already said it is leaving.
 func (m *Monitor) Forget(nodeID string) {
@@ -103,6 +146,27 @@ func (m *Monitor) Fleet() []placement.NodeView {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.view
+}
+
+// LiveFleet returns the nodes whose report is still inside the TTL.
+//
+// Fleet is the historical view -- it keeps a node that once reported so the
+// fleet report can explain a drain. Any caller that acts on a node (a renewal,
+// a probe, a control fan-out) must use this instead: acting on a stale entry
+// means paying that node's timeout on every pass, and a single unreachable node
+// then becomes a permanent tax on a mechanism that has nothing to do with it.
+func (m *Monitor) LiveFleet() []placement.NodeView {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	now := m.now()
+	live := make([]placement.NodeView, 0, len(m.view))
+	for _, view := range m.view {
+		if m.nodeTTL > 0 && now.Sub(view.SeenAt) > m.nodeTTL {
+			continue
+		}
+		live = append(live, view)
+	}
+	return live
 }
 
 // Version changes whenever the fleet does, so a reader can skip an unchanged pull.

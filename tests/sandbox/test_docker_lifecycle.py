@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -36,7 +37,7 @@ def test_lifecycle_restarts_an_idle_collector(monkeypatch, tmp_path) -> None:
         DockerLifecycleConfig(
             heartbeat_dir=str(tmp_path),
             heartbeat_interval_s=60,
-            lease_ttl_s=120,
+            lease_ttl_s=480,
         ),
     )
 
@@ -156,3 +157,80 @@ def test_the_collector_receives_the_configured_grace_period(monkeypatch, tmp_pat
     lifecycle.close()
 
     assert spawned[0]["stopped_grace_s"] == 600
+
+
+class TestTheOwnerLeaseBudget:
+    """A lease budget decides whether a running sandbox is reclaimed.
+
+    An owner that misses its beats reads as dead, and the node then destroys every
+    container that owner holds — so the budget has to absorb a heartbeat that was
+    merely late (a starved writer, a filesystem hiccup, a host under pressure).
+    """
+
+    def test_the_default_budget_covers_many_beats(self):
+        config = DockerLifecycleConfig(heartbeat_dir="/tmp/hb")
+
+        assert config.lease_ttl_s >= 8 * config.heartbeat_interval_s
+
+    def test_a_budget_too_small_to_survive_a_late_beat_is_refused(self):
+        with pytest.raises(ValueError, match="must cover at least"):
+            DockerLifecycleConfig(heartbeat_dir="/tmp/hb", heartbeat_interval_s=30, lease_ttl_s=120)
+
+    def test_a_generous_budget_is_accepted(self):
+        config = DockerLifecycleConfig(heartbeat_dir="/tmp/hb", heartbeat_interval_s=30, lease_ttl_s=300)
+
+        assert config.lease_ttl_s == 300
+
+
+class TestTheHeartbeatSurvivesWhatItIsFor:
+    """The lease heartbeat is the worker's liveness, so nothing may stop it early."""
+
+    def _lifecycle(self, tmp_path, monkeypatch, write):
+        monkeypatch.setattr("psrl.sandbox.backends.docker.lifecycle.write_owner_heartbeat", write)
+        monkeypatch.setattr(
+            "psrl.sandbox.backends.docker.lifecycle.force_remove_containers_by_label",
+            lambda *args, **kwargs: None,
+        )
+        return DockerLifecycle(
+            "worker-1",
+            DockerLifecycleConfig(
+                heartbeat_dir=str(tmp_path),
+                heartbeat_interval_s=0.01,
+                lease_ttl_s=8 * 0.01,
+                gc_enabled=False,
+            ),
+        )
+
+    def test_a_failing_write_does_not_kill_the_heartbeat(self, monkeypatch, tmp_path):
+        # A write that fails once must be retried, not end the lease: the collector
+        # reads a stopped heartbeat as a dead owner and reclaims live sandboxes.
+        calls = []
+
+        def write(heartbeat_dir, owner_id):
+            calls.append(owner_id)
+            if len(calls) == 1:
+                raise OSError("disk full")
+
+        lifecycle = self._lifecycle(tmp_path, monkeypatch, write)
+        lifecycle.start()
+
+        deadline = time.time() + 2
+        while len(calls) < 3 and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert len(calls) >= 3, "the heartbeat stopped after a failed write"
+        assert lifecycle._heartbeat_thread.is_alive()
+        lifecycle.close()
+
+    def test_the_lease_is_written_even_when_this_worker_collects_nothing(self, monkeypatch, tmp_path):
+        # The lease says *this worker is alive*, for every other worker's collector.
+        # Gating it on this process also running a collector would make a worker look
+        # dead to the first collector that shares the directory.
+        calls = []
+        lifecycle = self._lifecycle(tmp_path, monkeypatch, lambda d, o: calls.append(o))
+
+        assert calls == [], "the lease must not be written before start"
+        lifecycle.start()
+
+        assert calls == ["worker-1"]
+        lifecycle.close()

@@ -29,7 +29,6 @@ from psrl.utils.transferqueue_utils import (
     validate_ready_payload,
 )
 from psrl.workers.agent_loop.loops.utils import TerminateReason
-from psrl.workers.agent_loop.timeouts import resolve_from_config
 from psrl.workers.gen.utils import RolloutInstanceId
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.ps.staleness_controller import EntryInfo
@@ -76,6 +75,22 @@ class BoundedIdSet:
 
     def __len__(self) -> int:
         return len(self._ids)
+
+
+def _root_cause(failure_summary: str | None, terminate_reason) -> str:
+    """Turn a worker-captured diagnosis into something worth printing.
+
+    It never returns blank. A summary that is only whitespace -- which is what a
+    whitespace-only traceback produces -- prints as empty lines, and empty lines read as
+    "the logger is broken" rather than "this failure had no cause recorded". When there is
+    nothing to say it says so, and names the terminate reason, so the line still tells a
+    sandbox fault from a harness fault.
+    """
+    body = (failure_summary or "").strip()
+    if body:
+        return body
+    reason = terminate_reason.value if terminate_reason is not None else "<unset>"
+    return f"<the worker captured no underlying exception; terminate_reason={reason}>"
 
 
 class PSRL_AgentLoopManager:
@@ -228,6 +243,21 @@ class PSRL_AgentLoopManager:
         # task under the same slot. Held only for the round in flight.
         self._val_round_prompts: dict[int, TensorDict] = {}
 
+        # Training prompt rows still in flight, keyed by parent id. A member-level refill
+        # re-dispatches one failed child from its group's row, so the task and group id stay
+        # fixed while only the failed member reruns; the siblings keep their completed work.
+        # Dropped when the group occupies or is aborted, so this holds only live groups.
+        self._train_round_prompts: dict[int, TensorDict] = {}
+        # Attempts spent per failed training child. A member is retried in place up to this
+        # limit; after that the group falls back to the old whole-group replacement, which is
+        # the only safe answer to a task that kills every sandbox it runs in.
+        self.train_member_retry_limit = max(
+            1, int(self.config.psrl.agentic_rl.get("train_member_retry_limit", 3))
+        )
+        self._train_member_attempts: dict[int, int] = {}
+        # Validation children are retried in place the same way; kept per round so a
+        # prompt that exhausted its attempts in one round starts the next one fresh.
+
         # Refill breaker state (train only). Groups that fail before being replaced are counted
         # consecutively and cleared by any occupied group, so sporadic failures never trip it.
         # Only reasons that say something about the rollout itself count: a coordination fault
@@ -251,7 +281,6 @@ class PSRL_AgentLoopManager:
         # exception that ends the run.
         self._refill_breaker_diagnosis: str | None = None
 
-        self.timeouts = resolve_from_config(self.config)
         # The driver logs a progress line this often while a buffer is incomplete.
         self.buffer_wait_log_interval_s = float(self.config.psrl.agentic_rl.get("buffer_wait_log_interval_s", 60))
 
@@ -546,12 +575,12 @@ class PSRL_AgentLoopManager:
 
         tu.assign_non_tensor_stack(data, "version_tag", [-1] * len(data))
         psrl_logger.info(f"Retry dispatch: requests={len(data)}, prompts={len(data) // rollout_n}.")
-        await self._inner_dispatch_data(data, is_validate=False)
+        dispatched = await self._inner_dispatch_data(data, is_validate=False)
 
         # Account retry dispatches in the staleness throttle so that
         # `_train_dispatch_data` doesn't over-dispatch on top of retry bursts.
-        self._request_counter += len(data)
-        return len(data)
+        self._request_counter += dispatched
+        return dispatched
 
     def _reset_group_failure_streak(self, *, capacity_fault: bool = False) -> None:
         """Clear the refill breaker's failure streaks after a group is occupied.
@@ -605,8 +634,8 @@ class PSRL_AgentLoopManager:
 
         Capacity faults get their own streak rather than none at all. They are not evidence
         about the harness, but they are not harmless either: every sandbox that cannot be
-        admitted costs a full `acquire_timeout_s` and the group is replaced, so a node that
-        has run out of admittable capacity refills forever while the buffer never fills.
+        admitted is refused and the group is replaced, so a node that has run out of
+        admittable capacity refills forever while the buffer never fills.
         That is a livelock with a capacity cause, and it needs to end with a capacity
         diagnosis instead of hanging. Failures seen while the manager is shutting down are
         recorded and dropped, because every in-flight episode fails at that point regardless
@@ -651,12 +680,12 @@ class PSRL_AgentLoopManager:
     def _record_capacity_failure(self, reason: str, *, phase: str) -> None:
         """Account one training group lost to node capacity admission, and bound the wait.
 
-        `phase` names where the starvation was observed. A starved rollout admission costs a
-        full `acquire_timeout_s` before the group is replaced; a starved grading admission
-        costs the same before the episode is kept ungraded. Either way, once the threshold
-        is reached the run cannot make progress: stop with the capacity diagnosis, which
-        says what to look at, instead of grinding for hours. Set
-        `capacity_failure_threshold` to zero to wait indefinitely.
+        `phase` names where the starvation was observed. A starved rollout admission is
+        refused and the group is replaced; a starved grading admission is refused too and
+        the episode is kept ungraded. Either way, once the threshold is reached the run
+        cannot make progress: stop with the capacity diagnosis, which says what to look at,
+        instead of grinding for hours. Set `capacity_failure_threshold` to zero to wait
+        indefinitely.
         """
         if self.capacity_failure_threshold <= 0:
             self._report_coordination_failures()
@@ -667,8 +696,8 @@ class PSRL_AgentLoopManager:
         breakdown = ", ".join(f"{name}={count}" for name, count in self._coordination_failures.most_common())
         self._trip_refill_breaker(
             f"{self._capacity_failure_streak} consecutive training groups could not get a sandbox during "
-            f"{phase} (threshold={self.capacity_failure_threshold}). Every attempt waited the full "
-            f"{self.timeouts.admission_timeout_s:.0f}s admission deadline, so the buffer could never fill. "
+            f"{phase} (threshold={self.capacity_failure_threshold}). Every attempt waited for capacity "
+            "until it was refused, so the buffer could never fill. "
             f"Coordination reasons: {breakdown}. This is a capacity planning fault, not a harness fault: "
             "check that node capacity leases are actually returned (a lease held without a sandbox keeps the "
             "node full), that the node has the disk and memory those sandboxes need, and that the envelope "
@@ -693,7 +722,7 @@ class PSRL_AgentLoopManager:
             f"{total} rollout groups failed for coordination reasons: {breakdown}. These are not counted "
             "against the refill breaker because no episode ran or the run was stopping, but training cannot "
             "make progress while they continue. Check node capacity admission: "
-            "rollout.agent.sandbox.capacity.classes, acquire_timeout_s, and the envelope size."
+            "rollout.agent.sandbox.capacity.classes and the envelope size."
         )
 
     def _trip_refill_breaker(self, diagnosis: str) -> None:
@@ -958,6 +987,137 @@ class PSRL_AgentLoopManager:
             accumulated_buffer_size.pop(buffer_id, None)
         return add_buffer
 
+    def _member_prompt_row(
+        self, parent_id: int, failed_uid: int, is_validate: bool
+    ) -> TensorDict | None:
+        """Return the one-row batch for a failed child, if its group's rows are held.
+
+        The row is selected by the child's position in the group, not by its
+        prompt text: the siblings were sampled from this exact row, so re-running
+        it preserves both the task and the group's identity.
+        """
+        rows = self._val_round_prompts if is_validate else self._train_round_prompts
+        group = rows.get(parent_id)
+        if group is None:
+            return None
+        rollout_n = self._active_rollout_n(is_validate)
+        index = failed_uid - parent_id * rollout_n
+        if index < 0 or index >= group.shape[0]:
+            return None
+        return group[index : index + 1]
+
+    async def _refill_member(
+        self,
+        parent_id: int,
+        failed_uid: int,
+        is_validate: bool,
+        terminate_reason: TerminateReason | None,
+        failure_summary: str | None = None,
+    ) -> bool:
+        """Re-run one failed child in place, leaving its group and siblings intact.
+
+        Returns:
+            bool: Whether this failure was handled as a member refill. False means
+            the caller must fall back to the whole-group replacement: no retained
+            row, the member's retry budget is spent, or the dispatch was rejected.
+        """
+        retry_limit = self.val_retry_limit if is_validate else self.train_member_retry_limit
+
+        # A reason that already produced a usable partial trajectory (a
+        # trajectory timeout under the `keep` action) must not be re-run: the
+        # replacement would duplicate a turn the trainer is about to use. The
+        # existing group-level path knows how to release or replace that slot.
+        retryable = (
+            terminate_reason is None
+            or terminate_reason.is_coordination_fault
+            or terminate_reason.is_error
+        )
+        if not retryable:
+            psrl_logger.info(
+                "notify_group_failed: member uid=%s parent_id=%s is not retryable "
+                "(reason=%s, validate=%s).",
+                failed_uid,
+                parent_id,
+                terminate_reason.value if terminate_reason is not None else "<unset>",
+                is_validate,
+            )
+            return False
+
+        # The worker aborts the failed child before it notifies the manager. If
+        # the child is no longer marked aborted, a refill is already in flight
+        # (or the member has completed), so this notification is a duplicate
+        # rather than a new failure of the refill.
+        aborted = await self.ps_manager_handle.is_request_aborted.remote(failed_uid)
+        if not aborted:
+            psrl_logger.debug(
+                "notify_group_failed: member uid=%s parent_id=%s is not marked "
+                "aborted; its refill is already in flight.",
+                failed_uid,
+                parent_id,
+            )
+            return True
+
+        prompt = self._member_prompt_row(parent_id, failed_uid, is_validate)
+        if is_validate:
+            # The validation budget is per prompt and counts the first attempt,
+            # matching `_retry_validation_group`; a member refill spends one.
+            attempts = self._val_attempts.get(parent_id, 1)
+            allowed = attempts < retry_limit
+        else:
+            attempts = self._train_member_attempts.get(failed_uid, 0) + 1
+            allowed = attempts <= retry_limit
+        if prompt is None or not allowed:
+            psrl_logger.warning(
+                "notify_group_failed: member uid=%s parent_id=%s cannot be refilled "
+                "(row_retained=%s, attempts=%d/%d, validate=%s); falling back to a "
+                "whole-group replacement.",
+                failed_uid,
+                parent_id,
+                prompt is not None,
+                attempts if is_validate else attempts - 1,
+                retry_limit,
+                is_validate,
+            )
+            return False
+
+        # Release the aborted record so the same child id may be dispatched
+        # again. The id is the group's slot; allocating a new one would make the
+        # tracker see a group of the wrong size.
+        await self.ps_manager_handle.readmit_requests.remote(
+            [failed_uid], is_validate=is_validate
+        )
+        # A refill is generated under the model that is current now. The siblings
+        # keep their own version tags; the trainer's staleness accounting already
+        # treats a group's members as independently versioned.
+        current_version = -1 if not is_validate else self.curr_ps_version_tag
+        tu.assign_non_tensor_stack(prompt, "version_tag", [current_version])
+
+        dispatched = await self._inner_dispatch_data(
+            prompt, is_validate=is_validate, retain_prompts=False
+        )
+        if dispatched != 1:
+            return False
+
+        if is_validate:
+            self._val_attempts[parent_id] = attempts + 1
+        else:
+            self._train_member_attempts[failed_uid] = attempts
+            # One request, not one group: this counts against the staleness
+            # throttle exactly as the work it replaces did.
+            self._request_counter += 1
+        psrl_logger.warning(
+            "notify_group_failed: refilled member uid=%s parent_id=%s attempt=%d/%d "
+            "(reason=%s, validate=%s); siblings left running.\n%s",
+            failed_uid,
+            parent_id,
+            attempts + 1 if is_validate else attempts,
+            retry_limit,
+            terminate_reason.value if terminate_reason is not None else TerminateReason.UNKNOWN.value,
+            is_validate,
+            _root_cause(failure_summary, terminate_reason)[:2000],
+        )
+        return True
+
     async def notify_group_failed(
         self,
         parent_id: int,
@@ -976,20 +1136,28 @@ class PSRL_AgentLoopManager:
                 Recorded on the train path so the refill breaker can name the cause.
             failure_summary (str | None): Worker-captured root cause text for the log.
         """
-        if failure_summary:
-            psrl_logger.error(
-                "notify_group_failed: root cause for parent_id=%s failed_uid=%s:\n%s",
-                parent_id,
-                failed_uid,
-                failure_summary,
-            )
         async with AsyncBusyPollingRayLock(self.ps_manager_handle):
-            rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+            rollout_n = self._active_rollout_n(is_validate)
+
+            # A member-local failure is repaired in place: the same group id and
+            # the same child id, on the same prompt row, while the siblings keep
+            # their completed work and their sandboxes. This is the normal path;
+            # the whole-group replacement below is the fallback for a member that
+            # exhausted its budget or whose prompt row is no longer held.
+            if await self._refill_member(
+                parent_id, failed_uid, is_validate, terminate_reason, failure_summary
+            ):
+                return
+
             failed_group_ids = self._failed_val_group_ids if is_validate else self._failed_train_group_ids
             if parent_id in failed_group_ids:
-                psrl_logger.warning(
-                    f"Duplicate group failure: parent_id={parent_id}, "
-                    f"is_validate={is_validate}, failed_uid={failed_uid}. Skipping."
+                # The group has already been replaced as a whole, so a late
+                # notification from one of its children carries no new action.
+                psrl_logger.debug(
+                    "Duplicate group failure: parent_id=%s, is_validate=%s, failed_uid=%s. Skipping.",
+                    parent_id,
+                    is_validate,
+                    failed_uid,
                 )
                 return
             failed_group_ids.add(parent_id)
@@ -997,16 +1165,45 @@ class PSRL_AgentLoopManager:
             # must not be charged to the replacement group that reuses this parent id.
             self._grading_capacity_faults.discard(parent_id)
 
+            # The root cause is logged here rather than before the duplicate guard, and
+            # therefore once per group rather than once per child.
+            #
+            # A group failure aborts every sibling, and each aborted sibling reports its
+            # own failure with the same diagnosis. In a cascade that is thousands of
+            # identical lines carrying no new information -- which is how the one line an
+            # operator needs ends up buried. The first child to fail carries the cause;
+            # the rest are already known to be the same group.
+            psrl_logger.error(
+                "notify_group_failed: root cause for parent_id=%s failed_uid=%s (terminate_reason=%s):\n%s",
+                parent_id,
+                failed_uid,
+                terminate_reason.value if terminate_reason is not None else "<unset>",
+                _root_cause(failure_summary, terminate_reason),
+            )
+
             all_child_uids = [parent_id * rollout_n + i for i in range(rollout_n)]
+            if not is_validate:
+                # The group is being replaced as a whole, so the retained row and
+                # every member's retry state for it are no longer useful.
+                self._train_round_prompts.pop(parent_id, None)
+                for uid in all_child_uids:
+                    self._train_member_attempts.pop(uid, None)
             sibling_uids = [uid for uid in all_child_uids if uid != failed_uid]
-            if sibling_uids:
-                psrl_logger.info(
-                    "notify_group_failed: aborting %d sibling uids=%s for parent_id=%s.",
-                    len(sibling_uids),
-                    sibling_uids,
+            # This is the fallback, not the normal member recovery: the failed
+            # member exhausted its in-place attempts (or its prompt row is no
+            # longer held), so the group as a whole is replaced. Training aborts
+            # every child, including a failed uid that a readmit may have left
+            # PENDING; validation re-admits the whole group for its retry below.
+            abort_uids = all_child_uids if not is_validate else sibling_uids
+            if abort_uids:
+                psrl_logger.warning(
+                    "notify_group_failed: aborting %d child uids=%s for parent_id=%s "
+                    "while replacing the whole group.",
+                    len(abort_uids),
+                    abort_uids,
                     parent_id,
                 )
-                await self.ps_manager_handle.abort_requests.remote(sibling_uids, blocking=False)
+                await self.ps_manager_handle.abort_requests.remote(abort_uids, blocking=False)
 
             await self._purge_tracker_group(parent_id, rollout_n, is_validate)
 
@@ -1108,25 +1305,100 @@ class PSRL_AgentLoopManager:
         self.curr_ps_version_tag = version
         psrl_logger.info(f"Initialized resume PS version: version={version}.")
 
-    async def _inner_dispatch_data(self, data: TensorDict, is_validate: bool = False):
-        """Update request status to RUNNING in PSManager, then fan out to workers."""
+    async def _inner_dispatch_data(
+        self,
+        data: TensorDict,
+        is_validate: bool = False,
+        *,
+        retain_prompts: bool = True,
+    ) -> int:
+        """Update request status to RUNNING in PSManager, then fan out to workers.
+
+        Returns:
+            int: How many rows were actually dispatched. A request the PSManager
+            already aborted or considers stale is not sent to a worker: dispatching
+            it would spend a full episode on a result the tracker will discard, and
+            the group it belongs to could never occupy.
+        """
         # Rows are ordered as contiguous groups of `rollout_n` children per parent.
-        uids = tu.get(data, "uid")
+        uids = list(tu.get(data, "uid"))
         versions = tu.get(data, "version_tag")
 
-        # Update request status from PENDING to RUNNING
+        # Update request status from PENDING to RUNNING. The tracker answers per
+        # request; a non-empty result list is truthy even when every entry is
+        # False, so the old truthiness check dispatched aborted requests.
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             uids,
             PSRL_RequestStatus.RUNNING,
             model_version=versions,
             is_validate=is_validate,
         )
-        if not update_status_success:
-            return
+        if isinstance(update_status_success, bool):
+            update_status_success = [update_status_success] * len(uids)
+        if len(update_status_success) != len(uids):
+            raise RuntimeError(
+                f"update_request_status returned {len(update_status_success)} result(s) "
+                f"for {len(uids)} request(s)."
+            )
+        keep = [i for i, ok in enumerate(update_status_success) if ok]
+        if len(keep) != len(uids):
+            rejected = [uids[i] for i, ok in enumerate(update_status_success) if not ok]
+            psrl_logger.warning(
+                "dispatch: %d/%d request(s) were aborted or stale and are not "
+                "dispatched (is_validate=%s): %s",
+                len(rejected),
+                len(uids),
+                is_validate,
+                rejected,
+            )
+        if not keep:
+            return 0
+        if retain_prompts and not is_validate:
+            # Retain the full group's rows, including any child whose status
+            # update was rejected: a member refill selects its row by the child's
+            # position in the group, so the slice must not be compacted.
+            self._retain_train_round_prompts(data)
+        if len(keep) != len(uids):
+            data = data[keep]
 
         dispatch_plan = self.get_dispatch_plan(data, is_validate=is_validate)
         for worker_index, batch in dispatch_plan.items():
             self.agent_loop_workers[worker_index].add_agent_program.remote(batch)
+        return len(keep)
+
+    def _retain_train_round_prompts(self, data: TensorDict) -> None:
+        """Keep each in-flight training group's prompt rows for member refills.
+
+        A member refill has to re-run the same task under the same group id; the
+        dataloader's next prompt is a different task. The rows are dropped when
+        the group occupies or is replaced, so this holds only live groups.
+
+        Slices are stored per prompt rather than one reference to the whole
+        batch: a group is the unit a refill needs, and a per-group slice keeps
+        the cleanup as precise as the failure it serves.
+        """
+        rollout_n = self._active_rollout_n(is_validate=False)
+        parent_ids = tu.get(data, "parent_id") if rollout_n > 1 else tu.get(data, "uid")
+        rows_by_parent: dict[int, list[int]] = {}
+        for row, parent_id in enumerate(parent_ids):
+            rows_by_parent.setdefault(int(parent_id), []).append(row)
+        cap = max(4 * self.entries_per_buffer * (self.staleness + 1), 64)
+        for parent_id, rows in rows_by_parent.items():
+            if parent_id not in self._train_round_prompts and len(self._train_round_prompts) >= cap:
+                # A group whose completion never arrives (a stale abort, a lost
+                # worker) must not retain prompt tensors for the rest of the run.
+                self._train_round_prompts.pop(next(iter(self._train_round_prompts)))
+            self._train_round_prompts[parent_id] = data[rows]
+
+    def _active_rollout_n(self, is_validate: bool) -> int:
+        """Return the child count that defines one group for this partition."""
+        if is_validate:
+            return self.val_rollout_n
+        coordination = self.config.psrl.get("rollout_coordination", {})
+        redundant = coordination.get("redundant_rollout", {}) if coordination else {}
+        if redundant and redundant.get("enable", False):
+            return redundant.get("redundant_rollout_n", self.rollout_n)
+        return self.rollout_n
 
     def get_dispatch_plan(self, data: TensorDict, is_validate: bool = False) -> dict[int, TensorDict]:
         """Round-robin dispatch plan keyed by worker index, co-locating siblings.
@@ -1257,6 +1529,9 @@ class PSRL_AgentLoopManager:
                         is_validate=is_validate,
                     )
                     self.rollout_request_tracker.setdefault(prompt_id, []).append(entry_info)
+                    if not is_validate:
+                        # This child's refill, if it had one, has now reported.
+                        self._train_member_attempts.pop(request_id, None)
                     psrl_logger.debug(
                         f"Stored rollout entry: prompt_id={prompt_id}, entry={entry_info!r}, "
                         f"count={len(self.rollout_request_tracker[prompt_id])}."
@@ -1269,6 +1544,13 @@ class PSRL_AgentLoopManager:
                             f"samples for prompt {prompt_id}"
                         )
                         entry_infos = self.rollout_request_tracker.pop(prompt_id)
+                        if not is_validate:
+                            # The group is complete; its retained prompt and every
+                            # member's retry state have served their purpose.
+                            self._train_round_prompts.pop(prompt_id, None)
+                            for child_idx in range(rollout_n):
+                                child_uid = prompt_id * rollout_n + child_idx
+                                self._train_member_attempts.pop(child_uid, None)
                         psrl_logger.debug(
                             f"Popped entry_infos from rollout_request_tracker for prompt_id {prompt_id}, "
                             f"entry count: {len(entry_infos)}"

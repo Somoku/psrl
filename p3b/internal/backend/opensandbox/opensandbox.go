@@ -232,13 +232,14 @@ func (b *Backend) Capabilities() backend.Capabilities {
 		}
 	}
 	return backend.Capabilities{
+		// Delivery here is block-level, not lazy layers, so image_on_demand is
+		// absent and a spec needing true lazy loading will not select this backend.
 		Features: []string{
 			"freeze",
 			"filesystem_snapshot",
 			"restore",
 			"resume_anywhere",
 			"warm_pool",
-			"image_on_demand",
 			"image_block_delivery",
 			"template_build",
 			"volume",

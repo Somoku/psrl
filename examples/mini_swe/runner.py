@@ -16,6 +16,7 @@ from psrl.sandbox import (
     ExecMode,
     MountSpec,
     ResourceSpec,
+    SandboxCapacityTimeout,
     SandboxFeature,
     SandboxSource,
     SandboxSpec,
@@ -336,6 +337,7 @@ def grade_patch(
     sandbox: SyncSandboxManager,
     baseline_snapshot: SnapshotRef | None = None,
     grader_spec: SandboxSpec | None = None,
+    grading_timeout_s: float | None = None,
 ) -> dict[str, Any] | None:
     observation = payload["observation"]
     if not patch or observation.get("swe_grader") != "swebench_fresh_container":
@@ -366,7 +368,7 @@ def grade_patch(
             patch,
             grader_kind,
             swe_image,
-            int(grader_config.get("timeout", 900)),
+            grading_timeout_s,
             observation.get("swe_task_id", ""),
             grader_config.get("memory", ""),
             sandbox=sandbox,
@@ -374,6 +376,10 @@ def grade_patch(
             sandbox_snapshot=verifier_snapshot,
             grading_plan=GradingPlan.from_swe_problem(swe_problem),
         )
+    except SandboxCapacityTimeout:
+        # Nothing was measured without a sandbox, so this is not a grading result. The
+        # caller keeps the trajectory and reports it ungraded instead of training a zero.
+        raise
     except Exception as exc:
         return _grader_failure(swe_problem, str(exc))
 
@@ -382,6 +388,7 @@ def run_agent(
     payload: dict[str, Any],
     sandbox: SyncSandboxManager,
     cancel_event: threading.Event | None = None,
+    grading_timeout_s: float | None = None,
 ) -> dict[str, Any]:
     """Run one task through mini-SWE-agent's standard Python bindings."""
     from minisweagent.agents.default import DefaultAgent
@@ -469,7 +476,7 @@ def run_agent(
         except Exception:
             psrl_logger.warning("MiniSWE harness cleanup before grading failed.", exc_info=True)
         grade_start = time.perf_counter()
-        grader_result = grade_patch(payload, patch, sandbox, baseline_snapshot, grader_spec)
+        grader_result = grade_patch(payload, patch, sandbox, baseline_snapshot, grader_spec, grading_timeout_s)
         timing["grading_s"] = time.perf_counter() - grade_start
         return {
             "exit_status": result.get("exit_status", ""),

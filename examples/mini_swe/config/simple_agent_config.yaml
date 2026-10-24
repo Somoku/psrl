@@ -12,7 +12,6 @@
       memory: "8g"
     grader_environment:
       memory: "10g"   # toy repos don't need as much as real SWEbench
-      timeout: 900
   agent:
     system_template: |
       You are a helpful assistant that can interact with a computer to solve programming tasks.

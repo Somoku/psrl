@@ -330,6 +330,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     cd bindings/python && \
     maturin develop --features vendored-openssl --release
 
+# Go is needed to compile the p3b sandbox service (p3b/cmd/sandboxd), which is
+# the default rollout placement plane.
+ARG GO_VERSION=1.23.4
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+        -o /tmp/go.tar.gz && \
+    tar -C /usr/local -xzf /tmp/go.tar.gz && \
+    rm /tmp/go.tar.gz && \
+    /usr/local/go/bin/go version
+
+ENV GOROOT=/usr/local/go \
+    GOPATH=/root/go \
+    GOMODCACHE=/root/go/pkg/mod \
+    PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
+
 # Clone PSRL last so changing `PSRL_COMMIT` does not invalidate native
 # dependency layers. The PSRL patch plugin remains reachable by pyproject.toml.
 WORKDIR /home
@@ -338,12 +352,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git -C ${PSRL_HOME} checkout ${PSRL_COMMIT} && \
     cd ${PSRL_HOME} && \
     uv pip install --no-build-isolation -e . && \
+    uv pip install --no-build-isolation -e p3b/sdk && \
+    make -C p3b install && \
     python -c \
         "from importlib.metadata import entry_points, version; import vllm_patches; \
         version('vllm-psrl-patches'); assert any( \
         ep.name == 'custom_patches' for ep in entry_points(group='vllm.general_plugins'))" && \
     python -c "import psrl, smg.router, torch, transfer_queue, verl, vllm, vllm_patches" && \
-    python -c "import lmcache, nixl" && \
+    python -c "import lmcache, nixl, sandboxd" && \
     rm -rf /root/.cache/pip /root/.cache/uv
 
 WORKDIR ${PSRL_HOME}
@@ -352,10 +368,10 @@ RUN mkdir -p ${PSRL_WORKSPACE}/env
 COPY docker/env.sh ${PSRL_WORKSPACE}/env/psrl.sh
 
 ENV VIRTUAL_ENV=/root/venv \
-    PATH="/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    PATH="/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/go/bin:/root/go/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 RUN echo 'export VIRTUAL_ENV=/root/venv' >> ~/.bashrc && \
-    echo 'export PATH=/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' >> ~/.bashrc
+    echo 'export PATH=/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/go/bin:/root/go/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' >> ~/.bashrc
 
 LABEL org.opencontainers.image.title="PSRL CPU" \
       org.opencontainers.image.description="CPU development and smoke-test environment for PSRL" \

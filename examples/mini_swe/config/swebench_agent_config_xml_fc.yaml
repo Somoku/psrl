@@ -16,7 +16,6 @@
       memory: "8g"
     grader_environment:
       memory: "30g"
-      timeout: 900
   agent:
     system_template: |
       You are a helpful assistant that can interact with a computer to solve tasks.

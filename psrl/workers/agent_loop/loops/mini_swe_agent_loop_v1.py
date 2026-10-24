@@ -82,6 +82,7 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
             payload,
             sandbox,
             cancel_event,
+            self.timeouts.grading_timeout_s,
         )
         try:
             return await asyncio.wait_for(asyncio.shield(runner), timeout=timeout)

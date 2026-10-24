@@ -31,7 +31,14 @@ from typing import Any
 
 from examples.mini_swe.grading.runtime import run_grading
 from examples.mini_swe.grading.schema import GradingPlan, GradingResult
-from psrl.sandbox import ExecResult, SandboxSpec, SnapshotRef, SyncSandboxManager, SyncSandboxSession
+from psrl.sandbox import (
+    ExecResult,
+    SandboxCapacityTimeout,
+    SandboxSpec,
+    SnapshotRef,
+    SyncSandboxManager,
+    SyncSandboxSession,
+)
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -320,7 +327,7 @@ def grade_fresh_container(
     model_patch: str,
     grader_kind: str,
     image_name: str,
-    timeout: int = _DEFAULT_EVAL_TIMEOUT,
+    timeout: float | None = _DEFAULT_EVAL_TIMEOUT,
     swe_task_id: str = "",
     memory: str | int | None = "",
     sandbox: SyncSandboxManager | None = None,
@@ -343,7 +350,8 @@ def grade_fresh_container(
         model_patch (str): Patch submitted by the agent (unified diff).
         grader_kind (str): ``"verified"``, ``"gym"`` or ``"smith"``.
         image_name (str): Docker image used for the rollout.
-        timeout (int): Eval script execution timeout in seconds.
+        timeout (float | None): Eval script execution timeout in seconds, or
+            ``None`` to leave it untimed.
         swe_task_id (str): PSRL rollout episode ID for container labelling.
         memory (str): ``--memory`` limit for the grading container.
         sandbox: Generic synchronous PSRL sandbox manager used by training.
@@ -507,7 +515,9 @@ def grade_fresh_container(
             # --- 6. Run + grade inside the sandbox ---
             # Skip the eval script's editable re-install unless the patch changed that wheel.
             skip_editable_install = not _patch_needs_editable_install(model_patch)
-            psrl_logger.info(f"{log_prefix} Running eval script (timeout={timeout}s)...")
+            psrl_logger.info(
+                f"{log_prefix} Running eval script (timeout={timeout if timeout is not None else 'none'})..."
+            )
             verdict = run_grading(
                 sandbox_session,
                 plan,
@@ -523,6 +533,12 @@ def grade_fresh_container(
                 output_tail=out2.stdout[-_OUTPUT_TAIL_BYTES:],
             ).to_dict()
 
+    except SandboxCapacityTimeout:
+        # No grader sandbox existed, so this episode was never measured and it is not a
+        # verdict. Folding it into one anyway is what turns an infrastructure fault into a
+        # scored zero, which trains the absence of a measurement as a measured failure and
+        # moves the episode's whole GRPO group on something the policy cannot influence.
+        raise
     except Exception as exc:
         psrl_logger.error(f"{log_prefix} Container error: {exc}.")
         verdict = GradingResult(

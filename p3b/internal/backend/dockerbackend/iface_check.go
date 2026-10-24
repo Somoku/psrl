@@ -7,4 +7,5 @@ var (
 	_ backend.NodeScheduled = (*Backend)(nil)
 	_ backend.Stateful      = (*Backend)(nil)
 	_ backend.Preflighter   = (*Backend)(nil)
+	_ backend.Reconciler    = (*Backend)(nil)
 )

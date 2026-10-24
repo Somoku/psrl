@@ -93,6 +93,14 @@ type NodeView struct {
 	// accounting them apart would admit twice what the node has.
 	ClassHeadroom map[string]Headroom
 	Envelope      Headroom
+	// What the node has promised and what it measures, published together: a fleet view
+	// that only says how busy a node is cannot say whether it is refusing because the
+	// machine is full or because it is charging more than the sandboxes use.
+	Granted  Headroom
+	Observed Headroom
+	// Share of the interval the sandboxes spent throttled: the term that withdraws CPU
+	// overcommit, so it belongs wherever the envelope is published.
+	ThrottledPct float64
 
 	LiveSandboxes int
 	CPUUsedPct    float64
@@ -105,6 +113,42 @@ type NodeView struct {
 	// A node that cannot destroy what it holds still holds its memory, so
 	// admitting against it would over-commit the host.
 	Draining bool
+	// ClassReserve is what the node says one sandbox of each class costs it in memory, in MB.
+	//
+	// It is the only number admission can charge that is not the caller's maximum, and
+	// the node is the only place it can come from: the cost is measured from that node's
+	// own sandboxes. A node that has not enabled elastic pricing publishes nothing, which
+	// leaves callers charging the request's maximum as before.
+	ClassReserveMB map[string]int64
+	// ClassReserveCPU is the same publication for CPU, in millicores.
+	//
+	// It is the one a burst is usually bounded by: a sandbox declares the cores one tool
+	// call may want and uses a fraction of one between calls, so charging the declaration
+	// caps the fleet at a number that has nothing to do with the load on it.
+	ClassReserveCPUMillis map[string]int64
+
+	// Inventory is the node's own list of sandboxes it currently holds, with
+	// the sequence number the snapshot was taken under. The control plane
+	// reconciles its quota grants against this: a grant whose sandbox is absent
+	// from two consecutive eligible reports is charged for a runtime the node
+	// no longer has.
+	//
+	// InventoryReported distinguishes "this node holds nothing" from "this node
+	// is an older build that never sent an inventory". A zero value must not be
+	// read as an empty node, or a rolling upgrade releases every grant on it.
+	ReportSeq          uint64
+	InventoryReported  bool
+	InventoryTruncated bool
+	LiveSandboxIDs     []string
+	// LiveOwners is the set of callers this node holds sandboxes for. Renewal
+	// targets the holders, and this is the node's own answer when the control's
+	// create records are incomplete.
+	LiveOwners []string
+
+	// Diagnostics are the node's own counters, carried beside the scheduling
+	// view so an operator can see why a node is refusing or reaping without
+	// reading its logs. They are not inputs to placement.
+	Diagnostics map[string]float64
 }
 
 // Request is what a caller needs from a node.
@@ -131,6 +175,15 @@ type Request struct {
 	// request whose size is unknown cannot be compared against a remainder.
 	Footprint     Headroom
 	ResourceClass string
+	// ExcludeNodes names nodes this request has already been refused by, so a retry
+	// spends its attempt on a node it has not tried.
+	//
+	// A refusal is fresh evidence and placement's view is not: the headroom it compares
+	// against is a report that can be seconds old, while the node that just said no was
+	// looking at its own ledger at that instant. Without this a retry asks the same node
+	// the same question and gets the same answer, which is how a request burns every
+	// attempt on one machine and comes back as fleet-wide exhaustion.
+	ExcludeNodes []string
 }
 
 // Decision is one chosen node and the reservation protecting it.
@@ -257,6 +310,29 @@ func (s *Service) SetClock(now func() time.Time) {
 	s.now = now
 }
 
+// LiveCount reports how many nodes placement can currently consider.
+//
+// A retry loop in the control plane uses it to size itself: there is no point spending an
+// attempt on a fleet of two nodes when both have already refused. The attempt that follows a
+// full sweep of the fleet is worse than wasted -- with every node excluded the candidate set
+// is empty, and the resulting error loses the distinction between "the fleet is full" and
+// "nothing here can serve this request". A caller cannot act on a misclassified refusal, so
+// the loop stops while the refusals still say what they are.
+func (s *Service) LiveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	fleet := s.fleetLocked()
+	live := 0
+	for i := range fleet {
+		if now.Sub(fleet[i].SeenAt) > s.cfg.NodeTTL {
+			continue
+		}
+		live++
+	}
+	return live
+}
+
 // Choose picks a node that can actually hold the request and reserves it there.
 func (s *Service) Choose(req Request) (Decision, error) {
 	s.mu.Lock()
@@ -265,7 +341,7 @@ func (s *Service) Choose(req Request) (Decision, error) {
 	s.sweepLocked(now)
 
 	fleet := s.fleetLocked()
-	live := 0
+	live, excluded := 0, 0
 	capable, roomy := s.capable[:0], s.roomy[:0]
 	matched := s.matched
 	for i := range fleet {
@@ -273,8 +349,16 @@ func (s *Service) Choose(req Request) (Decision, error) {
 		if now.Sub(view.SeenAt) > s.cfg.NodeTTL {
 			continue
 		}
-		s.refreshPendingLocked(view)
+		// Live is counted before the exclusion, so the caller's diagnosis can tell the two
+		// apart: a fleet with nothing in it is one thing, and a request every node refused is
+		// another. Reporting the second as "no live nodes" sent an operator looking for dead
+		// nodes while the machine was simply full.
 		live++
+		if contains(req.ExcludeNodes, view.NodeID) {
+			excluded++
+			continue
+		}
+		s.refreshPendingLocked(view)
 		runtime, ok := s.satisfies(view, req)
 		if !ok {
 			continue
@@ -288,6 +372,16 @@ func (s *Service) Choose(req Request) (Decision, error) {
 		}
 	}
 	s.capable, s.roomy = capable, roomy
+	if len(capable) == 0 && excluded > 0 {
+		// Every node this request has already tried refused it. That is load, not a missing
+		// capability: the same spec was accepted by the same fleet minutes ago, and it will be
+		// accepted again once something is released. It has to come back as exhaustion, which
+		// the caller treats as "wait" -- a capability error tells the caller the request can
+		// never be served, and the caller then drops the trajectory instead of retrying it.
+		s.exhausted++
+		return Decision{}, fmt.Errorf("%w: %d of %d live node(s) have already refused this "+
+			"request. This clears as sandboxes are released", ErrExhausted, excluded, live)
+	}
 	if len(capable) == 0 {
 		s.noCandidate++
 		return Decision{}, fmt.Errorf("%w (live nodes: %d, backend: %q, features: %v): %s",
@@ -344,10 +438,11 @@ func (s *Service) refreshPendingLocked(view *NodeView) {
 // and a container daemon satisfies a full-state resume only through the former,
 // and the chosen name travels in the decision so the node provisions on the
 // runtime that was actually matched.
+//
+// A draining node is a candidate. Its stuck container is still charged to its
+// class, so the room this reads already excludes it, and dropping the node here
+// would take a whole machine out of the fleet for one container.
 func (s *Service) satisfies(view *NodeView, req Request) (string, bool) {
-	if view.Draining {
-		return "", false
-	}
 	if req.GPUCount > view.GPUFree {
 		return "", false
 	}
@@ -651,4 +746,16 @@ func maxF(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// contains reports whether a name is in a list. Kept local because the only thing it
+// does that a library call would not is say why it exists: the list is a handful of node
+// ids from one request's own history, not a set with semantics of its own.
+func contains(names []string, name string) bool {
+	for _, have := range names {
+		if have == name {
+			return true
+		}
+	}
+	return false
 }

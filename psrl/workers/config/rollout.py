@@ -64,6 +64,8 @@ class MultiTurnConfig(_VeRLMultiTurnConfig):
     _mutable_fields = {"max_turns"}
 
     enable: bool = False
+    # Turns per episode: a positive cap, or None/-1 for unlimited (bounded only by
+    # the trajectory time budget). A harness that takes no turn cap ignores it.
     max_turns: int | None = None
     tool_config_path: str | None = None
     function_tool_path: str | None = None
@@ -81,6 +83,14 @@ class AgentLoopConfig(_VeRLAgentLoopConfig):
 
     route_strategy: str = "round_robin"
     trajectory_timeout: float | None = None
+    # Seconds grading may run after the episode. Kept apart from the episode budget
+    # because grading is a separate phase an operator often wants a different answer
+    # for; null means grading is not timed.
+    grading_timeout: float | None = None
+    # What a harness does when its episode budget expires: `discard` cancels the episode
+    # and retries it, losing the partial work; `keep` stops the agent and collects and
+    # grades the partial patch and trajectory. Harness training only.
+    trajectory_timeout_action: str = "discard"
     env: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     data: AgentDataConfig = field(default_factory=AgentDataConfig)
     sandbox: SandboxManagerConfig = field(default_factory=SandboxManagerConfig)

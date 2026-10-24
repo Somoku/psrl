@@ -17,28 +17,40 @@ from urllib.parse import urlsplit
 from omegaconf import DictConfig, OmegaConf
 
 from psrl.sandbox import ExecResult, SandboxSession
+from psrl.workers.agent_loop.harness.episode import (
+    CLAUDE_CODE_STREAM_JSON,
+    CODEX_JSONL,
+    HarnessEpisodeSummary,
+    episode_summary,
+)
 from psrl.workers.agent_loop.harness.runtime import executable_path
 
 psrl_logger = logging.getLogger(__file__)
 
-# Deadline for reading a diagnostic log tail out of the sandbox. Bounded well below the
-# episode budget because it runs after the harness has already exited: a container that
-# cannot answer within this window is not going to, and the caller absorbs the failure
-# rather than spending the rest of the episode's wall clock waiting for it.
-_DIAGNOSTIC_READ_TIMEOUT_S = 60.0
+# The exit code a `HarnessResult` carries when the harness stopped the CLI at its
+# deadline rather than the CLI exiting on its own.
+EXIT_TIME_BUDGET_EXCEEDED = -1
 
-# Trajectory output formats the post-rollout integrity scanner can dispatch on.
-# `auto` resolves to the kind default below, but the scan dispatch key is always a concrete format.
+# Trajectory output formats the post-rollout integrity scanner and the episode
+# summary parser can dispatch on. `auto` resolves to the kind default below, but the
+# scan dispatch key is always a concrete format.
 SUPPORTED_TRAJECTORY_FORMATS = (
     "auto",
-    "claude_code_stream_json",
-    "codex_jsonl",
+    CLAUDE_CODE_STREAM_JSON,
+    CODEX_JSONL,
     "plain_text",
 )
 _KIND_DEFAULT_TRAJECTORY_FORMATS: dict[str, str] = {
-    "claude_code": "claude_code_stream_json",
-    "codex": "codex_jsonl",
+    "claude_code": CLAUDE_CODE_STREAM_JSON,
+    "codex": CODEX_JSONL,
 }
+
+# Harnesses whose CLI takes no turn cap of its own. Codex runs an episode from one
+# `exec` process and exposes no `--max-turns`-style flag, so a cap cannot be handed to
+# it; the session it talks to is held to the budget instead, which is the one component
+# that sees every model call. Listed by kind because taking a cap is a property of the
+# CLI, and a new harness whose CLI takes none belongs here.
+_KINDS_WITHOUT_CLI_TURN_CAP = frozenset({"codex"})
 
 
 @dataclass(frozen=True)
@@ -78,7 +90,6 @@ class HarnessConfig:
     env: Mapping[str, str] = field(default_factory=dict)
     home_dir: str = "/root"
     runtime_mount: str = "/opt/harness"
-    time_budget_s: float = 7200.0
     output_tail_chars: int = 16_384
     callback_base_url: str | None = None
     permission_mode: str | None = None
@@ -104,8 +115,8 @@ class HarnessConfig:
             raise ValueError("Harness kind and executable cannot be empty.")
         if not self.runtime_mount.startswith("/"):
             raise ValueError(f"Harness runtime_mount must be an absolute path, got {self.runtime_mount!r}.")
-        if self.time_budget_s <= 0 or self.output_tail_chars <= 0:
-            raise ValueError("Harness time_budget_s and output_tail_chars must be greater than zero.")
+        if self.output_tail_chars <= 0:
+            raise ValueError("Harness output_tail_chars must be greater than zero.")
         if self.system_prompt_mode not in ("append", "replace", "none"):
             raise ValueError(f"Unsupported harness system_prompt_mode {self.system_prompt_mode!r}.")
         if self.max_output_tokens is not None and self.max_output_tokens <= 0:
@@ -122,11 +133,31 @@ class HarnessConfig:
                 f"expected one of {SUPPORTED_TRAJECTORY_FORMATS}."
             )
 
+    def state_dir(self) -> str:
+        """The harness's own directory inside the sandbox.
+
+        It holds the CLI's logs and any payload the framework stages for this episode,
+        so it is the one directory on the guest side that the framework owns. Nothing
+        the agent is told to use lives here, which is what makes it safe to stage a file
+        in without competing with the agent's own scratch space.
+        """
+        return str(PurePosixPath(self.home_dir) / ".psrl-harness")
+
     def resolved_trajectory_format(self) -> str:
         """Return the concrete format the integrity scanner should dispatch on."""
         if self.trajectory_format != "auto":
             return self.trajectory_format
         return _KIND_DEFAULT_TRAJECTORY_FORMATS.get(self.kind, "plain_text")
+
+    @property
+    def cli_takes_turn_cap(self) -> bool:
+        """Return whether this harness's CLI accepts `rollout.multi_turn.max_turns`.
+
+        A CLI that takes one stops itself at the configured number. A CLI that takes none
+        is held to the same number by the session it talks to, declared as that session's
+        turn budget, so a configured cap is honoured either way.
+        """
+        return self.kind not in _KINDS_WITHOUT_CLI_TURN_CAP
 
     @classmethod
     def from_value(cls, value: HarnessConfig | DictConfig | Mapping[str, Any]) -> HarnessConfig:
@@ -155,17 +186,6 @@ class HarnessConfig:
         return cls(**normalized)
 
 
-class HarnessExecBudgetExpired(TimeoutError):
-    """The harness CLI itself overran ``HarnessConfig.time_budget_s``.
-
-    Raised only for the exec that runs the harness command, so a caller can tell the
-    episode's own backstop firing apart from an infrastructure timeout on some other call
-    inside the episode. Both surface as `TimeoutError`, and treating the second as the
-    first reports a completed episode as budget exhaustion, suppresses the retry an
-    infrastructure fault needs, and counts it against the run's failure streak.
-    """
-
-
 @dataclass(frozen=True)
 class HarnessRuntime:
     """Per-task values bound after the TITO session and sandbox exist."""
@@ -179,6 +199,13 @@ class HarnessRuntime:
     max_turns: int | None = None
 
 
+# The sentinel the gateway returns on an aborted request, echoed by the CLI into its
+# event stream. Kept as a literal here because the CLI's output is bytes this service
+# does not parse; matching the code is enough and parsing the JSON would couple this
+# to the CLI's schema.
+_ABORT_SENTINEL = "request_aborted"
+
+
 @dataclass(frozen=True)
 class HarnessResult:
     """Small process result retained outside the disposable sandbox."""
@@ -190,6 +217,24 @@ class HarnessResult:
     workdir: str = ""
     stdout_path: str = ""
     stderr_path: str = ""
+    # Set when the harness stopped the CLI at its deadline rather than the CLI exiting.
+    # The output files keep whatever the CLI had produced, so a `keep` caller can still
+    # collect the partial trajectory and grade it.
+    timed_out: bool = False
+
+    def aborted_by_gateway(self) -> bool:
+        """Report that the CLI stopped because the gateway aborted its request.
+
+        The abort reaches the CLI as an ordinary HTTP error on an LLM call *inside the
+        sandbox*, so by the time this service sees it, it looks like any other harness
+        failure. That is the whole problem: an abort is not a failure of the harness, and
+        treating it as one both retries work that was deliberately abandoned and feeds the
+        breaker that exists to catch a genuinely broken CLI.
+
+        Detected from the sentinel the gateway returns, which the CLI echoes into its own
+        event stream. See `psrl.utils.common.http_utils` for the sentinel's definition.
+        """
+        return _ABORT_SENTINEL in (self.stdout_tail or "") or _ABORT_SENTINEL in (self.stderr_tail or "")
 
     def diagnostic_text(self) -> str:
         """Return bounded, actionable process diagnostics for rollout failures."""
@@ -220,7 +265,7 @@ class Harness(ABC):
         self.config = config
         self.sandbox = sandbox
         self._active_exec: asyncio.Task[ExecResult] | None = None
-        self._log_dir = str(PurePosixPath(config.home_dir) / ".psrl-harness")
+        self._log_dir = config.state_dir()
 
     def config_dir(self) -> str | None:
         """Harness-specific config directory created during preparation."""
@@ -234,18 +279,41 @@ class Harness(ABC):
         network fetch and no mutation of the task image's global toolchain. All
         directories are created in the same probe, so per-trajectory setup stays
         to one round trip.
+
+        What the probe checks is what the mount owns: that the executable is present
+        and executable in this sandbox. Running it is not the probe's job, because a
+        CLI is hundreds of megabytes and this ran once per trajectory, so every step
+        paid for that read and its dynamic linking on the critical path of its whole
+        batch, at the moment that step was also creating all of its sandboxes. Whether
+        the binary runs in this image is answered by the first real invocation, which
+        reports the CLI's own diagnostics when it does not.
         """
         exe = executable_path(self.config.runtime_mount, self.config.executable)
         directories = [self._log_dir, self.config_dir()]
         mkdir = "mkdir -p " + " ".join(shlex.quote(d) for d in directories if d)
-        check = await self.sandbox.exec(f"{mkdir} && {shlex.quote(exe)} --version", timeout_s=60)
+        check = await self.sandbox.exec(f"{mkdir} && test -x {shlex.quote(exe)}", timeout_s=60)
         if check.exit_code != 0:
-            raise RuntimeError(
-                f"Harness executable {exe!r} is unavailable in the sandbox (exit {check.exit_code}). "
-                f"Mount the {self.config.kind!r} runtime tree at {self.config.runtime_mount!r} and ensure "
-                f"<runtime-root>/{self.config.kind}/bin/{self.config.executable} exists on the worker. "
+            # `test -x` answers 1 for "not there or not executable" and nothing else. Any
+            # other code is the probe failing, not the mount: a sandbox that cannot run
+            # `mkdir`, or one whose filesystem is gone, reports something else entirely.
+            # Reporting both as "missing or not executable" sent a hunt for a mount
+            # problem that was really a container being torn down underneath the episode.
+            details = (
                 f"stdout={check.stdout[-self.config.output_tail_chars :]!r}, "
                 f"stderr={check.stderr[-self.config.output_tail_chars :]!r}."
+            )
+            if check.exit_code == 1:
+                raise RuntimeError(
+                    f"Harness executable {exe!r} is missing or not executable in the sandbox. "
+                    f"Mount the {self.config.kind!r} runtime tree at {self.config.runtime_mount!r} and ensure "
+                    f"<runtime-root>/{self.config.kind}/bin/{self.config.executable} exists on the worker. "
+                    f"{details}"
+                )
+            raise RuntimeError(
+                f"Harness executable probe for {exe!r} failed (exit {check.exit_code}), which is "
+                f"not the same as the mount being absent: the sandbox could not run the probe "
+                f"at all, so the episode is lost to an infrastructure fault rather than to a "
+                f"missing runtime tree. {details}"
             )
         await self._prepare(runtime)
 
@@ -290,8 +358,16 @@ class Harness(ABC):
     def build_env(self, runtime: HarnessRuntime) -> Mapping[str, str]:
         """Build environment variables for one task-scoped inference endpoint."""
 
-    async def run(self, prompt: str, runtime: HarnessRuntime) -> HarnessResult:
-        """Run the harness CLI and retain bounded stdout/stderr diagnostic tails."""
+    async def run(self, prompt: str, runtime: HarnessRuntime, *, deadline_s: float | None = None) -> HarnessResult:
+        """Run the harness CLI and retain bounded stdout/stderr diagnostic tails.
+
+        ``deadline_s`` is the episode clock the loop hands down, so the harness stops
+        at the same instant the loop's budget expires rather than a second timer. When
+        it fires, the CLI is cancelled and the result is returned with ``timed_out=True``
+        and the output files intact, so a caller that keeps partial work can still read
+        and grade what the CLI produced. ``None`` runs the CLI to completion and relies
+        on an outside cancellation to stop it.
+        """
         stderr_path = str(PurePosixPath(self._log_dir) / "stderr.log")
         stdout_path = str(PurePosixPath(self._log_dir) / "stdout.log")
         argv = self.build_command(prompt, runtime)
@@ -303,19 +379,29 @@ class Harness(ABC):
                 command,
                 cwd=runtime.workdir,
                 env=self.build_env(runtime),
-                timeout_s=self.config.time_budget_s,
             )
         )
         self._active_exec = task
         try:
-            result = await task
-        except TimeoutError as expired:
-            # Mark the one timeout that really is the harness exec budget, so the caller
-            # does not have to infer it from an undistinguished TimeoutError raised by any
-            # other awaited call in this method.
-            raise HarnessExecBudgetExpired(
-                f"Harness {self.config.kind!r} exec exceeded its {self.config.time_budget_s:.0f}s budget."
-            ) from expired
+            if deadline_s is None:
+                result = await task
+            else:
+                result = await asyncio.wait_for(task, timeout=deadline_s)
+        except asyncio.TimeoutError:
+            # The deadline fired while the CLI was still working. Cancelling the exec is
+            # the best stop this layer can offer; the sandbox lease release is the hard
+            # one. Return the partial output rather than raising, so the caller decides
+            # whether to keep it.
+            return HarnessResult(
+                exit_code=EXIT_TIME_BUDGET_EXCEEDED,
+                timed_out=True,
+                stdout_tail=await self._read_tail(stdout_path),
+                stderr_tail=await self._read_tail(stderr_path),
+                command_name=str(argv[0]) if argv else self.config.executable,
+                workdir=runtime.workdir,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            )
         finally:
             if self._active_exec is task:
                 self._active_exec = None
@@ -347,6 +433,15 @@ class Harness(ABC):
             stderr_tail=await self._read_tail(result.stderr_path),
         )
 
+    def episode_summary(self, log_bytes: bytes) -> HarnessEpisodeSummary | None:
+        """Parse what this harness's CLI reported about the episode it just ran.
+
+        The CLI is the only component that knows how many turns it ran and why it
+        stopped, so its own output is what a caller should label the episode from.
+        Returns ``None`` when this harness's output format carries no such report.
+        """
+        return episode_summary(self.config.resolved_trajectory_format(), log_bytes)
+
     async def abort(self) -> None:
         """Cancel the active exec. Sandbox lease release supplies the hard stop."""
         task = self._active_exec
@@ -365,13 +460,17 @@ class Harness(ABC):
         had already finished its work — turning a complete episode into a reported budget
         expiry or a lost container. Losing the tail costs a post mortem; losing the
         trajectory costs the episode.
+
+        It reads the file rather than running `tail` in the sandbox, because a command is
+        not free: on a backend whose exec cannot be signalled (a one-shot exec), a command
+        that stalls is stopped by destroying the container. Swallowing that exception here
+        would leave a sandbox already destroyed under an episode that still has a patch to
+        collect, and the collection is what would then report the failure. A diagnostic
+        must not be able to cost the episode its sandbox.
         """
         try:
-            result = await self.sandbox.exec(
-                f"tail -c {self.config.output_tail_chars} {shlex.quote(path)}",
-                timeout_s=_DIAGNOSTIC_READ_TIMEOUT_S,
-            )
+            payload = await self.sandbox.read_bytes(path)
         except Exception:
             psrl_logger.warning(f"Could not read harness log tail {path!r}.", exc_info=True)
             return ""
-        return result.stdout if result.exit_code == 0 else ""
+        return payload[-self.config.output_tail_chars :].decode(errors="replace")

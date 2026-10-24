@@ -401,11 +401,11 @@ independent EROFS layers, and it keeps snapshots as incremental disk snapshots.
 The report rejects the registry and peer to peer approach on purpose, because
 sandboxes access only a small fraction of their image data.
 
-This design differs on purpose. The internal Docker backend is the local
-distributed test backend (D2), so it optimizes for contract conformance and
-operational simplicity, not for DSec's density and cold start. A registry is the
-established, Docker native way to make an image reachable cluster wide, and it
-reuses the create and auto pull path that already exists.
+This design differs on purpose. The internal Docker backend optimizes for
+contract conformance and operational simplicity, not for DSec's kernel level
+density and cold start. A registry is the established, Docker native way to make
+an image reachable cluster wide, and it reuses the create and auto pull path that
+already exists.
 
 The DSec capabilities are not lost. They live in the external providers that PSRL
 integrates. AgentEnv loads images on demand through overlaybd and ublk, and
@@ -429,7 +429,7 @@ expected to reach it (S8).
 | S5 | Snapshots are namespaced per run | Coarse and simple to GC, and a restore cannot cross runs |
 | S6 | The topology is one writable registry, replicated, on one object store | There is no proxy role to separate, because base images are not in this registry |
 | S7 | The registry storage backend is object storage, S3 or MinIO compatible | A replica is stateless, so the N replica shape holds, and the internal and external paths share one storage idiom |
-| S8 | The registry is the internal Docker backend's end state, not a bridge to on demand layers | The internal backend is the test path. DSec style on demand efficiency lives in the external providers, not here |
+| S8 | The registry is the internal Docker backend's end state for snapshots, not a bridge to on demand layers | DSec style kernel level on demand efficiency lives in the external providers, not here. A capability gated node local image snapshotter is separate from the registry and permitted on the backend |
 | S9 | The local snapshot cache has its own byte budget with LRU eviction, separate from the base image cache | A node cannot evict its base images to hold snapshots. A local miss pulls from the store, so eviction is never a correctness event |
 | S10 | The store declares `RESUME_ANYWHERE` at the `filesystem` level | A caller that needs a live process to survive a move is rejected here and lands on a provider instead |
 | S11 | Retention is an intent and the local budget is a fraction | An operator sets how long a snapshot outlives its run and what share of disk it may hold, not a TTL in seconds or a size in bytes |

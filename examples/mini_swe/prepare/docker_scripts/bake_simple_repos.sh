@@ -12,6 +12,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE="${1:-python:3.11-slim}"
 CONTAINER_NAME="bake_simple_repos_$$"
 
@@ -32,7 +33,7 @@ echo "=== Baking simple-test repos into: $IMAGE ==="
 SETUP_SCRIPT=$(python3 -c "
 import json, shlex, os
 
-script_dir = '${SCRIPT_DIR}'
+script_dir = '${DATA_DIR}'
 
 commands = []
 for split, fname in [('train', 'simple_cases_train.json'), ('val', 'simple_cases_val.json')]:

@@ -32,23 +32,35 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Mapping
 from typing import Any
 
+from sandboxd import (
+    ExecMode as ServiceExecMode,
+)
+from sandboxd import (
+    Feature as ServiceFeature,
+)
+from sandboxd import (
+    Mount as ServiceMount,
+)
+from sandboxd import (
+    Resources as ServiceResources,
+)
+from sandboxd import (
+    ResumeLevel as ServiceResumeLevel,
+)
+from sandboxd import Sandbox as ServiceSandbox
 from sandboxd import SandboxClient
 from sandboxd import SandboxSpec as ServiceSpec
 from sandboxd import (
-    ExecMode as ServiceExecMode,
-    Resources as ServiceResources,
     SnapshotRef as ServiceSnapshotRef,
+)
+from sandboxd import (
     Source as ServiceSource,
 )
-from sandboxd import Sandbox as ServiceSandbox
-from sandboxd.errors import (
-    SandboxCapabilityError,
-    SandboxCapacityTimeout,
-    SandboxError,
-)
+from sandboxd import errors as service_errors
 
 from psrl.sandbox.core import (
     ExecResult,
@@ -57,13 +69,21 @@ from psrl.sandbox.core import (
     ResumeLevel,
     SandboxBackend,
     SandboxCapabilities,
+    SandboxCapabilityError,
+    SandboxCapacityTimeout,
+    SandboxCommandTimeout,
     SandboxExitReason,
     SandboxFeature,
+    SandboxOomError,
+    SandboxPathNotFoundError,
     SandboxRef,
     SandboxSession,
+    SandboxSessionLostError,
+    SandboxSetupError,
     SandboxSourceKind,
     SandboxSpec,
     SandboxStatus,
+    SandboxTransportError,
     SnapshotKind,
     SnapshotRef,
 )
@@ -73,6 +93,59 @@ psrl_logger = logging.getLogger(__name__)
 # The service's default socket. A service per node uses this; a shared control
 # plane is reached by host:port.
 DEFAULT_ENDPOINT = "unix:///run/sandboxd.sock"
+
+
+def _exit_reason(raw: str) -> SandboxExitReason:
+    """Map the service's exit label onto PSRL's vocabulary, defaulting to UNKNOWN."""
+    if not raw:
+        return SandboxExitReason.UNKNOWN
+    try:
+        return SandboxExitReason(raw)
+    except ValueError:
+        return SandboxExitReason.UNKNOWN
+
+
+def _translate(exc: service_errors.SandboxError) -> BaseException:
+    """Map a service-side failure onto PSRL's neutral error vocabulary.
+
+    The SDK raises the service's own types; PSRL's callers catch PSRL's. Without
+    this translation the two sets never meet: a lost sandbox would surface as an
+    unclassified exception instead of a lost session, and its attribution would be
+    dropped, so a rollout could not be retried as `container_lost` nor a post
+    mortem tell why it went.
+    """
+    if isinstance(exc, service_errors.SandboxSessionLost):
+        return SandboxSessionLostError(
+            str(exc),
+            sandbox_id=exc.sandbox_id,
+            exit_reason=_exit_reason(exc.exit_reason),
+            exit_code=exc.exit_code,
+            finished_at=exc.finished_at,
+            state_error=exc.state_error,
+        )
+    if isinstance(exc, service_errors.SandboxCapacityTimeout):
+        return SandboxCapacityTimeout(str(exc))
+    if isinstance(exc, service_errors.SandboxCapabilityError):
+        return SandboxCapabilityError(str(exc))
+    if isinstance(exc, service_errors.SandboxOomError):
+        return SandboxOomError(str(exc))
+    if isinstance(exc, service_errors.SandboxCommandTimeout):
+        return SandboxCommandTimeout(str(exc), sandbox_preserved=getattr(exc, "sandbox_preserved", False))
+    if isinstance(exc, service_errors.SandboxPathNotFound):
+        # A path-level fact, not a lost sandbox: the sandbox stays usable and a
+        # caller that reads this as infrastructure loss replaces a healthy one.
+        return SandboxPathNotFoundError(str(exc))
+    if isinstance(exc, service_errors.SandboxTransportError):
+        return SandboxTransportError(str(exc))
+    return SandboxSetupError(str(exc))
+
+
+async def _service_call(awaitable):
+    """Await one SDK call, re-raising a service failure in PSRL's vocabulary."""
+    try:
+        return await awaitable
+    except service_errors.SandboxError as exc:
+        raise _translate(exc) from exc
 
 
 class P3bSession(SandboxSession):
@@ -152,17 +225,21 @@ class P3bSession(SandboxSession):
     ) -> ExecResult:
         """Run one command straight to the sandbox agent endpoint.
 
-        The SDK raises the same SandboxCommandTimeout, SandboxOomError, and
-        SandboxSessionLost types that PSRL already handles — no translation.
+        A service-side failure is re-raised in PSRL's vocabulary — a lost session
+        carries its exit attribution, a command timeout keeps its
+        `sandbox_preserved` flag — so the agent loop classifies the fault by type
+        instead of seeing an unclassified exception.
         """
         self._busy = True
         try:
-            result = await self._sandbox.exec(
-                command,
-                cwd=cwd,
-                env=env,
-                timeout_s=timeout_s,
-                silence_timeout_s=silence_timeout_s,
+            result = await _service_call(
+                self._sandbox.exec(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    timeout_s=timeout_s,
+                    silence_timeout_s=silence_timeout_s,
+                )
             )
         finally:
             self._busy = False
@@ -176,18 +253,22 @@ class P3bSession(SandboxSession):
         )
 
     async def read_bytes(self, path: str) -> bytes:
-        return await self._sandbox.read_bytes(path)
+        return await _service_call(self._sandbox.read_bytes(path))
 
     async def write_bytes(self, path: str, data: bytes) -> None:
-        await self._sandbox.write_bytes(path, data)
+        await _service_call(self._sandbox.write_bytes(path, data))
 
     # -- Control plane: back to the service ------------------------------------
 
     async def status(self) -> SandboxStatus:
         if self._terminated:
             return SandboxStatus.TERMINATED
-        raw = await self._sandbox.status()
-        return SandboxStatus(str(raw))
+        raw = await _service_call(self._sandbox.status())
+        # The SDK returns its own `SandboxStatus` enum. `str()` on a `str, Enum`
+        # member yields "SandboxStatus.RUNNING" in Python 3.12, not "running",
+        # so converting it back through the constructor raises and made every
+        # status call read as unreadable. Take the wire value instead.
+        return SandboxStatus(getattr(raw, "value", raw))
 
     async def terminate(self) -> None:
         """Release the sandbox back to the service.
@@ -199,7 +280,7 @@ class P3bSession(SandboxSession):
             return
         self._terminated = True
         self._exit_reason = SandboxExitReason.RELEASED
-        await self._sandbox.release()
+        await _service_call(self._sandbox.release())
 
     async def stats(self) -> ResourceUsage:
         """Return unknown usage.
@@ -211,7 +292,7 @@ class P3bSession(SandboxSession):
         return ResourceUsage()
 
     async def snapshot(self, kind: SnapshotKind = SnapshotKind.FILESYSTEM) -> SnapshotRef:
-        ref = await self._sandbox.snapshot(kind)
+        ref = await _service_call(self._sandbox.snapshot(kind))
         return SnapshotRef(
             backend=self._backend.name,
             snapshot_id=ref.snapshot_id,
@@ -220,10 +301,10 @@ class P3bSession(SandboxSession):
         )
 
     async def pause(self, mode: PauseMode = PauseMode.HIBERNATE) -> None:
-        await self._sandbox.pause(mode)
+        await _service_call(self._sandbox.pause(mode))
 
     async def resume(self) -> None:
-        await self._sandbox.resume()
+        await _service_call(self._sandbox.resume())
 
     def resolve_callback_url(self, url: str) -> str:
         """Return the URL unchanged.
@@ -235,6 +316,32 @@ class P3bSession(SandboxSession):
         gives the worker a routable address, not a loopback.
         """
         return url
+
+
+# How often this worker tells the service its owner is still alive.
+#
+# The node reclaims an owner's sandboxes once it has been silent for three of
+# these, so the interval is the unit that budget is counted in: a shorter one
+# reclaims a killed worker's sandboxes sooner, a longer one tolerates a stalled
+# process before doing so. It is stated here rather than derived because the two
+# sides are separate deployments, and it must stay below a third of the node's
+# silence budget (`timing.OwnerSilenceTTL` in p3b).
+OWNER_HEARTBEAT_INTERVAL_S = 30.0
+
+# The node reclaims an owner's sandboxes after this many missed beats, so the interval
+# above is a third of the silence budget by construction. Named here because the renewal
+# loop has to be able to say how close it is to losing everything.
+_OWNER_SILENCE_BEATS = 3
+
+# A renewal that has not come back in this long is abandoned rather than waited on. It has
+# to be well under one beat: a call that is allowed to run for the whole interval cannot
+# be distinguished from a loop that has stopped running.
+OWNER_RENEW_TIMEOUT_S = 10.0
+
+# How many consecutive misses before the renewal stops being a warning. Two, because the
+# budget is three: at two the next failure is the one that takes the sandboxes, and there
+# is still one beat left in which something can be done about it.
+_RENEWAL_MISSES_BEFORE_ALARM = 2
 
 
 class P3bBackend(SandboxBackend):
@@ -260,14 +367,34 @@ class P3bBackend(SandboxBackend):
         *,
         name: str = "p3b",
         resource_class: str = "rollout",
-        control_timeout_s: float = 60.0,
     ) -> None:
         self._name = name
         self._endpoint = endpoint
         self._resource_class = resource_class
-        self._client = SandboxClient(endpoint, control_timeout_s=control_timeout_s)
+        # No client deadline on a create: provisioning may pull a cold image, and
+        # the service bounds its own work. The client keeps only its internal
+        # liveness for calls expected to answer promptly.
+        self._client = SandboxClient(endpoint)
+        # The renewal gets its own connection pool. A create holds a control
+        # connection for its whole duration (it has no client deadline), so a
+        # burst of creates can occupy every slot in the shared pool; a heartbeat
+        # that then waits on a slot reports a missed beat while the service is
+        # answering every request promptly.
+        self._renew_client: SandboxClient | None = None
         self._owner_id = ""
         self._closed = False
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._contract_loaded = False
+        self._heartbeat_interval_s = OWNER_HEARTBEAT_INTERVAL_S
+        self._silence_ttl_s = OWNER_HEARTBEAT_INTERVAL_S * _OWNER_SILENCE_BEATS
+        self._renew_timeout_s = OWNER_RENEW_TIMEOUT_S
+        # Renewal health, exposed as metrics beside the fleet report: the
+        # caller's own timeouts are the only signal that a renewal is not
+        # reaching a node, and they must not exist only as log lines.
+        self._renew_attempts = 0
+        self._renew_failures = 0
+        self._renew_consecutive_misses = 0
+        self._renew_last_duration_s = 0.0
 
     @property
     def name(self) -> str:
@@ -297,32 +424,160 @@ class P3bBackend(SandboxBackend):
         cause PSRL to refuse before asking the service.
         """
         return SandboxCapabilities(
-            features=frozenset({
-                SandboxFeature.FREEZE,
-                SandboxFeature.HIBERNATE,
-                SandboxFeature.FILESYSTEM_SNAPSHOT,
-                SandboxFeature.FULL_STATE_SNAPSHOT,
-                SandboxFeature.RESTORE,
-                SandboxFeature.NATIVE_FORK,
-                SandboxFeature.RESUME_ANYWHERE,
-                SandboxFeature.WARM_POOL,
-                SandboxFeature.IMAGE_ON_DEMAND,
-            }),
+            features=frozenset(
+                {
+                    SandboxFeature.FREEZE,
+                    SandboxFeature.HIBERNATE,
+                    SandboxFeature.FILESYSTEM_SNAPSHOT,
+                    SandboxFeature.FULL_STATE_SNAPSHOT,
+                    SandboxFeature.RESTORE,
+                    SandboxFeature.NATIVE_FORK,
+                    SandboxFeature.RESUME_ANYWHERE,
+                    SandboxFeature.WARM_POOL,
+                    SandboxFeature.IMAGE_ON_DEMAND,
+                    # The service answers a mount per node: it shares the host trees its
+                    # operator listed and refuses the rest, so a deployment that allows
+                    # none advertises none and the caller is refused before it asks.
+                    SandboxFeature.HOST_MOUNT,
+                }
+            ),
             resume_level=ResumeLevel.FULL_STATE,
         )
 
     def adopt_owner_id(self, owner_id: str) -> None:
         """Record the owner for this worker's sandboxes.
 
-        Carried as spec metadata for correlation. The service reclaims by its
-        own owner labels, not by anything PSRL writes here.
+        Carried as spec metadata for correlation, and named by the heartbeat
+        that follows. This runs while the manager is built — which can be before
+        an event loop exists — so it only records the id; the renewal loop
+        starts with the first sandbox, in `create`, where a loop is running.
         """
         if not self._owner_id:
             self._owner_id = owner_id
 
+    async def _load_contract(self) -> None:
+        """Read the service's timing spans once, so this client stops guessing.
+
+        A failure here is not a create failure: the client keeps a conservative
+        default and says once that it did. The values it would have read govern
+        a liveness probe, not the sandbox the caller is asking for.
+        """
+        if self._contract_loaded:
+            return
+        self._contract_loaded = True
+        try:
+            contract = await self._client.contract()
+        except Exception as exc:  # noqa: BLE001 - a liveness detail must not fail a create
+            psrl_logger.warning(
+                "Could not read the sandbox service's timing contract; using the client defaults: %r",
+                exc,
+            )
+            return
+        heartbeat = float(contract.get("owner_heartbeat_interval_s") or self._heartbeat_interval_s)
+        silence = float(contract.get("owner_silence_ttl_s") or self._silence_ttl_s)
+        if heartbeat > 0 and silence > 0:
+            self._heartbeat_interval_s = heartbeat
+            self._silence_ttl_s = silence
+            # Never wait longer than a third of the silence budget: a renewal
+            # allowed to run that long cannot be told apart from a loop that has
+            # stopped, and the next beat would carry the loss.
+            self._renew_timeout_s = min(OWNER_RENEW_TIMEOUT_S, max(1.0, silence / 3.0))
+
+    def _ensure_owner_heartbeat(self) -> None:
+        """Start renewing this worker's ownership of the sandboxes it holds.
+
+        The node reclaims an owner's sandboxes once it has stopped hearing from
+        the owner, and this renewal is the only evidence it has: a sandbox's own
+        lifetime is a backstop measured in hours, which is far longer than a
+        killed worker should be allowed to strand its containers. Idempotent, so
+        every sandbox this worker starts keeps the same single loop.
+        """
+        if self._owner_id and (self._heartbeat_task is None or self._heartbeat_task.done()):
+            if self._renew_client is None:
+                self._renew_client = SandboxClient(self._endpoint, pool_size=4)
+            task = asyncio.create_task(self._renew_owner_loop())
+            task.add_done_callback(self._heartbeat_done)
+            self._heartbeat_task = task
+
+    def _heartbeat_done(self, task: asyncio.Task[None]) -> None:
+        """Report a renewal loop that stopped without being asked to.
+
+        A loop that dies silently is indistinguishable from a control plane
+        that is not answering: both end with the node reclaiming every sandbox
+        this worker holds, and neither leaves a line saying which one it was.
+        """
+        if self._closed or task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            psrl_logger.error(
+                "Sandbox owner renewal loop stopped unexpectedly; the node will "
+                "reclaim every sandbox this worker holds after %.0fs: %r",
+                self._silence_ttl_s,
+                exc,
+            )
+
+    async def _renew_owner_loop(self) -> None:
+        # Three properties this loop has to have, each of which it did not:
+        #
+        # 1. **A hung renewal must not eat the next beat.** The sleep came first and the
+        #    call was awaited inline with no deadline, so one slow renewal pushed every
+        #    later one out by however long it took. Under a loaded control plane that is
+        #    exactly the shape that lets a node's silence budget expire.
+        # 2. **The cadence is a period, not a gap.** Sleep the remainder of the interval
+        #    rather than the whole interval after the call, so the beats are evenly spaced
+        #    however long the call itself took.
+        # 3. **Failures have to be visible before they become reclamations.** A single
+        #    miss is harmless -- the node's budget is three beats wide -- but a run of
+        #    them means this worker is about to lose every sandbox it holds, and that was
+        #    previously only discoverable from the 409 the next exec happened to hit.
+        missed = 0
+        while not self._closed:
+            started = time.monotonic()
+            client = self._renew_client or self._client
+            self._renew_attempts += 1
+            try:
+                async with asyncio.timeout(self._renew_timeout_s):
+                    await client.renew_owner(self._owner_id)
+                if missed:
+                    psrl_logger.info(
+                        "Sandbox owner renewal recovered for owner %r after %d missed beat(s).",
+                        self._owner_id,
+                        missed,
+                    )
+                missed = 0
+                self._renew_consecutive_misses = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                missed += 1
+                self._renew_failures += 1
+                self._renew_consecutive_misses = missed
+                # One missed beat costs nothing; the second means one more will cost every
+                # sandbox this worker holds. Say so at the level that gets read.
+                log = psrl_logger.error if missed >= _RENEWAL_MISSES_BEFORE_ALARM else psrl_logger.warning
+                beats = max(1, int(round(self._silence_ttl_s / max(self._heartbeat_interval_s, 0.001))))
+                log(
+                    "Sandbox owner renewal failed for owner %r (%d consecutive miss(es), "
+                    "the node reclaims after %d): %r. Every sandbox this worker holds is at risk.",
+                    self._owner_id,
+                    missed,
+                    beats,
+                    exc,
+                )
+            finally:
+                self._renew_last_duration_s = time.monotonic() - started
+            remaining = self._heartbeat_interval_s - (time.monotonic() - started)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+
     async def create(self, spec: SandboxSpec) -> SandboxSession:
         self._require_open()
-        sandbox = await self._client.create(_to_service_spec(spec, self._owner_id, self._resource_class))
+        await self._load_contract()
+        self._ensure_owner_heartbeat()
+        sandbox = await _service_call(
+            self._client.create(_to_service_spec(spec, self._owner_id, self._resource_class))
+        )
         return P3bSession(self, sandbox, spec)
 
     async def connect(self, sandbox_id: str) -> SandboxSession:
@@ -338,14 +593,18 @@ class P3bBackend(SandboxBackend):
 
     async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> SandboxSession:
         self._require_open()
+        await self._load_contract()
+        self._ensure_owner_heartbeat()
         service_spec = _to_service_spec(spec, self._owner_id, self._resource_class) if spec is not None else None
-        sandbox = await self._client.restore(
-            ServiceSnapshotRef(
-                backend=snapshot.backend,
-                snapshot_id=snapshot.snapshot_id,
-                kind=str(snapshot.kind.value if hasattr(snapshot.kind, "value") else snapshot.kind),
-            ),
-            service_spec,
+        sandbox = await _service_call(
+            self._client.restore(
+                ServiceSnapshotRef(
+                    backend=snapshot.backend,
+                    snapshot_id=snapshot.snapshot_id,
+                    kind=str(snapshot.kind.value if hasattr(snapshot.kind, "value") else snapshot.kind),
+                ),
+                service_spec,
+            )
         )
         return P3bSession(self, sandbox, spec)
 
@@ -358,14 +617,24 @@ class P3bBackend(SandboxBackend):
         return None
 
     async def shutdown(self) -> None:
-        """Close the connection to the service.
+        """Stop renewing this worker's ownership and close the connection.
 
-        Sandboxes outlive the connection: the service holds the lifetime and
-        reclaims by its own sweep, so a worker exiting does not strand them.
+        Sandboxes outlive the connection in the sense that the service holds
+        their lifetime, but not in the sense of staying charged to a worker that
+        is gone: stopping the renewals here is what tells the node this owner has
+        left, so it reclaims them once the silence budget runs out rather than
+        holding them until their own lifetime expires.
         """
         if self._closed:
             return
         self._closed = True
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+            self._heartbeat_task = None
+        if self._renew_client is not None:
+            await self._renew_client.close()
+            self._renew_client = None
         await self._client.close()
 
     # -- Metric passthroughs ---------------------------------------------------
@@ -379,12 +648,15 @@ class P3bBackend(SandboxBackend):
         metrics dict, and includes per-node state for debugging.
         """
         self._require_open()
-        report = await self._client.fleet()
+        report = await _service_call(self._client.fleet())
         result = report.as_metrics()
         result["nodes"] = [
             {
                 "node_id": n.node_id,
-                "backend": n.backend,
+                # NodeReport carries every runtime the node hosts, not one: a
+                # machine can serve a spec through its container daemon and
+                # another through a microVM, and naming one would hide the other.
+                "backends": list(n.backends),
                 "live_sandboxes": n.live_sandboxes,
                 "cpu_used_pct": n.cpu_used_pct,
                 "mem_used_pct": n.mem_used_pct,
@@ -394,13 +666,34 @@ class P3bBackend(SandboxBackend):
         ]
         return result
 
+    async def diagnostics(self) -> dict[str, Any]:
+        """Return the service's own health counters, for PSRL's metric hooks."""
+        self._require_open()
+        return await _service_call(self._client.diagnostics())
+
+    def heartbeat_report(self) -> dict[str, float]:
+        """Return this backend's renewal health as flat metrics.
+
+        Renewal failures are otherwise only visible as repeated log lines on the
+        worker; a metric makes "this run's heartbeats never reached a node" a
+        number beside the fleet's, instead of a paragraph someone has to notice.
+        """
+        return {
+            "sandbox/p3b/renew/attempts": float(self._renew_attempts),
+            "sandbox/p3b/renew/failures": float(self._renew_failures),
+            "sandbox/p3b/renew/consecutive_misses": float(self._renew_consecutive_misses),
+            "sandbox/p3b/renew/last_duration_s": self._renew_last_duration_s,
+            "sandbox/p3b/renew/interval_s": self._heartbeat_interval_s,
+            "sandbox/p3b/renew/silence_ttl_s": self._silence_ttl_s,
+        }
+
     async def quota_report(self) -> dict[str, Any]:
         """Return the service's quota view for PSRL's metric hooks.
 
         Delegates to QuotaReport.as_metrics() for a flat metrics dict.
         """
         self._require_open()
-        report = await self._client.quota()
+        report = await _service_call(self._client.quota())
         return report.as_metrics()
 
     def _require_open(self) -> None:
@@ -410,6 +703,52 @@ class P3bBackend(SandboxBackend):
 
 # -- Module-level helpers (no PSRL sandbox state, pure conversion) -------------
 
+
+# Which of a PSRL spec's fields this conversion carries, and which it does not.
+# They make the boundary auditable, and the exhaustiveness test below enforces it.
+_FORWARDED_FIELDS = frozenset(
+    {
+        "source",
+        "resources",
+        "resource_class",
+        "workflow_id",
+        "idempotency_key",
+        "env",
+        "metadata",
+        "workdir",
+        "exec_mode",
+        "required_features",
+        "required_resume_level",
+        "backend",
+        "lifetime_timeout_s",
+    }
+)
+
+# Refused, because a sandbox that quietly lost one would run and produce a wrong result.
+_REFUSED_FIELDS = frozenset(
+    {
+        "mounts",
+        "volumes",
+        "egress",
+        "credentials",
+        "credential_bindings",
+        "assigned_gpus",
+    }
+)
+
+# Dropped, with the reason. None of them changes what the service does.
+_NOT_FORWARDED_FIELDS = {
+    "idle_timeout_s": (
+        "the service bounds a sandbox by its lifetime and its owner's silence and has no "
+        "idle concept, and the in-process Docker backend ignores this field too"
+    ),
+    "policy_profile": "a backend-specific profile, consumed only by the e2b backend",
+    "state_policy": "PSRL's session layer decides what a snapshot means, not the service",
+}
+
+_OUT_OF_SCOPE_FIELDS = _REFUSED_FIELDS | frozenset(_NOT_FORWARDED_FIELDS)
+
+
 def _to_service_spec(
     spec: SandboxSpec,
     owner_id: str,
@@ -417,18 +756,18 @@ def _to_service_spec(
 ) -> ServiceSpec:
     """Convert a PSRL SandboxSpec into the service's.
 
-    Anything the service has no field for is refused here rather than dropped.
-    A sandbox that quietly lost a bind mount, an egress policy, or injected
-    credentials would run and produce a wrong result; one that was refused
-    costs a configuration fix.
+    Every field of a PSRL spec is forwarded, refused, or named as deliberately
+    not forwarded; `_FORWARDED_FIELDS`, `_REFUSED_FIELDS` and
+    `_NOT_FORWARDED_FIELDS` say which, and the exhaustiveness test fails when
+    PSRL gains a field that none of them accounts for.
+
+    Refused rather than dropped, because a sandbox that quietly lost a bind
+    mount, an egress policy, or injected credentials would run and produce a
+    wrong result, while one that was refused costs a configuration fix. The same
+    reasoning is why the exec mode and the required features are forwarded: this
+    backend silently served one-shot commands and unchecked features for a
+    workload that had declared it needed otherwise.
     """
-    if spec.mounts:
-        raise ValueError(
-            "A p3b sandbox is placed by the service, which may land on a node "
-            "other than this worker's. A host bind mount cannot be honoured. "
-            "Use a provider volume that the service can attach, or use the "
-            "docker backend to run the sandbox on this worker's own node."
-        )
     if spec.volumes:
         raise ValueError(
             "P3bBackend does not forward provider volumes to the service. "
@@ -453,17 +792,11 @@ def _to_service_spec(
 
     metadata = dict(spec.metadata)
     if owner_id:
-        metadata.setdefault("psrl_owner_id", owner_id)
-
-    # Translate exec_mode. The PSRL and SDK enums share the same string values
-    # ("persistent", "one_shot"), so a direct string round-trip is safe. None
-    # means "let the service use its own default", which is what we want when
-    # the spec made no declaration.
-    service_exec_mode: ServiceExecMode | None = None
-    if spec.exec_mode is not None:
-        service_exec_mode = ServiceExecMode(
-            spec.exec_mode.value if hasattr(spec.exec_mode, "value") else str(spec.exec_mode)
-        )
+        # The name the node reclaims this sandbox by: it holds that owner's
+        # sandboxes only while the owner keeps renewing, and the renewal names
+        # the same string. It travels as metadata because it is an opaque caller
+        # identity the service only compares for equality.
+        metadata.setdefault("owner_id", owner_id)
 
     return ServiceSpec(
         source=ServiceSource(
@@ -481,7 +814,33 @@ def _to_service_spec(
         idempotency_key=spec.idempotency_key,
         env=dict(spec.env),
         metadata=metadata,
-        exec_mode=service_exec_mode,
+        # The container's starting directory, so a command that names none works where
+        # the workload said it works.
+        workdir=spec.workdir,
+        # Fixed at creation and not selectable per command, so a dropped mode serves
+        # every persistent-shell workload one-shot instead.
+        exec_mode=ServiceExecMode(spec.exec_mode.value) if spec.exec_mode is not None else None,
+        # The service refuses a backend that cannot provide one, which is the point of
+        # declaring them. Passing them on is what makes that refusal possible.
+        required_features=frozenset(ServiceFeature(feature.value) for feature in spec.required_features),
+        required_resume_level=(
+            ServiceResumeLevel(spec.required_resume_level.value) if spec.required_resume_level is not None else None
+        ),
+        # A recipe's pin, forwarded because the service validates the requirements
+        # against the pinned backend rather than trusting it.
+        backend=spec.backend,
+        # How long this sandbox is meant to work, which the caller knows and the node
+        # cannot infer.
+        lifetime_s=int(spec.lifetime_timeout_s) if spec.lifetime_timeout_s else None,
+        # Host paths this sandbox needs, forwarded so the node decides: it shares the
+        # trees its operator listed and refuses everything else. A path only exists on
+        # the machine that holds it, so this is the one request that depends on where
+        # the sandbox lands -- which is exactly why the node answers it rather than
+        # this client guessing. A fleet whose nodes share no storage refuses here, and
+        # that refusal names the path, which is the answer a caller can act on.
+        mounts=tuple(
+            ServiceMount(source=mount.source, target=mount.target, read_only=mount.read_only) for mount in spec.mounts
+        ),
     )
 
 

@@ -138,7 +138,7 @@ func TestV2MemoryUsedPctReadsFromMemoryMax(t *testing.T) {
 	// fraction on any large machine).
 	dir := t.TempDir()
 	writeFakeFile(t, dir, "cpu.stat", "usage_usec 0\n")
-	writeFakeFile(t, dir, "memory.max", "1073741824\n")  // 1 GiB
+	writeFakeFile(t, dir, "memory.max", "1073741824\n")    // 1 GiB
 	writeFakeFile(t, dir, "memory.current", "536870912\n") // 512 MiB
 	src := &v2Source{dir: dir}
 	r, err := newReaderFrom(src)

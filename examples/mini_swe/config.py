@@ -67,10 +67,11 @@ class MiniSandboxConfig:
     # behavior aligned without duplicating image, cwd, env, or lifetime config.
     environment: MiniEnvironmentConfig = field(default_factory=MiniEnvironmentConfig)
     rollout_environment: dict[str, Any] = field(default_factory=dict)
+    # The grading wall clock is `rollout.agent.grading_timeout`, not a sandbox-config key,
+    # so it is deliberately absent here: one place decides how long grading may run.
     grader_environment: dict[str, Any] = field(
         default_factory=lambda: {
             "memory": "30g",
-            "timeout": 900,
         }
     )
 

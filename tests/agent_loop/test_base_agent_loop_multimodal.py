@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 from psrl.utils.rollout.gateway_multimodal import GatewayMultimodalPayloadBuilder
+from psrl.utils.sampler_distribution import SamplerCapture
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.gen.utils import TokenInput
 
@@ -21,6 +22,7 @@ def _bare_loop():
         enable_rollout_routing_replay=False,
         prompt_length=16,
     )
+    loop.sampler_capture = SamplerCapture()
     return loop
 
 

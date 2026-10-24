@@ -62,6 +62,11 @@ class TerminateReason(Enum):
     # it was lost. A lifecycle or host fault rather than evidence about the model or the
     # harness: the group must be replaced, but it must not be counted against the harness.
     CONTAINER_LOST = "container_lost"
+    # The episode completed, but the harness could not collect its artifact because
+    # the sandbox's execution environment could not run the collector (a missing
+    # tool, a shell that never started). The environment fault is not evidence that
+    # the harness is broken, and it is not a model result either.
+    SANDBOX_COLLECT_FAILED = "sandbox_collect_failed"
     # The episode was cancelled from outside, typically while the run was shutting down.
     # Kept apart from `ROLLOUT_ERROR` so teardown cannot be mistaken for a rollout fault.
     ROLLOUT_CANCELLED = "rollout_cancelled"
@@ -158,6 +163,7 @@ class TerminateReason(Enum):
             TerminateReason.DOWNSTREAM_TIMEOUT,
             TerminateReason.SANDBOX_CAPACITY_TIMEOUT,
             TerminateReason.CONTAINER_LOST,
+            TerminateReason.SANDBOX_COLLECT_FAILED,
             TerminateReason.ROLLOUT_CANCELLED,
             TerminateReason.ROLLOUT_DEADLINE_EXCEEDED,
             TerminateReason.UNKNOWN,
@@ -182,6 +188,7 @@ class TerminateReason(Enum):
             TerminateReason.SANDBOX_CAPACITY_TIMEOUT,
             TerminateReason.GRADER_CAPACITY_TIMEOUT,
             TerminateReason.CONTAINER_LOST,
+            TerminateReason.SANDBOX_COLLECT_FAILED,
             TerminateReason.ROLLOUT_CANCELLED,
         )
 

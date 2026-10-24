@@ -6,7 +6,6 @@ from typing import Any
 
 import numpy as np
 import ray
-import torch
 import transfer_queue as tq
 from omegaconf import DictConfig
 from tensordict import TensorDict
@@ -26,6 +25,7 @@ from psrl.utils.server.command import Command, CommandExtension, CommandType
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.reward.reward_loop import load_reward_manager
 from psrl.workers.reward.reward_model import RewardModelManager
+from psrl.workers.reward.rm_scores import rm_scores_from_lengths
 from psrl.workers.reward.utils import ensure_reward_attention_mask
 
 psrl_logger = logging.getLogger(__name__)
@@ -345,14 +345,9 @@ class RewardLoopManager(CommandExtension):
         data["reward_extra_info"] = reward_extra_infos
         data["reward_score"] = reward_scores
 
-        response_mask = await tq.async_kv_batch_get(
-            keys=reward_batch.keys,
-            partition_id=reward_batch.partition_id,
-            select_fields=["response_mask"],
-        )["response_mask"]
-        rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
-        rm_scores[:, -1] = torch.as_tensor(reward_scores, dtype=rm_scores.dtype, device=rm_scores.device)
-        data["rm_scores"] = rm_scores
+        lengths = await self._response_lengths(reward_batch.keys, reward_batch.partition_id)
+        rm_scores = rm_scores_from_lengths(lengths, reward_scores.tolist())
+        data["rm_scores"] = list_of_dict_to_tensordict([{"rm_scores": row} for row in rm_scores])["rm_scores"]
 
         await tq.async_kv_batch_put(
             keys=reward_batch.keys,
@@ -367,7 +362,6 @@ class RewardLoopManager(CommandExtension):
             "reward_score": 0.0,
             "reward_extra_info": {},
             "reward_metrics": {},
-            "response_len": 1,
         }
 
     def _next_attempt_id(self) -> int:
@@ -464,8 +458,6 @@ class RewardLoopManager(CommandExtension):
                         result["request_keys"],
                         result["error"],
                     )
-                if reward is not None:
-                    reward["response_len"] = result["response_len"]
                 await self._set_reward_for_request_keys(result["request_keys"], reward)
 
     async def _set_reward_for_request_keys(self, request_keys: list[str], reward: dict[str, Any] | None):
@@ -577,6 +569,27 @@ class RewardLoopManager(CommandExtension):
 
         return sync_results[0] if sync_results else None
 
+    async def _response_lengths(self, keys: list[str], partition_id: str) -> list[int]:
+        """
+        Return each key's own response length in tokens, ordered like `keys`.
+
+        The length comes from the key's own `responses`, which is the field that owns it. A
+        length carried alongside the reward instead is a second copy of the same fact, and for
+        a session of several trajectories that one copy can only describe one of them.
+
+        Args:
+            keys (list[str]): Payload keys to read.
+            partition_id (str): Partition holding those keys.
+
+        Returns:
+            list[int]: Per-key response length in tokens.
+        """
+        data = await tq.async_kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["responses"])
+        responses = data["responses"]
+        if hasattr(responses, "offsets"):
+            return [int(length) for length in responses.offsets().diff()]
+        return [int(responses.shape[-1])] * len(keys)
+
     async def wait_for_reward_of_requests(self, requests: KVBatchMeta) -> KVBatchMeta:
         """Wait for all requested rewards and write them to the transfer queue."""
         request_keys = requests.keys
@@ -600,7 +613,6 @@ class RewardLoopManager(CommandExtension):
                     "reward_score": 0.0,
                     "reward_extra_info": {},
                     "reward_metrics": {},
-                    "response_len": 1,
                 }
             elif request_key in self.request_key_to_reward:
                 request_key_to_reward[request_key] = self.request_key_to_reward.pop(request_key)
@@ -624,22 +636,12 @@ class RewardLoopManager(CommandExtension):
             fields.append(reward)
             self.request_key_to_future.pop(request_key, None)
 
-        for i, f in enumerate(fields):
-            raw_response_len = f.pop("response_len", 1)
-            if raw_response_len <= 0:
-                psrl_logger.error(
-                    "wait_for_reward_of_requests: response_len=%d for key=%s, reward_score=%s, reward_keys=%s",
-                    raw_response_len,
-                    request_keys_to_put[i] if i < len(request_keys_to_put) else "?",
-                    f.get("reward_score"),
-                    list(f.keys()),
-                )
-            response_len = max(raw_response_len, 1)
-            rm_score_tensor = torch.zeros(response_len, dtype=torch.float32)
-            rm_score_tensor[-1] = float(f.get("reward_score", 0.0))
-            f["rm_scores"] = rm_score_tensor
-
         if request_keys_to_put:
+            # A session's trajectories differ in length, so each key builds from its own response.
+            lengths = await self._response_lengths(request_keys_to_put, partition_id)
+            rm_scores = rm_scores_from_lengths(lengths, [float(f.get("reward_score", 0.0)) for f in fields])
+            for f, rm_score in zip(fields, rm_scores, strict=True):
+                f["rm_scores"] = rm_score
             await tq.async_kv_batch_put(
                 keys=request_keys_to_put,
                 partition_id=partition_id,
@@ -683,14 +685,14 @@ class RewardLoopManager(CommandExtension):
             reward = resolved.get(request_key)
             if reward is None:
                 reward = self._default_reward_result()
-            f = reward.copy()
-            response_len = max(f.pop("response_len", 1), 1)
-            rm_score_tensor = torch.zeros(response_len, dtype=torch.float32)
-            rm_score_tensor[-1] = float(f.get("reward_score", 0.0))
-            f["rm_scores"] = rm_score_tensor
-            fields.append(f)
+            fields.append(reward.copy())
 
         if request_keys:
+            # A session's trajectories differ in length, so each key builds from its own response.
+            lengths = await self._response_lengths(request_keys, "train")
+            rm_scores = rm_scores_from_lengths(lengths, [float(f.get("reward_score", 0.0)) for f in fields])
+            for f, rm_score in zip(fields, rm_scores, strict=True):
+                f["rm_scores"] = rm_score
             await tq.async_kv_batch_put(
                 keys=request_keys,
                 partition_id="train",
@@ -936,7 +938,6 @@ class RewardLoopManager(CommandExtension):
         result = await self._compute_score(reward_data)
 
         n_trajectory = tu.get(reward_data, "n_trajectory", [1])[0]
-        result["response_len"] = reward_data["responses"].shape[-1]
 
         trajectory_to_results = {}
         if n_trajectory > 1:

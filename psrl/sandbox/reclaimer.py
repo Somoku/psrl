@@ -20,12 +20,21 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import BinaryIO, Protocol
 
 psrl_logger = logging.getLogger(__file__)
+
+# The lease convention both sides have to agree on: where a node's owner heartbeats
+# live, how long one may go unrefreshed before its sandboxes belong to nobody, and how
+# often a collector sweeps. They are stated here because this module owns the
+# convention, and the Docker lifecycle imports them rather than repeating them.
+DEFAULT_HEARTBEAT_DIR = os.path.join(tempfile.gettempdir(), "psrl-sandbox-heartbeats")
+DEFAULT_LEASE_TTL_S = 120.0
+DEFAULT_GC_INTERVAL_S = 30.0
 
 # Container states that can never serve another command again.
 STOPPED_CONTAINER_STATES = frozenset({"exited", "dead"})
@@ -226,6 +235,15 @@ class NodeReclaimer:
         doomed = [
             item.container_id for item in containers if item.owner_id in stale_owners or item.container_id in abandoned
         ]
+        if doomed:
+            # Say who is destroying what and why, before it is gone: this is the only
+            # record of a removal that no session observes, and an operator chasing a
+            # sandbox that vanished mid-episode has nothing else to read.
+            psrl_logger.warning(
+                f"Reclaiming {len(doomed)} sandbox container(s) whose owner lease is gone or that stayed "
+                f"stopped past their grace: stale_owners={sorted(stale_owners)}, "
+                f"stopped_past_grace={sorted(abandoned)}, containers={doomed}."
+            )
         removed, unremovable = self._remove(doomed)
         if removed:
             self._stopped.forget(removed)
@@ -261,7 +279,13 @@ class NodeReclaimer:
         return reclaimed
 
     def _stale_owners(self, containers: Sequence[OwnedContainer], now: float) -> set[str]:
-        """Read each lease once, because a filesystem error is not evidence of death."""
+        """Read each lease once, because a filesystem error is not evidence of death.
+
+        An owner with no readable lease is treated as gone, so a heartbeat that stops
+        while its worker is alive costs that worker every sandbox it holds. That is why
+        the age and the budget are named here rather than summarised: this line is the
+        only evidence that a removal was a missed lease and not a failed sandbox.
+        """
         stale: set[str] = set()
         for owner_id in {item.owner_id for item in containers}:
             try:
@@ -270,6 +294,10 @@ class NodeReclaimer:
                 psrl_logger.warning(f"Could not inspect sandbox owner lease {owner_id!r}: {exc}.")
                 continue
             if age is None or age > self.lease_ttl_s:
+                psrl_logger.warning(
+                    f"Sandbox owner {owner_id!r} lease is stale: "
+                    f"age={('missing' if age is None else f'{age:.0f}s')}, budget={self.lease_ttl_s:.0f}s."
+                )
                 stale.add(owner_id)
         return stale
 
@@ -423,6 +451,43 @@ def run_reclaimer_loop(
         _release_gc_lock(lock_handle)
 
 
+def sweep_once(reclaimer: NodeReclaimer) -> ReclaimOutcome | None:
+    """
+    Sweep once and return what it reclaimed, or None when another collector holds the store.
+
+    A preflight calls this before a run starts, so a previous run's sandboxes are gone
+    before anything binds the port their agents are retrying against. It takes the same
+    lock the loop takes, so a preflight and a live collector can never remove the same
+    container twice, and a store somebody is already sweeping answers None rather than
+    duplicating the work.
+    """
+    lock_handle = _acquire_gc_lock(_gc_lock_path(reclaimer.heartbeat_dir))
+    if lock_handle is None:
+        return None
+    try:
+        return reclaimer.sweep()
+    finally:
+        _release_gc_lock(lock_handle)
+
+
+def _summarise_sweep(outcome: ReclaimOutcome | None) -> None:
+    """Report one sweep's result, so a preflight leaves a record of what it did."""
+    if outcome is None:
+        psrl_logger.info("Another sandbox collector holds this store, so it is already sweeping.")
+        return
+    remaining = "unknown" if outcome.remaining is None else str(outcome.remaining)
+    psrl_logger.info(
+        f"Reclaimed {len(outcome.removed)} sandbox container(s) whose owner lease was gone, {remaining} remaining."
+    )
+    if outcome.unremovable:
+        psrl_logger.warning(
+            f"{len(outcome.unremovable)} sandbox container(s) could not be removed and are still "
+            f"holding their memory: {list(outcome.unremovable)}."
+        )
+    if outcome.orphan_tasks:
+        psrl_logger.info(f"Reclaimed {len(outcome.orphan_tasks)} orphan runtime task(s).")
+
+
 def _build_runtime(kind: str, docker_command: Sequence[str]) -> SandboxContainerRuntime:
     """Resolve a runtime name to an implementation.
 
@@ -439,16 +504,26 @@ def _build_runtime(kind: str, docker_command: Sequence[str]) -> SandboxContainer
 def main(argv: Sequence[str] | None = None) -> int:
     """
     Run a node collector as a program.
+
+    `--once` sweeps a single time and exits, which is what a preflight wants: it has to
+    finish before the run starts, and it is asking whether a previous run left anything
+    behind rather than keeping a node watched. Without it the collector loops, which is
+    what a worker starts when it wants its node swept for as long as it is running.
     """
     parser = argparse.ArgumentParser(description="Reclaim PSRL sandbox containers whose owner is gone.")
-    parser.add_argument("--heartbeat-dir", required=True)
-    parser.add_argument("--lease-ttl-s", type=float, required=True)
-    parser.add_argument("--interval-s", type=float, required=True)
+    parser.add_argument("--heartbeat-dir", default=DEFAULT_HEARTBEAT_DIR)
+    parser.add_argument("--lease-ttl-s", type=float, default=DEFAULT_LEASE_TTL_S)
+    parser.add_argument("--interval-s", type=float, default=DEFAULT_GC_INTERVAL_S)
     parser.add_argument("--idle-exit-cycles", type=int, default=10)
     parser.add_argument("--stopped-grace-s", type=float, default=300.0)
     parser.add_argument("--orphan-task-min-age-s", type=float, default=300.0)
     parser.add_argument("--runtime", default="docker")
     parser.add_argument("--docker-command", nargs="+", default=["docker"])
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Sweep once and exit, instead of watching the node until it goes idle.",
+    )
     arguments = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     reclaimer = NodeReclaimer(
@@ -458,6 +533,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         stopped_grace_s=arguments.stopped_grace_s,
         orphan_task_min_age_s=arguments.orphan_task_min_age_s,
     )
+    if arguments.once:
+        _summarise_sweep(sweep_once(reclaimer))
+        return 0
     return run_reclaimer_loop(
         reclaimer,
         interval_s=arguments.interval_s,

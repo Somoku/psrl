@@ -206,7 +206,6 @@ class SandboxCapacityConfig:
     lease_ttl_s: float = 180
     heartbeat_interval_s: float = 30
     classes: dict[str, ResourceClassShare] = field(default_factory=dict)
-    acquire_timeout_s: float | None = 1800.0
 
     def __post_init__(self) -> None:
         if self.memory_mb is not None and self.memory_mb <= 0:
@@ -234,8 +233,6 @@ class SandboxCapacityConfig:
                 "envelope. Keep the sum below one so every guarantee stays satisfiable without preempting "
                 "a running sandbox."
             )
-        if self.acquire_timeout_s is not None and self.acquire_timeout_s <= 0:
-            raise ValueError("Sandbox capacity acquire_timeout_s must be greater than zero when configured.")
 
 
 @dataclass(frozen=True)
@@ -432,7 +429,7 @@ class SandboxCapacityCoordinator:
     and only the remainder is borrowable. That ordering matters because admission is
     non-preemptive: if a borrower could take the share of a class that is already
     waiting, the waiting class would have to wait for an episode to finish, which can
-    exceed its whole ``acquire_timeout_s``. That is how a short, bursty grading class
+    exceed any deadline it was given. That is how a short, bursty grading class
     ends up starved behind a long rollout flood.
 
     The reservation is not free: it is what a class gives up to bound another class's
@@ -500,20 +497,8 @@ class SandboxCapacityCoordinator:
             f"cpu_cores={self.available_capacity.cpu_millis / 1000:g}, "
             f"gpus={self.available_capacity.gpu_count}, disk_mb={self.available_capacity.disk_mb}, "
             f"sources={self._capacity.memory_source!r}/{self._capacity.cpu_source!r}, "
-            f"class_guarantees={{{guaranteed_summary}}}, "
-            f"acquire_timeout_s={self.member_queue_deadline_s!r}."
+            f"class_guarantees={{{guaranteed_summary}}}."
         )
-
-    @property
-    def member_queue_deadline_s(self) -> float | None:
-        """
-        Return how long one request waits before it is a capacity fault.
-
-        This is the admission deadline the timing contract derived from the episode
-        deadline, so a member that cannot be admitted costs an episode retry rather
-        than holding the whole phase.
-        """
-        return self._config.acquire_timeout_s
 
     def _ensure_sweeper(self) -> None:
         if self._sweeper is None:
@@ -538,8 +523,10 @@ class SandboxCapacityCoordinator:
             memory_mb (int): Requested container memory in MiB.
             cpu_count (float): Requested container CPUs.
             resource_class (str): Role of the sandbox, used to pick its guarantee.
-            timeout_s (float | None): Queue deadline. ``None`` derives one from the
-                configured phase deadline.
+            timeout_s (float | None): Optional bound on this caller's own wait. ``None``
+                waits until the request is admitted or its owner lease expires: the
+                sandbox service is what refuses a request it cannot serve, so a queue
+                deadline here would only guess at that answer.
             gpu_count (int): Requested accelerator devices.
             disk_mb (int): Requested sandbox disk in MiB.
 
@@ -548,8 +535,8 @@ class SandboxCapacityCoordinator:
 
         Raises:
             ValueError: When the request exceeds the envelope or the lease id exists.
-            SandboxCapacityTimeout: When the deadline expires, or when the owner
-                lease expired while the request was still queued.
+            SandboxCapacityTimeout: When the caller's ``timeout_s`` expires, or when the
+                owner lease expired while the request was still queued.
             asyncio.CancelledError: When the caller cancelled the wait.
         """
         if self._closed:
@@ -575,7 +562,6 @@ class SandboxCapacityCoordinator:
         ceiling = self._ceilings.get(resource_class)
         if ceiling is not None and not resources.fits(ceiling):
             raise ValueError(f"Sandbox request exceeds the ceiling for class {resource_class!r}.")
-        deadline = self.member_queue_deadline_s if timeout_s is None else timeout_s
         loop = asyncio.get_running_loop()
         waiter = _Waiter(
             lease_id,
@@ -593,9 +579,9 @@ class SandboxCapacityCoordinator:
             self._enqueue(waiter)
             self._drain_waiters()
         try:
-            if deadline is None:
+            if timeout_s is None:
                 return await waiter.future
-            return await asyncio.wait_for(waiter.future, timeout=deadline)
+            return await asyncio.wait_for(waiter.future, timeout=timeout_s)
         except asyncio.TimeoutError:
             waited = time.monotonic() - waiter.queued_at
             async with self._lock:
@@ -604,7 +590,7 @@ class SandboxCapacityCoordinator:
                 self._drain_waiters()
             raise SandboxCapacityTimeout(
                 f"Sandbox lease {lease_id!r} of resource_class={resource_class!r} was not admitted within "
-                f"{deadline:g}s (waited {waited:.0f}s). Envelope memory_mb={self._capacity.resources.memory_mb}, "
+                f"{timeout_s:g}s (waited {waited:.0f}s). Envelope memory_mb={self._capacity.resources.memory_mb}, "
                 f"cpu_cores={self._capacity.resources.cpu_millis / 1000:g}. This is a capacity planning fault, "
                 "not a task failure: raise the envelope, lower utilization, or rebalance capacity.classes."
             ) from None
@@ -762,7 +748,7 @@ class SandboxCapacityCoordinator:
         A borrower is additionally held to the reservation rule: it may not take capacity
         that another *queued* class's guarantee is still short of. Without that, a class
         with a busy queue drains the envelope and the class waiting beside it has to wait
-        for an episode to end, which can outlast its whole `acquire_timeout_s`. The rule is
+        for an episode to end, which can outlast any deadline it was given. The rule is
         scoped to queued classes on purpose, so an idle class strands nothing.
         """
         while True:
@@ -856,8 +842,8 @@ class SandboxCapacityCoordinator:
         """Record every request that a younger one was admitted ahead of.
 
         Skipping is deliberate, so this is reported rather than acted on. A climbing count
-        means the class shares no longer match the workload, which `acquire_timeout_s`
-        eventually turns into a capacity fault.
+        means the class shares no longer match the workload, which turns into a capacity
+        fault once the queue never drains.
         """
         for head in eligible:
             if head.queued_at < waiter.queued_at:

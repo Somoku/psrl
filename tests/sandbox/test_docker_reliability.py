@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -154,6 +155,28 @@ async def test_exec_stream_failure_terminates_the_container(monkeypatch, error) 
         await session.exec("background-work")
 
     assert engine.removes == 1, "Disconnected exec processes must not outlive their sandbox."
+
+
+async def test_a_destroyed_sandbox_names_the_command_and_the_trigger(monkeypatch, caplog) -> None:
+    """A container PSRL destroys has to say which command took it and why.
+
+    Nothing else records it. The command that arrives next fails with "terminated before
+    this command could run", which names neither the abort nor the command behind it, so
+    the destroy itself is the only place the evidence can come from.
+    """
+    engine = FakeDockerEngine()
+    session = await DockerBackend(default_exec_mode=ExecMode.ONE_SHOT, engine=engine).create(
+        SandboxSpec(SandboxSource.image("image"))
+    )
+    monkeypatch.setattr(engine, "exec", AsyncMock(side_effect=aiohttp.ClientPayloadError("broken")))
+
+    with caplog.at_level(logging.WARNING), pytest.raises(aiohttp.ClientPayloadError):
+        await session.exec("tail -c 16384 /root/.psrl-harness/stdout.log")
+
+    assert "destroyed the sandbox" in caplog.text
+    assert "trigger=transport_error" in caplog.text
+    assert "tail -c 16384 /root/.psrl-harness/stdout.log" in caplog.text
+    assert "Aborted by:" in caplog.text, "The destroy must carry the stack that asked for it."
 
 
 async def test_oversized_exec_output_keeps_the_sandbox(monkeypatch) -> None:

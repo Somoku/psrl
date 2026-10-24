@@ -2,7 +2,7 @@
   "role": "node",
   "node_listen": "0.0.0.0:9090",
   "node_id": "node-a",
-  "timing": { "episode_deadline_s": 1800, "node_ttl_s": 120, "rpc_timeout_s": 60 },
+  "timing": { "node_ttl_s": 120, "rpc_timeout_s": 60 },
   "node": {
     "memory_mb": 960000,
     "cpu_millis": 180000,
@@ -10,15 +10,25 @@
     "gpu_indices": [],
     "local_cpu_ceiling": 0.95,
     "local_mem_ceiling": 0.9,
-    "overcommit": 1.5,
-    "utilization_target": 0.75
+    "overcommit": 1.0,
+    "utilization_target": 0.75,
+    "cgroup_parent": "psrl-sandboxes-a",
+    "sample_interval_s": 5,
+    "sandbox_memory_safety": 0.05,
+    "admission_reserve": 0.1
   },
   "classes": {
     "rollout": { "guaranteed_share": 0.45 },
     "grader": { "guaranteed_share": 0.45 }
   },
   "backends": [
-    { "type": "docker", "mode": "direct", "socket": "/var/run/docker.sock", "api_version": "v1.40" }
+    {
+      "type": "docker",
+      "mode": "direct",
+      "socket": "/var/run/docker.sock",
+      "api_version": "v1.40",
+      "max_create_concurrency": 16
+    }
   ],
   "default_backend": "docker"
 }

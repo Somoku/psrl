@@ -92,7 +92,10 @@ func newMixedStack(t *testing.T, fleetMemoryMB int64) *mixedStack {
 		t.Fatalf("agentenv backend: %v", err)
 	}
 
-	spans, err := timing.New(2*time.Second, 8*time.Second, 5*time.Second, nil)
+	// The node TTL has to outlast the reservation TTL or placement refuses the
+	// configuration. It is not what makes these tests fast: reclamation here is
+	// driven per sandbox by the lifetime its create states, and by the sweep.
+	spans, err := timing.New(timing.DefaultNodeTTL, 5*time.Second)
 	if err != nil {
 		t.Fatalf("timing: %v", err)
 	}
@@ -102,13 +105,13 @@ func newMixedStack(t *testing.T, fleetMemoryMB int64) *mixedStack {
 	ledger, err := quota.New(quota.Config{
 		Total:    quota.Amount{MemoryMB: fleetMemoryMB, CPUMillis: 100000, Sandboxes: 1000},
 		Classes:  map[string]quota.ClassShare{"rollout": {Guaranteed: 0.7}, "grader": {Guaranteed: 0.2}},
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	})
 	if err != nil {
 		t.Fatalf("ledger: %v", err)
 	}
 	place, err := placement.New(placement.Config{
-		NodeTTL: spans.NodeTTL, ReservationTTL: spans.ReservationTTL(), SweepInterval: spans.SweepInterval(),
+		NodeTTL: spans.NodeTTL, ReservationTTL: timing.ReservationTTL, SweepInterval: timing.SweepInterval,
 	}, mon)
 	if err != nil {
 		t.Fatalf("placement: %v", err)
@@ -121,7 +124,7 @@ func newMixedStack(t *testing.T, fleetMemoryMB int64) *mixedStack {
 	}
 	control, err := NewControl(ControlConfig{
 		Registry: registry, Ledger: ledger, Placement: place, Monitor: mon,
-		Nodes: NewLocalNodeClient(nodeAgent), AcquireTimeout: time.Minute,
+		Nodes: NewLocalNodeClient(nodeAgent),
 	})
 	if err != nil {
 		t.Fatalf("control: %v", err)
@@ -143,19 +146,15 @@ func dockerNodeFor(t *testing.T, memoryMB int64) (*dockerbackend.Backend, *Node)
 	if err := docker.Preflight(context.Background()); err != nil {
 		t.Skipf("daemon not usable: %v", err)
 	}
-	spans, _ := timing.New(2*time.Second, 8*time.Second, 5*time.Second, nil)
 	gate, err := node.NewAdmission(node.Config{
 		Envelope: node.Resources{MemoryMB: memoryMB, CPUMillis: 100000},
 		Classes:  map[string]node.ClassShare{"rollout": {Guaranteed: 0.7}, "grader": {Guaranteed: 0.2}},
-		LeaseTTL: spans.CapacityLeaseTTL(),
+		LeaseTTL: timing.OwnerLease,
 	})
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}
-	life, err := node.NewLifecycle("node-a", gate, node.Windows{
-		PauseWindow: spans.PauseWindow(), ReapWindow: spans.ReapWindow(),
-		Lifetime: spans.Lifetime(), SweepInterval: spans.SweepInterval(),
-	})
+	life, err := node.NewLifecycle("node-a", gate, timing.SweepInterval)
 	if err != nil {
 		t.Fatalf("lifecycle: %v", err)
 	}
@@ -266,7 +265,13 @@ func TestReleasingOnOneBackendReturnsQuotaTheOtherCanUse(t *testing.T) {
 		t.Fatalf("microvm create: %v", err)
 	}
 
-	if _, err := s.control.Create(ctx, &v1.CreateRequest{Spec: createSpec(64)}); err == nil {
+	// The fleet is spent on the microVM, so Docker must not be admitted. A full
+	// class queues rather than refusing, so the refusal the caller sees is its own
+	// deadline; the bound is on the test, and the rest of it needs the long
+	// context still alive.
+	giveUp, cancelGiveUp := context.WithTimeout(ctx, heldOnAFullFleet)
+	defer cancelGiveUp()
+	if _, err := s.control.Create(giveUp, &v1.CreateRequest{Spec: createSpec(64)}); err == nil {
 		t.Fatal("the fleet is spent on the microVM, so Docker must be refused")
 	}
 
@@ -299,7 +304,9 @@ func TestASpecNoBackendCanServeNamesWhatWasMissing(t *testing.T) {
 func TestAMixedBurstKeepsBothBackendsInsideOneFleet(t *testing.T) {
 	// 512MB of 64MB sandboxes is eight, whichever backend serves them.
 	s := newMixedStack(t, 512)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// The creates that cannot fit queue for the caller's deadline rather than
+	// failing at once, so the bound is what makes the test finish.
+	ctx, cancel := context.WithTimeout(context.Background(), burstGiveUp)
 	defer cancel()
 
 	var mu sync.Mutex

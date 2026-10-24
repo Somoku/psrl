@@ -5,6 +5,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import Response as FastAPIResponse
 from httpx import ASGITransport
+from psrl.utils.common.http_utils import SESSION_TURN_ACCOUNTING_KEY, SESSION_TURN_BUDGET_ERROR_CODE
 from psrl.workers.gen.session_router import SessionRouter
 
 # Mock SMG server
@@ -339,3 +340,142 @@ async def test_delete_during_new_request_returns_409(router, client):
     resp = await client.post("/sessions/sid-close/v1/chat/completions", json=payload)
     assert resp.status_code == 409
     assert "session is closing" in resp.text
+
+
+# --- Declared turn budgets ------------------------------------------------------------
+#
+# A harness whose CLI takes no turn cap declares one here instead, and this router is what
+# holds the session to it. Only the parent agent's model calls are charged: a subagent's
+# calls are counted separately, so the same configured cap means the same thing whether a
+# CLI enforces it or this does.
+
+BUDGET_HEADER = "x-psrl-max-turns"
+METADATA_HEADER = "x-codex-turn-metadata"
+
+
+def _metadata(thread_source: str) -> dict[str, str]:
+    return {METADATA_HEADER: json.dumps({"thread_source": thread_source, "turn_id": "t1"})}
+
+
+async def _create_with_budget(client, budget: int | None) -> None:
+    headers = {"x-request-id": "r1"}
+    if budget is not None:
+        headers[BUDGET_HEADER] = str(budget)
+    resp = await client.post("/sessions", headers=headers)
+    assert resp.status_code == 200
+
+
+async def _turn(client, sid: str, *, thread_source: str | None = None, stream: bool = False):
+    headers = _metadata(thread_source) if thread_source else {}
+    return await client.post(
+        f"/sessions/{sid}/v1/responses",
+        json={"model": "m", "input": [], "stream": stream},
+        headers=headers,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_declared_budget_is_captured_at_session_creation(client, router):
+    await _create_with_budget(client, 3)
+
+    assert router.states["test-sid-123"].max_turns == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", ["abc", "0", "-1"])
+async def test_an_unusable_budget_header_leaves_the_session_unbounded(client, router, raw):
+    resp = await client.post("/sessions", headers={BUDGET_HEADER: raw})
+    assert resp.status_code == 200
+
+    assert router.states["test-sid-123"].max_turns is None
+
+
+@pytest.mark.asyncio
+async def test_a_session_without_a_declared_budget_is_never_refused(client, router):
+    await _create_with_budget(client, None)
+
+    for _ in range(5):
+        await _turn(client, "test-sid-123")
+
+    assert router.states["test-sid-123"].main_turns == 5
+
+
+@pytest.mark.asyncio
+async def test_the_turn_after_the_budget_is_spent_is_refused(client, router):
+    await _create_with_budget(client, 2)
+
+    assert (await _turn(client, "test-sid-123")).status_code == 200
+    assert (await _turn(client, "test-sid-123")).status_code == 200
+
+    refused = await _turn(client, "test-sid-123")
+
+    assert refused.status_code == 400
+    assert refused.headers["x-smg-error-code"] == SESSION_TURN_BUDGET_ERROR_CODE
+    # The code travels in the body as well: a harness CLI echoes an error body verbatim
+    # into its own output, which is where the framework reads the stop reason from.
+    assert refused.json()["error"]["code"] == SESSION_TURN_BUDGET_ERROR_CODE
+    assert router.states["test-sid-123"].main_turns == 2, "a refused turn is not a served one"
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_turn_is_charged_separately_from_the_parent(client, router):
+    await _create_with_budget(client, 2)
+    state = router.states["test-sid-123"]
+
+    await _turn(client, "test-sid-123", thread_source="user")
+    await _turn(client, "test-sid-123", thread_source="subagent")
+
+    assert (state.main_turns, state.subagent_turns) == (1, 1)
+    # The parent still has its second turn: a subagent's work is not the parent's.
+    assert (await _turn(client, "test-sid-123", thread_source="user")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_turn_is_refused_once_the_parent_budget_is_spent(client, router):
+    """Nothing more runs once the parent's turns are gone, a subagent included."""
+    await _create_with_budget(client, 1)
+    await _turn(client, "test-sid-123", thread_source="user")
+
+    refused = await _turn(client, "test-sid-123", thread_source="subagent")
+
+    assert refused.status_code == 400
+    assert router.states["test-sid-123"].subagent_turns == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", ["not json", "[]", "{}"])
+async def test_a_turn_that_cannot_be_attributed_is_charged_to_the_parent(client, router, raw):
+    """A caller that sends no usable label spends the parent's budget.
+
+    Reading an unattributable call as a subagent's would let anything unbounded slip past
+    the budget.
+    """
+    await _create_with_budget(client, 1)
+
+    resp = await client.post(
+        "/sessions/test-sid-123/v1/responses",
+        json={"model": "m", "input": [], "stream": False},
+        headers={METADATA_HEADER: raw},
+    )
+
+    assert resp.status_code == 200
+    assert router.states["test-sid-123"].main_turns == 1
+    assert (await _turn(client, "test-sid-123")).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_the_session_view_reports_the_turn_accounting(client, router):
+    await _create_with_budget(client, 4)
+    await _turn(client, "test-sid-123")
+    await _turn(client, "test-sid-123", thread_source="subagent")
+
+    body = (await client.get("/sessions/test-sid-123")).json()
+
+    assert body[SESSION_TURN_ACCOUNTING_KEY] == {
+        "max_turns": 4,
+        "main_turns": 1,
+        "subagent_turns": 1,
+        "exhausted": False,
+    }
+    # The gateway's own view is untouched: this router adds one key of its own.
+    assert body["trajectories"][0]["accumulated_token_ids"] == [1, 2, 3]

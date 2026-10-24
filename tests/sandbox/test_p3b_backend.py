@@ -12,19 +12,28 @@ The service itself is covered by the Go suite and by
 
 from __future__ import annotations
 
-import pytest
+import asyncio
+import dataclasses
 
+import pytest
+from psrl.sandbox import SandboxPathNotFoundError
+from psrl.sandbox.backends import p3b as p3b_backend
 from psrl.sandbox.backends.p3b import P3bBackend, _to_service_spec
 from psrl.sandbox.core import (
     CredentialRef,
     EgressPolicy,
+    ExecMode,
     MountSpec,
     ResourceSpec,
     ResumeLevel,
+    SandboxExitReason,
     SandboxFeature,
     SandboxSource,
     SandboxSpec,
+    SandboxStatus,
 )
+from sandboxd import errors as service_errors
+from sandboxd.types import SandboxStatus as ServiceStatus
 
 _OWNER = "worker-1"
 _CLASS = "rollout"
@@ -90,18 +99,106 @@ class TestTheSpecSurvivesTheConversion:
 
         assert converted.workflow_id == "group-3"
 
-    def test_the_owner_is_carried_as_metadata_for_correlation(self):
+    def test_the_owner_the_service_reclaims_by_travels_with_the_spec(self):
+        """The owner id is the name the node reclaims this sandbox by.
+
+        The service reads it from the spec's metadata, and this worker's renewal
+        heartbeat names the same string. A rename on one side alone leaves every
+        sandbox owned by an owner nothing renews, and a node then reclaims them
+        while the worker is still using them.
+        """
         converted = convert(spec(), owner="worker-2")
 
-        assert converted.metadata["psrl_owner_id"] == "worker-2"
+        assert converted.metadata["owner_id"] == "worker-2"
+
+    def test_the_starting_directory_carries_over(self):
+        # The service applies this to the container, so a command that names no
+        # directory still starts there.
+        converted = convert(spec(workdir="/workspace/repo"))
+
+        assert converted.workdir == "/workspace/repo"
+
+    def test_the_exec_mode_carries_over_unchanged(self):
+        """The exec mode cannot be chosen later, only at creation.
+
+        The service fixes a sandbox's strategy when it is created and the exec
+        interface carries no mode, so a dropped mode is not a deferred decision --
+        every harness that declared a persistent shell would be served one-shot,
+        and would lose `cd`, `source` and its exported variables between turns.
+        """
+        for mode in ExecMode:
+            assert convert(spec(exec_mode=mode)).exec_mode.value == mode.value
+
+    def test_the_required_features_carry_over(self):
+        # A feature left behind here is not merely unrequested, it is dropped, and
+        # the sandbox lands somewhere that cannot honour it.
+        converted = convert(
+            spec(
+                required_features=frozenset({SandboxFeature.FREEZE, SandboxFeature.RESUME_ANYWHERE}),
+                required_resume_level=ResumeLevel.FULL_STATE,
+            )
+        )
+
+        assert {feature.value for feature in converted.required_features} == {
+            "freeze",
+            "resume_anywhere",
+        }
+        assert converted.required_resume_level.value == "full_state"
+
+    def test_the_backend_pin_carries_over(self):
+        # The service validates the requirements against the pinned backend, so
+        # forwarding the pin cannot weaken a check.
+        converted = convert(spec(backend="docker"))
+
+        assert converted.backend == "docker"
+
+    def test_a_spec_that_states_nothing_stays_unset(self):
+        # Forwarding must not invent a value: an unset mode, level or pin has to
+        # arrive unset, or the service takes a decision the caller left to it.
+        converted = convert(spec())
+
+        assert converted.exec_mode is None
+        assert converted.required_resume_level is None
+        assert converted.backend is None
+        assert converted.workdir is None
+        assert not converted.required_features
+
+
+class TestEverySpecFieldIsAccountedFor:
+    """A field that reaches neither set is dropped without anyone deciding.
+
+    That is how workdir, the exec mode, the required features, the resume level
+    and the backend pin were all lost -- the service grew a field for each and the
+    conversion was never revisited. Failing on a new PSRL field forces the decision
+    to be made here, rather than discovered as a workload that quietly ran differently.
+    """
+
+    def test_the_three_sets_cover_the_whole_spec(self):
+        declared = p3b_backend._FORWARDED_FIELDS | p3b_backend._OUT_OF_SCOPE_FIELDS
+        actual = {field.name for field in dataclasses.fields(SandboxSpec)}
+
+        assert declared == actual, (
+            "a PSRL SandboxSpec field is not accounted for by the p3b conversion: "
+            f"undecided {sorted(actual - declared)}, stale {sorted(declared - actual)}"
+        )
+
+    def test_the_forwarded_and_refused_sets_do_not_overlap(self):
+        # A field in both sets is a contradiction that the exhaustiveness check
+        # above cannot see on its own.
+        assert not (p3b_backend._FORWARDED_FIELDS & p3b_backend._REFUSED_FIELDS)
+        assert not (p3b_backend._FORWARDED_FIELDS & frozenset(p3b_backend._NOT_FORWARDED_FIELDS))
 
 
 class TestWhatTheServiceCannotCarryIsRefused:
     """A dropped field runs and produces a wrong result; a refusal costs a fix."""
 
-    def test_a_host_mount_is_refused(self):
-        with pytest.raises(ValueError, match="bind mount"):
-            convert(spec(mounts=(MountSpec(source="/data", target="/data"),)))
+    def test_a_host_mount_is_carried_to_the_service(self):
+        # The service answers a mount per node against its own allowlist, so the backend
+        # forwards it rather than refusing it here: a refusal here would deny mounts on
+        # every node because one node allows none.
+        out = convert(spec(mounts=(MountSpec(source="/data", target="/data"),)))
+
+        assert [(m.source, m.target) for m in out.mounts] == [("/data", "/data")]
 
     def test_an_egress_policy_is_refused(self):
         with pytest.raises(ValueError, match="egress policy"):
@@ -124,8 +221,10 @@ class TestCapabilitiesAreTheFleetsUnion:
         assert declared.supports(SandboxFeature.RESUME_ANYWHERE)
         assert declared.resume_level is ResumeLevel.FULL_STATE
 
-    def test_a_host_mount_is_not_claimed(self):
-        assert not make_backend().capabilities.supports(SandboxFeature.HOST_MOUNT)
+    def test_a_host_mount_is_claimed(self):
+        # Claimed because the service can answer it, and the caller is then refused by
+        # the node whose operator allowed nothing rather than by the client library.
+        assert make_backend().capabilities.supports(SandboxFeature.HOST_MOUNT)
 
 
 class TestAReattachIsRefusedRatherThanFaked:
@@ -133,3 +232,168 @@ class TestAReattachIsRefusedRatherThanFaked:
         with pytest.raises(NotImplementedError, match="agent endpoint"):
             await make_backend().connect("sb-1")
 
+
+class _RecordingClient:
+    """A stand-in for the SDK client that records renewals and closes."""
+
+    def __init__(self) -> None:
+        self.renewals: list[str] = []
+        self.closed = False
+
+    async def renew_owner(self, owner: str) -> None:
+        self.renewals.append(owner)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class TestItRenewsOwnershipWhileItHoldsSandboxes:
+    """The node reclaims an owner's sandboxes once it stops hearing from it.
+
+    A sandbox's own lifetime is a backstop measured in hours, so until it expires
+    a killed worker's containers stay up holding capacity. This renewal is the
+    only thing that bounds how long that lasts, which is why it starts with the
+    first sandbox and stops the moment the worker leaves.
+    """
+
+    async def test_it_renews_the_owner_on_a_timer(self, monkeypatch):
+        backend = make_backend()
+        client = _RecordingClient()
+        backend._client = client
+        backend._renew_client = client
+        backend._heartbeat_interval_s = 0.01
+        backend._renew_timeout_s = 0.1
+        backend.adopt_owner_id(_OWNER)
+
+        backend._ensure_owner_heartbeat()
+        await asyncio.sleep(0.05)
+        await backend.shutdown()
+
+        assert client.renewals, "a worker holding sandboxes must renew its ownership"
+        assert set(client.renewals) == {_OWNER}
+
+    async def test_renewal_uses_its_own_pool(self):
+        # A create holds a control connection for its whole duration, so a burst
+        # of creates can occupy every slot. The heartbeat must not wait behind
+        # them: a missed beat is then reported while the service is healthy.
+        backend = make_backend()
+        main, renew = _RecordingClient(), _RecordingClient()
+        backend._client = main
+        backend._renew_client = renew
+        backend._heartbeat_interval_s = 0.01
+        backend._renew_timeout_s = 0.1
+        backend.adopt_owner_id(_OWNER)
+
+        backend._ensure_owner_heartbeat()
+        await asyncio.sleep(0.05)
+        await backend.shutdown()
+
+        assert renew.renewals, "the renewal must use its dedicated client"
+        assert not main.renewals, "the data/control pool must not carry the heartbeat"
+
+    async def test_starting_it_more_than_once_keeps_one_loop(self, monkeypatch):
+        backend = make_backend()
+        backend._client = _RecordingClient()
+        backend._renew_client = _RecordingClient()
+        backend._heartbeat_interval_s = 0.01
+        backend._renew_timeout_s = 0.1
+        backend.adopt_owner_id(_OWNER)
+
+        backend._ensure_owner_heartbeat()
+        first = backend._heartbeat_task
+        backend._ensure_owner_heartbeat()
+
+        assert backend._heartbeat_task is first, "every sandbox shares one renewal loop"
+        await backend.shutdown()
+
+    async def test_it_stops_renewing_when_it_shuts_down(self, monkeypatch):
+        backend = make_backend()
+        client = _RecordingClient()
+        backend._client = client
+        backend._renew_client = client
+        backend._heartbeat_interval_s = 0.01
+        backend._renew_timeout_s = 0.1
+        backend.adopt_owner_id(_OWNER)
+
+        backend._ensure_owner_heartbeat()
+        await asyncio.sleep(0.05)
+        await backend.shutdown()
+        seen = len(client.renewals)
+        await asyncio.sleep(0.05)
+
+        assert len(client.renewals) == seen, "a closed backend must not keep renewing"
+        assert backend._heartbeat_task is None
+        assert client.closed
+
+    async def test_a_worker_with_no_owner_renews_nothing(self, monkeypatch):
+        # Without an owner id there is no name for the renewal, and the fleet
+        # would have nothing to key liveness on.
+        monkeypatch.setattr(p3b_backend, "OWNER_HEARTBEAT_INTERVAL_S", 0.01)
+        backend = make_backend()
+        client = _RecordingClient()
+        backend._client = client
+
+        backend._ensure_owner_heartbeat()
+        await asyncio.sleep(0.03)
+        await backend.shutdown()
+
+        assert not client.renewals
+
+
+class _StatusOnlySandbox:
+    """The service-side sandbox a P3bSession.status call needs, and nothing else."""
+
+    sandbox_id = "sb-status"
+
+    def __init__(self, status: ServiceStatus) -> None:
+        self._status = status
+
+    async def status(self) -> ServiceStatus:
+        return self._status
+
+
+class TestStatusKeepsTheWireValue:
+    """The SDK's status enum must not be stringified back through the constructor."""
+
+    @pytest.mark.asyncio
+    async def test_a_running_service_status_is_running(self):
+        session = p3b_backend.P3bSession.__new__(p3b_backend.P3bSession)
+        session._sandbox = _StatusOnlySandbox(ServiceStatus.RUNNING)
+        session._terminated = False
+
+        assert await session.status() is SandboxStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_service_status_is_unknown(self):
+        session = p3b_backend.P3bSession.__new__(p3b_backend.P3bSession)
+        session._sandbox = _StatusOnlySandbox(ServiceStatus.UNKNOWN)
+        session._terminated = False
+
+        assert await session.status() is SandboxStatus.UNKNOWN
+
+
+class TestFailuresKeepTheirAttribution:
+    """A failure's type is what a caller acts on, so the translation must not flatten it."""
+
+    def test_a_missing_path_is_not_a_lost_session(self):
+        translated = p3b_backend._translate(service_errors.SandboxPathNotFound("missing"))
+
+        assert isinstance(translated, SandboxPathNotFoundError)
+        assert not isinstance(translated, p3b_backend.SandboxSessionLostError)
+
+    def test_a_lost_session_keeps_its_exit_attribution(self):
+        translated = p3b_backend._translate(
+            service_errors.SandboxSessionLost(
+                "gone",
+                sandbox_id="sb-1",
+                exit_reason="oom",
+                exit_code=137,
+                finished_at="2026-10-22T02:13:07Z",
+                state_error="status=exited exit_code=137 oom_killed=true",
+            )
+        )
+
+        assert translated.exit_reason is SandboxExitReason.OOM
+        assert translated.exit_code == 137
+        assert translated.finished_at == "2026-10-22T02:13:07Z"
+        assert "oom_killed=true" in translated.state_error

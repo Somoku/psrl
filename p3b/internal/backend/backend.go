@@ -15,9 +15,59 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
+
+// ErrSessionLost marks a failure that is a fact about the caller's session
+// rather than a fault of the runtime: the session a command was sent to is gone,
+// so state the caller built in it is gone too.
+//
+// It is a sentinel rather than a status code so this package stays free of the
+// wire's vocabulary. The service maps it to the classification a caller acts on,
+// and the distinction is what lets a caller tell "the node did not answer" from
+// "my session is gone and an infrastructure retry will not bring it back".
+var ErrSessionLost = errors.New("sandbox session lost")
+
+// ErrRuntimeGone marks a failure where the sandbox's runtime object is gone:
+// the container stopped or no longer exists. It is deliberately distinct from
+// ErrSessionLost, whose meaning is narrower: the state a caller built inside a
+// command session is gone (a persistent shell exited), while the container may
+// still be alive and able to serve a fresh command.
+//
+// The two need different answers. A runtime-gone sandbox must be charged back
+// and replaced; a lost shell only costs the caller its working directory and
+// exported variables, and destroying the sandbox would throw away a healthy
+// runtime.
+var ErrRuntimeGone = errors.New("sandbox runtime gone")
+
+// ErrPathNotFound marks a file request that failed because the path does not
+// exist inside a sandbox that is otherwise healthy. It exists because a missing
+// file and a missing sandbox are both Docker 404s, and collapsing them made a
+// harness report an absent diagnostics file as a lost session.
+var ErrPathNotFound = errors.New("path not found in sandbox")
+
+// ExecResult is one completed command: its output streams kept separate, its
+// exit code, and whether the backend stopped retaining output at its budget.
+type ExecResult struct {
+	ExitCode  int
+	Stdout    string
+	Stderr    string
+	Truncated bool
+}
+
+// Executor is implemented by a backend that can run a command inside a
+// sandbox. It is optional and separate from Backend because a backend whose
+// sandboxes run their own in-agent command server never reaches this path.
+//
+// execMode is "persistent" or "one_shot"; an empty value takes the backend's
+// default. The result carries stdout and stderr separately: a caller diagnosing
+// a failed command needs to know which stream said what, and a backend that
+// merged them cannot answer that.
+type Executor interface {
+	Exec(ctx context.Context, handle Handle, execMode, command, workdir string, env map[string]string) (ExecResult, error)
+}
 
 // SchedulingMode says who chooses the node a sandbox lands on.
 //
@@ -64,9 +114,29 @@ type Resources struct {
 }
 
 // Spec is the portable creation request.
+// Mount is one host directory a sandbox needs to see.
+//
+// A mount is a request about the machine, not about the sandbox: it hands a sandbox a
+// view of a path the node owns. That is why a backend is allowed to refuse one -- see the
+// allowlist in the docker backend -- and why it travels as part of the spec's identity
+// rather than as a backend option: two environments that see different host paths are not
+// the same environment, and an idempotent create that silently dropped the mount would
+// hand back a sandbox that cannot do its work.
+type Mount struct {
+	// Source is the path on the node, which must exist and must be allowed.
+	Source string
+	// Target is where the sandbox sees it.
+	Target string
+	// ReadOnly keeps the sandbox from writing to a path the node shares with others.
+	ReadOnly bool
+}
+
 type Spec struct {
 	Source    Source
 	Resources Resources
+	// Mounts are the host paths this sandbox must see. Empty is the common case, and a
+	// backend that cannot mount refuses a spec that asks rather than degrading silently.
+	Mounts []Mount
 
 	ResourceClass  string
 	WorkflowID     string
@@ -91,6 +161,12 @@ type Spec struct {
 	RequiredNodeLabel   string
 	ForbiddenNodeLabels []string
 
+	// Lifetime is how long the sandbox may exist, counted from creation. Zero
+	// takes the node's default. It is stated by the caller because the caller
+	// knows what the sandbox is for, and it is the node's backstop for a caller
+	// that dies or forgets to release.
+	Lifetime time.Duration
+
 	// AssignedGPUs are the device indices node admission granted. Written by the
 	// service and never by a caller, which is why it is not part of a spec's
 	// identity.
@@ -102,6 +178,14 @@ type Spec struct {
 	// unportable.
 	BackendOptions map[string]map[string]string
 }
+
+// OwnerMetadataKey is where a caller states the owner its sandboxes belong to.
+//
+// It is metadata rather than a field because the value is an opaque caller
+// identity that the service only compares for equality. It lives here because
+// the runtime copies spec metadata into its own labels, so this key is also how
+// a restarted node recovers the owner of a container it no longer remembers.
+const OwnerMetadataKey = "owner_id"
 
 // Options returns this backend's own options from a spec, and whether the spec
 // named any.
@@ -235,6 +319,134 @@ type Stateful interface {
 // the refusal.
 type Preflighter interface {
 	Preflight(ctx context.Context) error
+}
+
+// Reconciled is one runtime object a backend found already present on this node,
+// carrying the facts a restarted node needs to charge for it exactly as the
+// create did.
+type Reconciled struct {
+	Handle     Handle
+	Owner      string
+	Class      string
+	ExecMode   string
+	Resources  Resources
+	GPUIndices []int32
+	Lifetime   time.Duration
+	CreatedAt  time.Time
+	Running    bool
+	// OOMKilled and ExitCode are the daemon's attribution for a container that
+	// stopped. They are what lets a restarted node report *why* an adoption was
+	// refused instead of a bare "not running".
+	OOMKilled bool
+	ExitCode  int
+	// FinishedAt is when the runtime observed the container stop. It is the
+	// clock a post mortem compares against a node's cgroup and kernel events.
+	FinishedAt time.Time
+	// Name is the runtime's name for the object, when it has one. It is what
+	// distinguishes unclaimed warm-pool inventory from a sandbox: a label written at
+	// create cannot be removed when an entry is claimed, but a name can be changed.
+	Name string
+	// PoolInventory reports that this object is an unclaimed warm-pool entry. A
+	// restarted node destroys these rather than charging them: nothing has been
+	// promised them, and they are rebuilt by the pool's own refill.
+	PoolInventory bool
+	// CgroupParent is where the object actually runs, so a restarted node can tell a
+	// sandbox it may adopt from one the sampler cannot see.
+	CgroupParent string
+}
+
+// ExitDetail is the runtime's attribution for a sandbox that stopped.
+//
+// It is more than Status's one-word answer: a caller that is about to release a
+// sandbox and blame a resource or an exit path needs the daemon's exit code and
+// the moment it happened, not a reconstruction from the reason.
+type ExitDetail struct {
+	Running   bool
+	OOMKilled bool
+	ExitCode  int
+	// ExitCodeKnown distinguishes a clean exit 0 from a runtime that had no
+	// code to report (a removed container, or one that never started).
+	ExitCodeKnown bool
+	// Status and Error are the daemon's own state and error text. They are what
+	// separates "the entrypoint exited 0" from "the runtime killed it" in a post
+	// mortem; the exit code alone does not name which process or why.
+	Status string
+	Error  string
+	// StartedAt precedes FinishedAt, so a loss report carries the lifetime the
+	// sandbox actually had, not just the moment it stopped.
+	StartedAt    time.Time
+	FinishedAt   time.Time
+	RestartCount int
+}
+
+// Evidence renders the daemon's account of the stop in one line. It is what
+// distinguishes an entrypoint that exited cleanly from a runtime kill when the
+// service's reason alone says only "exited".
+func (d ExitDetail) Evidence() string {
+	return fmt.Sprintf(
+		"status=%s running=%t oom_killed=%t exit_code=%d exit_code_known=%t error=%q "+
+			"started_at=%s finished_at=%s restart_count=%d",
+		d.Status,
+		d.Running,
+		d.OOMKilled,
+		d.ExitCode,
+		d.ExitCodeKnown,
+		d.Error,
+		evidenceTime(d.StartedAt),
+		evidenceTime(d.FinishedAt),
+		d.RestartCount,
+	)
+}
+
+func evidenceTime(t time.Time) string {
+	if t.IsZero() {
+		return "<unknown>"
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+// ExitDetailer is a backend that can report why a sandbox stopped, not merely
+// that it did. It is optional: a backend that cannot inspect keeps the
+// status-only attribution.
+type ExitDetailer interface {
+	ExitDetail(ctx context.Context, handle Handle) (ExitDetail, error)
+}
+
+// PoolBudget is what a backend that prefetches containers has to ask before it
+// builds one.
+//
+// A warm pool is not a class: its entries exist before any episode does, so charging
+// them to a class would let prefetching starve the work it exists to accelerate. The
+// pool is instead held against the node's declared envelope, subtracted from every
+// class's headroom, and released the moment an entry is claimed or destroyed.
+type PoolBudget interface {
+	// AcquirePool reserves one entry's footprint, reporting whether it fits.
+	AcquirePool(Resources) bool
+	// ReleasePool returns a footprint reserved by AcquirePool.
+	ReleasePool(Resources)
+	// MemoryPressure reports the measured memory fraction and whether it is usable.
+	// An unusable reading must stop refill rather than let it run blind.
+	MemoryPressure() (float64, bool)
+}
+
+// PoolBudgeted is implemented by a backend whose pool needs a budget.
+type PoolBudgeted interface {
+	SetPoolBudget(PoolBudget)
+}
+
+// Reconciler is implemented by a backend that can read back what it already
+// holds on this node.
+//
+// The runtime is the source of truth, so a restarted node rebuilds its
+// accounting from the daemon rather than from a second record that can disagree
+// with it. Without this a restart leaks every container the node had adopted,
+// because the ledger came back empty and nothing re-adopts them.
+type Reconciler interface {
+	// Reconcile returns every object this node holds, running or not.
+	Reconcile(ctx context.Context) ([]Reconciled, error)
+	// FindByIdempotencyKey returns the object a create with this key already
+	// made, so a create whose response was lost is adopted rather than repeated.
+	FindByIdempotencyKey(ctx context.Context, key string) (Reconciled, bool, error)
 }
 
 // Registry resolves a spec to the backend that will serve it.

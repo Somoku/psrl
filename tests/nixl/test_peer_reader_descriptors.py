@@ -18,7 +18,7 @@ from psrl.utils.nixl.registration_policy import (
     readers_by_source,
 )
 
-from test_peer_diffusion_plan import _cluster
+from tests.nixl.test_peer_diffusion_plan import _cluster
 
 pytestmark = pytest.mark.cpu_test
 

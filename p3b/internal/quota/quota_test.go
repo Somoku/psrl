@@ -165,6 +165,32 @@ func TestARequestLargerThanTheHeadroomIsRefusedRatherThanQueuedSilently(t *testi
 	}
 }
 
+func TestARequestAboveItsClassCeilingCanNeverBeAdmitted(t *testing.T) {
+	// A class ceiling is not something a release raises, so a request above it is a
+	// livelock rather than contention, and admission refuses it definitively.
+	cfg := fleet()
+	cfg.Classes["rollout"] = ClassShare{Guaranteed: 0.5, Max: 0.5}
+	ledger := mustLedger(t, cfg)
+
+	if ledger.CanEverAdmit("rollout", Amount{MemoryMB: 600, CPUMillis: 100, Sandboxes: 1}) {
+		t.Fatal("a request above the class ceiling must not be waitable")
+	}
+	if !ledger.CanEverAdmit("rollout", Amount{MemoryMB: 400, CPUMillis: 100, Sandboxes: 1}) {
+		t.Fatal("a request within the class ceiling must be waitable")
+	}
+}
+
+func TestAClassWithNoCeilingCanGrowToTheFleet(t *testing.T) {
+	ledger := mustLedger(t, fleet())
+
+	if !ledger.CanEverAdmit("rollout", Amount{MemoryMB: 1000, Sandboxes: 1}) {
+		t.Fatal("a class with no ceiling may borrow the whole fleet")
+	}
+	if ledger.CanEverAdmit("rollout", Amount{MemoryMB: 1001, Sandboxes: 1}) {
+		t.Fatal("a request above the fleet total can never be admitted")
+	}
+}
+
 func TestAZeroDimensionIsNotComparedAgainstTheLimit(t *testing.T) {
 	// Zero means the caller stated no requirement there, which is not a request
 	// for nothing and must not be filtered on.

@@ -411,7 +411,7 @@ subclasses it and supplies only the following hooks:
 | `prepare_harness_task` | Return prompt, rollout `SandboxSpec`, backend, and opaque task state |
 | `prepare_harness_sandbox` | Optionally initialize the acquired sandbox (e.g. git sanitization) and add timing entries |
 | `collect_harness_artifact` | Optionally collect a patch, answer file, or other result before sandbox deletion |
-| `finalize_harness_task` | Optionally grade the artifact in a clean environment and return reward fields |
+| `finalize_harness_task` | Optionally grade the artifact in a clean environment and return reward fields; receives the `grading_timeout` budget (`None` = untimed) |
 | `close_harness_task` | Release task-only resources such as environments or concurrency slots |
 
 Only `prepare_harness_task` is abstract. Tasks without artifacts or an external
@@ -683,6 +683,38 @@ It expects `data/swe_gym_293/{train,val}.parquet` and their prefetched images
 from [`prepare/README.md`](prepare/README.md) Path C, and it exports
 `SWE_STRICT_NO_TEST_PATCH=1` / `SWE_TEST_PATCH_POLICY_SCOPE=all_tests`.
 
+**Ready-to-run (Megatron, Codex).** `megatron_qwen_4b_swe_codex.sh` is the Codex
+twin of the recipe above: same model and data, `default_agent_loop=mini_swe_codex`,
+and it pins `tito_tool_normalization=none` (Codex resends tool arguments verbatim,
+so it needs no harness-specific canonicalizer) with `tito_debug=true` for the first
+validation pass. Codex runs with thinking enabled and its native `apply_patch`
+tool: the harness adapter writes a static model catalog into the sandbox
+(`apply_patch_tool_type=freeform`, plus the pinned base instructions) and points
+Codex at it with `model_catalog_json`, because Codex only exposes `apply_patch`
+when the model catalog marks the model freeform.
+
+```bash
+# 1. Rebuild the Codex runtime tree at the pinned version (sha256-checked).
+bash examples/mini_swe/prepare/docker_scripts/build_harness_runtimes.sh codex
+
+# 2. Build the Codex parquets (--agent-name mini_swe_codex); see prepare/README.md Path C.
+
+# 3. Launch (staleness defaults to 1).
+bash examples/mini_swe/megatron_qwen_4b_swe_codex.sh
+```
+
+During the first run, confirm:
+
+- SMG logs (`tito_debug=true`) show `mismatch_count==0` and a single trajectory per
+  session — a prefix miss would fork a phantom trajectory per turn.
+- The `--json` trajectory contains `command_execution` items, `apply_patch`
+  custom-tool calls, and `reasoning` items.
+- Reward on `swe_gym_293` validation is comparable to the Claude Code recipe.
+
+`tito_tool_normalization=codex` selects SMG's Codex tool-input canonicalizer (drops the
+redundant `cd /testbed && ` prefix on `exec_command`) so replayed histories keep matching
+the stored TITO prefix.
+
 **Generic (any model/dataset, FSDP).** Point the trainer at the harness config
 and a parquet whose `agent_name` selects the harness. Harness mode requires TITO
 auto trajectory IDs so sub-agent / compaction branches stay in one session:
@@ -773,14 +805,14 @@ which is written by `prepare_swebench.py`.
 | Field | Category | Description |
 |-------|----------|-------------|
 | `rollout.multi_turn.enable` | Required | Must be `True` for mini-SWE-agent |
-| `rollout.multi_turn.max_turns` | Required | Max LLM generation turns per episode; training reads `gen_actor_rollout_ref`, validation reads `train_actor_rollout_ref` |
+| `rollout.multi_turn.max_turns` | Optional | Turns per episode: a positive cap, or `-1`/`null` for unlimited (bounded only by `rollout.agent.trajectory_timeout`). The codex harness takes no turn cap and ignores it. Training reads `gen_actor_rollout_ref`, validation reads `train_actor_rollout_ref` |
 | `sandbox_config.environment.image` | Data-affine | Docker image (overridden per-SWE-problem for SWE-smith path) |
 | `sandbox_config.environment.template` | Data-affine | Provider template/snapshot ID for AgentEnv or CubeSandbox |
 | `sandbox_config.environment.cwd` | Data-affine | Working directory inside container (`/testbed` for SWE-bench images) |
 | `sandbox_config.environment.forward_env` | Infrastructure | Additional host environment names to forward; proxy variables are always included once |
-| `sandbox_config.environment` | Infrastructure | Shared image/template, cwd, env, forwarded env and timeout base for rollout and grader |
+| `sandbox_config.environment` | Infrastructure | Shared image/template, cwd, env, forwarded env and command-timeout base |
 | `sandbox_config.rollout_environment` | Infrastructure | Rollout-only overrides, including `memory` and command `timeout` |
-| `sandbox_config.grader_environment` | Infrastructure | Fresh-verifier overrides; resources must match rollout to reuse a microVM snapshot |
+| `sandbox_config.grader_environment` | Infrastructure | Fresh-verifier overrides; resources must match rollout to reuse a microVM snapshot. Grading's wall clock is `rollout.agent.grading_timeout`, not a key here |
 | `sandbox_config.environment.container_timeout` | Infrastructure | Max container lifetime (default: `2h`) |
 | `sandbox_config.backend` | Infrastructure | Optional backend name from PSRL's worker-local sandbox registry |
 | `sandbox_config.policy_profile` | Infrastructure | Docker policy profile; set `null` for microVM providers |

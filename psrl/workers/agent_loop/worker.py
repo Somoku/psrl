@@ -23,7 +23,7 @@ from verl.utils.tokenizer import (
 )
 from verl.workers.config.model import HFModelConfig
 
-from psrl.sandbox import SandboxCapacityTimeout, SandboxSessionLostError
+from psrl.sandbox import SandboxCapacityTimeout, SandboxCollectorError, SandboxSessionLostError
 from psrl.sandbox.config import build_sandbox_manager, placement_manager_config
 from psrl.sandbox.ray_plane import SandboxPlaneHandle
 from psrl.utils.common.chat_template import resolve_chat_template_value
@@ -31,9 +31,9 @@ from psrl.utils.common.http_io_thread import init_http_io_thread
 from psrl.utils.common.http_utils import configure_distributed_post, init_http_client
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
+from psrl.utils.transferqueue_utils import RESPONSE_ALIGNED_FIELDS, assert_response_aligned_lengths
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
-from psrl.workers.agent_loop.timeouts import resolve_from_config
 from psrl.workers.gen.utils import TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
@@ -80,6 +80,8 @@ def _classify_rollout_failure(exc: BaseException) -> TerminateReason:
             return TerminateReason.SANDBOX_CAPACITY_TIMEOUT
         if isinstance(current, SandboxSessionLostError):
             return TerminateReason.CONTAINER_LOST
+        if isinstance(current, SandboxCollectorError):
+            return TerminateReason.SANDBOX_COLLECT_FAILED
         if type(current).__name__ in _CANCELLATION_ERROR_NAMES:
             return TerminateReason.ROLLOUT_CANCELLED
     return TerminateReason.ROLLOUT_ERROR
@@ -98,9 +100,15 @@ def loss_mask_is_zero(terminate_reason: TerminateReason, *, overlong_filtering: 
     return terminate_reason.is_ungraded or (overlong_filtering and terminate_reason.is_budget_truncated)
 
 
-@ray.remote
+@ray.remote(concurrency_groups={"metrics": 1})
 class PSRL_AgentLoopWorker:
-    """Agent loop worker takes a batch of messages and run each message in an agent loop."""
+    """Agent loop worker takes a batch of messages and run each message in an agent loop.
+
+    The ``metrics`` group is a single slot the per-step snapshot read runs in, kept apart
+    from the pool trajectory work uses. Sharing that pool made observability the first
+    thing to fail as density rose: with every slot held by the data plane, the read that
+    reports how full the node is was the one call that could not run on a full node.
+    """
 
     def __init__(
         self,
@@ -159,8 +167,6 @@ class PSRL_AgentLoopWorker:
         self.reward_manager = None
         sandbox_config = config.gen_actor_rollout_ref.rollout.agent.sandbox
         self.sandbox_manager = self._build_sandbox_manager(sandbox_config, capacity_coordinator, sandbox_plane)
-        # Every deadline a rollout is held to comes from this one ladder.
-        self.timeouts = resolve_from_config(config)
 
         n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
         n_validate_instances = (
@@ -321,12 +327,17 @@ class PSRL_AgentLoopWorker:
         )
         await self.sandbox_manager.shutdown()
 
+    @ray.method(concurrency_group="metrics")
     def sandbox_metrics_snapshot(self) -> dict[str, float]:
         """Return this worker's sandbox plane metrics for the trainer's per-step hook.
 
         The planes report and never log, and the trainer is the only reader, so the
         sandbox metric group lands on the same step axis as reward and timing
         without a second pipeline.
+
+        It runs in its own concurrency group because it is a read of the control
+        plane, not part of the data plane: a snapshot that has to wait for a slot
+        behind trajectory work reports the node as it was, or not at all.
         """
         if self.sandbox_manager is None:
             return {}
@@ -358,10 +369,23 @@ class PSRL_AgentLoopWorker:
         return task_done_callback
 
     @staticmethod
-    def _failure_diagnostics(agent_loop) -> str:
-        """Extract the original loop failure retained across retry handling."""
-        details = getattr(agent_loop, "last_error_traceback", "")
-        return details or "<no underlying exception was captured>"
+    def _failure_diagnostics(agent_loop, terminate_reason=None) -> str:
+        """Extract the original loop failure retained across retry handling.
+
+        The result is stripped, because a summary that is only whitespace prints as blank
+        lines and a diagnostic that prints as nothing is worse than one that says it has
+        nothing: from the log an operator cannot tell "no cause was recorded" from "the
+        cause was empty", and both look like the logger is broken.
+
+        When nothing was captured the fallback names the terminate reason, because that
+        is the one thing known about the failure and it is enough to tell a sandbox fault
+        from a harness fault.
+        """
+        details = (getattr(agent_loop, "last_error_traceback", "") or "").strip()
+        if details:
+            return details
+        reason = terminate_reason.value if terminate_reason is not None else "<unset>"
+        return f"<no underlying exception was captured; terminate_reason={reason}>"
 
     async def generate_trajectory(self, batch: TensorDict):
         """Generate trajectories using the specified agent type based on configuration.
@@ -374,10 +398,6 @@ class PSRL_AgentLoopWorker:
         """
         assert len(batch) == 1, "Only support single request for generation"
 
-        # The configured loop, not a hardcoded one. A fixed name here silently ignores
-        # `rollout.agent.default_agent_loop`, so any run whose dataset or recipe wants a
-        # different loop fails with "Unregistered agent loop" naming a loop the caller
-        # never asked for -- which reads as a registration bug rather than a config one.
         agent_name = self.config.gen_actor_rollout_ref.rollout.agent.default_agent_loop
         task = asyncio.create_task(self._run_agent_loop(agent_name, batch))
         task.add_done_callback(self._create_task_done_callback(task))
@@ -513,7 +533,7 @@ class PSRL_AgentLoopWorker:
                                 request_ids,
                                 retry_attempt,
                                 retry_limit,
-                                self._failure_diagnostics(agent_loop),
+                                self._failure_diagnostics(agent_loop, terminate_reason),
                             )
                         psrl_logger.warning(
                             f"Retrying agent loop: request_ids={request_ids!r}, "
@@ -528,13 +548,32 @@ class PSRL_AgentLoopWorker:
                             "Agent loop requests %s exhausted with terminate_reason=%s. Root cause:\n%s",
                             request_ids,
                             terminate_reason.value,
-                            self._failure_diagnostics(agent_loop),
+                            self._failure_diagnostics(agent_loop, terminate_reason),
                         )
                     psrl_logger.warning(
                         f"Agent loop exhausted retries: request_ids={request_ids!r}, "
                         f"reason={terminate_reason.value!r}, attempts={retry_limit}."
                     )
                     output = None
+
+                # Release the failed child's record before asking the manager to
+                # recover it. A member-level refill keeps the same child id, so an
+                # abort issued after `notify_group_failed` would abort the refill
+                # the manager had just dispatched.
+                #
+                # Abort only this child. Letting the PSManager abort the whole
+                # group because one member is missing clears the group's buffer
+                # reservation, and the refill then has no entry to rejoin; the
+                # buffer it was counted in still expects the missing payload and
+                # fails validation. The manager issues its own whole-group abort
+                # if the member's retries are exhausted.
+                if output is None and terminate_reason != TerminateReason.ABORTED:
+                    psrl_logger.warning(
+                        f"Aborting failed generation: request_ids={request_ids!r}, reason={terminate_reason.value!r}."
+                    )
+                    await self.ps_manager_handle.abort_requests.remote(
+                        request_ids, abort_group=False
+                    )
 
                 # Only the manager can purge the partial group and dispatch a replacement
                 # prompt, and it owns the breaker that ends a deterministically failing run.
@@ -557,7 +596,7 @@ class PSRL_AgentLoopWorker:
                             failed_uid=failed_uid,
                             is_validate=validate,
                             terminate_reason=terminate_reason,
-                            failure_summary=self._failure_diagnostics(agent_loop),
+                            failure_summary=self._failure_diagnostics(agent_loop, terminate_reason),
                         )
                     else:
                         raise RuntimeError(
@@ -603,15 +642,7 @@ class PSRL_AgentLoopWorker:
                         terminate_reason.value,
                         prompt_index,
                     )
-            elif terminate_reason != TerminateReason.ABORTED:
-                # Abort the reserved inventory entry after an unreported generation
-                # failure so the buffer can progress.
-                psrl_logger.warning(
-                    f"Aborting failed generation: request_ids={request_ids!r}, reason={terminate_reason.value!r}."
-                )
-                await self.ps_manager_handle.abort_requests.remote(request_ids)
-
-            # After ALL cleanup is complete (notify_group_failed + abort_requests),
+            # After ALL cleanup is complete (abort_requests + notify_group_failed),
             # re-raise the original error so it propagates to the task callback.
             if raised_error is not None:
                 raise raised_error
@@ -717,16 +748,11 @@ class PSRL_AgentLoopWorker:
             field["multi_modal_inputs"] = multi_modal_inputs
             field["images_seqlens"] = images_seqlens
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
-            # Merged batch fields can carry a stale `response_mask`, so recheck the
-            # response-length invariant after assembly.
-            mask_len = field["response_mask"].size(0)
-            if mask_len != response_len:
-                raise AssertionError(
-                    f"[uid={uid} trajectory={i}/{len(outputs)}] responses has {response_len} "
-                    f"tokens but response_mask has {mask_len} after merging the batch fields "
-                    f"with this trajectory's output (prompt_len={prompt_len}). The merge picked "
-                    "up a mask that does not belong to this trajectory."
-                )
+            # Merged batch fields can carry a stale mask, so recheck the length contract after assembly.
+            assert_response_aligned_lengths(
+                {"responses": field["responses"], **{n: field[n] for n in RESPONSE_ALIGNED_FIELDS if n in field}},
+                stage=f"assemble uid={uid} trajectory={i}/{len(outputs)} prompt_len={prompt_len}",
+            )
             field["seq_len"] = prompt_len + response_len
             field["prompt_len"] = prompt_len
             field["response_len"] = response_len

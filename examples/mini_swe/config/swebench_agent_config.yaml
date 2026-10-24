@@ -16,7 +16,6 @@
     grader_environment:
       # Heavy repos run `pip install -e .` during grading and briefly need up to 30 GB.
       memory: "30g"
-      timeout: 900
   agent:
     # System / problem / observation / format-error templates copied verbatim from
     # the official mini-swe-agent swebench.yaml (plain ```bash``` fences variant).

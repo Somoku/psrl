@@ -374,3 +374,115 @@ def test_an_unowned_container_cannot_be_rescued_by_a_live_lease(tmp_path) -> Non
 
     assert outcome.removed == ("unclaimed",), "A live lease must not vouch for an unowned container."
     assert outcome.remaining == 1
+
+
+class TestARemovalSaysWhoAndWhy:
+    """A reclaimer's removal is the only one no session observes.
+
+    The container disappears and the episode that was using it dies at its next
+    command. Nothing else in the run records what happened, so the reclaimer has to
+    say which owner it judged gone, on what budget, and what it destroyed.
+    """
+
+    def test_a_stale_owner_is_reported_with_its_age_and_budget(self, tmp_path, caplog):
+        owner = "worker-1"
+        _write_heartbeat(str(tmp_path / "hb"), owner, age_s=5000)
+        reclaimer, _ = _reclaimer(tmp_path, [OwnedContainer("c1", owner, "running")], ttl_s=120)
+
+        with caplog.at_level("WARNING"):
+            reclaimer.sweep()
+
+        lines = [record.getMessage() for record in caplog.records]
+        assert any("worker-1" in line and "stale" in line and "5000s" in line and "120s" in line for line in lines), (
+            lines
+        )
+
+    def test_an_owner_with_no_lease_at_all_is_reported_as_missing(self, tmp_path, caplog):
+        reclaimer, _ = _reclaimer(tmp_path, [OwnedContainer("c1", "never-wrote", "running")], ttl_s=120)
+
+        with caplog.at_level("WARNING"):
+            reclaimer.sweep()
+
+        lines = [record.getMessage() for record in caplog.records]
+        assert any("never-wrote" in line and "missing" in line for line in lines), lines
+
+    def test_the_destruction_names_the_containers_and_the_owner(self, tmp_path, caplog):
+        owner = "worker-2"
+        _write_heartbeat(str(tmp_path / "hb"), owner, age_s=5000)
+        reclaimer, runtime = _reclaimer(tmp_path, [OwnedContainer("c9", owner, "running")], ttl_s=120)
+
+        with caplog.at_level("WARNING"):
+            reclaimer.sweep()
+
+        lines = [record.getMessage() for record in caplog.records]
+        assert any("worker-2" in line and "c9" in line for line in lines), lines
+        assert runtime.removed == ["c9"]
+
+    def test_a_live_owner_is_not_reported_and_not_touched(self, tmp_path, caplog):
+        owner = "worker-3"
+        _write_heartbeat(str(tmp_path / "hb"), owner, age_s=1)
+        reclaimer, runtime = _reclaimer(tmp_path, [OwnedContainer("c1", owner, "running")], ttl_s=120)
+
+        with caplog.at_level("WARNING"):
+            reclaimer.sweep()
+
+        assert not [r for r in caplog.records if "stale" in r.getMessage()]
+        assert runtime.removed == []
+
+
+class TestThePreflightSweep:
+    """One pass, on demand, for a run that wants to start from a clean node.
+
+    A preflight asks whether a previous run left sandboxes behind, and it has to have its
+    answer before the run binds anything, so it sweeps once instead of watching the node.
+    """
+
+    def test_it_reclaims_a_previous_runs_sandboxes(self, tmp_path) -> None:
+        heartbeat_dir = str(tmp_path / "hb")
+        _write_heartbeat(heartbeat_dir, "dead-owner", age_s=10_000)
+        reclaimer, runtime = _reclaimer(tmp_path, [OwnedContainer("c1", "dead-owner", "running")])
+
+        outcome = reclaimer_module.sweep_once(reclaimer)
+
+        assert outcome is not None
+        assert outcome.removed == ("c1",)
+        assert runtime.removed == ["c1"]
+
+    def test_it_leaves_a_live_runs_sandboxes_alone(self, tmp_path) -> None:
+        # A preflight must be safe to run while another run is alive, so it reclaims on
+        # evidence of a dead owner and never on the label alone.
+        heartbeat_dir = str(tmp_path / "hb")
+        _write_heartbeat(heartbeat_dir, "live-owner", age_s=1)
+        reclaimer, runtime = _reclaimer(tmp_path, [OwnedContainer("c1", "live-owner", "running")])
+
+        outcome = reclaimer_module.sweep_once(reclaimer)
+
+        assert outcome is not None
+        assert outcome.removed == ()
+        assert runtime.removed == []
+
+    def test_it_defers_to_a_collector_that_holds_the_store(self, tmp_path) -> None:
+        heartbeat_dir = str(tmp_path / "hb")
+        _write_heartbeat(heartbeat_dir, "dead-owner", age_s=10_000)
+        reclaimer, runtime = _reclaimer(tmp_path, [OwnedContainer("c1", "dead-owner", "running")])
+        held = reclaimer_module._acquire_gc_lock(reclaimer_module._gc_lock_path(heartbeat_dir))
+        assert held is not None
+        try:
+            assert reclaimer_module.sweep_once(reclaimer) is None
+        finally:
+            reclaimer_module._release_gc_lock(held)
+
+        assert runtime.removed == []
+
+    def test_the_once_switch_sweeps_one_pass_and_exits(self, tmp_path, monkeypatch, caplog) -> None:
+        heartbeat_dir = str(tmp_path / "hb")
+        _write_heartbeat(heartbeat_dir, "dead-owner", age_s=10_000)
+        runtime = FakeRuntime([OwnedContainer("c1", "dead-owner", "running")])
+        monkeypatch.setattr(reclaimer_module, "_build_runtime", lambda *args, **kwargs: runtime)
+
+        with caplog.at_level("INFO"):
+            code = reclaimer_module.main(["--once", "--heartbeat-dir", heartbeat_dir, "--lease-ttl-s", "900"])
+
+        assert code == 0
+        assert runtime.removed == ["c1"]
+        assert any("Reclaimed 1 sandbox container" in record.getMessage() for record in caplog.records)

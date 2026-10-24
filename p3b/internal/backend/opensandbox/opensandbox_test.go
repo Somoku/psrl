@@ -125,6 +125,20 @@ func TestProviderModeDeclaresWhatOnlyAClusterHas(t *testing.T) {
 	}
 }
 
+func TestProviderModeDoesNotDeclareLazyLayers(t *testing.T) {
+	// Delivery here is block-level: blocks come from a node cache and from peers,
+	// so the image is not loaded lazily layer by layer. Declaring image_on_demand
+	// would let a spec that needs true lazy loading select this backend by mistake
+	// and then fail inside an episode.
+	declared := featureSet(providerBackend(t, "https://gateway.example.com/v1"))
+	if declared["image_on_demand"] {
+		t.Error("provider mode must not declare image_on_demand: its delivery is block-level")
+	}
+	if !declared["image_block_delivery"] {
+		t.Error("provider mode must declare image_block_delivery")
+	}
+}
+
 func TestProviderModeCreateReachesTheGateway(t *testing.T) {
 	var firstPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

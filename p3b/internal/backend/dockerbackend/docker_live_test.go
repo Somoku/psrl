@@ -4,6 +4,7 @@ package dockerbackend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -98,15 +99,15 @@ func TestACreatedSandboxIsRunningAndRunsACommand(t *testing.T) {
 		t.Fatalf("status is %q, want running", status)
 	}
 
-	code, output, err := b.Exec(ctx, created.Handle, "echo hello-sandbox", "", nil)
+	result, err := b.Exec(ctx, created.Handle, "", "echo hello-sandbox", "", nil)
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
-	if code != 0 {
-		t.Fatalf("exit code %d, want 0 (output %q)", code, output)
+	if result.ExitCode != 0 {
+		t.Fatalf("exit code %d, want 0 (output %q)", result.ExitCode, result.Stdout)
 	}
-	if !strings.Contains(output, "hello-sandbox") {
-		t.Fatalf("output %q does not carry the command's stdout", output)
+	if !strings.Contains(result.Stdout, "hello-sandbox") {
+		t.Fatalf("output %q does not carry the command's stdout", result.Stdout)
 	}
 }
 
@@ -116,13 +117,13 @@ func TestExecReportsANonZeroExitRatherThanAnError(t *testing.T) {
 	b := liveBackend(t)
 	created := createOne(t, b)
 
-	code, _, err := b.Exec(context.Background(), created.Handle, "exit 42", "", nil)
+	result, err := b.Exec(context.Background(), created.Handle, "", "exit 42", "", nil)
 
 	if err != nil {
 		t.Fatalf("a non-zero exit must not be an error: %v", err)
 	}
-	if code != 42 {
-		t.Fatalf("exit code %d, want 42", code)
+	if result.ExitCode != 42 {
+		t.Fatalf("exit code %d, want 42", result.ExitCode)
 	}
 }
 
@@ -130,14 +131,14 @@ func TestExecCarriesTheWorkingDirectoryAndEnvironment(t *testing.T) {
 	b := liveBackend(t)
 	created := createOne(t, b)
 
-	_, output, err := b.Exec(context.Background(), created.Handle, "pwd && echo $SANDBOX_MARK", "/tmp",
+	result, err := b.Exec(context.Background(), created.Handle, "", "pwd && echo $SANDBOX_MARK", "/tmp",
 		map[string]string{"SANDBOX_MARK": "carried"})
 
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
-	if !strings.Contains(output, "/tmp") || !strings.Contains(output, "carried") {
-		t.Fatalf("output %q is missing the working directory or the environment", output)
+	if !strings.Contains(result.Stdout, "/tmp") || !strings.Contains(result.Stdout, "carried") {
+		t.Fatalf("output %q is missing the working directory or the environment", result.Stdout)
 	}
 }
 
@@ -147,13 +148,13 @@ func TestOutputIsDemultiplexedRatherThanFramed(t *testing.T) {
 	b := liveBackend(t)
 	created := createOne(t, b)
 
-	_, output, err := b.Exec(context.Background(), created.Handle, "printf 'clean'", "", nil)
+	result, err := b.Exec(context.Background(), created.Handle, "", "printf 'clean'", "", nil)
 
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
-	if output != "clean" {
-		t.Fatalf("output is %q, want exactly \"clean\"", output)
+	if result.Stdout != "clean" {
+		t.Fatalf("output is %q, want exactly \"clean\"", result.Stdout)
 	}
 }
 
@@ -176,8 +177,8 @@ func TestAFreezeKeepsTheSandboxResidentAndResumable(t *testing.T) {
 	if err := b.Resume(ctx, created.Handle); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	if code, _, err := b.Exec(ctx, created.Handle, "true", "", nil); err != nil || code != 0 {
-		t.Fatalf("a resumed sandbox must run commands: code=%d err=%v", code, err)
+	if result, err := b.Exec(ctx, created.Handle, "", "true", "", nil); err != nil || result.ExitCode != 0 {
+		t.Fatalf("a resumed sandbox must run commands: code=%d err=%v", result.ExitCode, err)
 	}
 }
 
@@ -196,8 +197,8 @@ func TestASnapshotCommitsTheFilesystemAndCanBeDeleted(t *testing.T) {
 	b := liveBackend(t)
 	created := createOne(t, b)
 	ctx := context.Background()
-	if code, _, err := b.Exec(ctx, created.Handle, "echo marked > /tmp/mark", "", nil); err != nil || code != 0 {
-		t.Fatalf("writing the marker: code=%d err=%v", code, err)
+	if result, err := b.Exec(ctx, created.Handle, "", "echo marked > /tmp/mark", "", nil); err != nil || result.ExitCode != 0 {
+		t.Fatalf("writing the marker: code=%d err=%v", result.ExitCode, err)
 	}
 
 	snapshotID, err := b.Snapshot(ctx, created.Handle, "filesystem")
@@ -266,28 +267,119 @@ func TestStatusOfAReleasedSandboxIsTerminatedRatherThanAnError(t *testing.T) {
 	}
 }
 
-func TestASweepFindsThisServiceOwnSandboxesFromTheDaemon(t *testing.T) {
+func TestAReconcileRebuildsWhatThisServiceHoldsFromTheDaemon(t *testing.T) {
 	// The daemon is the source of truth: a service that trusted its own list would
 	// leak every container it forgot across a restart.
 	b := liveBackend(t)
 	created := createOne(t, b)
 
-	found, err := b.Sweep(context.Background())
+	found, err := b.Reconcile(context.Background())
 	if err != nil {
-		t.Fatalf("sweep: %v", err)
+		t.Fatalf("reconcile: %v", err)
 	}
 
 	var matched bool
-	for _, handle := range found {
-		if handle.SandboxID == created.Handle.SandboxID {
-			matched = true
-			if handle.NodeID != "test-node" {
-				t.Fatalf("swept handle carries node %q, want test-node", handle.NodeID)
-			}
+	for _, rec := range found {
+		if rec.Handle.SandboxID != created.Handle.SandboxID {
+			continue
+		}
+		matched = true
+		if rec.Handle.NodeID != "test-node" {
+			t.Errorf("reconciled handle carries node %q, want test-node", rec.Handle.NodeID)
+		}
+		if !rec.Running {
+			t.Error("a live sandbox must reconcile as running")
+		}
+		if rec.Class != "rollout" {
+			t.Errorf("class: got %q, want rollout", rec.Class)
+		}
+		// The charge has to round-trip, or a restart rebuilds a different envelope.
+		if rec.Resources.MemoryMB != 64 || rec.Resources.CPUCount != 0.5 {
+			t.Errorf("resources: got %+v, want 64MB and 0.5 cores", rec.Resources)
 		}
 	}
 	if !matched {
-		t.Fatalf("sweep returned %d handles, none of them the live sandbox", len(found))
+		t.Fatalf("reconcile returned %d records, none of them the live sandbox", len(found))
+	}
+}
+
+func TestAReconcileRecoversTheFactsOnlyALabelCarries(t *testing.T) {
+	// How a sandbox is executed, how long it may live, how much disk it was
+	// charged and who owns it cannot be read off the container's limits, so the
+	// labels are the only place a restart can recover them from.
+	b := liveBackend(t)
+	request := spec()
+	request.ExecMode = "persistent"
+	request.Lifetime = 90 * time.Minute
+	request.Resources.DiskMB = 512
+	request.Metadata = map[string]string{backend.OwnerMetadataKey: "worker-7"}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	created, err := b.Create(ctx, "test-node", request, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer releaseCancel()
+		_ = b.Release(releaseCtx, created.Handle)
+	})
+
+	found, err := b.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	for _, rec := range found {
+		if rec.Handle.SandboxID != created.Handle.SandboxID {
+			continue
+		}
+		if rec.Owner != "worker-7" {
+			t.Errorf("owner: got %q, want worker-7", rec.Owner)
+		}
+		if rec.ExecMode != "persistent" {
+			t.Errorf("exec mode: got %q, want persistent", rec.ExecMode)
+		}
+		if rec.Lifetime != 90*time.Minute {
+			t.Errorf("lifetime: got %s, want 90m", rec.Lifetime)
+		}
+		if rec.Resources.DiskMB != 512 {
+			t.Errorf("disk: got %dMB, want 512MB", rec.Resources.DiskMB)
+		}
+		if rec.CreatedAt.IsZero() {
+			t.Error("created at: a reconciled sandbox needs its start time to age out on")
+		}
+		return
+	}
+	t.Fatalf("reconcile returned %d records, none of them the live sandbox", len(found))
+}
+
+func TestACreateIsFoundByItsIdempotencyKey(t *testing.T) {
+	// A create whose response was lost leaves a container the caller never learned
+	// the id of, so a retry has to find it rather than make a second one.
+	b := liveBackend(t)
+	request := spec()
+	request.IdempotencyKey = "ticket-lost-response"
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	created, err := b.Create(ctx, "test-node", request, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer releaseCancel()
+		_ = b.Release(releaseCtx, created.Handle)
+	})
+
+	found, ok, err := b.FindByIdempotencyKey(context.Background(), "ticket-lost-response")
+	if err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	if !ok || found.Handle.SandboxID != created.Handle.SandboxID {
+		t.Fatalf("the lost create must be found by its key, got %+v ok=%v", found, ok)
+	}
+	if _, ok, err := b.FindByIdempotencyKey(context.Background(), "no-such-ticket"); err != nil || ok {
+		t.Errorf("an unknown key must miss, got ok=%v err=%v", ok, err)
 	}
 }
 
@@ -297,15 +389,15 @@ func TestTheMemoryLimitIsAppliedToTheContainer(t *testing.T) {
 	b := liveBackend(t)
 	created := createOne(t, b)
 
-	_, output, err := b.Exec(context.Background(), created.Handle,
+	result, err := b.Exec(context.Background(), created.Handle, "",
 		"cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes", "", nil)
 
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
 	// 64MB was requested; the cgroup must report that rather than the host total.
-	if !strings.Contains(output, "67108864") {
-		t.Fatalf("cgroup reports %q, want the 64MB limit (67108864)", strings.TrimSpace(output))
+	if !strings.Contains(result.Stdout, "67108864") {
+		t.Fatalf("cgroup reports %q, want the 64MB limit (67108864)", strings.TrimSpace(result.Stdout))
 	}
 }
 
@@ -332,8 +424,8 @@ func TestConcurrentCreatesAndReleasesAllSucceed(t *testing.T) {
 				errs <- fmt.Errorf("create: %w", err)
 				return
 			}
-			if code, _, err := b.Exec(ctx, created.Handle, "true", "", nil); err != nil || code != 0 {
-				errs <- fmt.Errorf("exec: code=%d err=%w", code, err)
+			if result, err := b.Exec(ctx, created.Handle, "", "true", "", nil); err != nil || result.ExitCode != 0 {
+				errs <- fmt.Errorf("exec: code=%d err=%w", result.ExitCode, err)
 			}
 			if err := b.Release(ctx, created.Handle); err != nil {
 				errs <- fmt.Errorf("release: %w", err)
@@ -348,11 +440,147 @@ func TestConcurrentCreatesAndReleasesAllSucceed(t *testing.T) {
 	}
 
 	// Nothing of this run's may be left behind.
-	left, err := b.Sweep(ctx)
+	left, err := b.Reconcile(ctx)
 	if err != nil {
-		t.Fatalf("sweep: %v", err)
+		t.Fatalf("reconcile: %v", err)
 	}
 	if len(left) != 0 {
 		t.Fatalf("%d sandboxes survived the burst", len(left))
+	}
+}
+
+// -- the persistent shell's contract -------------------------------------------
+//
+// A caller builds state in the session shell across turns: a working directory,
+// an activated venv, exported variables. That state is only worth anything if the
+// session outlives every command sent to it, so these pin the two ways a shell
+// used to end early and take that state with it.
+
+// persistentOne creates a sandbox whose commands share one shell, which is the
+// mode a multi-turn harness uses.
+func persistentOne(t *testing.T, b *Backend) backend.Created {
+	t.Helper()
+	request := spec()
+	request.ExecMode = "persistent"
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	created, err := b.Create(ctx, "test-node", request, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer releaseCancel()
+		if err := b.Release(releaseCtx, created.Handle); err != nil {
+			t.Errorf("cleanup release: %v", err)
+		}
+	})
+	return created
+}
+
+func execIn(t *testing.T, b *Backend, handle backend.Handle, command string) (backend.ExecResult, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return b.Exec(ctx, handle, "persistent", command, "", nil)
+}
+
+// setUpSessionState builds the state whose loss these tests are about.
+func setUpSessionState(t *testing.T, b *Backend, handle backend.Handle) {
+	t.Helper()
+	if result, err := execIn(t, b, handle, "cd /tmp && export PSRL_MARK=kept"); err != nil || result.ExitCode != 0 {
+		t.Fatalf("setting session state failed: code=%d err=%v out=%q", result.ExitCode, err, result.Stdout)
+	}
+}
+
+func assertSessionSurvived(t *testing.T, b *Backend, handle backend.Handle) {
+	t.Helper()
+	result, err := execIn(t, b, handle, "pwd")
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("pwd after the command failed: code=%d err=%v", result.ExitCode, err)
+	}
+	if strings.TrimSpace(result.Stdout) != "/tmp" {
+		t.Errorf("the working directory is %q, so the session was replaced", strings.TrimSpace(result.Stdout))
+	}
+	result, err = execIn(t, b, handle, "echo $PSRL_MARK")
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("reading the exported variable failed: code=%d err=%v", result.ExitCode, err)
+	}
+	if strings.TrimSpace(result.Stdout) != "kept" {
+		t.Errorf("the exported variable is %q, so the session was replaced", strings.TrimSpace(result.Stdout))
+	}
+}
+
+func TestAnExitCommandReportsItsOwnStatusAndTheShellSurvives(t *testing.T) {
+	// The status of a command is data the caller reads, and a session that a
+	// command can end is not a session: `exit 3` has to report 3 and leave the
+	// shell it ran in standing.
+	b := liveBackend(t)
+	created := persistentOne(t, b)
+	setUpSessionState(t, b, created.Handle)
+
+	result, err := execIn(t, b, created.Handle, "exit 3")
+	if err != nil {
+		t.Fatalf("exit 3 was reported as a failure rather than as a status: %v", err)
+	}
+	if result.ExitCode != 3 {
+		t.Fatalf("exit 3 reported %d, want 3", result.ExitCode)
+	}
+	assertSessionSurvived(t, b, created.Handle)
+}
+
+func TestACallerErrexitDoesNotReplaceTheSession(t *testing.T) {
+	// A caller that runs `set -e` gets errexit in this shell, because the command
+	// runs in it. Without the group in the wrapper, the next failing command ends
+	// the shell before the status is written, and the caller's state is silently
+	// gone -- the failure it asked about looks like an ordinary non-zero exit.
+	b := liveBackend(t)
+	created := persistentOne(t, b)
+	setUpSessionState(t, b, created.Handle)
+
+	if result, err := execIn(t, b, created.Handle, "set -e"); err != nil || result.ExitCode != 0 {
+		t.Fatalf("set -e failed: code=%d err=%v", result.ExitCode, err)
+	}
+	result, err := execIn(t, b, created.Handle, "false")
+	if err != nil {
+		t.Fatalf("a failing command under errexit reported an error: %v", err)
+	}
+	if result.ExitCode != 1 {
+		t.Fatalf("false under errexit reported %d, want 1", result.ExitCode)
+	}
+	assertSessionSurvived(t, b, created.Handle)
+}
+
+func TestADeadShellIsReportedAndItsCommandIsNotRepeated(t *testing.T) {
+	// A shell can still be killed outright, and then the caller's state is gone
+	// whether or not anyone likes it. What must not happen is silence: the command
+	// is not re-run on a fresh shell, because nobody said it was safe to repeat,
+	// and the caller is told its session is lost rather than that the node failed.
+	b := liveBackend(t)
+	created := persistentOne(t, b)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if _, err := b.Exec(ctx, created.Handle, "persistent",
+		"echo ran >> /tmp/psrl-attempts && kill -9 $$", "", nil); err == nil {
+		t.Fatal("a command that killed its shell must be reported as a failure")
+	} else if !errors.Is(err, backend.ErrSessionLost) {
+		t.Fatalf("a dead shell must be reported as a lost session, got: %v", err)
+	}
+
+	// One line means one execution. A retry on a fresh shell would append twice.
+	data, err := b.ReadFile(ctx, created.Handle, "/tmp/psrl-attempts")
+	if err != nil {
+		t.Fatalf("reading the attempt log: %v", err)
+	}
+	if attempts := strings.Count(string(data), "ran"); attempts != 1 {
+		t.Fatalf("the command ran %d times, want exactly one: a lost session must not be retried", attempts)
+	}
+
+	// The dead session is replaced rather than left poisoned, so the next command
+	// works -- in a new shell, which is what "the state is gone" means.
+	if result, err := execIn(t, b, created.Handle, "echo after"); err != nil || result.ExitCode != 0 ||
+		!strings.Contains(result.Stdout, "after") {
+		t.Fatalf("the session was not replaced: code=%d err=%v out=%q", result.ExitCode, err, result.Stdout)
 	}
 }

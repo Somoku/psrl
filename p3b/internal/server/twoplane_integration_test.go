@@ -29,12 +29,14 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"psrl.dev/sandboxd/internal/backend"
 	"psrl.dev/sandboxd/internal/node"
 	"psrl.dev/sandboxd/internal/server"
+	"psrl.dev/sandboxd/internal/timing"
 )
 
 // fakeExecBackend is a minimal backend that keeps sandboxes in memory.
@@ -74,8 +76,8 @@ func (f *fakeExecBackend) Status(_ context.Context, handle backend.Handle) (stri
 	}
 	return "terminated", nil
 }
-func (f *fakeExecBackend) Exec(_ context.Context, _ backend.Handle, command, _ string, _ map[string]string) (int, string, error) {
-	return 0, "hello-from-" + f.name, nil
+func (f *fakeExecBackend) Exec(_ context.Context, _ backend.Handle, _, command, _ string, _ map[string]string) (backend.ExecResult, error) {
+	return backend.ExecResult{Stdout: "hello-from-" + f.name}, nil
 }
 
 // buildNodeForTest builds a real Node backed by the fake backend, returning it
@@ -90,12 +92,7 @@ func buildNodeForTest(t *testing.T, nodeID string, b backend.Backend) *server.No
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}
-	life, err := node.NewLifecycle(nodeID, gate, node.Windows{
-		PauseWindow:   5 * time.Second,
-		ReapWindow:    10 * time.Second,
-		Lifetime:      60 * time.Second,
-		SweepInterval: 2 * time.Second,
-	})
+	life, err := node.NewLifecycle(nodeID, gate, timing.SweepInterval)
 	if err != nil {
 		t.Fatalf("lifecycle: %v", err)
 	}
@@ -135,7 +132,7 @@ func TestTwoPlaneCreateExecRelease(t *testing.T) {
 	n := buildNodeForTest(t, "node-1", b)
 	addr := startNodeListener(t, n)
 
-	remote := server.NewRemoteNodeClient(addr, 10*time.Second)
+	remote := server.NewRemoteNodeClient(addr, 10*time.Second, 10*time.Second)
 	fleet := server.NewFleetNodeClient(map[string]*server.RemoteNodeClient{
 		"node-1": remote,
 	})
@@ -185,15 +182,15 @@ func TestTwoPlaneCreateExecRelease(t *testing.T) {
 
 	// Step 4: exec — the node proxies for a backend whose sandboxes have no
 	// in-sandbox agent, which is exactly what the docker backend does.
-	code, stdout, err := fleet.ExecOn(ctx, created.Handle, "echo hello", "", nil)
+	result, err := fleet.ExecOn(ctx, created.Handle, "echo hello", "", nil)
 	if err != nil {
 		t.Fatalf("exec_on: %v", err)
 	}
-	if code != 0 {
-		t.Errorf("exec exit code: got %d, want 0", code)
+	if result.ExitCode != 0 {
+		t.Errorf("exec exit code: got %d, want 0", result.ExitCode)
 	}
-	if !strings.Contains(stdout, "hello-from-fake") {
-		t.Errorf("exec stdout: got %q, want it to contain hello-from-fake", stdout)
+	if !strings.Contains(result.Stdout, "hello-from-fake") {
+		t.Errorf("exec stdout: got %q, want it to contain hello-from-fake", result.Stdout)
 	}
 
 	// Step 5: release
@@ -222,8 +219,8 @@ func TestTwoPlaneMultiNodeRouting(t *testing.T) {
 	addr2 := startNodeListener(t, n2)
 
 	fleet := server.NewFleetNodeClient(map[string]*server.RemoteNodeClient{
-		"node-a": server.NewRemoteNodeClient(addr1, 5*time.Second),
-		"node-b": server.NewRemoteNodeClient(addr2, 5*time.Second),
+		"node-a": server.NewRemoteNodeClient(addr1, 5*time.Second, 5*time.Second),
+		"node-b": server.NewRemoteNodeClient(addr2, 5*time.Second, 5*time.Second),
 	})
 
 	ctx := context.Background()
@@ -248,12 +245,12 @@ func TestTwoPlaneMultiNodeRouting(t *testing.T) {
 	}
 
 	// Exec must reach node-b's backend, not node-a's.
-	_, stdout, err := fleet.ExecOn(ctx, created.Handle, "echo hello", "", nil)
+	result, err := fleet.ExecOn(ctx, created.Handle, "echo hello", "", nil)
 	if err != nil {
 		t.Fatalf("exec_on: %v", err)
 	}
-	if !strings.Contains(stdout, "hello-from-fake2") {
-		t.Errorf("exec reached wrong node: got stdout %q, want hello-from-fake2", stdout)
+	if !strings.Contains(result.Stdout, "hello-from-fake2") {
+		t.Errorf("exec reached wrong node: got stdout %q, want hello-from-fake2", result.Stdout)
 	}
 
 	// node-a must not have seen the sandbox.
@@ -266,10 +263,10 @@ func TestTwoPlaneMultiNodeRouting(t *testing.T) {
 // node not in the fleet returns an error rather than panicking or timing out.
 func TestTwoPlaneExecOnUnknownNodeReturnsError(t *testing.T) {
 	fleet := server.NewFleetNodeClient(map[string]*server.RemoteNodeClient{
-		"node-a": server.NewRemoteNodeClient("127.0.0.1:1", 1*time.Second),
+		"node-a": server.NewRemoteNodeClient("127.0.0.1:1", 1*time.Second, 1*time.Second),
 	})
 	handle := backend.Handle{Backend: "fake", SandboxID: "sb-1", NodeID: "node-missing"}
-	_, _, err := fleet.ExecOn(context.Background(), handle, "echo hi", "", nil)
+	_, err := fleet.ExecOn(context.Background(), handle, "echo hi", "", nil)
 	if err == nil {
 		t.Fatal("expected error for sandbox on an unknown node, got nil")
 	}
@@ -361,4 +358,64 @@ func (c *capabilityBackend) Create(
 func (c *capabilityBackend) Release(context.Context, backend.Handle) error { return nil }
 func (c *capabilityBackend) Status(context.Context, backend.Handle) (string, error) {
 	return "running", nil
+}
+
+// TestRenewOwnerCrossesTheNodePlane pins the control-to-node heartbeat path.
+//
+// A node reclaims an owner's sandboxes once it has been silent past the lease
+// TTL, so the control plane has to relay the heartbeat over the node plane. A
+// renewal that stopped at the control plane would leave every sandbox on every
+// node to be reclaimed as an orphan while its run is still alive.
+func TestRenewOwnerCrossesTheNodePlane(t *testing.T) {
+	b := newFakeExecBackend("fake")
+	gate, err := node.NewAdmission(node.Config{
+		Envelope: node.Resources{MemoryMB: 4096, CPUMillis: 4000},
+		Classes:  map[string]node.ClassShare{"default": {Guaranteed: 0.5, Max: 1.0}},
+		LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	// The gate is read from the listener's own goroutines, so its clock is driven
+	// through an atomic rather than a plain closure variable.
+	var clockNs atomic.Int64
+	clockNs.Store(time.Now().UnixNano())
+	gate.SetClock(func() time.Time { return time.Unix(0, clockNs.Load()) })
+	life, err := node.NewLifecycle("node-r", gate, timing.SweepInterval)
+	if err != nil {
+		t.Fatalf("lifecycle: %v", err)
+	}
+	n, err := server.NewNode(server.NodeConfig{
+		NodeID: "node-r", Admission: gate, Lifecycle: life, Backends: []backend.Backend{b},
+	})
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	addr := startNodeListener(t, n)
+	fleet := server.NewFleetNodeClient(map[string]*server.RemoteNodeClient{
+		"node-r": server.NewRemoteNodeClient(addr, 10*time.Second, 10*time.Second),
+	})
+
+	ctx := context.Background()
+	spec := backend.Spec{
+		Source:        backend.Source{Kind: "image", Reference: "alpine:latest"},
+		ResourceClass: "default",
+		WorkflowID:    "owner-r",
+		Resources:     backend.Resources{MemoryMB: 128},
+	}
+	if _, _, refusal, err := fleet.Admit(ctx, "node-r", spec); err != nil || refusal != "" {
+		t.Fatalf("admit: err=%v refusal=%q", err, refusal)
+	}
+
+	clockNs.Add(int64(90 * time.Second))
+	if gate.OwnerAlive("owner-r") {
+		t.Fatal("an owner silent past the lease TTL must read as gone")
+	}
+
+	if err := fleet.RenewOwnerOn(ctx, "node-r", "owner-r"); err != nil {
+		t.Fatalf("renew_owner: %v", err)
+	}
+	if !gate.OwnerAlive("owner-r") {
+		t.Fatal("renew_owner did not reach the node's admission")
+	}
 }

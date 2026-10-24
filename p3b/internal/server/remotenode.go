@@ -16,6 +16,7 @@ import (
 
 	"psrl.dev/sandboxd/internal/backend"
 	"psrl.dev/sandboxd/internal/monitor"
+	"psrl.dev/sandboxd/internal/placement"
 )
 
 // Ensure FleetNodeClient satisfies the NodeClient interface at compile time.
@@ -32,26 +33,61 @@ var _ NodeClient = (*FleetNodeClient)(nil)
 type RemoteNodeClient struct {
 	address string
 	timeout time.Duration
+	// createTimeout bounds a create_on round trip, which legitimately outlasts one
+	// RPC budget because the node may pull an image before it can answer.
+	createTimeout time.Duration
 }
 
 // NewRemoteNodeClient returns a client for a node at the given address.
 //
 // Addresses follow the same "unix://..." / "host:port" convention as the SDK's
-// own listen address.
-func NewRemoteNodeClient(address string, timeout time.Duration) *RemoteNodeClient {
+// own listen address. A non-positive create timeout falls back to the ordinary
+// one, so a caller that has no image-pull budget to state still gets a bound.
+func NewRemoteNodeClient(address string, timeout, createTimeout time.Duration) *RemoteNodeClient {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	return &RemoteNodeClient{address: address, timeout: timeout}
+	if createTimeout <= 0 {
+		createTimeout = timeout
+	}
+	return &RemoteNodeClient{address: address, timeout: timeout, createTimeout: createTimeout}
+}
+
+// budgetFor is how long one method's round trip may take.
+func (r *RemoteNodeClient) budgetFor(method string) time.Duration {
+	if method == "create_on" {
+		return r.createTimeout
+	}
+	return r.timeout
 }
 
 // call dials the node, sends one request, reads one reply, and closes.
 func (r *RemoteNodeClient) call(ctx context.Context, method string, payload any) (json.RawMessage, error) {
-	conn, err := dialNode(r.address, r.timeout)
+	conn, err := dialNode(ctx, r.address, r.timeout)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "node at %s: %v", r.address, err)
 	}
 	defer conn.Close()
+
+	// A peer that accepts the connection and then stalls must not hold this
+	// goroutine, so the whole exchange is bounded rather than only the dial. A
+	// caller's own deadline, when it is earlier, wins.
+	deadline := time.Now().Add(r.budgetFor(method))
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = conn.SetDeadline(deadline)
+	// A cancel without a deadline would otherwise leave the read blocked until
+	// the budget expires, so closing the connection is what unblocks it.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stop:
+		}
+	}()
 
 	raw, err := json.Marshal(request{Method: method, Payload: mustMarshal(payload)})
 	if err != nil {
@@ -139,22 +175,34 @@ func (r *RemoteNodeClient) statusOn(ctx context.Context, handle backend.Handle) 
 	return out.Status, nil
 }
 
-func (r *RemoteNodeClient) execOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (int, string, error) {
+func (r *RemoteNodeClient) renewOwnerOn(ctx context.Context, owner string) error {
+	_, err := r.call(ctx, "renew_owner", map[string]any{"owner": owner})
+	return err
+}
+
+func (r *RemoteNodeClient) execOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (backend.ExecResult, error) {
 	raw, err := r.call(ctx, "exec", map[string]any{
 		"backend": handle.Backend, "sandbox_id": handle.SandboxID, "node_id": handle.NodeID,
 		"command": command, "cwd": cwd, "env": env,
 	})
 	if err != nil {
-		return 0, "", err
+		return backend.ExecResult{}, err
 	}
 	var out struct {
-		ExitCode int    `json:"exit_code"`
-		Stdout   string `json:"stdout"`
+		ExitCode  int    `json:"exit_code"`
+		Stdout    string `json:"stdout"`
+		Stderr    string `json:"stderr"`
+		Truncated bool   `json:"truncated"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return 0, "", fmt.Errorf("exec reply: %w", err)
+		return backend.ExecResult{}, fmt.Errorf("exec reply: %w", err)
 	}
-	return out.ExitCode, out.Stdout, nil
+	return backend.ExecResult{
+		ExitCode:  out.ExitCode,
+		Stdout:    out.Stdout,
+		Stderr:    out.Stderr,
+		Truncated: out.Truncated,
+	}, nil
 }
 
 func (r *RemoteNodeClient) readBytesOn(ctx context.Context, handle backend.Handle, path string) (string, error) {
@@ -281,11 +329,20 @@ func (f *FleetNodeClient) StatusOn(ctx context.Context, handle backend.Handle) (
 	return n.statusOn(ctx, handle)
 }
 
+// RenewOwnerOn tells the named node that an owner is still running.
+func (f *FleetNodeClient) RenewOwnerOn(ctx context.Context, nodeID, owner string) error {
+	n, err := f.node(nodeID)
+	if err != nil {
+		return err
+	}
+	return n.renewOwnerOn(ctx, owner)
+}
+
 // ExecOn runs one command in a sandbox on the node that holds it.
-func (f *FleetNodeClient) ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (int, string, error) {
+func (f *FleetNodeClient) ExecOn(ctx context.Context, handle backend.Handle, command, cwd string, env map[string]string) (backend.ExecResult, error) {
 	n, err := f.node(handle.NodeID)
 	if err != nil {
-		return 0, "", err
+		return backend.ExecResult{}, err
 	}
 	return n.execOn(ctx, handle, command, cwd, env)
 }
@@ -314,7 +371,9 @@ func (f *FleetNodeClient) WriteBytesOn(ctx context.Context, handle backend.Handl
 // interval governs how often each node is polled. A node that does not answer
 // within its own timeout is skipped for that round and its view ages out
 // naturally through the monitor's TTL.
-func (f *FleetNodeClient) PollFleet(ctx context.Context, fleet *monitor.Monitor, interval time.Duration) {
+func (f *FleetNodeClient) PollFleet(
+	ctx context.Context, fleet *monitor.Monitor, interval time.Duration, onView func(placement.NodeView),
+) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -340,7 +399,11 @@ func (f *FleetNodeClient) PollFleet(ctx context.Context, fleet *monitor.Monitor,
 						// network blip should not cause a mass placement failure.
 						return
 					}
-					fleet.Report(nodeViewFromWire(wire))
+					view := nodeViewFromWire(wire)
+					fleet.Report(view)
+					if onView != nil {
+						onView(view)
+					}
 				}(n)
 			}
 		}
@@ -349,11 +412,16 @@ func (f *FleetNodeClient) PollFleet(ctx context.Context, fleet *monitor.Monitor,
 
 // -- helpers -------------------------------------------------------------------
 
-func dialNode(address string, timeout time.Duration) (net.Conn, error) {
+func dialNode(ctx context.Context, address string, timeout time.Duration) (net.Conn, error) {
+	// DialContext, not DialTimeout: a caller that has already bounded the call
+	// (a renewal with a three-second budget, say) must not then block for the
+	// client's full sixty-second dial timeout on a node whose port is a
+	// black hole.
+	dialer := &net.Dialer{Timeout: timeout}
 	if path, found := cutPrefix(address, "unix://"); found {
-		return net.DialTimeout("unix", path, timeout)
+		return dialer.DialContext(ctx, "unix", path)
 	}
-	return net.DialTimeout("tcp", address, timeout)
+	return dialer.DialContext(ctx, "tcp", address)
 }
 
 func cutPrefix(s, prefix string) (string, bool) {
@@ -364,23 +432,88 @@ func cutPrefix(s, prefix string) (string, bool) {
 }
 
 func wireErrorToStatus(e *wireError) error {
-	var code codes.Code
-	switch e.Code {
-	case "capability":
-		code = codes.FailedPrecondition
-	case "capacity_timeout":
-		code = codes.ResourceExhausted
-	case "session_lost":
-		code = codes.NotFound
-	case "transport":
-		code = codes.Unavailable
-	case "command_timeout":
-		code = codes.DeadlineExceeded
-	default:
-		code = codes.Internal
+	failure := &nodeFailure{
+		code:       wireErrorCode(e.Code),
+		class:      e.Code,
+		message:    e.Message,
+		exitReason: e.ExitReason,
+		stateError: e.StateError,
 	}
-	return status.Error(code, e.Message)
+	if e.ExitCode != nil {
+		failure.exitCode = *e.ExitCode
+		failure.codeKnown = true
+	}
+	if e.FinishedAt != "" {
+		if finished, err := time.Parse(time.RFC3339Nano, e.FinishedAt); err == nil {
+			failure.finishedAt = finished
+		}
+	}
+	return failure
 }
+
+// wireErrorCode maps a wire classification onto the gRPC code a caller reads.
+//
+// path_not_found shares codes.NotFound with session_lost because gRPC has no
+// better slot for it, but the class travels beside the code: classify prefers
+// the class, so the two are not conflated where the caller reads them.
+func wireErrorCode(class string) codes.Code {
+	switch class {
+	case "capability":
+		return codes.FailedPrecondition
+	case "capacity_timeout":
+		return codes.ResourceExhausted
+	case "session_lost", "path_not_found":
+		return codes.NotFound
+	case "transport":
+		return codes.Unavailable
+	case "command_timeout":
+		return codes.DeadlineExceeded
+	default:
+		return codes.Internal
+	}
+}
+
+// nodeFailure is a failure from a node plane that keeps both the classification
+// and the attribution across the hop.
+//
+// A plain status error would carry the code and drop the reason, and the reason
+// is what a post mortem reads: one `session_lost` means the caller released its
+// sandbox, another that it outlived its lifetime, and another that its owner went
+// silent. This implements the same interface the wire layer already looks for, so
+// a failure that crossed a node boundary is attributed exactly like one raised in
+// this process.
+type nodeFailure struct {
+	code       codes.Code
+	class      string
+	message    string
+	exitReason string
+	exitCode   int
+	codeKnown  bool
+	finishedAt time.Time
+	stateError string
+}
+
+func (e *nodeFailure) Error() string { return e.message }
+
+// WireCode keeps the node's own classification across the control hop. Without
+// it a path_not_found would be re-read as session_lost from its gRPC status
+// alone, which is exactly the conflation this class exists to prevent.
+func (e *nodeFailure) WireCode() string { return e.class }
+
+func (e *nodeFailure) GRPCStatus() *status.Status { return status.New(e.code, e.message) }
+
+func (e *nodeFailure) ExitReason() string { return e.exitReason }
+
+// ExitCode keeps the runtime's exit code across the control hop, so the SDK and
+// the trainer see the code the node observed rather than None.
+func (e *nodeFailure) ExitCode() (int, bool) { return e.exitCode, e.codeKnown }
+
+// FinishedAt keeps the runtime's stop time across the control hop.
+func (e *nodeFailure) FinishedAt() time.Time { return e.finishedAt }
+
+// StateError keeps the runtime evidence or the inspect failure across the
+// control hop, so a loss without an exit code still names its cause.
+func (e *nodeFailure) StateError() string { return e.stateError }
 
 func mustMarshal(v any) json.RawMessage {
 	b, err := json.Marshal(v)
@@ -410,6 +543,7 @@ func specToWire(spec backend.Spec) map[string]any {
 		"required_features":     spec.RequiredFeatures,
 		"required_node_label":   spec.RequiredNodeLabel,
 		"forbidden_node_labels": spec.ForbiddenNodeLabels,
+		"lifetime_s":            int64(spec.Lifetime / time.Second),
 	}
 	resources := map[string]any{}
 	if spec.Resources.CPUCount > 0 {
@@ -427,6 +561,19 @@ func specToWire(spec backend.Spec) map[string]any {
 	s["resources"] = resources
 	if len(spec.BackendOptions) > 0 {
 		s["backend_options"] = spec.BackendOptions
+	}
+	if len(spec.Mounts) > 0 {
+		// A mount is part of the environment the sandbox is for, so it crosses to the node
+		// like every other field of the spec: the node decides whether it will share the
+		// path, and a hop that dropped it would hand back a sandbox whose work cannot run
+		// while looking exactly like one that can.
+		mounts := make([]map[string]any, 0, len(spec.Mounts))
+		for _, mount := range spec.Mounts {
+			mounts = append(mounts, map[string]any{
+				"source": mount.Source, "target": mount.Target, "read_only": mount.ReadOnly,
+			})
+		}
+		s["mounts"] = mounts
 	}
 	return s
 }
@@ -475,4 +622,3 @@ func createdFromWire(raw json.RawMessage) (backend.Created, error) {
 		WarmStart: out.WarmStart,
 	}, nil
 }
-

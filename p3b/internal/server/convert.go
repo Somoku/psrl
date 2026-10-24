@@ -7,6 +7,8 @@
 package server
 
 import (
+	"time"
+
 	v1 "psrl.dev/sandboxd/api/v1"
 	"psrl.dev/sandboxd/internal/backend"
 	"psrl.dev/sandboxd/internal/node"
@@ -34,6 +36,7 @@ func specFromProto(in *v1.SandboxSpec) backend.Spec {
 		Backend:             in.GetBackend(),
 		RequiredNodeLabel:   in.GetRequiredNodeLabel(),
 		ForbiddenNodeLabels: in.GetForbiddenNodeLabels(),
+		Lifetime:            time.Duration(in.GetLifetimeS()) * time.Second,
 	}
 	if source := in.GetSource(); source != nil {
 		spec.Source = backend.Source{Kind: sourceKindName(source.GetKind()), Reference: source.GetReference()}
@@ -45,6 +48,11 @@ func specFromProto(in *v1.SandboxSpec) backend.Spec {
 			DiskMB:   resources.GetDiskMb(),
 			GPUCount: resources.GetGpuCount(),
 		}
+	}
+	for _, mount := range in.GetMounts() {
+		spec.Mounts = append(spec.Mounts, backend.Mount{
+			Source: mount.GetSource(), Target: mount.GetTarget(), ReadOnly: mount.GetReadOnly(),
+		})
 	}
 	for _, feature := range in.GetRequiredFeatures() {
 		spec.RequiredFeatures = append(spec.RequiredFeatures, featureName(feature))
@@ -172,6 +180,13 @@ func headroomToProto(r node.Resources) *v1.Headroom {
 
 func quotaHeadroomToProto(a quota.Amount) *v1.Headroom {
 	return &v1.Headroom{MemoryMb: a.MemoryMB, CpuMillis: a.CPUMillis, GpuCount: a.GPUCount, DiskMb: a.DiskMB}
+}
+
+// placementHeadroomToProto is headroomToProto for the placement type. The two exist
+// because placement speaks the service's own units and the wire speaks MiB and
+// millicores; a conversion that guessed would silently swap them.
+func placementHeadroomToProto(r placement.Headroom) *v1.Headroom {
+	return &v1.Headroom{MemoryMb: r.MemoryMB, CpuMillis: r.CPUMillis, GpuCount: r.GPUCount, DiskMb: r.DiskMB}
 }
 
 func placementHeadroom(r node.Resources) placement.Headroom {

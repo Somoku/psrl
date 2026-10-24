@@ -18,7 +18,7 @@
 
 五条结论，每条都是从「PSRL 是 pull 架构」推出来的，不是从别的框架抄的：
 
-1. **量化结构不声明，向消费者读取。** rollout 已经以 block FP8（`psrl.nixl.rollout_quantization=fp8`）实例化，vLLM 的
+1. **量化结构不声明，向消费者读取。** rollout 已经以 block FP8（`psrl.nixl.weight_quantization.scheme=fp8`）实例化，vLLM 的
    quant method 已经建好了 `weight`(fp8) + `weight_scale{,_inv}` 并写了 shape。
    哪些层量化、scale 叫什么、grid 多大，**全部可以从已注册的 rollout 参数读出来**。
    miles 与 SkyRL 都维护手写白名单（`ModelFp8Spec`）是因为它们是 push 架构，生产者
@@ -188,7 +188,7 @@ scale_indices = weight_indices                   # 同一个 rank 拿同一块
 （`self_attention.linear_{proj,qkv}`、`mlp.linear_fc1/fc2`、MoE experts/shared_experts、MLA…），
 SkyRL 用 `ModelFp8Spec` registry。两者都是 **per-model 手工资产**，接新模型就要加一条。
 
-**PSRL 的做法：** rollout 侧已经以 block FP8（`psrl.nixl.rollout_quantization=fp8`）实例化，
+**PSRL 的做法：** rollout 侧已经以 block FP8（`psrl.nixl.weight_quantization.scheme=fp8`）实例化，
 vLLM 的 quant method 已经在 `create_weights` 里建好了全部参数：
 `create_fp8_weight_parameter` 建 fp8 weight，`register_parameter("weight_scale_inv")`
 或 `w13_{weight_scale_name}` 建 scale，并把 `quant_method`

@@ -159,6 +159,14 @@ The standalone service shape: a cluster control plane with a fleet monitor, one 
 per node owning lifecycle and reclamation, and a Python SDK as the only caller surface.
 :::
 
+:::{grid-item-card} {octicon}`cpu;1.5em` Quantized Weight Transport
+:link: quantized_weight_transport
+:link-type: doc
+
+The transport-side quantization plan, auxiliary parameter wire format, global scale
+reductions, and the scheme support matrix from BF16 to NVFP4.
+:::
+
 :::{grid-item-card} {octicon}`sparkles;1.5em` Score Centering
 :link: score_centering
 :link-type: doc
@@ -200,6 +208,7 @@ sandbox_agentenv
 sandbox_opensandbox
 sandbox_snapshot_store
 sandbox_service
+quantized_weight_transport
 score_centering
 score_centering_zh
 sampler_distribution

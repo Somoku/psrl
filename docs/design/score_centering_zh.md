@@ -338,7 +338,7 @@ rollout 卡）。vocab-parallel normalizer 的 head mass 在 0.5B 上与 sampler
 0.99517），在 8B base 上一致到 1e-6（0.9999987 对 0.9999988，采样 log-prob 差 7.4e-4），与 FSDP
 同级；head、complete receipt 与 sampled label 的 THD 切分路径每步都会执行，张量并行 4 走同一条
 代码路径，只是词表分片更宽。同一 8B TP2 配置也在 block FP8 rollout
-（`psrl.nixl.rollout_quantization=fp8`）下跑通：每个 rollout rank 拉取 4.72 GB，sampler 与 trainer
+（`psrl.nixl.weight_quantization.scheme=fp8`）下跑通：每个 rollout rank 拉取 4.72 GB，sampler 与 trainer
 的 head mass 仍一致到 3e-7，量化误差体现为 KL 5.0e-3（CUTLASS）或 8.8e-3（DeepGEMM）。
 
 ### 训练开销

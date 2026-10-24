@@ -985,7 +985,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
       fp8 weight+scale 共存、buffer 不随模型增长、**`register_memory` 调用数 == 0**。
       **KV cache 对比与稳态切回需 vLLM engine，属 L2**
 - [x] **A9 block FP8 已接入生产并验证**：`psrl/utils/nixl/block_fp8.py`。
-      rollout 声明 `quantization: fp8` 时 `validate_config` 打开 `publish_fp8_block`。
+      rollout 声明 `weight_quantization.scheme: fp8` 时 `validate_config` 解析出 `publish_quantization` 计划。
       vLLM converter 在每个 FP8 权重的规范视图旁给出 `<key>_scale_inv`，取融合 scale 的对应视图，
       于是 q/k/v、gate/up 与分组 expert 各自带 scale key，切法与权重一致。meta server 从 trainer
       权重的切法推出 scale 的切法，trainer 分配 scale 张量、把这些权重发布为 FP8 副本，

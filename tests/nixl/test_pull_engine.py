@@ -24,6 +24,7 @@ from psrl.utils.nixl.handshake_notif import NotifKind
 from psrl.utils.nixl.nixl_spec import NIXLClientType, NIXLSharding
 from psrl.utils.nixl.pull_engine import ChunkUnavailable, NIXLPullEngine
 from psrl.utils.nixl.server import NIXLMetaServer
+from psrl.utils.quantization import QuantizationPlan
 
 from tests.nixl.coord_judge import check_by_layout, check_fp8_exact, fill_by_layout, fill_fp8_exact
 from tests.nixl.memcpy_agent import MemcpyAgent, NotifBus
@@ -438,6 +439,13 @@ def test_the_pull_path_makes_no_control_plane_calls():
 
 
 BLOCK = (32, 32)
+FP8_PLAN = QuantizationPlan(
+    scheme="fp8",
+    block=BLOCK,
+    scale_suffix="_scale_inv",
+    scale_dtype="float32",
+    weight_dtype="float8_e4m3fn",
+)
 FP8_KEYS = ["layers.0.q_proj.weight", "layers.0.o_proj.weight", "layers.0.down_proj.weight"]
 
 
@@ -509,7 +517,7 @@ def _fp8_cluster(
         )
         if kind is NIXLClientType.PUSH_SIDE:
             client.set_publish_cast(train_dtype, torch.bfloat16)
-            client.set_publish_fp8(BLOCK)
+            client.set_publish_quantization(FP8_PLAN)
         client.register_local_tensors(cluster.states[name], unified[name])
         cluster.clients[name] = client
     if peer_diffusion:

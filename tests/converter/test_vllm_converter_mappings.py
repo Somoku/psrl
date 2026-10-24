@@ -674,3 +674,33 @@ class TestGetShardingForParam:
         module.tp_size = 2
         with pytest.raises(ValueError, match="Unsupported module type"):
             conv.get_sharding_for_param(module, "weight")
+
+
+class _QuantizedModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(128, 256, dtype=torch.float8_e4m3fn), requires_grad=False)
+        self.weight_scale_inv = nn.Parameter(torch.empty(1, 2, dtype=torch.float32), requires_grad=False)
+
+
+def test_a_plan_drives_auxiliary_parameter_discovery():
+    from psrl.utils.converter.vllm_converter import fused_auxiliary, is_auxiliary_parameter
+    from psrl.utils.quantization import resolve_quantization_plan
+
+    module = _QuantizedModule()
+    plan = resolve_quantization_plan({"scheme": "fp8"})
+
+    assert is_auxiliary_parameter(module, "weight_scale_inv", plan)
+    assert not is_auxiliary_parameter(module, "weight", plan)
+    assert fused_auxiliary(module, "weight", module.weight, plan) is module.weight_scale_inv
+
+
+def test_without_a_plan_nothing_is_treated_as_an_auxiliary():
+    from psrl.utils.converter.vllm_converter import fused_auxiliary, is_auxiliary_parameter
+    from psrl.utils.quantization import QuantizationPlan
+
+    module = _QuantizedModule()
+    plan = QuantizationPlan()
+
+    assert not is_auxiliary_parameter(module, "weight_scale_inv", plan)
+    assert fused_auxiliary(module, "weight", module.weight, plan) is None

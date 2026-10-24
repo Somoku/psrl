@@ -1,10 +1,8 @@
-"""The published weight format is shared by every rollout engine that pulls it.
+"""The published weight format is one resolved plan shared by every participant.
 
-Generation engines read `gen_actor_rollout_ref.rollout`; validate engines are built from
-`train_actor_rollout_ref.rollout`. Under direct supply the trainer publishes one format
-for both. If only one side is configured for block FP8, the other registers bf16 tensors
-and its first pull of a published version dies on a dtype assertion -- during a validation
-wake, long after startup looked healthy. The mismatch is refused at config validation.
+The plan names the wire format, so the publisher, the converter and both rollout roles
+cannot disagree about scale names or block geometry. It is resolved once at config
+validation and serialized into `psrl.nixl.publish_quantization`.
 """
 
 from __future__ import annotations
@@ -16,47 +14,53 @@ from psrl.utils.config import _resolve_publish_cast
 pytestmark = pytest.mark.cpu_test
 
 
-def _config(gen_quantization=None, validate_quantization=None, colocate: bool = True):
+def _config(scheme: str = "none", **weight_quantization):
     return OmegaConf.create(
         {
             "psrl": {
-                "colocate_validate_and_train": colocate,
-                "nixl": {"publish_fp8_block": None},
+                "colocate_validate_and_train": True,
+                "nixl": {
+                    "weight_quantization": {"scheme": scheme, **weight_quantization},
+                },
             },
-            "gen_actor_rollout_ref": {
-                "rollout": {"dtype": "bfloat16", "quantization": gen_quantization}
-            },
+            "gen_actor_rollout_ref": {"rollout": {"dtype": "bfloat16", "quantization": None}},
             "train_actor_rollout_ref": {
                 "actor": {"strategy": "megatron"},
-                "rollout": {"quantization": validate_quantization},
+                "rollout": {"quantization": None},
             },
         }
     )
 
 
-def test_an_fp8_rollout_publishes_block_fp8():
-    config = _config("fp8", "fp8")
+def test_an_fp8_plan_publishes_block_fp8():
+    config = _config("fp8")
     _resolve_publish_cast(config)
 
-    assert config.psrl.nixl.publish_fp8_block == [128, 128]
+    plan = config.psrl.nixl.publish_quantization
+    assert plan.scheme == "fp8"
+    assert list(plan.block) == [128, 128]
+    assert plan.scale_suffix == "_scale_inv"
 
 
-def test_matching_bf16_rollouts_publish_no_fp8_copy():
-    _resolve_publish_cast(_config())
-
-    # No assertion raised; the block stays null.
-
-
-def test_a_bf16_validate_engine_next_to_an_fp8_rollout_is_refused():
-    with pytest.raises(AssertionError, match="must agree on quantization"):
-        _resolve_publish_cast(_config(gen_quantization="fp8", validate_quantization=None))
-
-
-def test_disagreeing_formats_are_allowed_without_validate_instances():
-    """Without a separate validate fleet, validation runs on the generation engines, so
-    the two config blocks cannot describe different formats."""
-    config = _config(gen_quantization="fp8", validate_quantization=None, colocate=False)
-
+def test_a_none_plan_publishes_the_trainer_dtype():
+    config = _config()
     _resolve_publish_cast(config)
 
-    assert config.psrl.nixl.publish_fp8_block == [128, 128]
+    assert config.psrl.nixl.publish_quantization.scheme == "none"
+
+
+def test_a_reserved_scheme_is_rejected_at_validation():
+    with pytest.raises(ValueError, match="reserved for Phase 2"):
+        _resolve_publish_cast(_config("mxfp8"))
+
+
+def test_an_unknown_scheme_is_rejected_at_validation():
+    with pytest.raises(ValueError, match="Unknown psrl.nixl.weight_quantization.scheme"):
+        _resolve_publish_cast(_config("int4"))
+
+
+def test_trainer_side_qat_is_refused_under_direct_supply():
+    config = _config()
+    config.gen_actor_rollout_ref.rollout.quantization = {"linear": "FP8_BLOCK"}
+    with pytest.raises(ValueError, match="trainer-side QAT path"):
+        _resolve_publish_cast(config)

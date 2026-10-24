@@ -26,6 +26,7 @@ from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
+from psrl.utils.quantization import resolve_quantization_plan
 from psrl.utils.nixl import (
     NIXL_META_SERVER_NAME,
     NIXLClientType,
@@ -41,6 +42,8 @@ from psrl.workers.ps import (
     PSWorkerGroup,
 )
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+FP8_PLAN = resolve_quantization_plan({"scheme": "fp8"})
 
 try:
     from tests.nixl.coord_judge import (
@@ -522,7 +525,7 @@ class TrainClientActor:
         self.print("step4: register_local_tensors")
         self.client.set_publish_cast(self.train_dtype, self.gen_dtype)
         if self.fp8_block is not None:
-            self.client.set_publish_fp8(self.fp8_block)
+            self.client.set_publish_quantization(FP8_PLAN)
         self.client.register_local_tensors(self.state_dict, self.unified_sharding)
         self.print("step5: send_local_info")
         self.client.send_local_info()

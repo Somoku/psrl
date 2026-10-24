@@ -17,7 +17,7 @@ def _config(
     ps_mode: str = "nixl_direct",
     train_dtype: str = "bf16",
     rollout_dtype: str = "bfloat16",
-    fp8_block=None,
+    quantization_scheme: str = "none",
     colocate: bool = False,
     decided="auto",
 ):
@@ -30,7 +30,7 @@ def _config(
                     "await_write_gate": decided,
                     "publish_train_dtype": train_dtype,
                     "publish_rollout_dtype": rollout_dtype,
-                    "publish_fp8_block": fp8_block,
+                    "publish_quantization": {"scheme": quantization_scheme},
                 },
             }
         }
@@ -44,7 +44,7 @@ def test_direct_supply_at_matched_precision_enables_the_gate():
 
 
 def test_a_fp8_rollout_reads_a_published_copy_and_skips_the_gate():
-    config = _config(fp8_block=[128, 128])
+    config = _config(quantization_scheme="fp8")
     _resolve_write_gate(config)
     assert config.psrl.nixl.await_write_gate is False
 

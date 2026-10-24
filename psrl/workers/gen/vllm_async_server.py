@@ -47,6 +47,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 import grpc
 from psrl.sandbox.config import SandboxManagerConfig
+from psrl.utils.cuda_toolchain import DEEP_GEMM_MIN_NVCC, deep_gemm_jit_available
 from psrl.utils.kv_cache import KVCacheManager, LMCacheConfig, enable_for_pool
 from psrl.utils.logger import (
     DualOutputHandler,
@@ -454,6 +455,22 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                     "deep_gemm package is unavailable. Install the pinned DeepGEMM build or set "
                     "the vLLM linear_backend to a supported alternative explicitly."
                 )
+        if "deep_gemm" in (
+            engine_kwargs.get("linear_backend"),
+            engine_kwargs.get("moe_backend"),
+        ) and not deep_gemm_jit_available():
+            # The package can import and still fail on the first FP8 layer: DeepGEMM
+            # compiles its kernels at load and refuses NVCC older than 12.9. Falling
+            # back here keeps the rollout runnable, and the warning says which knob was
+            # overridden rather than leaving a slow kernel choice unexplained.
+            psrl_logger.warning(
+                "DeepGEMM needs NVCC >= %d.%d; using vLLM's own FP8 kernel selection.",
+                *DEEP_GEMM_MIN_NVCC,
+            )
+            os.environ["VLLM_USE_DEEP_GEMM"] = "0"
+            for option in ("linear_backend", "moe_backend"):
+                if engine_kwargs.get(option) == "deep_gemm":
+                    engine_kwargs[option] = "auto"
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):

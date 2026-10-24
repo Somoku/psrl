@@ -387,9 +387,11 @@ Multi-node:
 - **Kernel backend defaults.** On the H20 environment, compressed-tensors `FP8_BLOCK`
   initializes with an explicit non-DeepGEMM backend such as `cutlass` or `marlin`. The
   automatic choice reaches DeepGEMM and fails while transforming block scales, because
-  the DeepGEMM JIT requires a newer NVCC than the image ships. Phase 2 therefore needs
-  an explicit backend capability probe rather than inheriting upstream's DeepGEMM
-  default.
+  the DeepGEMM JIT requires a newer NVCC than the image ships. The native FP8 rollout
+  path inherits the same upstream default, so the engine probes the NVCC release before
+  accepting it and falls back to vLLM's own selection when the toolchain is older than
+  12.9. Phase 2 still needs the same probe for compressed-tensors rather than inheriting
+  upstream's DeepGEMM default.
 - **Model layouts.** Fused QKV with grouped-query attention and head sizes smaller than
   the quantization tile cannot be expressed by a naive scale view. The converter must
   reject them at validation or map them with a dedicated rule.
@@ -428,3 +430,12 @@ CPU validation:
 GPU validation used the single-node layout above. A multi-node run is not required for
 Phase 1 because the transport path and wire shape did not change, and the earlier
 multi-node transport acceptance still applies.
+
+After merging the sandbox and harness work, the same path was re-run as a colocated
+one-step smoke on one eight-GPU H20 node: Qwen3-8B, block-FP8 publish, direct supply,
+four prompts with two responses each. The step completed with `actor/pg_loss` -0.00265
+and `actor/grad_norm` 0.400. The rollout and trainer distributions agreed at
+`rollout_actor_probs_pearson_corr` 0.9878, `rollout_corr/kl` -0.00116 and
+`rollout_corr/ppl_ratio` 0.9989, which is the same agreement the pre-merge runs showed.
+The engine's DeepGEMM probe fell back to vLLM's own kernel selection because the host
+NVCC is 12.8, and the rollout still ran.

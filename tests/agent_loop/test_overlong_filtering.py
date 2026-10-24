@@ -120,6 +120,19 @@ class TestTokenMeanHandlesAnEmptyBatch:
         loss = agg_loss(loss_mat=loss_mat, loss_mask=loss_mask, loss_agg_mode="token-mean")
         assert loss.item() == pytest.approx(1.0)
 
+    def test_an_integer_batch_count_of_zero_is_clamped(self):
+        # Megatron passes batch_num_tokens as an int after the DP reduce. The guard
+        # must handle that shape as well as the tensor an offline batch produces.
+        from verl.trainer.ppo.core_algos import agg_loss
+
+        loss_mat = torch.randn(2, 4)
+        loss_mask = torch.zeros(2, 4)
+        loss = agg_loss(
+            loss_mat=loss_mat, loss_mask=loss_mask, loss_agg_mode="token-mean", batch_num_tokens=0
+        )
+        assert torch.isfinite(loss)
+        assert loss.item() == pytest.approx(0.0)
+
     def test_partially_masked_batch_normalizes_by_surviving_tokens(self):
         from verl.trainer.ppo.core_algos import agg_loss
 

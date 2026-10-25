@@ -1224,7 +1224,7 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       | `resource_num_per_bundle` | `psrl/trainer/ppo/resource_pool.py` | `init_workers()` 里 `TypeError` |
       | `configure_verl_logging` | `psrl/utils/logger/verl_logging.py` | import 期 `ImportError` |
       | `max_concurrency` | `PSRL_vLLMReplica` 的 property | 启 rollout server 时 `AttributeError` |
-      | `use_per_rank_checkpoint` | 改为显式拒绝 | struct 模式下写未声明键 |
+      | `use_per_rank_checkpoint` | 从 verl patch 移除 | struct 模式下写未声明键；nvrx 落地后成为死代码 |
       | `load_weight` | 让 upstream 照常加载 | `McoreEngineConfig` 收到未知 kwarg |
 
       其中**分数 bundle 必须在两处同时生效**：placement group 的 bundle，
@@ -1315,10 +1315,13 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       worker，worker 进程不继承父进程的 UCX context 和已注册显存，因此与 NIXL 进度线程
       完全兼容。落地改动：
 
-      - `patch/verl/3efe38c7.patch`：`_dispatch_finalize` 从
+      - `patch/verl/dc709af.patch`：`_dispatch_finalize` 从
         `megatron.core.strategies.base.async_calls`（Megatron 0.19 不存在）改为 nvrx
         `AsyncCallsQueue`；`save_dist_checkpointing` 用 `async_strategy="nvrx"` 而非
         `async_sharded_save=True`（后者触发 fork）
+      - `patch/verl/dc709af.patch`：删除 `use_per_rank_checkpoint` 相关 hunk。没有任何
+        活跃配置再把它置为 true，逐 rank 路径已由 `PSRL_PerRankMegatronCheckpointManager`
+        子类独立提供，不再需要改 vendored checkout
       - `psrl/utils/config.py`：移除 `nixl_direct + use_dcp_save=True` 的 assert，
         nvrx spawn 路径安全
       - `psrl/workers/train/engine_train_worker.py`：`_maybe_use_per_rank_checkpointing`
@@ -1333,7 +1336,8 @@ FSDP2 converter 在 2 卡与 4 卡各验证 27 个张量（torchrun，独立运�
       **`PSRL_PerRankMegatronCheckpointManager` 的状态**：已保留但不再激活。
       `_maybe_use_per_rank_checkpointing` 是 no-op，该 manager 作为后备保留直到真实栈
       的 nvrx async save 端到端验证完成（需 Ray 集群跑到 `save_freq` 边界，确认
-      `.distcp` 目录完整、NIXL 0 错误、能 resume）。
+      `.distcp` 目录完整、NIXL 0 错误、能 resume）。它是自包含子类，不依赖 verl patch
+      中的逐 rank 钩子。
 
       **旧的临时方案（已废弃，但代码保留）**：`psrl/utils/checkpoint/megatron_manager.py`
       中的 `PSRL_PerRankMegatronCheckpointManager` 用逐 rank `torch.save` 取代
@@ -1993,7 +1997,7 @@ trainer 侧 `client.py` 的注册与发布）。只在测试里被调用的模�
 | W15 | ~~FP8 发布点的重量化成本~~ | ✅ 融合 Triton kernel（`fp8_kernels.quantize_into`）单遍读 bf16、写 FP8 + scale，3169 GB/s，235B 下每 rank 从 513 ms 降到约 35 ms（14.8×）。已达目标（≤ 稳态 sync 的 20%；稳态 ~1.5 s，20% = 300 ms，35 ms = 2.3%）。`test_fp8_kernels_gpu.py` 22 passed，含 roofline 断言。选择性重量化（只重量化变化过的 key）可在此基础上进一步优化，但已超出当前目标，按需实施 | 发布刷新 ≤ 稳态 sync 的 20% | 已完成 |
 | W13 | ~~colocate 走 CUDA IPC（设计项 2 / A8）~~ | ✅ `_should_register_rdma()` 已接入 `register_local_tensors` 的两处 `_register_memory` 调用点：当 comm plan 证明所有读者都在同节点时跳过 RDMA 注册；否则（无 plan 或存在跨节点读者）回落到注册。同时 `registration_policy.py` 已由 `_is_reader_of()` 接入 E4 两段式 join 路径。`test_registration_policy.py` 增加 3 个 wiring 测试（共 20 passed） | colocate 切换路径上 `register_memory` 调用数 == 0（comm plan 为全同节点时）；测试 20 passed | 已完成 |
 | W14 | ~~多角色与 role 隔离（设计 §3.10）~~ | ✅ `WeightBackup` ref 路径落地：`engine_train_worker.py` 增加 `capture_ref_backup()` / `compute_ref_log_prob()` / `mark_modified()` 三个接入点；`ray_trainer.py` 在 LoRA path（`ref_in_actor=True`）的 `init_model` 后调用 `capture_ref_backup()` 并将 `_compute_ref_log_prob` 的 LoRA 分支改为 `actor_wg.compute_ref_log_prob(batch)`。代价：init 一次 D2H，每 ref pass 一次 H2D+H2D（~46 GB/s/rank），替代一整份 GPU 模型副本。`test_weight_backup_gpu.py` 9 passed，含 logits 等值校验与 PCIe 带宽断言。非 LoRA 的 `ref_policy_wg` 路径不变，向后兼容 | 两个角色各自推进版本而互不影响；LoRA ref 路径用 host snapshot 而非独立 GPU | 已完成 |
-| ~~W16~~ | ~~DCP async save 与 NIXL 共存（nvrx 集成）~~ | ✅ nvrx 0.7.0 `AsyncCallsQueue(persistent=True)` spawn 路径与 NIXL 进度线程共存；verl patch 修 `_dispatch_finalize` + `save_dist_checkpointing`；config 移除阻断断言；进度线程始终开启；`scripts/install_basic.sh` 和 `docker/Dockerfile` 均加入安装步骤。实测 30s：113–119 GB/s，0 错误，PASS。真实栈端到端验证（Ray 集群到 `save_freq` 边界）待完成后可删 `PSRL_PerRankMegatronCheckpointManager` | `repro_dcp_nvrx.py` PASS；真实栈 e2e 待验 | 合成层已完成，真实栈待验 |
+| ~~W16~~ | ~~DCP async save 与 NIXL 共存（nvrx 集成）~~ | ✅ nvrx 0.7.0 `AsyncCallsQueue(persistent=True)` spawn 路径与 NIXL 进度线程共存；verl patch 修 `_dispatch_finalize` + `save_dist_checkpointing`；config 移除阻断断言；进度线程始终开启；`scripts/install_basic.sh` 和 `docker/Dockerfile` 均加入安装步骤。verl patch 中的 `use_per_rank_checkpoint` 钩子已移除。实测 30s：113–119 GB/s，0 错误，PASS。真实栈端到端验证（Ray 集群到 `save_freq` 边界）待完成后可删 `PSRL_PerRankMegatronCheckpointManager` | `repro_dcp_nvrx.py` PASS；真实栈 e2e 待验 | 合成层已完成，真实栈待验 |
 | ~~W17~~ | ~~rollout 版本感知选源~~ | ✅ PSManager 维护 `(version, frozenset[trainer_names])`（`_nixl_version_holders`），`push_model_state_dict_nixl` 每步刷新，新增 `get_nixl_version_state()` 原子 RPC（后扩展为同时返回失效集合）；`vllm_async_server.nixl_pull_model` 拉取持有者集合并透传；`pull_engine.pull(version_holders=...)` 在任何字节搬动前按集合过滤 upstream，`version_holders=None` 时旧行为保持。每步一次 O(1) 新 RPC，选源时 O(S) 集合查找（S=每 key 的 source 数，通常 1-2），与集群规模无关 | `tests/unit/test_version_aware_source_selection.py` 16 passed | 已完成 |
 | ~~W18~~ | ~~peer diffusion 拓扑感知 designate 选择~~ | ✅ `_make_peer_groups` sort key 从 `(upstream_load, name)` 改为 `(-trainer_link_priority, upstream_load, name)`：和 trainer 有 NVLink 的 instance 优先成为 designate，IB 带宽只用于必须的跨节点流量，NVLink 在节点内自由使用；负载均衡作为同优先级内的第二排序键保留；规划期 O(G log G) 每组，总复杂度不变，无运行时开销 | `tests/nixl/test_topology_aware_designate.py` 15 passed；scale test：1024 instance × 200 key 的 `_make_peer_groups` < 1.15s（< 3s 限制） | 已完成 |
 | ~~W19~~ | ~~删除 `_DONE` barrier~~ | ✅ 从第一性原理确认 `_DONE` 不解锁任何操作（follower 在 `_await(_DONE)` 前已完成自己所有 peer 读，buffer 生命周期由外部调度控制），删除 `_DONE` 常量、designate 侧 `publish(_DONE)` 和 follower 侧 `_await(_DONE)` 及超时 warning；`peer_timeout_s` 保留用于 `_READY` 等待 | 60 tests pass（`test_pull_engine.py` + `test_version_aware_source_selection.py`） | 已完成 |

@@ -531,22 +531,21 @@ index a14ec2af..43d6735f 100644
  full_determinism: false
  
 diff --git a/verl/trainer/config/engine/megatron.yaml b/verl/trainer/config/engine/megatron.yaml
-index 0ee54390..30263441 100644
+index 0ee54390..a4ebff5b 100644
 --- a/verl/trainer/config/engine/megatron.yaml
 +++ b/verl/trainer/config/engine/megatron.yaml
-@@ -63,6 +63,10 @@ entropy_from_logits_chunk_size: 2048
+@@ -63,6 +63,9 @@ entropy_from_logits_chunk_size: 2048
  # oc.select: default val for ref.megatron.seed
  seed: 42
  
 +load_weight: true
 +
-+use_per_rank_checkpoint: False
 +
  # Allow to override Distributed Data Parallel (DDP) config
  override_ddp_config: {}
  
 diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
-index afa86c25..2da754ac 100644
+index afa86c25..de6a982e 100644
 --- a/verl/trainer/ppo/core_algos.py
 +++ b/verl/trainer/ppo/core_algos.py
 @@ -1145,6 +1145,7 @@ def agg_loss(
@@ -568,7 +567,7 @@ index afa86c25..2da754ac 100644
          loss_scale_factor: scale factor for "seq-mean-token-sum-norm" mode. If None, uses loss_mask.shape[-1].
              Set this to a constant value to ensure consistent normalization throughout training.
  
-@@ -1167,7 +1172,15 @@ def agg_loss(
+@@ -1167,11 +1172,26 @@ def agg_loss(
          loss: `a scalar torch.Tensor`
              aggregated loss
      """
@@ -585,9 +584,7 @@ index afa86c25..2da754ac 100644
          if batch_num_tokens is None:
              if dp_size > 1:
                  raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
-@@ -1174,3 +1179,10 @@ def agg_loss(
              batch_num_tokens = loss_mask.sum()
--        loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
 +        # A fully filtered batch leaves no valid tokens. The unclamped division would
 +        # emit 0/0 = nan, which propagates through every parameter.
 +        batch_num_tokens = (
@@ -595,8 +592,9 @@ index afa86c25..2da754ac 100644
 +            if isinstance(batch_num_tokens, int)
 +            else batch_num_tokens.clamp(min=1)
 +        )
-+        loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
+         loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
      elif loss_agg_mode == "token-sum":
+         # DDP/FSDP average gradients across data-parallel ranks. Scaling each
 diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
 index 3de61d36..d8693de8 100644
 --- a/verl/trainer/ppo/metric_utils.py
@@ -1247,234 +1245,10 @@ index 561772cc..0f55453f 100644
 +    # processor, while both tensors were engine-local and identically shaped.
      return ppo_loss(config, model_output, data, dp_group)
 diff --git a/verl/utils/checkpoint/megatron_checkpoint_manager.py b/verl/utils/checkpoint/megatron_checkpoint_manager.py
-index 3c7d487a..916a544b 100644
+index 3c7d487a..898a82d0 100644
 --- a/verl/utils/checkpoint/megatron_checkpoint_manager.py
 +++ b/verl/utils/checkpoint/megatron_checkpoint_manager.py
-@@ -173,6 +173,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-         bridge=None,
-         provider=None,
-         peft_cls=None,
-+        use_per_rank_checkpoint: bool = False,
-         **kwargs,
-     ):
-         super().__init__(
-@@ -198,8 +199,12 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-         self.provider = provider
-         self.peft_cls = peft_cls
-         self.use_megatron_fsdp = use_megatron_fsdp
-+        self.use_per_rank_checkpoint = use_per_rank_checkpoint and not self.use_megatron_fsdp
-         self.rank = torch.distributed.get_rank()
- 
-+        if self.use_per_rank_checkpoint and self.checkpoint_config.async_save:
-+            raise ValueError("Per-rank checkpoints do not support asynchronous saves.")
-+
-         # ``use_dist_checkpointing`` selects Megatron shards for the ``model``
-         # slot; HF weights always go through ``bridge`` when requested by
-         # ``save_contents`` / ``load_contents``.
-@@ -495,6 +500,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-         transformer_config_rel = _rel(get_transformer_config_checkpoint_path(local_path))
- 
-         contents: dict[str, dict] = {}
-+        regular_format = "megatron_per_rank" if self.use_per_rank_checkpoint else "megatron_dist_checkpoint"
-+        regular_backend = "torch_save_per_rank" if self.use_per_rank_checkpoint else "dist_checkpointing"
- 
-         if self.should_save_hf_model:
-             model_entry: dict = {
-@@ -521,33 +528,33 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-         if self.should_save_dist_ckpt_model:
-             contents["model"] = {
-                 "path": model_dist_rel,
--                "format": "megatron_dist_checkpoint",
--                "backend": "dist_checkpointing",
-+                "format": regular_format,
-+                "backend": regular_backend,
-             }
- 
-         if self.should_save_hf_model and self.peft_cls is not None:
-             contents["peft_adapters"] = {
-                 "path": model_dist_rel,
--                "format": "megatron_dist_checkpoint",
-+                "format": regular_format,
-                 "note": "PEFT adapter shards sit next to base-model HF weights, under model/dist_ckpt/.",
-             }
- 
-         if self.should_save_optimizer:
-             contents["optimizer"] = {
-                 "path": optim_dist_rel,
--                "format": "megatron_dist_checkpoint",
-+                "format": regular_format,
-             }
-             if self.lr_scheduler is not None:
-                 contents["lr_scheduler"] = {
-                     "path": optim_dist_rel,
--                    "format": "megatron_dist_checkpoint",
-+                    "format": regular_format,
-                     "key": "lr_scheduler",
-                 }
- 
-         if self.should_save_extra:
-             contents["rng_state"] = {
-                 "path": extra_dist_rel,
--                "format": "megatron_dist_checkpoint",
-+                "format": regular_format,
-                 "key": "rng_state",
-             }
-             contents["transformer_config"] = {
-@@ -836,11 +843,22 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-             raise KeyError
-         tensor_parallel.get_cuda_rng_tracker().set_states(rng_states["rng_tracker_states"])
- 
-+    def _per_rank_checkpoint_metadata(self) -> dict:
-+        """Return non-topology metadata validated by the per-rank checkpoint backend."""
-+        return {
-+            "optimizer_mode": "distributed" if self.use_distributed_optimizer else "replicated",
-+            "architecture": self.arch,
-+        }
-+
-     def _load_content_metadata(self, ckpt_dir: str) -> dict:
-         """Fetch MCore's content_metadata for a dist_ckpt dir with a fallback."""
-         load_content_metadata = getattr(dist_checkpointing, "load_content_metadata", None)
-         metadata = None
--        if load_content_metadata is not None and self._has_checkpoint_files(ckpt_dir):
-+        if (
-+            not self.use_per_rank_checkpoint
-+            and load_content_metadata is not None
-+            and self._has_checkpoint_files(ckpt_dir)
-+        ):
-             metadata = load_content_metadata(checkpoint_dir=ckpt_dir)
-         if metadata is None:
-             if self.use_distributed_optimizer:
-@@ -849,6 +867,22 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-                 metadata = self._build_sharded_state_dict_metadata()
-         return metadata
- 
-+    def _load_dist_checkpoint(self, sharded_state_dict: dict, ckpt_dir: str) -> dict:
-+        """Load one checkpoint content tree through the selected regular Megatron backend."""
-+        if not self.use_per_rank_checkpoint:
-+            return load_dist_checkpointing(
-+                sharded_state_dict=sharded_state_dict,
-+                ckpt_dir=ckpt_dir,
-+            )
-+
-+        from psrl.utils.checkpoint import load_megatron_checkpoint
-+
-+        return load_megatron_checkpoint(
-+            sharded_state_dict=sharded_state_dict,
-+            ckpt_dir=ckpt_dir,
-+            expected_metadata=self._per_rank_checkpoint_metadata(),
-+        )
-+
-     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
-         """Load a Megatron checkpoint in the v2 split layout.
- 
-@@ -907,10 +941,13 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-         # ── Load model weights ──────────────────────────────────────────────
-         if self.should_load_dist_ckpt_model or (self.should_load_hf_model and self.peft_cls is not None):
-             model_sd = self._maybe_filter_peft_state_dict(dict(model_sharded_state_dict))
--            loaded_model = load_dist_checkpointing(
--                sharded_state_dict=model_sd,
--                ckpt_dir=model_dist_path,
-+            log_with_rank(
-+                f"Loading model checkpoint from {model_dist_path}",
-+                rank=self.rank,
-+                logger=logger,
-+                log_only_rank_0=True,
-             )
-+            loaded_model = self._load_dist_checkpoint(model_sd, model_dist_path)
-             assert "model" in loaded_model or any(
-                 f"model{vpp_rank}" in loaded_model for vpp_rank in range(len(self.model))
-             ), f"Model state dict not found in {loaded_model.keys()}. Please check the checkpoint file {local_path}."
-@@ -935,10 +972,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-         # ── Load optimizer / LR scheduler ───────────────────────────────────
-         if self.should_load_optimizer:
-             optim_sd = self._build_optimizer_state_dict(model_sharded_state_dict, metadata, is_loading=True)
--            loaded_optim = load_dist_checkpointing(
--                sharded_state_dict=optim_sd,
--                ckpt_dir=optim_dist_path,
--            )
-+            loaded_optim = self._load_dist_checkpoint(optim_sd, optim_dist_path)
-             assert "optimizer" in loaded_optim, (
-                 f"Optimizer state dict not found in {loaded_optim.keys()}. "
-                 f"Please check the checkpoint file {optim_dist_path}."
-@@ -959,10 +993,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-         # ── Load RNG states ─────────────────────────────────────────────────
-         if self.should_load_extra:
-             extra_sd = self._build_extra_state_dict()
--            loaded_extra = load_dist_checkpointing(
--                sharded_state_dict=extra_sd,
--                ckpt_dir=extra_dist_path,
--            )
-+            loaded_extra = self._load_dist_checkpoint(extra_sd, extra_dist_path)
-             assert "rng_state" in loaded_extra, (
-                 f"RNG state dict not found in {loaded_extra.keys()}. "
-                 f"Please check the checkpoint file {extra_dist_path}."
-@@ -1034,29 +1065,50 @@ class MegatronCheckpointManager(BaseCheckpointManager):
-             )
- 
-     def _save_dist_checkpoint(self, dist_checkpoint_path: str, state_dict: dict):
--        """Persist ``state_dict`` via Megatron dist_checkpointing.
-+        """Persist ``state_dict`` through DCP or the synchronous per-rank backend.
- 
--        Writes one self-contained ``torch_dist`` directory under
--        ``dist_checkpoint_path``.  Callers compose the exact state dict to go
--        into this directory; in the v2 layout there are up to three such
--        directories per checkpoint (``model/dist_ckpt/``,
--        ``optimizer/dist_ckpt/``, ``extra/dist_ckpt/``).
-+        Callers compose the exact state dict written under ``dist_checkpoint_path``.
-+        The v2 layout has up to three independent trees per checkpoint
-+        (``model/dist_ckpt/``, ``optimizer/dist_ckpt/``, ``extra/dist_ckpt/``).
- 
-         Returns the async save request when ``async_save`` is enabled, or
-         ``None`` for synchronous saves.
-         """
-         sharded_sd_metadata = self._build_sharded_state_dict_metadata()
- 
--        async_save_request = save_dist_checkpointing(
--            sharded_state_dict=state_dict,
--            ckpt_path=dist_checkpoint_path,
--            async_save=self.checkpoint_config.async_save,
--            content_metadata=sharded_sd_metadata,
--        )
-+        if self.use_per_rank_checkpoint:
-+            from psrl.utils.checkpoint import save_megatron_checkpoint
-+            log_with_rank(
-+                f"Using PSRL per-rank checkpoint save (UCX-safe) to {dist_checkpoint_path}",
-+                rank=self.rank,
-+                logger=logger,
-+                log_only_rank_0=True,
-+            )
-+            save_megatron_checkpoint(
-+                sharded_state_dict=state_dict,
-+                ckpt_path=dist_checkpoint_path,
-+                async_save=False,
-+                metadata=self._per_rank_checkpoint_metadata(),
-+            )
-+            async_save_request = None
-+        else:
-+            log_with_rank(
-+                f"Using DCP save to {dist_checkpoint_path}",
-+                rank=self.rank,
-+                logger=logger,
-+                log_only_rank_0=True,
-+            )
-+            async_save_request = save_dist_checkpointing(
-+                sharded_state_dict=state_dict,
-+                ckpt_path=dist_checkpoint_path,
-+                async_save=self.checkpoint_config.async_save,
-+                content_metadata=sharded_sd_metadata,
-+            )
- 
--        if not self.checkpoint_config.async_save:
--            assert async_save_request is None, "Async save request should be None when not using async save."
--            torch.distributed.barrier()
-+            # Synchronize all async save requests
-+            if not self.checkpoint_config.async_save:
-+                assert async_save_request is None, "Async save request should be None when not using async save."
-+                torch.distributed.barrier()
- 
-         return async_save_request
- 
-@@ -1141,10 +1193,18 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+@@ -1141,10 +1141,18 @@ class MegatronCheckpointManager(BaseCheckpointManager):
          """
          if self.checkpoint_config.async_save and async_requests:
              async_requests[-1].add_finalize_fn(finalize_save_fn)
@@ -1783,7 +1557,7 @@ index 731b26c2..9e781f41 100644
          if self.loss_agg_mode not in valid_loss_agg_modes:
              raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
 diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
-index 00cea677..420a893c 100644
+index 00cea677..9b7a17ad 100644
 --- a/verl/workers/config/engine.py
 +++ b/verl/workers/config/engine.py
 @@ -110,10 +110,16 @@ class EngineConfig(BaseConfig):
@@ -1803,14 +1577,6 @@ index 00cea677..420a893c 100644
      def __post_init__(self):
          pass
          # TODO: turn on this check after we reorg config
-@@ -199,6 +205,7 @@ class McoreEngineConfig(EngineConfig):
-     pad_to_length: bool = False
-     pad_to_length_bucket: int = 512
-     use_dist_checkpointing: bool = False
-+    use_per_rank_checkpoint: bool = False
-     dist_checkpointing_path: Optional[str] = None
-     dist_checkpointing_prefix: str = ""
-     dist_ckpt_optim_fully_reshardable: bool = False
 diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
 index 4bfef74d..e200e063 100644
 --- a/verl/workers/config/rollout.py
@@ -2091,7 +1857,7 @@ index fa5d3e89..dc769e66 100644
                              logits=logits_rmpad,
                              labels=input_ids_rmpad_rolled,
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index d473ce66..6a156600 100644
+index d473ce66..e687fc5c 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
 @@ -15,6 +15,7 @@
@@ -2150,7 +1916,7 @@ index d473ce66..6a156600 100644
  
          if torch.distributed.get_rank() == 0:
              print_model_size(module[0])
-@@ -531,85 +541,90 @@ class MegatronEngine(BaseEngine):
+@@ -531,85 +541,89 @@ class MegatronEngine(BaseEngine):
      def initialize(self):
          self._hf_export_tasks = None
          self._build_tf_config()
@@ -2286,7 +2052,6 @@ index d473ce66..6a156600 100644
 +                provider=self.provider,
 +                peft_cls=self.peft_cls,
 +                use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
-+                use_per_rank_checkpoint=self.engine_config.use_per_rank_checkpoint,
 +            )
  
 -        self.to(
@@ -2307,7 +2072,7 @@ index d473ce66..6a156600 100644
  
      def train_mode(self, **kwargs):
          """
-@@ -915,17 +930,43 @@ class MegatronEngine(BaseEngine):
+@@ -915,17 +929,43 @@ class MegatronEngine(BaseEngine):
          # batch should be a list of batches inside micro-batches
          batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
  
@@ -2360,7 +2125,7 @@ index d473ce66..6a156600 100644
  
          if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
              # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
-@@ -1158,6 +1199,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1158,6 +1198,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
          data_format: str,
          cp_layout: str = "zigzag",
          local_cp_size: int | None = None,
@@ -2368,7 +2133,7 @@ index d473ce66..6a156600 100644
      ):
          assert logits.shape[:2] == label.shape[:2]
          # avoid non-positive temperature such as padding
-@@ -1204,8 +1246,37 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1204,8 +1245,37 @@ class MegatronEngineWithLMHead(MegatronEngine):
                      local_cp_size=local_cp_size,
                  )
              )
@@ -2407,7 +2172,7 @@ index d473ce66..6a156600 100644
  
          return ret
  
-@@ -1227,6 +1298,21 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1227,6 +1297,21 @@ class MegatronEngineWithLMHead(MegatronEngine):
          calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
          distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
          distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
@@ -2429,7 +2194,7 @@ index d473ce66..6a156600 100644
          pad_to_length_bucket = (
              self.engine_config.pad_to_length_bucket
              if self.engine_config.pad_to_length and self.engine_config.use_remove_padding
-@@ -1235,6 +1321,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1235,6 +1320,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
  
          if pad_to_length_bucket is not None and distillation_use_topk:
              raise RuntimeError("pad_to_length is not supported with top-K distillation")
@@ -2440,7 +2205,7 @@ index d473ce66..6a156600 100644
          if pad_to_length_bucket is not None and self.enable_routing_replay:
              raise RuntimeError("pad_to_length is not supported with router replay")
  
-@@ -1344,6 +1434,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -1344,6 +1433,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                  data_format=data_format,
                  cp_layout=cp_layout,
                  local_cp_size=local_cp_size,

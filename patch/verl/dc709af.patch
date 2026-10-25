@@ -2306,3 +2306,16 @@ index aff27653..7fba900f 100644
              "sc_support_aligned",
              "sc_sampler_tail_mass",
              "sc_support_unknown",
+diff --git a/verl/trainer/config/data/legacy_data.yaml b/verl/trainer/config/data/legacy_data.yaml
+index 2971c6b5..8f0ad7dd 100644
+--- a/verl/trainer/config/data/legacy_data.yaml
++++ b/verl/trainer/config/data/legacy_data.yaml
+@@ -65,7 +65,7 @@ return_raw_chat: True
+ return_full_prompt: False
+ 
+ # Whether to shuffle the data in the dataloader.
+-shuffle: True
++shuffle: False
+ 
+ # Seed to use when shuffling the data
+ seed: null

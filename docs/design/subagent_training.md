@@ -328,29 +328,75 @@ trains it. The subagent owns node 1 but it is token-only, so it is context only.
 ### 5.2 Request headers
 
 Five new headers are introduced. One is session scoped and four are turn
-scoped.
+scoped. None of them is read while training data is built. They matter during
+rollout, because SMG persists their values into the TITO snapshot and the
+extractor reads that snapshot.
 
 | Header | From | To | Scope | Meaning |
 |---|---|---|---|---|
 | `x-psrl-subagent-training` | agent loop | SessionRouter, on `POST /sessions` | session | `off`, `main_only`, `all`, or `selected` |
-| `x-psrl-agent-role` | SessionRouter | SMG | turn | `main` or `subagent` |
+| `x-psrl-agent-role` | SessionRouter | SMG | turn | `main`, `subagent`, `auxiliary`, or `compaction` |
 | `x-psrl-agent-id` | SessionRouter | SMG | turn | stable agent identity |
 | `x-psrl-parent-agent-id` | SessionRouter | SMG | turn | parent agent identity, empty for main |
 | `x-psrl-tito-capture` | SessionRouter | SMG | turn | `full` or `tokens` |
 
-The existing `x-codex-turn-metadata` remains the input signal. It is not new and
-it is already forwarded by the SessionRouter.
+The role domain has four values. `auxiliary` covers harness calls that are not
+part of the agent conversation, such as title generation and side replies.
+`compaction` covers a main-context rewrite. It is not a subagent.
+
+#### Header lifecycle
+
+1. The agent loop sends `x-psrl-subagent-training` once, on `POST /sessions`.
+   The harness CLI does not send it.
+2. The harness CLI sends its own native per-call metadata. The SessionRouter
+   reads it and normalizes it into `x-psrl-agent-role`, `x-psrl-agent-id`, and
+   `x-psrl-parent-agent-id`.
+3. The SessionRouter computes `x-psrl-tito-capture` from the session policy and
+   the role, and sends it to SMG with the turn.
+4. SMG stores the role, agent id, parent, owner, and capture into the TITO
+   session. The extractor reads only the snapshot.
+
+The harness must carry its native marker on every model call. It does not need
+to send the `x-psrl-*` names itself. If it has no native marker, the router
+cannot distinguish its subagents, and the strict default attributes every call
+to the main agent.
+
+The SessionRouter overwrites any client-supplied `x-psrl-agent-role`,
+`x-psrl-agent-id`, `x-psrl-parent-agent-id`, and `x-psrl-tito-capture` with its
+own normalized values. Only the native harness markers are trusted from the
+client. This keeps a harness from declaring an auxiliary call trainable.
+
+#### Native harness markers
+
+| Harness | Native input | Notes |
+|---|---|---|
+| Codex | `x-codex-turn-metadata` | `thread_source` is `user` or `subagent`. A stable `thread_id` and parent id are used when present. |
+| Claude Code | `x-claude-code-request-class`, `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, `x-claude-code-agent-type` | The request class is `main`, `subagent`, `workflow`, `compaction`, `auxiliary`, or `side_reply`. Agent id and parent id are emitted for non-main agents. |
+| Generic | `x-psrl-agent-role`, `x-psrl-agent-id`, `x-psrl-parent-agent-id` | A harness without native metadata may send the normalized headers directly. |
+
+Claude Code gates `x-claude-code-request-class` and
+`x-claude-code-agent-type` behind `CLAUDE_CODE_GATEWAY_HINT_HEADERS` or a
+first-party base URL. A custom session router is not first-party, so the Claude
+Code adapter must set `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` in the harness
+environment. Without it, `x-claude-code-agent-id` and
+`x-claude-code-parent-agent-id` are still emitted for non-main agents, but the
+router cannot tell a subagent from an auxiliary call.
 
 Normalization rules:
 
-- `thread_source == "subagent"` maps to role `subagent`. Any other value maps to
-  `main`.
-- `agent_id` uses the harness thread id when present. Otherwise the router uses
-  `main` for the main thread and `subagent:<session turn index>` for a subagent.
-- `parent_agent_id` uses the harness parent thread id when present. Otherwise it
-  uses the session's first main agent id.
+- Codex `thread_source == "subagent"` maps to `subagent`. Any other value maps
+  to `main`.
+- Claude Code `request-class == "subagent"` or `"workflow"` maps to `subagent`.
+  `"main"` maps to `main`. `"compaction"` maps to `compaction`.
+  `"auxiliary"` and `"side_reply"` map to `auxiliary`.
+- `agent_id` uses the native agent id or thread id when present. Otherwise the
+  router uses `main` for the main thread and `subagent:<session turn index>` for
+  a subagent.
+- `parent_agent_id` uses the native parent id when present. Otherwise it uses
+  the session's first main agent id.
 - `x-psrl-tito-capture` comes from the session policy and the role. A trainable
-  agent gets `full`. An untrained agent gets `tokens`.
+  agent gets `full`. An untrained agent and every `auxiliary` call get `tokens`.
+  A `compaction` call follows the main agent's trainability.
 - A request without any role metadata is charged to the main agent, which is the
   stricter default.
 
@@ -364,9 +410,9 @@ The SessionRouter owns the policy. It stores the session mode and the resolved
 trainable agent ids in `SessionState`.
 
 ```text
-is_subagent = is_subagent_request(request)
+role        = classify_request(request)   # main, subagent, auxiliary, compaction
 agent_id    = normalized agent identity
-trainable   = policy.is_trainable(is_subagent, agent_id)
+trainable   = policy.is_trainable(role, agent_id)
 capture     = "full" if trainable else "tokens"
 ```
 
@@ -378,6 +424,10 @@ Policy semantics:
 - `all`: the main agent and every subagent are `full`.
 - `selected`: the main agent plus the configured agent ids or patterns are
   `full`. Everything else is `tokens`.
+- `auxiliary` and `side_reply` calls are always `tokens` and never produce a
+  training row.
+- `compaction` calls follow the main agent's trainability. They are a context
+  rewrite of the main path, not a separate agent.
 
 The policy can be overridden per dataset row through
 `extra_info.subagent_training`. The agent loop reads it and sends it in
@@ -557,14 +607,67 @@ creation. The same resolved policy is used at extraction time. If the two
 disagree, `require_primary_capture` fails the sample instead of silently
 training a context token.
 
+### 5.7 Harness adaptation
+
+The harness changes are additive. The session URL is already the only endpoint
+the CLI talks to. The extra work is to enable subagents and to expose their
+native role metadata.
+
+#### Codex
+
+- Enable subagent generation. `CodexHarness._model_catalog()` currently sets
+  `multi_agent_version = None`, and `HarnessConfig.subagents_enabled` is not
+  wired into the Codex adapter. Set the catalog's multi-agent fields to the
+  values the installed CLI supports, and map `subagents_enabled` to them.
+- Keep the provider on the session URL. Codex applies one `model_provider` to
+  the main agent and its subagents, so no per-agent URL override is needed. A
+  harness that lets a subagent select another provider must force the session
+  provider.
+- Keep `x-codex-turn-metadata` on every call. `thread_source` is the role
+  marker. A stable `thread_id` and parent id improve agent selection, and the
+  trajectory id plus the TITO tree are the fallback.
+- The turn budget already counts subagent calls separately. No change.
+
+#### Claude Code
+
+- Set `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` in the harness environment. The
+  Claude Code adapter already writes `settings.json` under the sandbox home, so
+  this is one entry in that file. Without it, the request-class and agent-type
+  headers are gated off on a custom base URL.
+- `subagents_enabled` already controls the `Agent` tool. With the flag on, the
+  CLI emits `x-claude-code-request-class = subagent` or `workflow`, plus
+  `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, and
+  `x-claude-code-agent-type`.
+- Keep the Messages session URL for the main agent and its subagents.
+- `x-claude-code-request-class = auxiliary` or `side_reply` marks calls outside
+  the agent conversation. They are captured as `tokens` and never trained.
+- `x-claude-code-request-class = compaction` is a main-context rewrite. It
+  follows the main agent's trainability and is part of the main path.
+- The CLI's `isSidechain` and `parent_tool_use_id` are transcript-level markers.
+  The router does not need them.
+
+#### Generic harnesses
+
+- Send `x-psrl-agent-role`, `x-psrl-agent-id`, and `x-psrl-parent-agent-id` on
+  every model call, or a native marker the SessionRouter knows.
+- The SessionRouter sets `x-psrl-tito-capture` from the policy. The harness does
+  not compute it.
+- Use the same session URL for every agent. A subagent that talks to another
+  endpoint is not captured.
+- A harness that cannot set per-call metadata keeps the strict default. Every
+  call is attributed to the main agent, so only `main_only` is meaningful.
+
 ## 6. Behavior matrix
 
-| Mode | Main capture | Subagent capture | Training rows |
-|---|---|---|---|
-| `off` | tokens | tokens | none, session is rejected |
-| `main_only` | full | tokens | main only |
-| `all` | full | full | main plus every subagent |
-| `selected` | full | full for selected, tokens for others | main plus selected agents |
+| Mode | Main capture | Subagent capture | Auxiliary capture | Training rows |
+|---|---|---|---|---|
+| `off` | tokens | tokens | tokens | none, session is rejected |
+| `main_only` | full | tokens | tokens | main only |
+| `all` | full | full | tokens | main plus every subagent |
+| `selected` | full | full for selected, tokens for others | tokens | main plus selected agents |
+
+A `compaction` call follows the main agent's row. It is a context rewrite of the
+main path, not a separate agent.
 
 For `main_only` and `selected`, an untrained subagent still keeps its token ids
 and turn boundaries. Its next turn can continue from the same prefix and KV
@@ -621,6 +724,9 @@ P (main prompt)
   apply to their nodes the same way.
 - A harness that cannot mark subagent calls has all calls attributed to the main
   agent. This is the strict default and matches the current turn-budget rule.
+- Claude Code auxiliary and side-reply calls are captured as `tokens` and never
+  become rows. Compaction calls follow the main agent. The TITO tree already
+  carries the compaction branch.
 - The session API, the TITO tree shape, and the existing `x-codex-turn-metadata`
   input stay compatible.
 
@@ -670,9 +776,12 @@ Integration:
 1. Does the Codex version in use put a stable `thread_id` and a parent thread id
    in `x-codex-turn-metadata`? If it does not, the fallback agent id is the
    trajectory id and the parent is derived from the tree.
-2. Does the Claude Code CLI mark subagent calls in a header the SessionRouter can
-   read? If it does not, Claude Code keeps the strict default and all calls are
-   attributed to the main agent until an adapter adds a marker.
+2. Claude Code 2.1.300 emits `x-claude-code-request-class`,
+   `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, and
+   `x-claude-code-agent-type`. The request-class and agent-type headers are
+   gated behind `CLAUDE_CODE_GATEWAY_HINT_HEADERS` or a first-party base URL.
+   Confirm the deployed version behaves the same way and that the harness sets
+   the variable.
 3. Should the session-level policy travel as a header or in the
    `POST /sessions` body? This design uses a header for consistency with the
    existing session metadata.

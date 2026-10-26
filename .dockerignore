@@ -26,3 +26,8 @@ wandb
 
 # Documentation and test data are not needed to install the runtime package.
 docs/_build
+
+# Local checkpoints, model symlinks, and JS tooling are not build inputs.
+output
+models
+node_modules

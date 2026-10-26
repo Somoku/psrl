@@ -32,10 +32,11 @@ ARG MEGATRON_BRIDGE_REF=94d1870
 ARG TMS_REF=d64a6394d1e09c613fab90260054cecc2684586d
 ARG NVRX_REF=v0.7.0
 ARG SMG_REF=psrl-dev
-ARG PSRL_COMMIT=main
+ARG PSRL_REPO=https://github.com/Somoku/psrl.git
+ARG PSRL_COMMIT=dev/fp8-p3b
 ARG APEX_REF=10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
 ARG TRANSFORMER_ENGINE_REF=v2.17
-ARG DEEPEP_REF=73b6ea4
+ARG DEEPEP_REF=d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb
 ARG GDRCOPY_REF=v2.5.1
 ARG NVSHMEM_VERSION=3.3.24
 ARG MOONCAKE_VERSION=0.3.10.post2
@@ -99,6 +100,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libaio-dev \
         libcap-dev \
         libcurl4-openssl-dev \
+        libdw-dev \
         libgl1 \
         libibverbs-dev \
         libnuma-dev \
@@ -160,7 +162,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     containerd --version
 
 # Install the shared PyTorch/CUDA ABI first. Every native extension below is
-# compiled against this exact environment.
+# compiled against this exact environment. NCCL 2.31 is the first wheel line
+# whose headers carry the GIN types DeepEP v2 compiles against.
 RUN --mount=type=cache,target=/root/.cache/uv \
     CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
     expected_cuda="$(echo "${CUDA_VERSION}" | cut -d. -f1,2)" && \
@@ -173,7 +176,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install "tensordict==0.13.0" --no-deps && \
     uv pip install \
         triton \
-        "nvidia-nccl-cu${CUDA_MAJOR}==2.30.7" && \
+        "nvidia-nccl-cu${CUDA_MAJOR}==2.31.2" && \
     python -c \
         "import torch; expected='${expected_cuda}'; assert torch.version.cuda == expected, \
         f'Expected PyTorch CUDA {expected}, got {torch.version.cuda}.'"
@@ -348,6 +351,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # DeepEP revision and its legacy NVSHMEM backend for workloads that still use it.
 RUN --mount=type=cache,target=/root/.cache/uv \
     cd ${PSRL_THIRD_PARTY}/vllm && \
+    # The helper reinstalls torch, whose exact NCCL pin would downgrade the
+    # 2.31 headers DeepEP's Gin backend needs. torch/cmake/ninja are present.
+    sed -i 's/uv pip install cmake torch ninja/uv pip install --no-deps cmake ninja/' \
+        tools/ep_kernels/install_python_libraries.sh && \
     NVSHMEM_VER=${NVSHMEM_VERSION} \
     TORCH_CUDA_ARCH_LIST="9.0a 10.0a" \
         bash tools/ep_kernels/install_python_libraries.sh \
@@ -406,7 +413,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
-    uv pip install "nvidia-nccl-cu${CUDA_MAJOR}==2.30.7"
+    uv pip install "nvidia-nccl-cu${CUDA_MAJOR}==2.31.2"
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     NVCC_APPEND_FLAGS="--threads 4" \
@@ -481,7 +488,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git -C ${PSRL_THIRD_PARTY}/LMCache apply ${PSRL_PATCH_DIR}/lm_cache.patch && \
     LMCACHE_CUDA_MAJOR="${CUDA_VERSION%%.*}" \
         uv pip install --no-build-isolation -e ${PSRL_THIRD_PARTY}/LMCache && \
-    python -c "import lmcache_native, lmcache"
+    python -c "from lmcache.lmcache_native import Bitmap; import lmcache"
+
+# The build network goes through an HTTP proxy that breaks cargo's HTTP/2
+# multiplexing with PROTOCOL_ERROR; disable it and retry transient failures.
+ENV CARGO_HTTP_MULTIPLEXING=false \
+    CARGO_NET_RETRY=10
 
 # Build SMG with PSRL routing/state support and install all Python protocol
 # packages plus the native binding.
@@ -494,6 +506,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     "${PROTOC}" --version && \
     test -f "${PROTOC_INCLUDE}/google/protobuf/timestamp.proto" && \
     test -f "${PROTOC_INCLUDE}/google/protobuf/struct.proto" && \
+    mkdir -p /root/.cargo && \
+    printf '[source.crates-io]\nreplace-with = "ustc"\n[source.ustc]\nregistry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"\n[http]\nmultiplexing = false\ntimeout = 60\n' \
+        > /root/.cargo/config.toml && \
     cargo build --release && \
     uv pip install --no-build-isolation -e crates/grpc_client/python/ && \
     uv pip install --no-build-isolation -e crates/psrl_state/python/ && \
@@ -506,7 +521,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # dependency layers. The PSRL patch plugin remains reachable by pyproject.toml.
 WORKDIR /home
 RUN --mount=type=cache,target=/root/.cache/uv \
-    git clone https://github.com/psrl-project/psrl.git ${PSRL_HOME} && \
+    git clone ${PSRL_REPO} ${PSRL_HOME} && \
     git -C ${PSRL_HOME} checkout ${PSRL_COMMIT} && \
     cd ${PSRL_HOME} && \
     uv pip install --no-build-isolation -e . && \
@@ -531,7 +546,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
-    uv pip install "nvidia-nccl-cu${CUDA_MAJOR}==2.30.7"
+    uv pip install "nvidia-nccl-cu${CUDA_MAJOR}==2.31.2"
 
 RUN rm -rf /root/.cache/pip /root/.cache/uv
 

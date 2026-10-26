@@ -374,6 +374,22 @@ client. This keeps a harness from declaring an auxiliary call trainable.
 | Claude Code | `x-claude-code-request-class`, `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, `x-claude-code-agent-type` | The request class is `main`, `subagent`, `workflow`, `compaction`, `auxiliary`, or `side_reply`. Agent id and parent id are emitted for non-main agents. |
 | Generic | `x-psrl-agent-role`, `x-psrl-agent-id`, `x-psrl-parent-agent-id` | A harness without native metadata may send the normalized headers directly. |
 
+Claude Code 2.1.295 is the minimum version with
+`x-claude-code-request-class`, `x-claude-code-agent-type`, and the
+`CLAUDE_CODE_GATEWAY_HINT_HEADERS` gate. The harness runtime currently pins
+2.1.233, and 2.1.251 also lacks those fields. On older versions only
+`x-claude-code-agent-id` and `x-claude-code-parent-agent-id` are available.
+
+The older-version fallback is:
+
+- No `x-claude-code-agent-id` means the main agent. The CLI omits the header
+  when the agent context is `main`.
+- `x-claude-code-agent-id` plus `x-claude-code-parent-agent-id` means a
+  subagent.
+- `x-claude-code-agent-id` without a parent is probably auxiliary, but it
+  cannot be separated reliably from a subagent. Bump the runtime to 2.1.295 or
+  newer when Claude Code needs per-agent training.
+
 Claude Code gates `x-claude-code-request-class` and
 `x-claude-code-agent-type` behind `CLAUDE_CODE_GATEWAY_HINT_HEADERS` or a
 first-party base URL. A custom session router is not first-party, so the Claude
@@ -630,14 +646,19 @@ native role metadata.
 
 #### Claude Code
 
+- Use Claude Code 2.1.295 or newer. The harness runtime currently pins 2.1.233,
+  and 2.1.251 also lacks `x-claude-code-request-class`,
+  `x-claude-code-agent-type`, and the gateway-hint switch. On those versions,
+  fall back to the agent-id heuristics in section 5.2. Bump the pinned runtime
+  before relying on per-agent training.
 - Set `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` in the harness environment. The
   Claude Code adapter already writes `settings.json` under the sandbox home, so
   this is one entry in that file. Without it, the request-class and agent-type
   headers are gated off on a custom base URL.
-- `subagents_enabled` already controls the `Agent` tool. With the flag on, the
-  CLI emits `x-claude-code-request-class = subagent` or `workflow`, plus
-  `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, and
-  `x-claude-code-agent-type`.
+- `subagents_enabled` already controls the `Agent` tool. On 2.1.295 or newer,
+  with the flag on, the CLI emits `x-claude-code-request-class = subagent` or
+  `workflow`, plus `x-claude-code-agent-id`,
+  `x-claude-code-parent-agent-id`, and `x-claude-code-agent-type`.
 - Keep the Messages session URL for the main agent and its subagents.
 - `x-claude-code-request-class = auxiliary` or `side_reply` marks calls outside
   the agent conversation. They are captured as `tokens` and never trained.
@@ -780,8 +801,9 @@ Integration:
    `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, and
    `x-claude-code-agent-type`. The request-class and agent-type headers are
    gated behind `CLAUDE_CODE_GATEWAY_HINT_HEADERS` or a first-party base URL.
-   Confirm the deployed version behaves the same way and that the harness sets
-   the variable.
+   The headers appear in 2.1.295. The pinned harness runtime is 2.1.233, and
+   2.1.251 also lacks them. Decide whether to bump the pinned runtime to
+   2.1.295 or newer, or to accept the agent-id fallback for older versions.
 3. Should the session-level policy travel as a header or in the
    `POST /sessions` body? This design uses a header for consistency with the
    existing session metadata.

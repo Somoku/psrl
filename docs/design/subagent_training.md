@@ -1088,7 +1088,10 @@ Design:
   episode ends; a turn arriving later is post-main by construction.
 - Session deletion cancels or abandons remaining background work. It does not
   wait for it; waiting would only extend the session and hold the TITO store
-  open.
+  open. The generic `delete_session` drain is for requests on the main path;
+  v2 must cancel or detach background in-flight turns instead of counting them
+  in that drain. Otherwise the rollout still blocks on work that cannot
+  contribute.
 - A background subagent that writes to a separate session is out of scope. It
   must use the same session URL.
 - Test: a harness reports two live background subagents at main close. The

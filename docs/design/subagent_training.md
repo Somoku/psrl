@@ -1138,7 +1138,7 @@ tests. `cargo test -p smg --lib` passes 1350 tests. The Python suites
 `tests/trainer/test_group_baseline.py`, `tests/trainer/test_chunk_manager.py`,
 `tests/config/test_subagent_training_config.py`, and
 `tests/agent_loop/test_harness.py` cover the extraction, policy, router,
-advantage, loss, and adapter changes. That combined Python run passes 180 tests.
+advantage, loss, and adapter changes. That combined Python run passes 183 tests.
 `tests/trainer/test_session_loss.py` adds 11 policy-loss, entropy, and KL tests
 when the vendored verl checkout is present.
 

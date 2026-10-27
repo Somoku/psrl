@@ -1127,6 +1127,11 @@ Phase 3 is the v2 design set. It is not part of this landing.
 These are the checks that exercised the implementation. Conditions are kept
 because a capture or extraction result is only meaningful with them.
 
+The gateway changes are in the companion SMG branch `dev/subagent-training`.
+Build and install that binding before running the PSRL branch; the stock
+gateway does not know the four normalized headers or the per-turn capture
+field.
+
 **Test suites.** `cargo test -p smg-tito` passes 97 unit tests and 8 engine
 tests. `cargo test -p smg --lib` passes 1350 tests. The Python suites
 `tests/tito`, `tests/nixl/test_session_loss_agg.py`,

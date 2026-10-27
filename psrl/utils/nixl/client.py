@@ -260,6 +260,10 @@ class NIXLStorageClient:
         self._publish_copies: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         # Quantizer for published weights and the keys that carry auxiliary tensors.
         self._quantizer = None
+        #: True on a rollout that quantizes BF16 read bytes into its own FP8 parameters.
+        #: The trainer side of the same mode publishes no weight copies; it only derives
+        #: the scale metadata that the unified sharding needs.
+        self._reader_quantization = False
         self._quantized_pairs: dict[str, tuple[object, NIXLSharding, object, tuple[int, int]]] = {}
         self.publish_copy_bytes = 0
         # Train dtype to rollout dtype. Shards of a cast dtype are published as copies in the rollout dtype.
@@ -416,14 +420,31 @@ class NIXLStorageClient:
         if train_dtype != rollout_dtype:
             self._publish_casts[train_dtype] = rollout_dtype
 
-    def set_publish_quantization(self, plan: QuantizationPlan) -> None:
+    def set_publish_quantization(self, plan: QuantizationPlan, *, reader_quantization: bool = False) -> None:
         """
         Publish weights in the plan's wire format. Call before registration.
 
         The scale keys come from the unified sharding, so the rollout's own parameters
         decide which weights are quantized. The trainer supplies the bytes.
+
+        With ``reader_quantization=True`` the trainer supplies **BF16** bytes in place
+        and allocates no weight publish copy. The plan is still used to derive the scale
+        metadata the unified sharding needs; the rollout quantizes the BF16 reads into
+        its own FP8 parameters and scales.
         """
         assert self.client_type is NIXLClientType.PUSH_SIDE, "Only a train client publishes quantized weights."
+        self._reader_quantization = bool(reader_quantization)
+        self._quantizer = quantizer_for_plan(plan)
+
+    def set_reader_quantization(self, plan: QuantizationPlan) -> None:
+        """Quantize BF16 source shards into this rollout's FP8 parameters.
+
+        Call before registration. The rollout's local state already carries the FP8
+        weights and `_scale_inv`; the trainer has no scale source in this mode, so the
+        pull engine derives the scale from the same BF16 tile as the weight.
+        """
+        assert self.client_type is NIXLClientType.PULL_SIDE, "Only a rollout client quantizes on land."
+        self._reader_quantization = True
         self._quantizer = quantizer_for_plan(plan)
 
     def _derive_aux_parameters(self, state_dict: dict, sharding_dict: dict) -> dict:
@@ -1413,7 +1434,9 @@ class NIXLStorageClient:
                     # saving from 2.5x into 10.7x (measured on Qwen3-30B-A3B). Equal-but-
                     # distinct objects would serialise 128 times over.
                     if key in self._quantized_pairs:
-                        publish_dtype = self._quantizer.weight_dtype
+                        # Reader-side quantization keeps the live BF16 bytes readable.
+                        # The rollout quantizes them; the trainer allocates no FP8 copy.
+                        publish_dtype = nominal_dtype if self._reader_quantization else self._quantizer.weight_dtype
                     elif (
                         self._quantizer is not None
                         and self._quantizer.base_of_scale_key(key) in self._quantized_pairs
@@ -1450,7 +1473,7 @@ class NIXLStorageClient:
                             self._quantizer is not None
                             and self._quantizer.base_of_scale_key(key) in self._quantized_pairs
                         )
-                        if is_upstream_source and (
+                        if is_upstream_source and not self._reader_quantization and (
                             fragmented or is_scale or publish_dtype != nominal_dtype or quantized_source is not None
                         ):
                             # Readers get a contiguous copy in their dtype, so any cut of it is one descriptor.

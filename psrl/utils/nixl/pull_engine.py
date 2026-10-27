@@ -58,6 +58,11 @@ class _Staged:
     local_view: torch.Tensor
     view_shape: tuple[int, ...]
     view_strides: tuple[int, ...]
+    #: Reader-side quantization: the staging bytes are `source_dtype`, and the
+    #: scatter step quantizes them into `local_view` (FP8) plus its `_scale_inv`.
+    source_dtype: torch.dtype | None = None
+    quantize: bool = False
+    shard: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -298,6 +303,10 @@ class NIXLPullEngine:
         self._completed_keys: set[str] = set()
         self._pull_keys: set[str] = set()
         self._key_outstanding: dict[str, int] = {}
+        #: Keys whose staged bytes still need a quantize/scatter before they are complete.
+        self._quantize_keys: set[str] = set()
+        self._quantize_pending: dict[str, int] = {}
+        self._accounted_phases: set[int] = set()
         self._next_control_poll = 0.0
         #: True while re-reading suspect keys from holders; peer reads must not re-raise.
         self._repairing = False
@@ -321,12 +330,28 @@ class NIXLPullEngine:
         remote_info = self.client.all_client_infos[source].tensor_infos[key]
         positions = {s: i for i, s in enumerate(remote_info.sharding.shard_indices)}
         cells = []
+        quantized = []
         for shard in shards:
             pos = positions[shard]
             meta = remote_info.shard_meta_infos[pos]
             local = self._local_view(key, shard)
             address = remote_info.read_addrs[pos] if remote_info.read_addrs else None
             assert address is not None, f"{source} exposes no readable bytes for {key!r} shard {shard}."
+            quantize = (
+                self.client._reader_quantization
+                and self.client._quantizer is not None
+                and meta.dtype != local.dtype
+                and local.dtype == self.client._quantizer.weight_dtype
+            )
+            if quantize:
+                assert tuple(meta.shape) == tuple(local.shape), (
+                    f"{key!r} shard {shard}: source {meta.dtype} {tuple(meta.shape)} at {source} "
+                    f"does not match the rollout target {local.dtype} {tuple(local.shape)}."
+                )
+                source_itemsize = torch.empty((), dtype=meta.dtype).element_size()
+                runs = view_runs(address, tuple(meta.shape), tuple(remote_info.read_strides[pos]), source_itemsize)
+                quantized.append((shard, meta, local, runs))
+                continue
             assert meta.dtype == local.dtype and tuple(meta.shape) == tuple(local.shape), (
                 f"{key!r} shard {shard} is {meta.dtype} {tuple(meta.shape)} at {source} "
                 f"but {local.dtype} {tuple(local.shape)} locally."
@@ -338,6 +363,32 @@ class NIXLPullEngine:
                 (local.untyped_storage().data_ptr(), remote_info.read_bases[pos]), len(self._region_labels)
             )
             cells.append((local, local_runs, remote_runs, tuple(remote_info.read_strides[pos]), meta.version, region))
+
+        if quantized:
+            staged = []
+            versions = set()
+            nbytes = 0
+            for shard, meta, local, runs in quantized:
+                item = _Staged(
+                    key,
+                    runs.total_bytes,
+                    runs.starts,
+                    np.arange(runs.count, dtype=np.int64) * runs.run_bytes,
+                    np.full(runs.count, runs.run_bytes, dtype=np.int64),
+                    local,
+                    tuple(meta.shape),
+                    tuple(_dense(meta.shape)),
+                    source_dtype=meta.dtype,
+                    quantize=True,
+                    shard=shard,
+                )
+                staged.append(item)
+                versions.add(meta.version)
+                nbytes += item.nbytes
+            empty = np.zeros(0, dtype=np.int64)
+            spec = _Spec(source, key, empty, empty, empty, empty, staged, versions, nbytes)
+            self._specs[(source, key)] = spec
+            return spec
 
         shared = self._ipc_cells(source, remote_info, shards, positions, cells)
         if shared is not None:
@@ -685,6 +736,10 @@ class NIXLPullEngine:
     def _note_completed(self, handle: _Handle) -> None:
         """Mark a handle's keys complete once every read that covers them finished."""
         for key in handle.keys:
+            if key in self._quantize_keys:
+                # The source bytes are in the staging pool, but the target is not written
+                # until `_quantize_scatter`. A preemption must not certify it before then.
+                continue
             remaining = self._key_outstanding.get(key, 0) - 1
             self._key_outstanding[key] = remaining
             if remaining <= 0:
@@ -777,11 +832,61 @@ class NIXLPullEngine:
     def _scatter(self, items: list[tuple[_Staged, int]], pool: torch.Tensor) -> None:
         with torch.cuda.stream(self._copy_stream) if self._copy_stream is not None else nullcontext():
             for item, offset in items:
+                if item.quantize:
+                    assert item.source_dtype is not None and item.shard is not None
+                    typed = pool.view(item.source_dtype)
+                    source = torch.as_strided(
+                        typed,
+                        item.view_shape,
+                        item.view_strides,
+                        offset // typed.element_size(),
+                    )
+                    self._quantize_scatter(item, source)
+                    continue
                 typed = pool.view(item.local_view.dtype)
                 source = torch.as_strided(
                     typed, item.view_shape, item.view_strides, offset // item.local_view.element_size()
                 )
                 item.local_view.copy_(source, non_blocking=True)
+
+    @torch.no_grad()
+    def _quantize_scatter(self, item: _Staged, source: torch.Tensor) -> None:
+        """Quantize a staged BF16/FP32 source shard into the rollout's FP8 view and scale.
+
+        The scale is derived from the same source tile as the weight. A finer rollout
+        scale grid receives the coarse 128x128 scale repeated over the cells it covers,
+        matching what the trainer-side publisher wrote.
+        """
+        quantizer = self.client._quantizer
+        assert quantizer is not None
+        block = quantizer.plan.block
+        assert block is not None
+        target = item.local_view
+        q, s = quantizer.quantize(source)
+        scale_key = quantizer.scale_key_of(item.key)
+        scale_view = self.client.get_original_tensor_mapping().get((scale_key, item.shard))
+        if scale_view is not None:
+            scale_tile = getattr(
+                self.client.local_client_info.tensor_infos[scale_key].sharding,
+                "scale_tile",
+                None,
+            ) or block
+            repeat = tuple(int(b // t) for b, t in zip(block, scale_tile))
+            if repeat != (1, 1):
+                s = quantizer.refine_scale(s, repeat)
+            assert tuple(scale_view.shape) == tuple(s.shape), (
+                f"{scale_key} shard {item.shard}: derived scale {tuple(s.shape)} does not "
+                f"match the registered {tuple(scale_view.shape)}."
+            )
+            scale_view.copy_(s)
+        target.copy_(q)
+        pending = self._quantize_pending.get(item.key, 1) - 1
+        if pending <= 0:
+            self._quantize_pending.pop(item.key, None)
+            self._quantize_keys.discard(item.key)
+            self._completed_keys.add(item.key)
+        else:
+            self._quantize_pending[item.key] = pending
 
     def _run(self, phase: _Phase) -> None:
         handles, copy = self._start(phase)
@@ -813,6 +918,13 @@ class NIXLPullEngine:
         """
         if self._copy_stream is None and self.client.device.type == "cuda":
             self._copy_stream = torch.cuda.Stream(device=self.client.device)
+        if id(phase) not in self._accounted_phases:
+            self._accounted_phases.add(id(phase))
+            for members in phase.round_items:
+                for item, _offset in members:
+                    if item.quantize:
+                        self._quantize_keys.add(item.key)
+                        self._quantize_pending[item.key] = self._quantize_pending.get(item.key, 0) + 1
         direct = self._post(phase.direct)
         copy = None
         if phase.ipc:
@@ -1072,7 +1184,17 @@ class NIXLPullEngine:
         upstream: dict[str, dict[str, list]] = {}
         peer: dict[str, list[str]] = defaultdict(list)
         followers: set[str] = set()
+        reader_quantization = self.client._reader_quantization
+        quantizer = self.client._quantizer
         for key, per_source in plan.rollout_pull_from_ps_plan.get(me, {}).items():
+            if reader_quantization:
+                # `_scale_inv` has no source in this mode: the reader derives it from the
+                # same BF16 tile as the weight. Phase 1 also disables peer diffusion for
+                # quantized keys so a follower cannot read an uninitialized holder scale.
+                if quantizer is not None and quantizer.base_of_scale_key(key) is not None:
+                    continue
+                upstream[key] = per_source
+                continue
             local = tensors.get(key)
             live = [w for w in plan.get_peer_group(me, key) if w == me or participates(w)]
             if len(live) >= 2 and local is not None:
@@ -1199,6 +1321,9 @@ class NIXLPullEngine:
         self._next_control_poll = 0.0
         self._repairing = False
         self._ipc_peer_bytes = 0
+        self._quantize_keys = set()
+        self._quantize_pending = {}
+        self._accounted_phases = set()
         upstream, peer, followers = self._assign(lambda c: participants is None or c in participants)
         self._pull_keys = set(upstream) | {key for keys in peer.values() for key in keys}
         # D1 version-aware source selection: keep only trainer sources that have published

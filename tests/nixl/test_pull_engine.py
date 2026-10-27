@@ -450,7 +450,14 @@ FP8_KEYS = ["layers.0.q_proj.weight", "layers.0.o_proj.weight", "layers.0.down_p
 
 
 def _fp8_cluster(
-    train_tp, gen_tp, instances, peer_diffusion, train_dtype=torch.bfloat16, scale_tile=BLOCK, train_fp8=False
+    train_tp,
+    gen_tp,
+    instances,
+    peer_diffusion,
+    train_dtype=torch.bfloat16,
+    scale_tile=BLOCK,
+    train_fp8=False,
+    reader_quantization=False,
 ):
     """Build a cluster whose rollouts are FP8, reusing `Cluster` with the gen state swapped before registration."""
     cluster = Cluster.__new__(Cluster)
@@ -517,7 +524,9 @@ def _fp8_cluster(
         )
         if kind is NIXLClientType.PUSH_SIDE:
             client.set_publish_cast(train_dtype, torch.bfloat16)
-            client.set_publish_quantization(FP8_PLAN)
+            client.set_publish_quantization(FP8_PLAN, reader_quantization=reader_quantization)
+        elif reader_quantization:
+            client.set_reader_quantization(FP8_PLAN)
         client.register_local_tensors(cluster.states[name], unified[name])
         cluster.clients[name] = client
     if peer_diffusion:
@@ -920,3 +929,39 @@ def test_an_instance_that_joins_later_pulls_correct_bytes():
         judged, failure = check_by_layout(cluster.states[name], cluster.declared[name], list(MODEL), version=7)
         assert failure is None, f"{name}: {failure}"
         assert judged == len(MODEL)
+
+
+@pytest.mark.parametrize("train_tp,gen_tp", [(1, 2), (2, 2), (4, 2), (2, 4)])
+def test_reader_quantization_pulls_bf16_and_quantizes_in_place(train_tp, gen_tp):
+    """The trainer keeps BF16 and allocates no publish copy; the rollout quantizes."""
+    cluster = _fp8_cluster(
+        train_tp,
+        gen_tp,
+        instances=2,
+        peer_diffusion=True,
+        reader_quantization=True,
+    )
+    for rank in range(train_tp):
+        trainer = cluster.clients[f"NIXLTrainClient_{rank}"]
+        assert trainer.publish_copy_bytes == 0, trainer.publish_copy_bytes
+
+    cluster.pull(epoch=1)
+    _judge_fp8(cluster, version=7)
+
+    # A second version must replace every FP8 byte and scale, not just the weights.
+    for rank in range(train_tp):
+        name = f"NIXLTrainClient_{rank}"
+        fill_fp8_exact(cluster.states[name], cluster.declared[name], FP8_KEYS, lambda t: (1,) * (t.dim() - 2) + BLOCK, version=8)
+        rest = {k: v for k, v in cluster.states[name].items() if k not in FP8_KEYS}
+        fill_by_layout(rest, cluster.declared[name], version=8, wire_dtype=torch.bfloat16)
+        cluster.clients[name].publish_version(8)
+    cluster.pull(epoch=2)
+    _judge_fp8(cluster, version=8)
+
+
+def test_reader_quantization_does_not_override_the_scale_source():
+    """Scale keys are derived locally; no upstream scale key is planned in this mode."""
+    cluster = _fp8_cluster(2, 2, instances=2, peer_diffusion=True, reader_quantization=True)
+    report = cluster.pull(epoch=1)[cluster.gen[0]]
+    assert report.upstream_keys == len(FP8_KEYS) + 1  # three FP8 weights + one norm; no scales
+    _judge_fp8(cluster, version=7)

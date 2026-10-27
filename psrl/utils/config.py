@@ -162,6 +162,28 @@ def _resolve_publish_format(config: DictConfig) -> None:
     quantization = resolve_quantization_plan(nixl.get("weight_quantization"))
     nixl.publish_quantization = quantization.to_config()
 
+    reader_quantization = bool(nixl.get("reader_quantization", False))
+    if reader_quantization:
+        if quantization.scheme != "fp8":
+            raise ValueError(
+                "psrl.nixl.reader_quantization=true requires "
+                "psrl.nixl.weight_quantization.scheme=fp8."
+            )
+        if str(config.train_actor_rollout_ref.actor.strategy) != "megatron":
+            raise ValueError(
+                "psrl.nixl.reader_quantization=true is implemented for Megatron only; "
+                f"got actor.strategy={config.train_actor_rollout_ref.actor.strategy!r}."
+            )
+        from psrl.utils.ps_mode import has_ps_data_plane
+
+        if has_ps_data_plane(config.psrl.ps_mode):
+            raise ValueError(
+                "psrl.nixl.reader_quantization=true requires direct supply "
+                "(ps_mode=nixl_direct); got ps_mode="
+                f"{config.psrl.ps_mode!r}."
+            )
+    nixl.reader_quantization = reader_quantization
+
 
 def _validate_nixl_offload_flags(config: DictConfig) -> None:
     """Reject both FSDP2 parameter-offload switches (design doc 3.9.3c).
@@ -277,7 +299,17 @@ def _resolve_write_gate(config: DictConfig) -> None:
     direct = not has_ps_data_plane(config.psrl.ps_mode)
     matched = _normalise(nixl.publish_train_dtype) == _normalise(nixl.publish_rollout_dtype)
     quantization = QuantizationPlan.from_config(nixl.get("publish_quantization"))
-    nixl.await_write_gate = bool(direct and matched and not quantization.is_quantized)
+    reader_quantization = bool(nixl.get("reader_quantization", False))
+    # Reader-side quantization also reads the trainer's live BF16 bytes, so it needs
+    # the same epoch gate as a matched-precision read. The old publisher-side path
+    # reads a separate publish copy and does not.
+    nixl.await_write_gate = bool(
+        direct
+        and (
+            (matched and not quantization.is_quantized)
+            or (reader_quantization and quantization.is_quantized)
+        )
+    )
     if nixl.await_write_gate and isinstance(nixl.get("await_readers_before_publish"), bool):
         # The gate supersedes the publish-time drain for this path. Leaving both on would
         # make publish invalidate versions that the gate already proved single-version and

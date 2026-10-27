@@ -122,6 +122,10 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             segment_registration=segment_registration,
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
+        if bool(nixl_config.get("reader_quantization", False)):
+            plan = QuantizationPlan.from_config(nixl_config.get("publish_quantization"))
+            self.nixl_storage_client.set_reader_quantization(plan)
+            psrl_logger.info("NIXL reader-side FP8 quantization enabled.")
 
     def nixl_convert_params(self, model_config: DictConfig, quantization: dict | None = None):
         """Convert the model parameters to unified format.

@@ -799,11 +799,14 @@ P (main prompt)
 | A trainable trajectory has a `Tokens` owned node | Raise when `require_primary_capture` is on |
 | Two `Full` stores disagree on an owner | Keep the first owner and log a warning |
 | No main trajectory in the session | Raise, because the session has no primary |
+| A subagent finishes after the main sample closed | Capture `tokens` only; never train it under the session reward |
 | The snapshot has no role or owner metadata | Use the legacy linear path |
 | A `Tokens` record has no `output_token_ids` | Raise, because the boundary cannot be reconstructed |
 | A shared node has `num_tokens` mismatch across snapshots | Raise, because the tree is inconsistent |
 | `drop_dead_leaves` would drop a live subagent | Keep the leaf, because it is still pointed to by `trajectory_leaves` |
 | The capture policy and the extraction policy disagree | `require_primary_capture` fails the sample |
+| An identified agent has several leaves | Keep the highest trajectory id as the live leaf |
+| The snapshot `format` is unknown | Error; an absent field means `expanded` |
 
 ## 9. Compatibility
 
@@ -1021,6 +1024,12 @@ The session body policy must be visible to extraction and offline analysis.
 Background subagents can outlive the main turn or the CLI process. They are not
 part of the first landing.
 
+The training question is causal, not temporal: a subagent may be trained only
+when its output is part of the context or artifact that the session reward
+scores. A subagent that finishes after the main agent's last turn cannot have
+influenced that turn, so the session reward carries no credit for it. Training
+it would reinforce arbitrary tokens.
+
 Design:
 
 - The harness episode summary reports subagent lifecycle: started, finished,
@@ -1029,35 +1038,61 @@ Design:
   time.
 - Before snapshot and session deletion, the agent loop drains live subagents up
   to `subagent_training.background_drain_timeout_s`.
-- A subagent that finishes within the budget is captured normally. One that
-  does not is captured as `tokens` with `finish_reason=timeout`, or dropped
-  when no tokens are available.
+- The extractor marks a subagent `post_main` when its result never entered the
+  main trajectory's subsequent context or final artifact. A post-main
+  trajectory is always captured as `tokens`; it never produces a trainable row,
+  even under `all` or `selected`.
+- A background result that the main agent consumes in a later turn is not
+  post-main. The main context is the authority, so a main agent that resumes
+  after a subagent completes can still make that subagent eligible.
+- A subagent that finishes within the drain budget but after the main sample
+  closed is kept as token-only context for diagnostics. One that does not
+  finish is token-only with `finish_reason=timeout`, or dropped when no tokens
+  are available.
 - A background subagent that writes to a separate session is out of scope. It
   must use the same session URL.
-- Test: a background subagent that finishes before the timeout, one that
-  outlives it, and a main sample that is unaffected.
+- Test: a subagent that completes before main ends and is read by main, one
+  that completes after main ends, one that main resumes and reads, and one that
+  outlives the drain timeout. The main sample is unaffected in every case.
+
+The same causal rule also applies to a subagent that completes but whose result
+the main agent never reads. The first version broadcasts the session reward to
+all selected subagents, which is a coarse credit assignment. Detecting
+"spawned but unused" from the main context is a later refinement; `post_main`
+is the unambiguous hard gate because there is no later main context at all.
+
+Per-agent reward would let a post-main subagent be trained as its own sample
+with its own task verifier. That is a different aggregation and reward path,
+not the session-reward path. Until it is designed, post-main output is
+diagnostic only.
 
 ### 10.11 Workspace isolation (v2 design)
 
 TITO separates trajectories but not filesystem writes. Parallel subagents in
 one sandbox can overwrite each other.
 
-Options:
+The v2 choice is **logical isolation**. It is a convention rather than a
+security boundary: the task root is mounted read-only, each agent writes only
+under `/workspace/agents/<agent_id>/`, and the main artifact collector reads
+the main directory. The harness prompt states the agent's directory, and a
+best-effort check reports writes outside it.
 
-- **Logical isolation:** a read-only task root plus a per-agent directory
-  `/workspace/agents/<agent_id>/`. The harness prompt requires every agent to
-  write only under its directory. The main artifact collector reads the main
-  directory. This is a convention, not a security boundary.
+The other options remain available when a deployment needs a hard boundary:
+
 - **Sandbox isolation:** one sandbox per agent with a read-only copy of the
   task root and a per-agent output volume. The shared TITO session still works
-  because model calls go through the same SessionRouter. Only the execution
-  filesystem is separate. This costs one sandbox per parallel subagent.
+  because model calls go through the same SessionRouter. This costs one sandbox
+  per parallel subagent.
 - **Worktree isolation:** for git tasks, one worktree per agent under
   `/workspace/.agents/<agent_id>/`. This is a special case of logical
   isolation.
 
-The first version uses sequential subagents or a single workspace with the
-per-agent directory convention. Parallel isolation is a v2 harness change.
+Logical isolation is chosen because it keeps one sandbox per session, preserves
+the shared filesystem the harness already expects, and costs no extra
+container or volume. Its weakness is deliberate: a misbehaving agent can still
+write outside its directory, which is why the out-of-directory check is
+diagnostic rather than a guarantee. A deployment that cannot accept that
+weakness selects sandbox isolation per task class.
 
 Test: two subagents write the same filename. The per-agent directories keep
 both artifacts and the main collector reads the main directory.
@@ -1068,6 +1103,12 @@ The current snapshot stores `accumulated_token_ids` and `turn_records` per
 leaf, duplicating shared prefixes. A compact tree snapshot stores each node
 once.
 
+The snapshot carries a top-level `format` field. `format: "expanded"` is the
+current per-trajectory view and the default when the field is absent, so old
+SMG builds and old PSRL readers keep working. `format: "compact"` is the tree
+form. The request selects it explicitly, and an unknown format is an error
+rather than a silent fallback.
+
 Design:
 
 - `nodes[]` carries `id`, `parent`, the node's own token segment or its
@@ -1077,11 +1118,11 @@ Design:
   `thread_source`, `agent_id`, `parent_trajectory_id`, and `capture`.
 - The extractor reconstructs a leaf's `accumulated_token_ids` and
   `turn_records` by walking the path. Shared nodes are read once.
-- Keep the current per-trajectory view as a derived compatibility adapter, or
-  gate the compact form with a `format` or `version` field.
+- The per-trajectory view remains a derived adapter over the compact form or
+  the current expanded form; training rows are identical either way.
 - Tests: compact and expanded snapshots produce identical training rows. A
   shared prefix appears once. Phantom boundaries and dead leaves match the
-  current behavior.
+  current behavior. A snapshot without `format` is read as `expanded`.
 
 This is a v2 transport and memory optimization. It does not change the
 training semantics.
@@ -1113,7 +1154,7 @@ designed.
 | 0 | Contract: all four headers, session body policy, SMG fields, SessionRouter normalization, snapshot dump, both capture modes. | Done | Rust tests cover the store fields and capture merge. A live Codex episode shows role, agent id, parent, owner, and capture in the snapshot. |
 | 1 | First landing: `main_only`, four headers active, `tokens` for untrained subagents and auxiliary calls, owner-aware masks, token-only extraction, routed-expert zero-row padding, the first-version correctness fixes in section 10. | Done | A live subagent episode produces one main row. Its token-only subagent has no logprobs or routed experts, and its next turn still completes. |
 | 2 | `all` and `selected`, `session_primary`, request-aggregated multi-row advantage and session loss weights. | Done | Live `all` episodes produce one row per trainable agent. Unit tests pin the advantage selection and the session-weighted loss. Config validation refuses `all`/`selected` outside request aggregation. |
-| 3 | v2 designs: background and async drain, workspace isolation, compact tree snapshot, per-agent reward and credit, shared-prefix forward if measurement justifies it. | Not started | Section 10 designs are the input to the next phase. |
+| 3 | v2 designs: background/async drain with causal training eligibility, logical workspace isolation, compact tree snapshot under a `format` field, per-agent reward and credit, shared-prefix forward if measurement justifies it. | Not started | Section 10 designs are the input to the next phase. |
 
 Phase 1 is the first landing. Phase 2 is implemented in the same landing because
 `all` and `selected` reuse the same extraction, selection, and policy plumbing;
@@ -1299,7 +1340,16 @@ Integration:
    sessions, or implement the per-agent protected-leaf rule in the store?
    `trajectory_leaves` already protects every live leaf, including a subagent
    leaf and its parent chain; no change is needed for the first version.
-9. Which isolation level is acceptable for parallel subagents: per-agent
-   directory convention, per-agent worktree, or a sandbox per agent?
-10. Should the compact tree snapshot be a new `format` field or a separate
-    endpoint and PSRL adapter?
+9. Resolved: parallel subagents use logical isolation. A read-only task root,
+   per-agent `/workspace/agents/<agent_id>/` directories, a diagnostic
+   out-of-directory check, and a main collector that reads only the main
+   directory. Sandbox and worktree isolation remain deployment options for
+   tasks that cannot accept the convention.
+10. Resolved: the compact snapshot uses a top-level `format` field.
+    `expanded` is the current view and the default when the field is absent;
+    `compact` is the tree form, selected explicitly. An unknown format is an
+    error.
+11. Resolved: a subagent that finishes after the main sample has no causal
+    path to the session reward, so it is `tokens` only and never a trainable
+    row. Training it requires the per-agent reward path, where it is a separate
+    sample with its own verifier.

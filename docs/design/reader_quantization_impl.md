@@ -128,3 +128,22 @@ peer-diffusion semantics; the designate writes the scale before the wave is sign
    validation, sync time, and trainer HBM peak with the publisher baseline.
 5. Scale test: 235B only if nodes and time permit; otherwise report the measured
    smaller-model result and the arithmetic extrapolation.
+
+## Measured status at this snapshot
+
+- CPU integration (`tests/nixl/test_pull_engine.py`, memcpy transport, real
+  clients/planner): 5 reader-quantization tests pass. They cover train/gen TP
+  combinations 1->2, 2->2, 4->2, and 2->4, a second version that replaces every
+  FP8 byte and scale, and exact-shard peer diffusion (one upstream BF16 read per
+  key/shard-set group, followers read the designate's FP8 weight and scale).
+- CPU regression: 93 tests pass across the pull engine, publish-format config,
+  write-gate config, and write-state suites.
+- GPU FP8 quantizer: 46 tests pass, including bit and scale equality with vLLM's
+  block quantizer and the full quantize/requantize round trip.
+- Full GPU training end-to-end: not completed in this environment. Two-node and
+  single-node attempts reached configuration validation, model construction, and
+  vLLM engine startup. They then hit environment-level blockers: vLLM startup
+  latency beyond the test window, a colocated validation KV-cache OOM, and a NIXL
+  handshake timeout. No end-to-end latency or trainer-HBM number is claimed here.
+- Canonical-chunk cache across different rollout layouts: not implemented. Exact
+  shard groups are shared; different target layouts quantize independently.

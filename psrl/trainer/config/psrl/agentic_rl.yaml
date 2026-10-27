@@ -74,8 +74,5 @@ subagent_training:
   require_primary_capture: true
   # Validation scoring may use a different selection. Validation never trains.
   val_mode: main_only
-  # v2 orphan-collection window only. It never delays the main snapshot; 0 disables
-  # collection, which is the default under the session reward.
-  background_drain_timeout_s: 0
 
 # TODO(lhy): Move multi-turn agent settings from `rollout.yaml` to `psrl.yaml`.

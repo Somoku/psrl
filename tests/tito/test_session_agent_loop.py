@@ -381,7 +381,6 @@ def _subagent_session(*, mode: str = "main_only") -> dict:
             "loss_weight": {"main": 1.0, "subagent": 2.0},
             "require_primary_capture": True,
             "val_mode": "main_only",
-            "background_drain_timeout_s": 300,
         },
         "trajectories": [
             {

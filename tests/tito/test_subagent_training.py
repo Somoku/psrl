@@ -252,7 +252,3 @@ def test_parallel_subagents_with_distinct_ids_are_both_kept():
     selections = select_trainable_trajectories(session, SubagentTrainingPolicy.from_mapping({"mode": "all"}))
 
     assert {selection.trajectory["trajectory_id"] for selection in selections} == {0, 1, 2}
-
-
-def test_post_main_orphan_collection_is_off_by_default():
-    assert SubagentTrainingPolicy().background_drain_timeout_s == 0.0

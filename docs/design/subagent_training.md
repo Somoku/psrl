@@ -676,8 +676,6 @@ psrl:
       require_primary_capture: true
       # Validation selection. Validation captures tokens only.
       val_mode: main_only
-      # v2 orphan-collection window; never delays the main snapshot. 0 disables.
-      background_drain_timeout_s: 0
 ```
 
 The capture mode is not a config field. It is derived per call: `full` for a
@@ -1045,33 +1043,43 @@ Design:
   once the main agent has made its last turn, no later subagent result can
   enter the main context or the main artifact, so waiting cannot change a main
   training row.
-- After the main snapshot, an optional orphan-collection pass may run off the
-  training critical path to record diagnostics or to prepare a future
-  per-agent reward sample. Its timeout bounds only that pass; it never delays
-  the main sample.
 - The SessionRouter exposes the live trajectory set and the last activity
   time.
-- The extractor marks a subagent `post_main` when its result never entered the
-  main trajectory's subsequent context or final artifact. A post-main
-  trajectory is always captured as `tokens`; it never produces a trainable row,
-  even under `all` or `selected`.
+- At the main snapshot, the agent loop records only a count: the number of
+  distinct subagent trajectories that are still live. A trajectory is live when
+  the harness reports it started and not finished, or, when the harness reports
+  no lifecycle, when it has an in-flight request at the snapshot. The count is
+  emitted as a metric (`subagent/background_live_count`); the current version
+  does not collect the trajectories or their tokens.
+- A live background subagent is not trainable. If TITO already holds some of
+  its completed turns, they are context/diagnostic only and never produce a
+  training row, even under `all` or `selected`.
 - A background result that the main agent consumes in a later turn is not
   post-main. The main context is the authority, so a main agent that resumes
   after a subagent completes can still make that subagent eligible. In the
   current one-episode-per-session flow the main sample closes when the harness
   episode ends; a result arriving later is post-main by construction.
-- A subagent that finishes within the orphan-collection window is kept as
-  token-only context for diagnostics. One that does not finish is token-only
-  with `finish_reason=timeout`, or dropped when no tokens are available.
 - Session deletion cancels or abandons remaining background work. It does not
-  wait for a trajectory that cannot contribute a training row; waiting would
-  only extend the session and hold the TITO store open.
+  wait for it; waiting would only extend the session and hold the TITO store
+  open.
 - A background subagent that writes to a separate session is out of scope. It
   must use the same session URL.
-- Test: a subagent that completes before main ends and is read by main, one
-  that completes after main ends, one that main resumes and reads, and one that
-  outlives the collection window. The main sample is unaffected in every case,
-  and the main snapshot latency does not depend on the background timeout.
+- Test: a harness reports two live background subagents at main close. The
+  metric is 2, neither trajectory produces a row, the main rows and snapshot
+  latency are unchanged, and session deletion does not wait for either.
+
+The count is deliberately an observation, not a collection point. No timeout is
+involved because nothing waits. If a deployment later wants post-main tokens
+for diagnostics or a per-agent reward sample, that is a separate opt-in
+collection path with its own lifetime, not part of the main snapshot.
+
+If a subagent contributes early turns and continues after main closes, the
+trajectory is mixed. Whole-trajectory exclusion would drop the causal early
+turns, and whole-trajectory training would train the post-main turns. The
+correct rule is per turn or per segment: mark the records after the main-close
+boundary as `contributes_to_session=false`. The current version counts the
+trajectory and excludes it; per-turn masking is the next refinement if real
+harnesses produce this shape.
 
 The same causal rule also applies to a subagent that completes but whose result
 the main agent never reads. The first version broadcasts the session reward to
@@ -1172,7 +1180,7 @@ designed.
 | 0 | Contract: all four headers, session body policy, SMG fields, SessionRouter normalization, snapshot dump, both capture modes. | Done | Rust tests cover the store fields and capture merge. A live Codex episode shows role, agent id, parent, owner, and capture in the snapshot. |
 | 1 | First landing: `main_only`, four headers active, `tokens` for untrained subagents and auxiliary calls, owner-aware masks, token-only extraction, routed-expert zero-row padding, the first-version correctness fixes in section 10. | Done | A live subagent episode produces one main row. Its token-only subagent has no logprobs or routed experts, and its next turn still completes. |
 | 2 | `all` and `selected`, `session_primary`, request-aggregated multi-row advantage and session loss weights. | Done | Live `all` episodes produce one row per trainable agent. Unit tests pin the advantage selection and the session-weighted loss. Config validation refuses `all`/`selected` outside request aggregation. |
-| 3 | v2 designs: background/async drain with causal training eligibility, logical workspace isolation, compact tree snapshot under a `format` field, per-agent reward and credit, shared-prefix forward if measurement justifies it. | Not started | Section 10 designs are the input to the next phase. |
+| 3 | v2 designs: background/async live count with causal training eligibility, logical workspace isolation, compact tree snapshot under a `format` field, per-agent reward and credit, shared-prefix forward if measurement justifies it. | Not started | Section 10 designs are the input to the next phase. |
 
 Phase 1 is the first landing. Phase 2 is implemented in the same landing because
 `all` and `selected` reuse the same extraction, selection, and policy plumbing;
@@ -1351,10 +1359,9 @@ Integration:
    later if wire size matters.
 6. Resolved: Codex 0.164 honors the catalog's `multi_agent_version`; `v1` plus
    `[features] multi_agent = true` produced a live subagent call.
-7. Resolved: `subagent_training.background_drain_timeout_s` is not a
-   pre-snapshot drain. It bounds only the optional post-main orphan collection
-   and defaults to 0 (disabled) under the session reward. A positive value is
-   for diagnostics or a future per-agent sample, never for the main snapshot.
+7. Resolved: there is no background drain or collection timeout. The main
+   snapshot is immediate, background subagents are only counted, and session
+   deletion does not wait for them.
 8. Should the first version disable `tito_drop_dead_leaves` for subagent
    sessions, or implement the per-agent protected-leaf rule in the store?
    `trajectory_leaves` already protects every live leaf, including a subagent

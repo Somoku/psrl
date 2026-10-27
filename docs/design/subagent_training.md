@@ -676,8 +676,8 @@ psrl:
       require_primary_capture: true
       # Validation selection. Validation captures tokens only.
       val_mode: main_only
-      # v2 background drain budget; unused in the first version.
-      background_drain_timeout_s: 300
+      # v2 orphan-collection window; never delays the main snapshot. 0 disables.
+      background_drain_timeout_s: 0
 ```
 
 The capture mode is not a config field. It is derived per call: `full` for a
@@ -1040,26 +1040,38 @@ Design:
 
 - The harness episode summary reports subagent lifecycle: started, finished,
   background. Codex and Claude Code stream-json events are the source.
+- The main sample is snapshotted as soon as the main agent's episode closes.
+  The extractor does not wait for background subagents before that snapshot:
+  once the main agent has made its last turn, no later subagent result can
+  enter the main context or the main artifact, so waiting cannot change a main
+  training row.
+- After the main snapshot, an optional orphan-collection pass may run off the
+  training critical path to record diagnostics or to prepare a future
+  per-agent reward sample. Its timeout bounds only that pass; it never delays
+  the main sample.
 - The SessionRouter exposes the live trajectory set and the last activity
   time.
-- Before snapshot and session deletion, the agent loop drains live subagents up
-  to `subagent_training.background_drain_timeout_s`.
 - The extractor marks a subagent `post_main` when its result never entered the
   main trajectory's subsequent context or final artifact. A post-main
   trajectory is always captured as `tokens`; it never produces a trainable row,
   even under `all` or `selected`.
 - A background result that the main agent consumes in a later turn is not
   post-main. The main context is the authority, so a main agent that resumes
-  after a subagent completes can still make that subagent eligible.
-- A subagent that finishes within the drain budget but after the main sample
-  closed is kept as token-only context for diagnostics. One that does not
-  finish is token-only with `finish_reason=timeout`, or dropped when no tokens
-  are available.
+  after a subagent completes can still make that subagent eligible. In the
+  current one-episode-per-session flow the main sample closes when the harness
+  episode ends; a result arriving later is post-main by construction.
+- A subagent that finishes within the orphan-collection window is kept as
+  token-only context for diagnostics. One that does not finish is token-only
+  with `finish_reason=timeout`, or dropped when no tokens are available.
+- Session deletion cancels or abandons remaining background work. It does not
+  wait for a trajectory that cannot contribute a training row; waiting would
+  only extend the session and hold the TITO store open.
 - A background subagent that writes to a separate session is out of scope. It
   must use the same session URL.
 - Test: a subagent that completes before main ends and is read by main, one
   that completes after main ends, one that main resumes and reads, and one that
-  outlives the drain timeout. The main sample is unaffected in every case.
+  outlives the collection window. The main sample is unaffected in every case,
+  and the main snapshot latency does not depend on the background timeout.
 
 The same causal rule also applies to a subagent that completes but whose result
 the main agent never reads. The first version broadcasts the session reward to
@@ -1339,9 +1351,10 @@ Integration:
    later if wire size matters.
 6. Resolved: Codex 0.164 honors the catalog's `multi_agent_version`; `v1` plus
    `[features] multi_agent = true` produced a live subagent call.
-7. What default should `subagent_training.background_drain_timeout_s` use? It
-   depends on the harness and the task budget. The first version sets 300 s but
-   does not yet use it.
+7. Resolved: `subagent_training.background_drain_timeout_s` is not a
+   pre-snapshot drain. It bounds only the optional post-main orphan collection
+   and defaults to 0 (disabled) under the session reward. A positive value is
+   for diagnostics or a future per-agent sample, never for the main snapshot.
 8. Should the first version disable `tito_drop_dead_leaves` for subagent
    sessions, or implement the per-agent protected-leaf rule in the store?
    `trajectory_leaves` already protects every live leaf, including a subagent

@@ -39,7 +39,7 @@ class SubagentTrainingPolicy:
     loss_weight_subagent: float = 1.0
     require_primary_capture: bool = True
     val_mode: str = "main_only"
-    background_drain_timeout_s: float = 300.0
+    background_drain_timeout_s: float = 0.0
 
     def __post_init__(self) -> None:
         if self.mode not in _MODES:
@@ -82,7 +82,7 @@ class SubagentTrainingPolicy:
             loss_weight_subagent=float(loss_weight.get("subagent", 1.0)),
             require_primary_capture=bool(mapping.get("require_primary_capture", True)),
             val_mode=_normalize_mode(mapping.get("val_mode"), "main_only"),
-            background_drain_timeout_s=float(mapping.get("background_drain_timeout_s", 300.0)),
+            background_drain_timeout_s=float(mapping.get("background_drain_timeout_s", 0.0)),
         )
 
     def overrides(self, mapping: Mapping[str, Any] | None) -> SubagentTrainingPolicy:

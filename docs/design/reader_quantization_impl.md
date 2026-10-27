@@ -39,7 +39,7 @@ psrl:
     weight_quantization:
       scheme: fp8
     reader_quantization: true
-    peer_diffusion: false          # phase 1: all readers quantize from BF16
+    peer_diffusion: true           # exact shard groups share a quantized holder
     await_write_gate: auto        # resolves to true for this mode
 ```
 
@@ -71,9 +71,13 @@ The pull engine:
    certify partially quantized bytes.
 5. Records the source version for the torn/commit checks.
 
-`peer_diffusion` is disabled for this mode in phase 1. Every rollout reader reads
-BF16 from the trainer and quantizes its own target shard. This is the no-designate
-baseline. It is correct but repeats the BF16 hop and the quantization per reader.
+Peer diffusion is enabled for exact shard groups. The existing planner elects the
+first reader of each (key, shard set) group as the designate. The designate reads BF16,
+quantizes the weight, and writes its scale. A follower reads the designate's FP8 weight
+and derived `_scale_inv` over NVLink. The scale key shares its weight key's wave. This
+removes the repeated BF16 read and quantization for identical target shards. Different
+target layouts form different groups and still quantize independently; the
+layout-independent canonical-chunk cache is phase 2.
 
 ## Version and failure behavior
 
@@ -87,19 +91,20 @@ baseline. It is correct but repeats the BF16 hop and the quantization per reader
 
 ## Phase 2: peer diffusion / canonical chunks
 
-Phase 1 deliberately does not share quantized results across readers. Phase 2 will
+Phase 1 shares quantized results only across readers with identical target shards. Phase 2 will
 add the canonical-chunk relay described in design 7.2:
 
-- Group readers by `(version, logical chunk, scale scheme)`.
+- Group readers by `(version, logical chunk, scale scheme)` instead of exact shard sets.
 - Let the first reader quantize a layout-independent FP8 chunk into a bounded cache.
 - Followers read the cached FP8 chunk and slice their target layout.
 - The cache is bounded (K chunks), evicts, and is version/generation tagged.
 - No designate process is added; the first holder is the existing peer planner's
   first reader for that chunk.
 
-Before phase 2, the exact-shard peer grouping cannot safely share a scale key
-because a rollout holder's scale is derived, not pulled. Phase 1 therefore disables
-peer diffusion for this mode rather than risk reading an uninitialized scale.
+Phase 1 shares the designate's derived scale through the same peer wave as its
+weight. A follower whose target shard differs cannot reuse it; that is the case the
+canonical-chunk cache will cover. Version stamps on rollout holders are the existing
+peer-diffusion semantics; the designate writes the scale before the wave is signalled.
 
 ## Supported matrix (phase 1)
 

@@ -959,9 +959,12 @@ def test_reader_quantization_pulls_bf16_and_quantizes_in_place(train_tp, gen_tp)
     _judge_fp8(cluster, version=8)
 
 
-def test_reader_quantization_does_not_override_the_scale_source():
-    """Scale keys are derived locally; no upstream scale key is planned in this mode."""
+def test_reader_quantization_peer_diffusion_shares_training_reads():
+    """One designate per key group reads BF16 and quantizes; followers read FP8."""
     cluster = _fp8_cluster(2, 2, instances=2, peer_diffusion=True, reader_quantization=True)
-    report = cluster.pull(epoch=1)[cluster.gen[0]]
-    assert report.upstream_keys == len(FP8_KEYS) + 1  # three FP8 weights + one norm; no scales
+    reports = cluster.pull(epoch=1)
     _judge_fp8(cluster, version=7)
+    # One designate per (key, shard-set) group. With gen TP2: three FP8 weights
+    # have two shard sets each, and the norm has one => 7 upstream keys. Scales are derived.
+    assert sum(r.upstream_keys for r in reports.values()) == 7
+    assert sum(r.peer_keys for r in reports.values()) > 0

@@ -7,9 +7,9 @@
 # before the optimizer writes, preempts in-flight readers, and lets a conflicting
 # reader retry the next version.
 #
-# This is the phase-1 edge of design 7.2. Peer diffusion is disabled for this mode so
-# a follower cannot read an uninitialized holder scale; every reader quantizes its own
-# target shard. The canonical-chunk peer cache is phase 2.
+# This is the phase-1 edge of design 7.2. Peer diffusion groups readers by exact
+# shard set: the designate quantizes BF16 once, and followers read its FP8 weight and
+# scale over NVLink. A layout-independent canonical-chunk cache is phase 2.
 #
 # All other settings are aligned with `qwen3_8b_megatron_direct_fp8gen.sh` so the
 # reader-quantized arm can be compared with the publisher arm on data, batch sizes,

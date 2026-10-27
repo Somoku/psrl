@@ -1187,17 +1187,36 @@ class NIXLPullEngine:
         reader_quantization = self.client._reader_quantization
         quantizer = self.client._quantizer
         for key, per_source in plan.rollout_pull_from_ps_plan.get(me, {}).items():
-            if reader_quantization:
-                # `_scale_inv` has no source in this mode: the reader derives it from the
-                # same BF16 tile as the weight. Phase 1 also disables peer diffusion for
-                # quantized keys so a follower cannot read an uninitialized holder scale.
-                if quantizer is not None and quantizer.base_of_scale_key(key) is not None:
+            local = tensors.get(key)
+            if reader_quantization and quantizer is not None:
+                base = quantizer.base_of_scale_key(key)
+                if base is not None:
+                    # `_scale_inv` has no upstream source. It is computed by the reader
+                    # that quantizes the weight. Followers read the designate's scale;
+                    # the designate skips both upstream and peer for this key.
+                    group_key = base if plan.get_peer_group(me, base) else key
+                    live = [w for w in plan.get_peer_group(me, group_key) if w == me or participates(w)]
+                    if len(live) >= 2 and local is not None:
+                        shards = list(local.sharding.shard_indices)
+                        readable = [w for w in live if w == me or self._source_readable(w, key, shards)]
+                        if readable and readable[0] != me:
+                            peer[readable[0]].append(key)
                     continue
+                # A weight key uses the ordinary peer grouping. The designate reads
+                # BF16 upstream and quantizes; a follower reads its FP8 output.
+                live = [w for w in plan.get_peer_group(me, key) if w == me or participates(w)]
+                if len(live) >= 2 and local is not None:
+                    shards = list(local.sharding.shard_indices)
+                    readable = [w for w in live if w == me or self._source_readable(w, key, shards)]
+                    if readable:
+                        designate = readable[0]
+                        if designate != me:
+                            peer[designate].append(key)
+                            continue
+                        followers.update(w for w in live if w != me)
                 upstream[key] = per_source
                 continue
-            local = tensors.get(key)
-            live = [w for w in plan.get_peer_group(me, key) if w == me or participates(w)]
-            if len(live) >= 2 and local is not None:
+            if len(live := [w for w in plan.get_peer_group(me, key) if w == me or participates(w)]) >= 2 and local is not None:
                 shards = list(local.sharding.shard_indices)
                 readable = [w for w in live if w == me or self._source_readable(w, key, shards)]
                 if readable:
@@ -1235,15 +1254,32 @@ class NIXLPullEngine:
         Wave of every key, cut in model order into byte balanced runs.
 
         Group members hold identical keys, so a designate and its followers derive the same waves.
+        A reader-derived scale key shares its weight key's wave: the designate computes
+        the scale while it quantizes that weight, and followers may only read it after the
+        wave is signalled.
         """
         info = self.client.local_client_info.tensor_infos
+        quantizer = self.client._quantizer if self.client._reader_quantization else None
+
+        def base_key(key: str) -> str:
+            if quantizer is None:
+                return key
+            base = quantizer.base_of_scale_key(key)
+            return base if base is not None and base in info else key
+
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for key in keys:
+            grouped[base_key(key)].append(key)
         sizes = [
-            (key, sum(info[key].get_shard_size_bytes(i) for i in range(info[key].num_local_shards))) for key in keys
+            (base, sum(info[base].get_shard_size_bytes(i) for i in range(info[base].num_local_shards)))
+            for base in grouped
         ]
         total = max(sum(n for _, n in sizes), 1)
         waves, acc = {}, 0
-        for key, nbytes in sorted(sizes):
-            waves[key] = min(self.waves - 1, acc * self.waves // total)
+        for base, nbytes in sorted(sizes):
+            wave = min(self.waves - 1, acc * self.waves // total)
+            for key in grouped[base]:
+                waves[key] = wave
             acc += nbytes
         return waves
 

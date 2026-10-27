@@ -159,8 +159,15 @@ pub struct TurnRecord {
 
     pub owner_trajectory_id: u64,
     pub capture: TurnCapture,
+    /// Session-wide storage order, assigned when the token stream is first
+    /// stored. It is the causal boundary for post-main turns.
+    pub sequence: u64,
 }
 ```
+
+`sequence` is monotonic within a session and is preserved across a later
+payload upgrade. `contributes_to_session` is not stored in SMG; PSRL derives it
+from `sequence` and the primary main leaf.
 
 `output_token_ids` is populated on every capture path. It is the authoritative
 source of generated ids for a token-only record. With `Full` it duplicates the
@@ -289,6 +296,8 @@ generated the node. A tool that joins snapshots by `hash` can use both.
           "output_logprobs": [[-0.1, 3]],
           "owner_trajectory_id": 0,
           "capture": "full",
+          "sequence": 1,
+          "contributes_to_session": true,
           "finish_reason": "tool_calls"
         }
       ]
@@ -307,6 +316,8 @@ generated the node. A tool that joins snapshots by `hash` can use both.
           "output_logprobs": null,
           "owner_trajectory_id": 1,
           "capture": "tokens",
+          "sequence": 2,
+          "contributes_to_session": false,
           "finish_reason": "stop"
         }
       ]
@@ -330,6 +341,10 @@ generated the node. A tool that joins snapshots by `hash` can use both.
 In this example the subagent record starts at `prompt_token_count = 3`, so the
 shared prefix node 0 is inside its prompt. The main trajectory owns node 0 and
 trains it. The subagent owns node 1 but it is token-only, so it is context only.
+`sequence` is stored by SMG; `contributes_to_session` is derived by PSRL at
+snapshot normalization. Here the main-close sequence is 1; the subagent record
+has sequence 2, so it is post-main and masked. A subagent record with sequence
+<= 1 would contribute.
 
 ### 5.2 Request headers
 
@@ -624,6 +639,8 @@ extra_fields = {
     "capture": "full",
     "session_primary": bool,
     "loss_weight": float,
+    # v2: owned records that may train; num_turns remains all owned records.
+    "trainable_turns": int,
 }
 ```
 
@@ -797,12 +814,13 @@ P (main prompt)
 | A trainable trajectory has a `Tokens` owned node | Raise when `require_primary_capture` is on |
 | Two `Full` stores disagree on an owner | Keep the first owner and log a warning |
 | No main trajectory in the session | Raise, because the session has no primary |
-| A subagent finishes after the main sample closed | Capture `tokens` only; never train it under the session reward |
+| A subagent turn completes after the main-close sequence | Mask that turn; earlier contributing turns of the same trajectory may still train |
 | The snapshot has no role or owner metadata | Use the legacy linear path |
 | A `Tokens` record has no `output_token_ids` | Raise, because the boundary cannot be reconstructed |
 | A shared node has `num_tokens` mismatch across snapshots | Raise, because the tree is inconsistent |
 | `drop_dead_leaves` would drop a live subagent | Keep the leaf, because it is still pointed to by `trajectory_leaves` |
-| The capture policy and the extraction policy disagree | `require_primary_capture` fails the sample |
+| A contributing owned record has token-only capture | `require_primary_capture` fails the sample |
+| A record has no sequence | Treat `contributes_to_session` as true (legacy snapshot) |
 | An identified agent has several leaves | Keep the highest trajectory id as the live leaf |
 | The snapshot `format` is unknown | Error; an absent field means `expanded` |
 
@@ -872,6 +890,11 @@ Move the prompt boundary to the first record owned by the trainable trajectory:
 The total context window `prompt_length + response_length` is unchanged. Only
 the prompt/response split changes. The shared prefix is prompt context in the
 subagent sample and is trained in the owner's sample.
+
+v2 addendum: `num_turns` remains the count of owned records in the row.
+`trainable_turns` counts only owned records with
+`contributes_to_session=true`. A mixed trajectory therefore keeps its early
+contributing turns and masks its post-main turns without lowering `num_turns`.
 
 ### 10.3 Routed-experts offset and alignment (first version)
 
@@ -996,6 +1019,9 @@ Validation may run subagents. Train and validation selection are separate:
   raising on multiple trajectories.
 - The request-aggregated batch schedule handles extra rows in validation the
   same way as in training.
+- Validation applies the same per-turn `contributes_to_session` gate. A
+  post-main subagent turn is not scored even when `val_mode` selects its
+  trajectory.
 - Test: a validation session with main and subagents. Only the primary
   contributes to accuracy. Subagent rows are available for dump but are not
   scored.
@@ -1051,41 +1077,75 @@ Design:
   no lifecycle, when it has an in-flight request at the snapshot. The count is
   emitted as a metric (`subagent/background_live_count`); the current version
   does not collect the trajectories or their tokens.
-- A live background subagent is not trainable. If TITO already holds some of
-  its completed turns, they are context/diagnostic only and never produce a
-  training row, even under `all` or `selected`.
+- A live background subagent is not a whole-trajectory training unit. Its
+  completed turns are handled per turn: a turn that completed after the
+  main-close boundary is context/diagnostic only; a turn that completed before
+  the boundary may still train when it is owned by a selected trajectory.
 - A background result that the main agent consumes in a later turn is not
   post-main. The main context is the authority, so a main agent that resumes
   after a subagent completes can still make that subagent eligible. In the
   current one-episode-per-session flow the main sample closes when the harness
-  episode ends; a result arriving later is post-main by construction.
+  episode ends; a turn arriving later is post-main by construction.
 - Session deletion cancels or abandons remaining background work. It does not
   wait for it; waiting would only extend the session and hold the TITO store
   open.
 - A background subagent that writes to a separate session is out of scope. It
   must use the same session URL.
 - Test: a harness reports two live background subagents at main close. The
-  metric is 2, neither trajectory produces a row, the main rows and snapshot
-  latency are unchanged, and session deletion does not wait for either.
+  metric is 2, the main rows and snapshot latency are unchanged, session
+  deletion does not wait for either, and only their pre-boundary owned turns
+  can train.
+
+#### Turn-level contribution boundary
+
+A trajectory can straddle the main close: the main agent used an early result,
+then sent a follow-up and ended while the same subagent was still working.
+Whole-trajectory exclusion would drop the causal early turns; whole-trajectory
+training would train the post-main turns. The boundary is therefore per turn.
+
+- **Sequence.** TITO assigns a session-wide monotonic `sequence` to a turn when
+  its token stream is first stored, not when its request starts. A later
+  payload upgrade keeps the original sequence, because the output was already
+  available. A turn that completes after main close gets a larger sequence even
+  if it started earlier.
+- **Main close.** `main_close_sequence` is the `sequence` of the last record on
+  the primary main trajectory. The primary is the latest main-role leaf, the
+  same rule the extractor already uses. If the main later resumes, its new last
+  record moves the boundary later, so turns that were before the resumed main
+  become eligible again.
+- **Marking.** PSRL normalizes the snapshot before selection and sets
+  `contributes_to_session` on every record:
+  - main-role records and compactions of the main agent: true;
+  - auxiliary records: false;
+  - subagent records and compactions of a subagent: true when
+    `sequence <= main_close_sequence`, false otherwise;
+  - a record with no `sequence` (legacy snapshot): true, which preserves the
+    old coarse behavior.
+- **Selection.** A trajectory is selected only when it has at least one owned
+  record with `contributes_to_session=true`. `require_primary_capture` checks
+  capture only on those contributing owned records; a post-main token-only
+  turn does not fail a mixed trajectory.
+- **Extraction.** `build_training_data` sets `train_here` only for an owned,
+  full-capture, contributing record. A post-main record is still part of the
+  response with mask 0, zero logprobs, an empty sampler segment, and zero
+  routed-expert rows. The row remains valid for its earlier contributing
+  turns.
+- **Turn counts.** `num_turns` keeps counting every owned record in the
+  trajectory. `trainable_turns` counts the owned contributing records. A
+  trajectory with `trainable_turns == 0` produces no row.
+- **Compact snapshot.** The compact form carries the same turn sequence and
+  contribution marker through its node/turn-record payload; expanded and
+  compact snapshots must produce identical masks.
+
+This boundary is still a time-order lower bound for credit: a subagent turn
+that completed before main close but whose result the main never read remains
+`true`. Detecting "spawned but unused" requires linking the subagent output to
+the main messages; that is a later refinement, not part of this boundary.
 
 The count is deliberately an observation, not a collection point. No timeout is
 involved because nothing waits. If a deployment later wants post-main tokens
 for diagnostics or a per-agent reward sample, that is a separate opt-in
 collection path with its own lifetime, not part of the main snapshot.
-
-If a subagent contributes early turns and continues after main closes, the
-trajectory is mixed. Whole-trajectory exclusion would drop the causal early
-turns, and whole-trajectory training would train the post-main turns. The
-correct rule is per turn or per segment: mark the records after the main-close
-boundary as `contributes_to_session=false`. The current version counts the
-trajectory and excludes it; per-turn masking is the next refinement if real
-harnesses produce this shape.
-
-The same causal rule also applies to a subagent that completes but whose result
-the main agent never reads. The first version broadcasts the session reward to
-all selected subagents, which is a coarse credit assignment. Detecting
-"spawned but unused" from the main context is a later refinement; `post_main`
-is the unambiguous hard gate because there is no later main context at all.
 
 Per-agent reward would let a post-main subagent be trained as its own sample
 with its own task verifier. That is a different aggregation and reward path,
@@ -1146,6 +1206,9 @@ Design:
   `turn_records` by walking the path. Shared nodes are read once.
 - The per-trajectory view remains a derived adapter over the compact form or
   the current expanded form; training rows are identical either way.
+- Each turn record carries its storage `sequence` and the derived
+  `contributes_to_session` marker, so the compact form preserves the per-turn
+  boundary.
 - Tests: compact and expanded snapshots produce identical training rows. A
   shared prefix appears once. Phantom boundaries and dead leaves match the
   current behavior. A snapshot without `format` is read as `expanded`.
@@ -1180,7 +1243,7 @@ designed.
 | 0 | Contract: all four headers, session body policy, SMG fields, SessionRouter normalization, snapshot dump, both capture modes. | Done | Rust tests cover the store fields and capture merge. A live Codex episode shows role, agent id, parent, owner, and capture in the snapshot. |
 | 1 | First landing: `main_only`, four headers active, `tokens` for untrained subagents and auxiliary calls, owner-aware masks, token-only extraction, routed-expert zero-row padding, the first-version correctness fixes in section 10. | Done | A live subagent episode produces one main row. Its token-only subagent has no logprobs or routed experts, and its next turn still completes. |
 | 2 | `all` and `selected`, `session_primary`, request-aggregated multi-row advantage and session loss weights. | Done | Live `all` episodes produce one row per trainable agent. Unit tests pin the advantage selection and the session-weighted loss. Config validation refuses `all`/`selected` outside request aggregation. |
-| 3 | v2 designs: background/async live count with causal training eligibility, logical workspace isolation, compact tree snapshot under a `format` field, per-agent reward and credit, shared-prefix forward if measurement justifies it. | Not started | Section 10 designs are the input to the next phase. |
+| 3 | v2 designs: background/async live count with per-turn causal eligibility, logical workspace isolation, compact tree snapshot under a `format` field, per-agent reward and credit, shared-prefix forward if measurement justifies it. | Not started | Section 10 designs are the input to the next phase. |
 
 Phase 1 is the first landing. Phase 2 is implemented in the same landing because
 `all` and `selected` reuse the same extraction, selection, and policy plumbing;
@@ -1295,7 +1358,8 @@ SMG:
 - Token-only records omit logprobs, sampler distribution, and routed experts but
   keep `output_token_ids`.
 - A shared node appears in `trajectory_ids` for every path and has one owner.
-- The snapshot round-trips the new fields.
+- The snapshot round-trips the new fields, including the per-turn storage
+  `sequence`.
 - `drop_dead_leaves` keeps live subagent leaves. `trajectory_leaves` is the
   protection set, so a live leaf is never dead even when it is not the newest
   node in the tree.
@@ -1306,8 +1370,8 @@ PSRL:
 - `all` returns one row per trainable agent. The shared prefix is mask 1 only in
   the owner row.
 - `selected` filters by agent id.
-- A trainable node without `Full` capture fails when
-  `require_primary_capture` is set.
+- A contributing owned record without `Full` capture fails when
+  `require_primary_capture` is set; a post-main token-only record does not.
 - A token-only node is mask 0 in every sample.
 - `session_primary` selects the main row for the advantage.
 - A legacy snapshot without metadata matches the current extraction.
@@ -1317,6 +1381,13 @@ PSRL:
   as one chunk and one sample.
 - A subagent sample uses the first owned record's prompt as `prompt_ids` and
   counts only owned records in `num_turns`.
+- A mixed trajectory keeps its turn before `main_close_sequence` and masks the
+  turn after it. `num_turns` counts both; `trainable_turns` counts one.
+- A trajectory whose owned turns are all post-main produces no row.
+- A main agent that resumes moves `main_close_sequence` later and makes an
+  earlier subagent turn contributing again.
+- A record with no `sequence` (legacy snapshot) is contributing.
+- Expanded and compact snapshots produce the same per-turn masks.
 - Routed experts are placed by `prompt_start`. A full, then tokens, then full
   sequence zero-fills the gap. A tokens final turn and a tokens-only trajectory
   are also covered.
@@ -1375,7 +1446,11 @@ Integration:
     `expanded` is the current view and the default when the field is absent;
     `compact` is the tree form, selected explicitly. An unknown format is an
     error.
-11. Resolved: a subagent that finishes after the main sample has no causal
-    path to the session reward, so it is `tokens` only and never a trainable
-    row. Training it requires the per-agent reward path, where it is a separate
-    sample with its own verifier.
+11. Resolved: contribution is per turn, not per trajectory. TITO assigns a
+    storage `sequence`; the boundary is the last record on the primary main
+    trajectory; a subagent record after it is `contributes_to_session=false`.
+    A mixed trajectory keeps its early contributing turns and masks the late
+    ones. A turn that completed before the boundary but whose result main never
+    read remains coarse session credit; detecting that is a later refinement.
+    A fully post-main trajectory needs the per-agent reward path to train as its
+    own sample with its own verifier.

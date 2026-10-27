@@ -393,9 +393,10 @@ part of the turn to keep:
 The SessionRouter computes it from the session policy and the role. SMG does not
 need to know the training policy. It only needs to know what to store.
 
-The header is only needed once token-only capture lands. Phases 0 to 2 send
-`full` for every turn and use the role and owner masks for correctness. Phase 3
-adds `tokens` and the storage saving.
+The header is part of the first landing. The first version implements both
+`full` and `tokens`. A trainable agent gets `full`, and untrained agents and
+auxiliary calls get `tokens`. A correctness run may force `full` for everyone
+before `tokens` is enabled in production.
 
 #### Header lifecycle
 
@@ -792,11 +793,13 @@ P (main prompt)
 
 | Phase | Scope | Exit criterion |
 |---|---|---|
-| 0 | SMG fields, headers, SessionRouter normalization, snapshot dump | A Codex subagent episode shows role, owner, and capture in the snapshot. Existing tests pass. |
-| 1 | `main_only` selection and owner-aware masks. Full capture everywhere. | A subagent episode produces one training row. The main path has the correct masks. |
+| 0 | Contract: all four headers, session body, SMG fields, SessionRouter normalization, snapshot dump. Both `full` and `tokens` capture modes are implemented. | A Codex subagent episode shows role, owner, and capture in the snapshot. Existing tests pass. |
+| 1 | First landing: `main_only`, all four headers active, `tokens` for untrained subagents and auxiliary calls, owner-aware masks, token-only extraction, routed-expert zero-row padding, tests. | A subagent episode produces one training row. An untrained subagent snapshot has no logprobs or routed experts, and its next turn still works. The main path has the correct masks. |
 | 2 | `all` and `selected`, `session_primary`, multi-row advantage and loss | A shared prefix token is mask 1 exactly once. The session loss matches the expected total. |
-| 3 | Token-only capture, `output_token_ids`, skipped logprobs and routed experts, zero-row padding | An untrained subagent snapshot has no logprobs or routed experts. Its next turn still works. Memory and wire size drop. |
-| 4 | Per-agent reward and loss weights | Optional. Not required for the first landing. |
+| 3 | Per-agent reward and loss weights | Optional. Not required for the first landing. |
+
+Phase 1 is the first landing. It covers all four headers, both capture modes,
+and the token-only extraction path. There is no separate token-only phase.
 
 ## 11. Testing
 

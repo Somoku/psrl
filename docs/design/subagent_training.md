@@ -327,14 +327,32 @@ trains it. The subagent owns node 1 but it is token-only, so it is context only.
 
 ### 5.2 Request headers
 
-Five new headers are introduced. One is session scoped and four are turn
-scoped. None of them is read while training data is built. They matter during
-rollout, because SMG persists their values into the TITO snapshot and the
-extractor reads that snapshot.
+Four turn-level headers are introduced. The session policy is not a header. It
+travels in the `POST /sessions` JSON body. None of the headers is read while
+training data is built. They matter during rollout, because SMG persists their
+values into the TITO snapshot and the extractor reads that snapshot.
+
+The session body is:
+
+```json
+{
+  "subagent_training": {
+    "mode": "main_only",
+    "train_agents": [],
+    "capture": "auto",
+    "shared_prefix": "owner",
+    "reward": "session",
+    "loss_weight": {"main": 1.0, "subagent": 1.0}
+  }
+}
+```
+
+The SessionRouter parses it, stores it in `SessionState`, and does not forward it
+to SMG. An empty body uses the configured default. A body is a better fit than a
+header because the policy is structured and session scoped.
 
 | Header | From | To | Scope | Meaning |
 |---|---|---|---|---|
-| `x-psrl-subagent-training` | agent loop | SessionRouter, on `POST /sessions` | session | `off`, `main_only`, `all`, or `selected` |
 | `x-psrl-agent-role` | SessionRouter | SMG | turn | `main`, `subagent`, `auxiliary`, or `compaction` |
 | `x-psrl-agent-id` | SessionRouter | SMG | turn | stable agent identity |
 | `x-psrl-parent-agent-id` | SessionRouter | SMG | turn | parent agent identity, empty for main |
@@ -344,10 +362,45 @@ The role domain has four values. `auxiliary` covers harness calls that are not
 part of the agent conversation, such as title generation and side replies.
 `compaction` covers a main-context rewrite. It is not a subagent.
 
+#### Why the identity headers exist
+
+Each harness already marks its own calls in its own way. Codex uses
+`x-codex-turn-metadata.thread_source`. Claude Code uses
+`x-claude-code-request-class`, `x-claude-code-agent-id`, and
+`x-claude-code-parent-agent-id`. A third-party harness may have no marker at
+all.
+
+`x-psrl-agent-role`, `x-psrl-agent-id`, and `x-psrl-parent-agent-id` are the
+normalization layer. The SessionRouter is the only component that knows the
+harness dialect. SMG and the extractor see one vocabulary. This keeps SMG from
+depending on Codex or Claude Code, and it gives one place to add a new harness.
+
+The headers are turn scoped because the role is a property of the call, not of
+the session. A session can mix main, subagent, auxiliary, and compaction calls.
+The identity is turn scoped for the same reason.
+
+#### Why the capture header exists
+
+`x-psrl-tito-capture` is the storage decision for one turn. It tells SMG which
+part of the turn to keep:
+
+- `full`: keep `output_logprobs`, `sampler_distribution`, and
+  `routed_experts`, in addition to the token ids. The node can train.
+- `tokens`: keep the token ids, prompt boundary, output ids, and finish reason.
+  Drop the training payload. The node can still be used as context for the next
+  turn, but it can never train.
+
+The SessionRouter computes it from the session policy and the role. SMG does not
+need to know the training policy. It only needs to know what to store.
+
+The header is only needed once token-only capture lands. Phases 0 to 2 send
+`full` for every turn and use the role and owner masks for correctness. Phase 3
+adds `tokens` and the storage saving.
+
 #### Header lifecycle
 
-1. The agent loop sends `x-psrl-subagent-training` once, on `POST /sessions`.
-   The harness CLI does not send it.
+1. The agent loop sends the `subagent_training` object once, in the
+   `POST /sessions` body. The harness CLI does not send it.
 2. The harness CLI sends its own native per-call metadata. The SessionRouter
    reads it and normalizes it into `x-psrl-agent-role`, `x-psrl-agent-id`, and
    `x-psrl-parent-agent-id`.
@@ -374,29 +427,15 @@ client. This keeps a harness from declaring an auxiliary call trainable.
 | Claude Code | `x-claude-code-request-class`, `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, `x-claude-code-agent-type` | The request class is `main`, `subagent`, `workflow`, `compaction`, `auxiliary`, or `side_reply`. Agent id and parent id are emitted for non-main agents. |
 | Generic | `x-psrl-agent-role`, `x-psrl-agent-id`, `x-psrl-parent-agent-id` | A harness without native metadata may send the normalized headers directly. |
 
-Claude Code 2.1.295 is the minimum version with
-`x-claude-code-request-class`, `x-claude-code-agent-type`, and the
-`CLAUDE_CODE_GATEWAY_HINT_HEADERS` gate. The harness runtime currently pins
-2.1.233, and 2.1.251 also lacks those fields. On older versions only
-`x-claude-code-agent-id` and `x-claude-code-parent-agent-id` are available.
-
-The older-version fallback is:
-
-- No `x-claude-code-agent-id` means the main agent. The CLI omits the header
-  when the agent context is `main`.
-- `x-claude-code-agent-id` plus `x-claude-code-parent-agent-id` means a
-  subagent.
-- `x-claude-code-agent-id` without a parent is probably auxiliary, but it
-  cannot be separated reliably from a subagent. Bump the runtime to 2.1.295 or
-  newer when Claude Code needs per-agent training.
+The Claude Code runtime is pinned to 2.1.295 or newer. That version emits
+`x-claude-code-request-class`, `x-claude-code-agent-type`,
+`x-claude-code-agent-id`, and `x-claude-code-parent-agent-id`.
 
 Claude Code gates `x-claude-code-request-class` and
 `x-claude-code-agent-type` behind `CLAUDE_CODE_GATEWAY_HINT_HEADERS` or a
 first-party base URL. A custom session router is not first-party, so the Claude
 Code adapter must set `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` in the harness
-environment. Without it, `x-claude-code-agent-id` and
-`x-claude-code-parent-agent-id` are still emitted for non-main agents, but the
-router cannot tell a subagent from an auxiliary call.
+environment.
 
 Normalization rules:
 
@@ -446,8 +485,8 @@ Policy semantics:
   rewrite of the main path, not a separate agent.
 
 The policy can be overridden per dataset row through
-`extra_info.subagent_training`. The agent loop reads it and sends it in
-`x-psrl-subagent-training` when it creates the session.
+`extra_info.subagent_training`. The agent loop reads it and sends it in the
+`POST /sessions` body when it creates the session.
 
 The harness setting `harness.subagents_enabled` is separate. It controls whether
 the CLI may spawn subagents. The training policy controls whether their
@@ -618,7 +657,7 @@ A dataset row may override the mode:
 {"extra_info": {"subagent_training": {"mode": "all"}}}
 ```
 
-The agent loop sends the resolved mode in `x-psrl-subagent-training` at session
+The agent loop sends the resolved policy in the `POST /sessions` body at session
 creation. The same resolved policy is used at extraction time. If the two
 disagree, `require_primary_capture` fails the sample instead of silently
 training a context token.
@@ -646,19 +685,17 @@ native role metadata.
 
 #### Claude Code
 
-- Use Claude Code 2.1.295 or newer. The harness runtime currently pins 2.1.233,
-  and 2.1.251 also lacks `x-claude-code-request-class`,
-  `x-claude-code-agent-type`, and the gateway-hint switch. On those versions,
-  fall back to the agent-id heuristics in section 5.2. Bump the pinned runtime
-  before relying on per-agent training.
+- The harness runtime pins Claude Code 2.1.295 or newer. That version emits
+  `x-claude-code-request-class`, `x-claude-code-agent-type`,
+  `x-claude-code-agent-id`, and `x-claude-code-parent-agent-id`.
 - Set `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` in the harness environment. The
   Claude Code adapter already writes `settings.json` under the sandbox home, so
   this is one entry in that file. Without it, the request-class and agent-type
   headers are gated off on a custom base URL.
-- `subagents_enabled` already controls the `Agent` tool. On 2.1.295 or newer,
-  with the flag on, the CLI emits `x-claude-code-request-class = subagent` or
-  `workflow`, plus `x-claude-code-agent-id`,
-  `x-claude-code-parent-agent-id`, and `x-claude-code-agent-type`.
+- `subagents_enabled` already controls the `Agent` tool. With the flag on, the
+  CLI emits `x-claude-code-request-class = subagent` or `workflow`, plus
+  `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, and
+  `x-claude-code-agent-type`.
 - Keep the Messages session URL for the main agent and its subagents.
 - `x-claude-code-request-class = auxiliary` or `side_reply` marks calls outside
   the agent conversation. They are captured as `tokens` and never trained.
@@ -797,16 +834,12 @@ Integration:
 1. Does the Codex version in use put a stable `thread_id` and a parent thread id
    in `x-codex-turn-metadata`? If it does not, the fallback agent id is the
    trajectory id and the parent is derived from the tree.
-2. Claude Code 2.1.300 emits `x-claude-code-request-class`,
-   `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, and
-   `x-claude-code-agent-type`. The request-class and agent-type headers are
-   gated behind `CLAUDE_CODE_GATEWAY_HINT_HEADERS` or a first-party base URL.
-   The headers appear in 2.1.295. The pinned harness runtime is 2.1.233, and
-   2.1.251 also lacks them. Decide whether to bump the pinned runtime to
-   2.1.295 or newer, or to accept the agent-id fallback for older versions.
-3. Should the session-level policy travel as a header or in the
-   `POST /sessions` body? This design uses a header for consistency with the
-   existing session metadata.
+2. Resolved: the harness runtime pins Claude Code 2.1.295 or newer. That version
+   emits `x-claude-code-request-class`, `x-claude-code-agent-type`,
+   `x-claude-code-agent-id`, and `x-claude-code-parent-agent-id`. The Claude
+   Code adapter must set `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`.
+3. Resolved: the session policy travels in the `POST /sessions` body, not in a
+   header.
 4. Does the deployed gateway rebuild from the vendored SMG source in
    `third_party/smg`? The implementation assumes it does.
 5. Should `output_token_ids` be emitted for `Full` records as well? This design

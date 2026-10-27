@@ -360,6 +360,32 @@ def mirror_bypass_config_to_actor(config: DictConfig) -> None:
         actor_policy_loss["loss_mode"] = "bypass_mode"
 
 
+def validate_subagent_training_config(config: DictConfig, batch_agg_mode: str):
+    """
+    Validate the subagent training policy against the batch aggregation mode.
+
+    A mode that can put more than one trajectory row in one session is only meaningful
+    when those rows stay one sample, which is what request aggregation provides.
+
+    Args:
+        config (DictConfig): The resolved training config.
+        batch_agg_mode (str): The resolved `psrl.agentic_rl.batch_agg_mode`.
+
+    Returns:
+        SubagentTrainingPolicy: The resolved session policy.
+    """
+    from psrl.utils.subagent_training import SubagentTrainingPolicy
+
+    policy = SubagentTrainingPolicy.from_mapping(config.psrl.agentic_rl.get("subagent_training", {}))
+    if {policy.mode, policy.val_mode} & {"all", "selected"}:
+        assert batch_agg_mode == REQUEST_AGG_MODE, (
+            "psrl.agentic_rl.subagent_training mode/val_mode 'all' or 'selected' can put "
+            "multiple rows in one session; those rows are one sample, so "
+            "psrl.agentic_rl.batch_agg_mode must be 'request'."
+        )
+    return policy
+
+
 def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
@@ -586,6 +612,7 @@ def validate_config(
     assert batch_agg_mode in SUPPORTED_BATCH_AGG_MODES, (
         f"psrl.agentic_rl.batch_agg_mode must be one of {sorted(SUPPORTED_BATCH_AGG_MODES)}, got {batch_agg_mode!r}."
     )
+    validate_subagent_training_config(config, batch_agg_mode)
     if batch_agg_mode == REQUEST_AGG_MODE and not config.psrl.rollout_coordination.redundant_rollout.enable:
         rollout_n = config.gen_actor_rollout_ref.rollout.n
         requests_per_buffer = config.psrl.staleness_buffer_entries * rollout_n

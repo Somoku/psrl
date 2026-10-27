@@ -551,7 +551,7 @@ actually leak (see §2).
 ### 1. Harness runtime trees (host-side, read-only mount)
 
 The harness executables are **self-contained native binaries** — Claude Code
-2.1.233 (linux-x64) and Codex 0.154.0 (linux-x64). There is no Node, no npm and
+2.1.295 (linux-x64) and Codex 0.164.0 (linux-x64). There is no Node, no npm and
 no in-sandbox installation. Each sandbox binds one runtime tree read-only; the
 mount path is the harness config's `runtime_mount` (default `/opt/harness`) and
 the executable resolves to `<runtime_mount>/bin/<executable>`.
@@ -651,7 +651,7 @@ docker run --rm "$tag" bash -lc \
 
 | Aspect | mini-SWE-agent | `claude_code` harness |
 |--------|----------------|------------------------|
-| CLI / agent location | Host-side Python library (`pip install mini-swe-agent`), imported by the runner | **Sandbox-resident CLI**: a self-contained native binary (Claude Code 2.1.233 / Codex 0.154.0), bind-mounted read-only from the host runtime tree — no Node, no npm |
+| CLI / agent location | Host-side Python library (`pip install mini-swe-agent`), imported by the runner | **Sandbox-resident CLI**: a self-contained native binary (Claude Code 2.1.295 / Codex 0.164.0), bind-mounted read-only from the host runtime tree — no Node, no npm |
 | Per-sandbox install | None (pure Python on the host) | **None** — a single `<runtime_mount>/bin/<executable> --version` probe; the executable is mounted read-only |
 | Network dependency | None at rollout time | None at rollout time: the runtime tree is built ahead of time (`build_harness_runtimes.sh`) |
 | System prompt / tools | Native mini-SWE-agent template | Keeps Claude Code's stock system prompt (`system_prompt_mode: none`) and full default tool catalog (`tools: null`); task + integrity rules ride in the user message, and safety is enforced post-hoc by the integrity scan |

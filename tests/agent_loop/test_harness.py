@@ -267,6 +267,7 @@ async def test_claude_code_uses_session_root_and_bounded_process_output() -> Non
     assert settings["permissions"]["allow"] == ["Bash(*)", "Read(*)", "Edit(*)"]
     assert settings["permissions"]["deny"] == []
     assert "defaultMode" not in settings["permissions"]
+    assert settings["env"]["CLAUDE_CODE_GATEWAY_HINT_HEADERS"] == "1"
     cli_command, cwd, env = next(item for item in sandbox.commands if "--output-format" in item[0])
     assert "--output-format stream-json" in cli_command
     assert "--permission-mode acceptEdits" in cli_command
@@ -729,7 +730,9 @@ async def test_codex_writes_responses_provider_config_and_uses_session_as_key() 
     assert "enabled = false" in codex_config  # analytics / feedback disabled
     # Hosted web_search must be off: the gateway rejects its schema and the task
     # forbids fetching the solution from the web. Must be a top-level key.
-    assert tomllib.loads(codex_config)["web_search"] == "disabled"
+    parsed = tomllib.loads(codex_config)
+    assert parsed["web_search"] == "disabled"
+    assert parsed["features"]["multi_agent"] is True
     assert harness.build_env(_runtime())["OPENAI_API_KEY"] == "session-1"
     command = harness.build_command("fix", _runtime())
     assert command[0] == "/opt/harness/bin/codex"
@@ -756,6 +759,7 @@ async def test_codex_catalog_enables_apply_patch_and_carries_base_instructions()
     assert entry["apply_patch_tool_type"] == "freeform"
     assert entry["shell_type"] == "unified_exec"
     assert entry["default_reasoning_level"] == "high"
+    assert entry["multi_agent_version"] == "v1"
     assert entry["model_messages"]["instructions_template"] == _base_instructions()
     assert _base_instructions().strip() != ""
 
@@ -978,3 +982,33 @@ def test_the_abort_path_can_name_a_dict_request() -> None:
 
     assert _request_id_of({"uid": 7}) == "7"
     assert _request_id_of({}) == "N/A"
+
+
+@pytest.mark.asyncio
+async def test_codex_disabled_subagents_emit_no_multi_agent_surface() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(
+        HarnessConfig(kind="codex", executable="codex", subagents_enabled=False),
+        sandbox,
+    )
+
+    await harness.prepare(_runtime())
+
+    catalog = json.loads(sandbox.writes["/root/.codex/model_catalog.json"])
+    assert catalog["models"][0]["multi_agent_version"] is None
+    config = tomllib.loads(sandbox.writes["/root/.codex/config.toml"].decode())
+    assert "features" not in config
+
+
+@pytest.mark.asyncio
+async def test_claude_code_disabled_subagents_keep_the_agent_deny_rule() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(
+        HarnessConfig(kind="claude_code", executable="claude", subagents_enabled=False),
+        sandbox,
+    )
+
+    await harness.prepare(_runtime())
+
+    settings = json.loads(sandbox.writes["/root/.claude/settings.json"])
+    assert settings["permissions"]["deny"] == ["Agent"]

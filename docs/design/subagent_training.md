@@ -630,12 +630,14 @@ extra_fields = {
 #### Advantage
 
 `compute_advantage_for_multi_trajectories()` prefers the row with
-`session_primary=True` for the session advantage. If the field is absent, it
-keeps the current behavior and uses the last row.
+`session_primary=True` for the session advantage. When several rows carry the
+same marker (legacy loops emit no marker), the latest trajectory index wins, as
+before.
 
-`session_primary` must travel in the TransferQueue non-tensor fields. The
-trainer's field selection in `ray_trainer.py` gains it next to `uid` and
-`parent_id`.
+`session_primary` and `loss_weight` are emitted for every rollout row with
+defaults `True` and `1.0`. The TransferQueue reads a field for the whole batch,
+so a field that only some loops emit would fail the batch rather than fall back.
+`ray_trainer.py` selects both next to `uid` and `parent_id`.
 
 #### Loss and reward
 
@@ -644,7 +646,8 @@ trainer's field selection in `ray_trainer.py` gains it next to `uid` and
   reward as the main agent.
 - `loss_agg_mode=session-mean-token-mean` is recommended. `uid` identifies the
   session and `T_s` counts only mask 1 tokens. Shared prefix tokens appear in
-  mask 1 only in the owner row, so they are counted once.
+  mask 1 only in the owner row, so they are counted once. The per-row
+  `loss_weight` multiplies that row's share of the session mean.
 - `group_baseline_valid_only` excludes zero-mask rows from the group baseline.
 - `n_trajectory` is the number of trainable rows, not the number of leaves.
 
@@ -661,11 +664,9 @@ psrl:
       mode: main_only
       # Used only by selected. Exact agent ids or simple prefix patterns.
       train_agents: []
-      # auto resolves to full for trainable agents and tokens for the rest.
-      capture: auto
-      # owner is the only supported value for training.
+      # owner is the only supported value for training. context is diagnostic.
       shared_prefix: owner
-      # session | per_agent. per_agent is reserved.
+      # session is the only implemented value. per_agent is reserved and rejected.
       reward: session
       # Applied to the session-weighted loss. Both default to 1.0.
       loss_weight:
@@ -673,7 +674,16 @@ psrl:
         subagent: 1.0
       # Fail when a trainable trajectory has no training payload.
       require_primary_capture: true
+      # Validation selection. Validation captures tokens only.
+      val_mode: main_only
+      # v2 background drain budget; unused in the first version.
+      background_drain_timeout_s: 300
 ```
+
+The capture mode is not a config field. It is derived per call: `full` for a
+trainable agent, `tokens` for an untrained or auxiliary call, and `tokens` for
+every validation call. `all` and `selected` put more than one row in one
+session, so config validation requires `psrl.agentic_rl.batch_agg_mode=request`.
 
 A dataset row may override the mode:
 
@@ -694,17 +704,17 @@ native role metadata.
 
 #### Codex
 
-- Enable subagent generation. `CodexHarness._model_catalog()` currently sets
-  `multi_agent_version = None`, and `HarnessConfig.subagents_enabled` is not
-  wired into the Codex adapter. Set the catalog's multi-agent fields to the
-  values the installed CLI supports, and map `subagents_enabled` to them.
+- Enable subagent generation. The adapter writes `multi_agent_version = "v1"`
+  when `subagents_enabled` is true and `null` when it is false, and adds
+  `[features] multi_agent = true`. Codex 0.164 honors both; the live episode
+  spawned a subagent with the namespaced v1 tool.
 - Keep the provider on the session URL. Codex applies one `model_provider` to
   the main agent and its subagents, so no per-agent URL override is needed. A
   harness that lets a subagent select another provider must force the session
   provider.
 - Keep `x-codex-turn-metadata` on every call. `thread_source` is the role
-  marker. A stable `thread_id` and parent id improve agent selection, and the
-  trajectory id plus the TITO tree are the fallback.
+  marker. The router reads `thread_id` as the stable agent id and the parent
+  thread id when present. The TITO tree is the fallback parent.
 - The turn budget already counts subagent calls separately. No change.
 
 #### Claude Code
@@ -911,10 +921,12 @@ The deterministic rules are:
   `thread_source=main`, not the lowest or highest trajectory id.
 - **Duplicate agent ids are retries.** If the same agent id appears on two
   leaves, the later leaf is live and the earlier leaf is protected or excluded
-  by the dead-leaf rule. The extraction selects the live leaf per agent id.
-- **Concurrent non-main threads.** A non-subagent call whose agent id differs
-  from the main is auxiliary unless it declares a parent. This prevents a
-  second primary row.
+  by the dead-leaf rule. Extraction also keeps only the highest trajectory id
+  for an identified main or subagent, so a retry or a compaction never emits two
+  rows for the same agent.
+- **Concurrent non-main threads.** Once a main call has been seen, a later
+  main-labeled call with a different agent id is auxiliary unless it declares a
+  parent (then it is a subagent). This prevents a second primary row.
 
 The request aggregation keeps the rows of one session together. Parallel
 branches add rows, not samples.
@@ -996,6 +1008,9 @@ The session body policy must be visible to extraction and offline analysis.
   accounting.
 - `TitoSessionData`, or the PSRL session snapshot wrapper, carries the policy
   and the per-trajectory `TrajectoryMeta`.
+- The session view also carries `main_agent_id`. It is session state rather than
+  policy: compaction resolution needs the parent identity the session actually
+  observed.
 - Extraction uses the snapshot policy when present and falls back to the
   current config only for legacy sessions.
 - Test: a snapshot with a policy different from the current config selects the
@@ -1093,23 +1108,111 @@ designed.
 
 ## 11. Implementation phases
 
-| Phase | Scope | Exit criterion |
+| Phase | Scope | State | Evidence |
+|---|---|---|---|
+| 0 | Contract: all four headers, session body policy, SMG fields, SessionRouter normalization, snapshot dump, both capture modes. | Done | Rust tests cover the store fields and capture merge. A live Codex episode shows role, agent id, parent, owner, and capture in the snapshot. |
+| 1 | First landing: `main_only`, four headers active, `tokens` for untrained subagents and auxiliary calls, owner-aware masks, token-only extraction, routed-expert zero-row padding, the first-version correctness fixes in section 10. | Done | A live subagent episode produces one main row. Its token-only subagent has no logprobs or routed experts, and its next turn still completes. |
+| 2 | `all` and `selected`, `session_primary`, request-aggregated multi-row advantage and session loss weights. | Done | Live `all` episodes produce one row per trainable agent. Unit tests pin the advantage selection and the session-weighted loss. Config validation refuses `all`/`selected` outside request aggregation. |
+| 3 | v2 designs: background and async drain, workspace isolation, compact tree snapshot, per-agent reward and credit, shared-prefix forward if measurement justifies it. | Not started | Section 10 designs are the input to the next phase. |
+
+Phase 1 is the first landing. Phase 2 is implemented in the same landing because
+`all` and `selected` reuse the same extraction, selection, and policy plumbing;
+the only new requirement is request aggregation, which the config validator now
+enforces.
+
+Phase 3 is the v2 design set. It is not part of this landing.
+
+### 11.1 Measured results
+
+These are the checks that exercised the implementation. Conditions are kept
+because a capture or extraction result is only meaningful with them.
+
+**Test suites.** `cargo test -p smg-tito` passes 97 unit tests and 8 engine
+tests. `cargo test -p smg --lib` passes 1350 tests. The Python suites
+`tests/tito`, `tests/nixl/test_session_loss_agg.py`,
+`tests/trainer/test_group_baseline.py`, `tests/trainer/test_chunk_manager.py`,
+`tests/config/test_subagent_training_config.py`, and
+`tests/agent_loop/test_harness.py` cover the extraction, policy, router,
+advantage, loss, and adapter changes. That combined Python run passes 180 tests.
+
+**Live stack, synthetic client.** Qwen2.5-0.5B-Instruct on one H20, a vLLM gRPC
+worker, SMG with TITO, and the SessionRouter in process. The client drove two
+main turns and two subagent turns that share the main prefix.
+
+| Case | Rows | Prompt | Response | Mask | Turns | Distribution |
+|---|---|---|---|---|---|---|
+| `main_only`, main | 1 | 40 | 48 | 34 | 2 | n/a (disabled sampler) |
+| `all`, main | 1 | 40 | 53 | 39 | 2 | n/a |
+| `all`, subagent | 1 | 75 | 36 | 21 | 2 | n/a |
+
+The subagent prompt includes the shared main prefix; its response contains only
+its own turns. The router sent `tokens` for the subagent in `main_only` and
+`full` in `all`.
+
+**Sampler capture.** The same stack with `SamplerCapture(mode="topk", budget=8)`
+produced sampler distributions whose lengths matched the main (52 responses, 38
+masked) and subagent (36 responses, 21 masked) rows exactly. `strict_validation`
+accepted both.
+
+**Capture cost and payload.** Six subagent turns on the same stack, with the
+same seeds:
+
+| Capture | Median turn latency | Snapshot size |
 |---|---|---|
-| 0 | Contract: all four headers, session body, SMG fields, SessionRouter normalization, snapshot dump. Both `full` and `tokens` capture modes are implemented. | A Codex subagent episode shows role, owner, and capture in the snapshot. Existing tests pass. |
-| 1 | First landing: `main_only`, all four headers active, `tokens` for untrained subagents and auxiliary calls, owner-aware masks, token-only extraction, routed-expert zero-row padding, the first-version correctness fixes in section 10, tests. | A subagent episode produces one training row. An untrained subagent snapshot has no logprobs or routed experts, and its next turn still works. The main path has the correct masks. |
-| 2 | `all` and `selected`, `session_primary`, request-aggregated multi-row advantage and loss | A shared prefix token is mask 1 exactly once. The session loss matches the expected total. |
-| 3 | v2 designs: background and async drain, workspace isolation, compact tree snapshot, per-agent reward and credit, shared-prefix forward if measurement justifies it | Each item is designed in section 10 and approved before implementation. |
+| `tokens` | 0.157 s | 6,484 bytes |
+| `full` + top-8 sampler | 0.159 s | 19,747 bytes |
 
-Phase 1 is the first landing. It covers all four headers, both capture modes,
-the first-version correctness fixes in section 10, and the token-only
-extraction path. There is no separate token-only phase.
+Token-only storage is 3.05x smaller on the wire for this six-turn subagent. The
+turn latency is within noise on a dense 0.5B model with 16-token generations;
+the engine still computes sampled-token logprobs. The benefit that scales is
+the stored payload and the omitted sampler and routed-expert collection, not
+short-turn decode time.
 
-Phase 2 adds trainable subagents. It relies on request aggregation as described
-in section 10.1.
+**Real harness episodes.** Codex 0.164.0 and Claude Code 2.1.295, each against
+the same SMG and SessionRouter with a Qwen3-8B worker and a 32768-token context.
+Both prompts asked the model to delegate through its subagent tool. Both
+harnesses spawned one subagent.
 
-Phase 3 is the v2 design set. It is not part of the first landing.
+| Harness | Main agent | Main rows | Main prompt / response / mask / turns | Subagent agent | Subagent prompt / response / mask / turns |
+|---|---|---|---|---|---|
+| Codex | catalog `multi_agent_version=v1` | 1 | 9195 / 1709 / 1009 / 3 | native `thread_id` | 7017 / 250 / 250 / 1 |
+| Claude Code | `main` | 1 | 15425 / 2729 / 1493 / 3 | native `agent-id` | 9573 / 486 / 486 / 1 |
+
+`main_only` selected one row and `all` selected two in both snapshots. The
+subagent's `parent_agent_id` was the main agent in both. `parent_trajectory_id`
+was absent because these subagents started a fresh context rather than sharing
+the main prefix; the explicit parent agent id is what identifies them. The Codex
+snapshot carried the main `thread_id` as its agent id, proving the native
+metadata was normalized; the Claude Code subagent carried its native agent id,
+proving `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` exposed the request-class and
+identity headers.
+
+**Extraction cost.** A synthetic 40-turn main trajectory with 2560 response
+tokens took 0.56 ms in the owner-aware builder and 0.57 ms in the legacy path.
+The builder is linear in tokens; the ownership checks add no measurable cost at
+this scale.
+
+**Not exercised live.** Routed-expert capture needs a model with experts. The
+dense models above cannot produce it. The assembler is covered by unit tests
+for gaps, overlap, out-of-range starts, metadata mismatch, and zero-fill; a
+live MoE episode is the remaining check before production. Compaction is
+covered by the classification and policy tests and by the existing TITO
+branching tests, but the live harness episodes did not force a compaction.
+
+The live synthetic check is reproducible with `tests/tito/live_subagent_e2e.py`.
+It expects a vLLM gRPC worker on port 51051 unless
+`PSRL_TITO_E2E_START_VLLM=1` is set:
+
+```bash
+PSRL_TITO_E2E_MODEL=/models/Qwen3-8B \
+PSRL_TITO_E2E_MAX_MODEL_LEN=32768 \
+CUDA_VISIBLE_DEVICES=0 python tests/tito/live_subagent_e2e.py
+```
 
 ## 12. Testing
+
+The unit suites cover the behavior below. The live checks in section 11.1 cover
+the end-to-end contract.
 
 SMG:
 
@@ -1119,7 +1222,9 @@ SMG:
   keep `output_token_ids`.
 - A shared node appears in `trajectory_ids` for every path and has one owner.
 - The snapshot round-trips the new fields.
-- `drop_dead_leaves` keeps live subagent leaves.
+- `drop_dead_leaves` keeps live subagent leaves. `trajectory_leaves` is the
+  protection set, so a live leaf is never dead even when it is not the newest
+  node in the tree.
 
 PSRL:
 
@@ -1132,7 +1237,8 @@ PSRL:
 - A token-only node is mask 0 in every sample.
 - `session_primary` selects the main row for the advantage.
 - A legacy snapshot without metadata matches the current extraction.
-- `session-mean-token-mean` counts the shared prefix once.
+- `session-mean-token-mean` counts the shared prefix once, and the per-row
+  `loss_weight` scales each session share.
 - Request aggregation with one main and several subagent rows keeps the request
   as one chunk and one sample.
 - A subagent sample uses the first owned record's prompt as `prompt_ids` and
@@ -1141,11 +1247,12 @@ PSRL:
   sequence zero-fills the gap. A tokens final turn and a tokens-only trajectory
   are also covered.
 - Parallel subagents get distinct trajectory ids and stable agent ids.
-- A nested subagent's parent is the parent trajectory, not the session main.
+- A nested subagent's parent is the parent agent or the parent trajectory, not
+  the session main.
 - A subagent compaction follows the subagent's trainability, not the main's.
 - `drop_dead_leaves` keeps the latest live leaf per agent.
 - Validation scores the primary by default and can include subagents when
-  `val_mode` selects them.
+  `val_mode` selects them. Validation turns capture tokens only.
 - A snapshot with a persisted policy selects rows from the snapshot, not from a
   different current config.
 
@@ -1157,30 +1264,34 @@ Integration:
 - Run one training step with `main_only` and one with `all`.
 - Run one parallel and one nested subagent episode.
 - Run one compaction episode for the main and one for a subagent.
+- Run one MoE episode to exercise live routed-expert capture.
 
 ## 13. Open questions
 
-1. Does the Codex version in use put a stable `thread_id` and a parent thread id
-   in `x-codex-turn-metadata`? If it does not, the fallback agent id is the
-   trajectory id and the parent is derived from the tree.
+1. Resolved: Codex 0.164 emits a stable thread id and the parent thread id; the
+   live Codex episode normalized both. A subagent that starts a fresh context
+   has no tree-derived `parent_trajectory_id`; its explicit parent agent id is
+   the authority.
 2. Resolved: the harness runtime pins Claude Code 2.1.295 or newer. That version
    emits `x-claude-code-request-class`, `x-claude-code-agent-type`,
    `x-claude-code-agent-id`, and `x-claude-code-parent-agent-id`. The Claude
    Code adapter must set `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`.
 3. Resolved: the session policy travels in the `POST /sessions` body, not in a
    header.
-4. Does the deployed gateway rebuild from the vendored SMG source in
-   `third_party/smg`? The implementation assumes it does.
+4. Resolved: the gateway is rebuilt from the modified SMG source before a run.
+   The live checks used the rebuilt binding.
 5. Should `output_token_ids` be emitted for `Full` records as well? This design
    emits it to keep the extraction uniform. It can be dropped for `Full` records
    later if wire size matters.
-6. Does the Codex version in use support the catalog's `multi_agent_version`
-   field and the subagent feature? If it does not, Codex training keeps the
-   strict default and cannot exercise this design.
+6. Resolved: Codex 0.164 honors the catalog's `multi_agent_version`; `v1` plus
+   `[features] multi_agent = true` produced a live subagent call.
 7. What default should `subagent_training.background_drain_timeout_s` use? It
-   depends on the harness and the task budget.
+   depends on the harness and the task budget. The first version sets 300 s but
+   does not yet use it.
 8. Should the first version disable `tito_drop_dead_leaves` for subagent
    sessions, or implement the per-agent protected-leaf rule in the store?
+   `trajectory_leaves` already protects every live leaf, including a subagent
+   leaf and its parent chain; no change is needed for the first version.
 9. Which isolation level is acceptable for parallel subagents: per-agent
    directory convention, per-agent worktree, or a sandbox per agent?
 10. Should the compact tree snapshot be a new `format` field or a separate

@@ -1030,6 +1030,12 @@ scores. A subagent that finishes after the main agent's last turn cannot have
 influenced that turn, so the session reward carries no credit for it. Training
 it would reinforce arbitrary tokens.
 
+The artifact boundary is part of that definition. Under logical isolation the
+main collector reads only the main directory, so a post-main subagent's writes
+to its own directory cannot enter the scored artifact. A deployment that lets a
+post-main subagent write the scored artifact has a broken attribution boundary:
+it must either exclude those writes or stop using the session reward for them.
+
 Design:
 
 - The harness episode summary reports subagent lifecycle: started, finished,

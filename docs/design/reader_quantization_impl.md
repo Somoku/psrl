@@ -136,8 +136,8 @@ peer-diffusion semantics; the designate writes the scale before the wave is sign
   combinations 1->2, 2->2, 4->2, and 2->4, a second version that replaces every
   FP8 byte and scale, and exact-shard peer diffusion (one upstream BF16 read per
   key/shard-set group, followers read the designate's FP8 weight and scale).
-- CPU regression: 93 tests pass across the pull engine, publish-format config,
-  write-gate config, and write-state suites.
+- CPU regression: 877 tests pass across the full `tests/unit` and CPU-marked
+  `tests/nixl` suites (8 skipped, 668 deselected GPU/other tests).
 - GPU FP8 quantizer: 46 tests pass, including bit and scale equality with vLLM's
   block quantizer and the full quantize/requantize round trip.
 - Full GPU training end-to-end: not completed in this environment. Two-node and

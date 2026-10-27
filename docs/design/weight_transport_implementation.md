@@ -926,7 +926,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | **D1 _DONE barrier 删除** | ✅ | ✅ `pull_engine.py` | L1 60 tests pass；`_DONE` 信号不解锁任何操作（follower 在收到 `_DONE` 前已完成自己所有 peer 读，buffer 生命周期由外部调度控制）；`peer_timeout_s` 保留用于 `_READY` 等待 |
 > | D2 `holder_index` | ✅ | ❌ 零 import | L1；多模型隔离改由客户端名承担（§11.1） |
 > | D3 `nixl_direct` | ✅ | ✅ | L2 ✅ 31 格，L3 ✅，**PS 未删** |
-> | **R1 reader-side FP8（Megatron）** | ✅ `client.py` + `pull_engine.py` | ✅ `psrl.nixl.reader_quantization=true` | L1 ✅ 5 条 reader-quant（1→2 / 2→2 / 4→2 / 2→4，两版本，exact-shard peer）+ 93 条 pull/config/state 回归；GPU 量化器与 vLLM 等价 46 条通过；完整 L2 训练 e2e 在本环境未完成（vLLM 启动/放置/OOM），性能数字待补；trainer 不分配 publish copy，scale 由 reader 派生；canonical chunk cache 留待 phase 2 |
+> | **R1 reader-side FP8（Megatron）** | ✅ `client.py` + `pull_engine.py` | ✅ `psrl.nixl.reader_quantization=true` | L1 ✅ 5 条 reader-quant（1→2 / 2→2 / 4→2 / 2→4，两版本，exact-shard peer）+ 全量 CPU suite 877 passed / 8 skipped；GPU 量化器与 vLLM 等价 46 条通过；完整 L2 训练 e2e 在本环境未完成（vLLM 启动/放置/OOM），性能数字待补；trainer 不分配 publish copy，scale 由 reader 派生；canonical chunk cache 留待 phase 2 |
 > | D4 单向标记 | ✅ | ✅ `ray_trainer.py` | L2 ✅ |
 > | D4 `holder_roles` / bootstrap | ✅ | ❌ 零 import | L1 |
 > | D5 `chunk_offset` | ✅ | ❌ 零 import | L1 |

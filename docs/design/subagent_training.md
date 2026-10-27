@@ -1139,6 +1139,8 @@ tests. `cargo test -p smg --lib` passes 1350 tests. The Python suites
 `tests/config/test_subagent_training_config.py`, and
 `tests/agent_loop/test_harness.py` cover the extraction, policy, router,
 advantage, loss, and adapter changes. That combined Python run passes 180 tests.
+`tests/trainer/test_session_loss.py` adds 11 policy-loss, entropy, and KL tests
+when the vendored verl checkout is present.
 
 **Live stack, synthetic client.** Qwen2.5-0.5B-Instruct on one H20, a vLLM gRPC
 worker, SMG with TITO, and the SessionRouter in process. The client drove two

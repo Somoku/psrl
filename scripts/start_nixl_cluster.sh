@@ -40,10 +40,38 @@ done
 "${RAY_BIN}" stop --force > /dev/null 2>&1
 sleep 5
 
-echo "=== starting head on ${HEAD_IP} ==="
+echo "=== checking network profile ==="
 # shellcheck disable=SC1090
 source "${ENV_SH}"
 unset http_proxy https_proxy
+
+# UCX device selection is per cluster, not per node: a static list that spans several
+# RoCE rails is only usable where the rails are mutually routable. Forwarding the
+# caller's override makes `PSRL_UCX_NET_DEVICES=bond1 scripts/start_nixl_cluster.sh ...`
+# apply to every node, including the workers that do not inherit this shell.
+UCX_ENV=""
+if [ -n "${PSRL_UCX_NET_DEVICES:-}" ]; then
+    UCX_ENV="export PSRL_UCX_NET_DEVICES=${PSRL_UCX_NET_DEVICES};"
+fi
+
+# A split device list is worse than a slow one. NIXL resolves a peer's UCX endpoints
+# during the notification handshake; an address present on only one side is tried and
+# times out before the control message is delivered (`NIXL_ERR_NOT_FOUND` at the
+# PSManager, thirty seconds per endpoint). The same profile must be sourced everywhere.
+HEAD_UCX="${UCX_NET_DEVICES:-}"
+for ip in "${WORKERS[@]}"; do
+    worker_ucx=$(timeout 60 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$ip" \
+        "${UCX_ENV} source ${ENV_SH} >/dev/null 2>&1; printf '%s' \"\${UCX_NET_DEVICES:-}\"" 2>/dev/null)
+    if [ "${worker_ucx}" != "${HEAD_UCX}" ]; then
+        echo "ERROR: UCX_NET_DEVICES differs between nodes" >&2
+        echo "  head ${HEAD_IP}: ${HEAD_UCX}" >&2
+        echo "  node ${ip}: ${worker_ucx}" >&2
+        echo "Source the same cluster profile on every node, or set PSRL_UCX_NET_DEVICES for all." >&2
+        exit 1
+    fi
+done
+
+echo "=== starting head on ${HEAD_IP} ==="
 if ! timeout 240 "${RAY_BIN}" start --head \
         --node-ip-address="${HEAD_IP}" --port="${PORT}" --num-gpus="${GPUS}" \
         2>&1 | grep -q "Ray runtime started"; then
@@ -54,7 +82,7 @@ fi
 for ip in "${WORKERS[@]}"; do
     echo "=== joining ${ip} ==="
     joined=$(timeout 260 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$ip" \
-        "source ${ENV_SH} >/dev/null 2>&1; unset http_proxy https_proxy; \
+        "${UCX_ENV} source ${ENV_SH} >/dev/null 2>&1; unset http_proxy https_proxy; \
          ${VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR:+export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=${VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR};} \
          timeout 200 ${RAY_BIN} start --address='${HEAD_IP}:${PORT}' --num-gpus=${GPUS} 2>&1 \
          | grep -c 'Ray runtime started'" 2>/dev/null | tail -1)

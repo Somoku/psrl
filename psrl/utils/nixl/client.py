@@ -1741,7 +1741,10 @@ class NIXLStorageClient:
             # Refresh local temp descriptors so later reads use current buffers.
             self._all_temp_mappings[self.client_name] = self._temp_desc_bytes_mapping
 
-            psrl_logger.info(f"{self.client_name} all local tensors are registered.")
+            psrl_logger.info(
+                f"{self.client_name} all local tensors are registered. "
+                f"node_ip={self.local_client_info.node_ip} gpu_id={self.local_client_info.node_gpu_id}"
+            )
 
     def _within_copy_budget(
         self,

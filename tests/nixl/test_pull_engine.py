@@ -959,6 +959,22 @@ def test_reader_quantization_pulls_bf16_and_quantizes_in_place(train_tp, gen_tp)
     _judge_fp8(cluster, version=8)
 
 
+def test_reader_quantization_peer_diffusion_shares_training_reads_across_separate_instances():
+    """Four separate TP1 rollout instances on one node share one designate per key.
+
+    Each instance is its own NIXL client wanting the identical, unsharded tensor --
+    the deployment shape measured on real hardware in the GPU validation run, where
+    this grouping did not trigger. The planner is verified correct here; a live run
+    is needed to confirm what differs in the actual deployment (see the "Measured
+    status" note in docs/design/reader_quantization_impl.md).
+    """
+    cluster = _fp8_cluster(4, 1, instances=4, peer_diffusion=True, reader_quantization=True)
+    reports = cluster.pull(epoch=1)
+    _judge_fp8(cluster, version=7)
+    assert sum(r.peer_keys for r in reports.values()) > 0
+    assert all(r.followers or r.peer_keys for r in reports.values())
+
+
 def test_reader_quantization_peer_diffusion_shares_training_reads():
     """One designate per key group reads BF16 and quantizes; followers read FP8."""
     cluster = _fp8_cluster(2, 2, instances=2, peer_diffusion=True, reader_quantization=True)

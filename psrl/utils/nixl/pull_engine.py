@@ -1239,9 +1239,14 @@ class NIXLPullEngine:
         """
         info = self.client.all_client_infos.get(source)
         if info is None:
+            psrl_logger.debug(f"{self.client.client_name}: {source!r} has no entry in all_client_infos.")
             return False
         tensor = info.tensor_infos.get(key)
         if tensor is None or not tensor.read_addrs:
+            psrl_logger.debug(
+                f"{self.client.client_name}: {source!r} has no read_addrs for {key!r} "
+                f"(tensor is None: {tensor is None})."
+            )
             return False
         positions = {shard: index for index, shard in enumerate(tensor.sharding.shard_indices)}
         return all(

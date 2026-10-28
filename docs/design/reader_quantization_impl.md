@@ -245,23 +245,29 @@ transport side's descriptor and registration count independent of expert count.
   `RAY_DEDUP_LOGS=0` rules this out: all four replicas report the identical
   `node_ip=29.162.247.148`. The gap is confirmed to be somewhere else in what
   the live multi-process deployment feeds the planner, since the planning
-  algorithm itself is verified correct in isolation with matching inputs, and
-  a CPU run that queries `comm_plan.get_peer_group` directly after the pull
-  (bypassing `_assign`) also returns the full 4-member group from every
-  client's perspective. `pull_engine._assign` and `comm_plan._make_peer_groups`
-  now log the resolved peer group and candidate-group sizes at `DEBUG`, but a
-  fourth run with `PSRL_LOGGING_LEVEL=DEBUG` set before launch produced zero
-  `DEBUG:` lines anywhere in the log -- the cluster's shared environment file
-  (sourced by `scripts/nixl_env.sh` when starting the head/worker Ray daemons)
-  hardcodes `PSRL_LOGGING_LEVEL=INFO`, and since that sourcing happens at `ray
-  start` time it is baked into the raylet's own environment and inherited by
-  every actor it spawns afterward -- a launch-shell export reaches only the
-  driver process, the same inheritance point that the `LOCAL_NODE_IP` and
-  `UCX_NET_DEVICES` fixes earlier in this document had to go through. The
-  fourth run still reproduced the same zero-peer-bytes result, so the logging
-  gap is itself the only thing still unverified; the next attempt needs
-  `PSRL_LOGGING_LEVEL=DEBUG` exported before `ray start`, not just before the
-  training script.
+  algorithm itself is verified correct in isolation with matching inputs. Five
+  independent clean runs reproduce the same zero-peer-bytes result.
+  `pull_engine._assign` and `comm_plan._make_peer_groups` now log the resolved
+  peer group and candidate-group sizes at `DEBUG` (the level must be exported
+  before `ray start`, not just before the training script, because the
+  cluster's shared environment file is sourced when the head/worker Ray
+  daemons start and is what every actor inherits from -- the same inheritance
+  point the `LOCAL_NODE_IP` and `UCX_NET_DEVICES` fixes earlier in this
+  document had to go through). With that captured, both sides agree with the
+  CPU case: the server forms every one of 651 candidate groups with exactly 4
+  wanters, and `pull_engine._assign` reads back the full 4-member group for
+  every key on every client. The gap is downstream of both of those -- in
+  `_source_readable`, which rejects every peer without logging either of its
+  two early-return reasons (no entry in `all_client_infos`, or a tensor with no
+  `read_addrs` at all). That leaves exactly one place left to fail: a
+  `read_addrs` entry that is present but `None` for a specific shard index,
+  which is what `register_local_tensors(..., meta_only=True)` writes
+  (`client.py`, where `meta_only` appends `None` per shard instead of a real
+  address). `vllm_extension.py`'s `nixl_protocol` sets its own `meta_only` from
+  whether its role's `full_tag` resolves to `"full"` or `"meta"` -- the next
+  step is to log that resolution (and the relevance filter in
+  `_get_relevant_client_names_for_agent`) for this specific `n_rollout_
+  instances=4` topology, not to add another guess about the planner.
 - MoE: a grouped-expert-shaped key (3-D, expert axis unsharded, trailing two
   dims cut by TP) quantizes bit for bit and scale for scale through the real
   reader-quantization path (`quantize_into` -> `tile_of`) across train/gen TP

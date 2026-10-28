@@ -6,11 +6,16 @@ analyzing network topology and tensor distribution to generate optimal
 PUSH_SIDE to PS and PULL_SIDE from PS communication plans.
 """
 
+import logging
+import os
 import pickle
 from dataclasses import dataclass, field
 
 from psrl.utils.nixl.global_vars import GLOBAL_TOPOLOGY
 from psrl.utils.nixl.nixl_spec import NIXLClientInfo, NIXLClientType
+
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 @dataclass
@@ -265,6 +270,12 @@ class CommunicationPlanner:
                 tensor_info = info.tensor_infos[key]
                 positions = {s: i for i, s in enumerate(tensor_info.sharding.shard_indices)}
                 key_bytes[(pull_client, key)] = sum(tensor_info.get_shard_size_bytes(positions[s]) for s in shards)
+
+        psrl_logger.debug(
+            f"Peer-diffusion candidate groups: {len(wanted)} total, "
+            f"{sum(1 for w in wanted.values() if len(w) >= 2)} with >= 2 wanters, "
+            f"sizes {sorted({len(w) for w in wanted.values()})}."
+        )
 
         upstream_load: dict[str, int] = {}
         groups: dict[str, dict[str, tuple[str, ...]]] = {}

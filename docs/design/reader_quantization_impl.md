@@ -245,11 +245,14 @@ transport side's descriptor and registration count independent of expert count.
   `RAY_DEDUP_LOGS=0` rules this out: all four replicas report the identical
   `node_ip=29.162.247.148`. The gap is confirmed to be somewhere else in what
   the live multi-process deployment feeds the planner, since the planning
-  algorithm itself is verified correct in isolation with matching inputs. Next
-  step for whoever picks this up: log `comm_plan.get_peer_group(me, key)`'s
-  resolved value from inside a live `pull_engine._assign` call (not just the
-  registration-time `node_ip`), since every other input to the grouping key
-  checks out by this point.
+  algorithm itself is verified correct in isolation with matching inputs, and
+  a CPU run that queries `comm_plan.get_peer_group` directly after the pull
+  (bypassing `_assign`) also returns the full 4-member group from every
+  client's perspective. `pull_engine._assign` and `comm_plan._make_peer_groups`
+  now log the resolved peer group and candidate-group sizes at `DEBUG`
+  (`PSRL_LOGGING_LEVEL=DEBUG`); the next real run should capture that output
+  to see which side -- the plan the server built, or what `_assign` read back
+  for these specific clients -- actually differs from the CPU case.
 - MoE: a grouped-expert-shaped key (3-D, expert axis unsharded, trailing two
   dims cut by TP) quantizes bit for bit and scale for scale through the real
   reader-quantization path (`quantize_into` -> `tile_of`) across train/gen TP

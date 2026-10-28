@@ -1204,6 +1204,9 @@ class NIXLPullEngine:
                     continue
                 # A weight key uses the ordinary peer grouping. The designate reads
                 # BF16 upstream and quantizes; a follower reads its FP8 output.
+                psrl_logger.debug(
+                    f"{me}: peer group for {key!r} is {plan.get_peer_group(me, key)!r}."
+                )
                 live = [w for w in plan.get_peer_group(me, key) if w == me or participates(w)]
                 if len(live) >= 2 and local is not None:
                     shards = list(local.sharding.shard_indices)

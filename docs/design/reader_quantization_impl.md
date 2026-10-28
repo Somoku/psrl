@@ -234,18 +234,22 @@ transport side's descriptor and registration count independent of expert count.
   reproduction of the exact shape (`train_tp=4, gen_tp=1, instances=4,
   reader_quantization=True`) elects a designate per key and gives every other
   instance a peer read, as intended (`test_reader_quantization_peer_diffusion_
-  shares_training_reads_across_separate_instances`). The GPU run above did not
+  shares_training_reads_across_separate_instances`). The GPU run above does not
   show this: all four replicas read the full 16.38 GB upstream with zero peer
-  bytes, reproduced across repeated clean runs. Since the planning algorithm is
-  verified correct in isolation, the gap is in what the live multi-process
-  deployment feeds it. Ray's log deduplication collapsed the per-replica
-  `node_ip=...` diagnostic added this round across replicas sharing a template,
-  which hid the one value (each replica's advertised `node_ip`, set once per
-  process from `LOCAL_NODE_IP`/`get_local_ip()` in
+  bytes, reproduced across three independent clean runs. A same-node `node_ip`
+  mismatch was the leading suspect (each replica's advertised `node_ip` is set
+  once per process from `LOCAL_NODE_IP`/`get_local_ip()` in
   `psrl/utils/nixl/network_topology.py`, read inside vLLM's per-GPU spawned
-  worker subprocess rather than the parent actor) most likely to explain it.
-  The next real run should set `RAY_DEDUP_LOGS=0` to see all four values before
-  changing the election logic.
+  worker subprocess rather than the parent actor, and Ray's log deduplication
+  had hidden the per-replica values in earlier runs). Re-running with
+  `RAY_DEDUP_LOGS=0` rules this out: all four replicas report the identical
+  `node_ip=29.162.247.148`. The gap is confirmed to be somewhere else in what
+  the live multi-process deployment feeds the planner, since the planning
+  algorithm itself is verified correct in isolation with matching inputs. Next
+  step for whoever picks this up: log `comm_plan.get_peer_group(me, key)`'s
+  resolved value from inside a live `pull_engine._assign` call (not just the
+  registration-time `node_ip`), since every other input to the grouping key
+  checks out by this point.
 - MoE: a grouped-expert-shaped key (3-D, expert axis unsharded, trailing two
   dims cut by TP) quantizes bit for bit and scale for scale through the real
   reader-quantization path (`quantize_into` -> `tile_of`) across train/gen TP

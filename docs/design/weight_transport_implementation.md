@@ -926,7 +926,7 @@ def assert_matches_global_coord(key, tensor, global_offset, dtype_tol): ...
 > | **D1 _DONE barrier 删除** | ✅ | ✅ `pull_engine.py` | L1 60 tests pass；`_DONE` 信号不解锁任何操作（follower 在收到 `_DONE` 前已完成自己所有 peer 读，buffer 生命周期由外部调度控制）；`peer_timeout_s` 保留用于 `_READY` 等待 |
 > | D2 `holder_index` | ✅ | ❌ 零 import | L1；多模型隔离改由客户端名承担（§11.1） |
 > | D3 `nixl_direct` | ✅ | ✅ | L2 ✅ 31 格，L3 ✅，**PS 未删** |
-> | **R1 reader-side FP8（Megatron）** | ✅ `client.py` + `pull_engine.py` | ✅ `psrl.nixl.reader_quantization=true` | L1 ✅ 5 条 reader-quant（1→2 / 2→2 / 4→2 / 2→4，两版本，exact-shard peer）+ 全量 CPU suite 877 passed / 8 skipped；GPU 量化器与 vLLM 等价 46 条通过；完整 L2 训练 e2e 在本环境未完成（vLLM 启动/放置/OOM），性能数字待补；trainer 不分配 publish copy，scale 由 reader 派生；canonical chunk cache 留待 phase 2 |
+> | **R1 reader-side FP8（Megatron）** | ✅ `client.py` + `pull_engine.py` | ✅ `psrl.nixl.reader_quantization=true` | L1 ✅ 5 条 reader-quant（1→2 / 2→2 / 4→2 / 2→4，两版本，exact-shard peer）+ 全量 CPU suite 877 passed / 8 skipped；GPU 量化器与 vLLM 等价 46 条通过；**L2 两节点 8B 实测**（Megatron TP4×2DP → vLLM TP1×4）：握手 4.63s，首次拉取每副本 16.38GB（= 活体 BF16 模型，非压缩副本），trainer 每卡 13.5-13.7GiB（无额外 publish copy 可见增量）；**未完成训练 step**——生成请求在 rollout gateway 侧挂死（4 个 backend 均报 healthy/load=0，但 vLLM 引擎输入队列全程为空），与 `reader_quantization` 本身无关（直连 gateway 复现），另案跟踪；**同节点多实例 peer diffusion 未生效**（4 副本各自拉取全量 16.38GB，0 peer bytes）——CPU 复现同形状（`train_tp=4,gen_tp=1,instances=4`）peer 选举正确，疑为真实部署中各副本的 `node_ip`（由每进程的 `LOCAL_NODE_IP`/`get_local_ip()` 决定，读取发生在 vLLM 每卡 spawn 出的 worker 子进程内）未如预期一致，待下次实测加日志定位；canonical chunk cache 留待 phase 2 |
 > | D4 单向标记 | ✅ | ✅ `ray_trainer.py` | L2 ✅ |
 > | D4 `holder_roles` / bootstrap | ✅ | ❌ 零 import | L1 |
 > | D5 `chunk_offset` | ✅ | ❌ 零 import | L1 |

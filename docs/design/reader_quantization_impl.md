@@ -53,6 +53,16 @@ Validation rules:
 - Quantization tiles must be whole in the trainer shards. A configuration that cuts
   a 128x128 tile is rejected at registration, as in the current publisher.
 
+### Network profile
+
+Every node must source the same UCX profile before Ray starts. A split device list is
+worse than a slow one: NIXL resolves a peer's UCX endpoints during the notification
+handshake, and an address present on only one side is tried and times out before the
+control message is delivered. The PSManager then raises `NIXL_ERR_NOT_FOUND`.
+`scripts/start_nixl_cluster.sh` compares `UCX_NET_DEVICES` on all nodes and refuses to
+start on a mismatch. On rail-isolated clusters, pass one list for all nodes through
+`PSRL_UCX_NET_DEVICES`; do not configure the head by hand.
+
 ## Data flow
 
 ```text
@@ -140,10 +150,32 @@ peer-diffusion semantics; the designate writes the scale before the wave is sign
   `tests/nixl` suites (8 skipped, 668 deselected GPU/other tests).
 - GPU FP8 quantizer: 46 tests pass, including bit and scale equality with vLLM's
   block quantizer and the full quantize/requantize round trip.
-- Full GPU training end-to-end: not completed in this environment. Two-node and
-  single-node attempts reached configuration validation, model construction, and
-  vLLM engine startup. They then hit environment-level blockers: vLLM startup
-  latency beyond the test window, a colocated validation KV-cache OOM, and a NIXL
-  handshake timeout. No end-to-end latency or trainer-HBM number is claimed here.
+- GPU two-node weight transport (8B, Megatron TP4 x2 DP -> vLLM TP1 x4 instances,
+  `reader_quantization=true`): the NIXL handshake, sharding exchange, and the
+  first PS-to-rollout pull completed on real hardware once every node sourced the
+  same UCX device list (see "Network profile" above). The handshake took 4.63 s.
+  Each rollout replica pulled 16.38 GB upstream -- the live BF16 model, not a
+  cast or compressed copy, confirming the trainer published no FP8 snapshot. The
+  trainer ranks held 13.5-13.7 GiB each afterward, in the range of plain Megatron
+  TP4 training memory with no separate FP8 publish allocation visible. The run
+  did not reach a completed training step: rollout generation stalled indefinitely
+  after the pull, with the rollout gateway reporting every backend healthy and
+  idle (zero load) while the vLLM engine's own input queue stayed empty. This is
+  a generation-dispatch fault in the serving layer the gateway sits on, reproduced
+  with a direct request to the gateway and independent of `reader_quantization`;
+  it is tracked separately from this transport design.
+- Peer diffusion for this topology (4 same-node rollout instances, each its own
+  NIXL client, all wanting the identical unsharded tensor): a CPU-level
+  reproduction of the exact shape (`train_tp=4, gen_tp=1, instances=4,
+  reader_quantization=True`) elects a designate per key and gives every other
+  instance a peer read, as intended. The GPU run above did not show this: all
+  four replicas read the full 16.38 GB upstream with zero peer bytes. Since the
+  planning algorithm is verified correct in isolation, the gap is in what the
+  live multi-process deployment feeds it (most likely each replica's advertised
+  `node_ip`, set once per process from `LOCAL_NODE_IP`/`get_local_ip()` -- see
+  `psrl/utils/nixl/network_topology.py` -- and read inside vLLM's per-GPU spawned
+  worker subprocess, not the parent actor). Needs a real run with the comm plan's
+  resolved `node_ip` per client logged to confirm before changing the election
+  logic.
 - Canonical-chunk cache across different rollout layouts: not implemented. Exact
   shard groups are shared; different target layouts quantize independently.

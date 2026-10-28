@@ -249,10 +249,19 @@ transport side's descriptor and registration count independent of expert count.
   a CPU run that queries `comm_plan.get_peer_group` directly after the pull
   (bypassing `_assign`) also returns the full 4-member group from every
   client's perspective. `pull_engine._assign` and `comm_plan._make_peer_groups`
-  now log the resolved peer group and candidate-group sizes at `DEBUG`
-  (`PSRL_LOGGING_LEVEL=DEBUG`); the next real run should capture that output
-  to see which side -- the plan the server built, or what `_assign` read back
-  for these specific clients -- actually differs from the CPU case.
+  now log the resolved peer group and candidate-group sizes at `DEBUG`, but a
+  fourth run with `PSRL_LOGGING_LEVEL=DEBUG` set before launch produced zero
+  `DEBUG:` lines anywhere in the log -- the cluster's shared environment file
+  (sourced by `scripts/nixl_env.sh` when starting the head/worker Ray daemons)
+  hardcodes `PSRL_LOGGING_LEVEL=INFO`, and since that sourcing happens at `ray
+  start` time it is baked into the raylet's own environment and inherited by
+  every actor it spawns afterward -- a launch-shell export reaches only the
+  driver process, the same inheritance point that the `LOCAL_NODE_IP` and
+  `UCX_NET_DEVICES` fixes earlier in this document had to go through. The
+  fourth run still reproduced the same zero-peer-bytes result, so the logging
+  gap is itself the only thing still unverified; the next attempt needs
+  `PSRL_LOGGING_LEVEL=DEBUG` exported before `ray start`, not just before the
+  training script.
 - MoE: a grouped-expert-shaped key (3-D, expert axis unsharded, trailing two
   dims cut by TP) quantizes bit for bit and scale for scale through the real
   reader-quantization path (`quantize_into` -> `tile_of`) across train/gen TP

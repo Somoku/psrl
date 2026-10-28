@@ -477,7 +477,10 @@ def _fp8_cluster(
             declared = {k: _sharding(d, gen_tp, r) for k, (s, d) in MODEL.items()}
             for key in FP8_KEYS:
                 state[key] = torch.zeros(state[key].shape, dtype=torch.float8_e4m3fn)
-                state[key + "_scale_inv"] = torch.zeros(scale_shape(state[key].shape, scale_tile), dtype=torch.float32)
+                padded_tile = (1,) * (state[key].dim() - 2) + tuple(scale_tile)
+                state[key + "_scale_inv"] = torch.zeros(
+                    scale_shape(state[key].shape, padded_tile), dtype=torch.float32
+                )
                 declared[key + "_scale_inv"] = copy.deepcopy(declared[key])
                 declared[key + "_scale_inv"].scale_tile = scale_tile
             cluster.states[name], cluster.declared[name] = state, declared
@@ -984,3 +987,24 @@ def test_reader_quantization_peer_diffusion_shares_training_reads():
     # have two shard sets each, and the norm has one => 7 upstream keys. Scales are derived.
     assert sum(r.upstream_keys for r in reports.values()) == 7
     assert sum(r.peer_keys for r in reports.values()) > 0
+
+
+@pytest.mark.parametrize("train_tp,gen_tp", [(1, 2), (2, 2), (4, 2), (2, 4)])
+def test_reader_quantization_tiles_a_grouped_moe_shaped_key(monkeypatch, train_tp, gen_tp):
+    """A 3-D grouped-expert tensor quantizes bit for bit, same as a dense 2-D one.
+
+    `VllmFp8BlockQuantizer.tile_of` pads leading dims with 1, so each expert's
+    trailing 2-D slice gets its own independent block tile -- quantizing a
+    `(experts, out, in)` tensor is the same per-slice math as `(out, in)`, just
+    repeated down an unsharded leading axis. This is the production reader-side
+    path (`pull_engine._quantize_scatter` -> `quantize_into` -> `tile_of`), not
+    the test fixture's own tiling helper, so it exercises the real code.
+    """
+    moe_key = "layers.0.experts.gate_up_proj.weight"
+    model = dict(MODEL)
+    model[moe_key] = ((4, HIDDEN, INTER), 2)
+    monkeypatch.setattr(f"{__name__}.MODEL", model)
+    monkeypatch.setattr(f"{__name__}.FP8_KEYS", FP8_KEYS + [moe_key])
+    cluster = _fp8_cluster(train_tp, gen_tp, instances=1, peer_diffusion=True, reader_quantization=True)
+    cluster.pull(epoch=1)
+    _judge_fp8(cluster, version=7)

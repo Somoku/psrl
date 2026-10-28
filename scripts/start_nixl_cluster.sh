@@ -32,13 +32,35 @@ HEAD_IP="$1"; shift
 WORKERS=("$@")
 
 echo "=== stopping any previous cluster ==="
+# `ray stop` only reaps processes it can find through its own session bookkeeping.
+# A head start that died partway through (the session-name race in
+# `Node._write_cluster_info_to_kv`, seen when a previous attempt's gcs_server/raylet
+# were not fully torn down before the next one claimed the port) leaves orphans that
+# bookkeeping never learns about, so `ray stop` silently does nothing to them and the
+# next `ray start --head` reaches the same race again. Killing the known process
+# names directly is what actually frees the port.
+KILL_CMD='pkill -9 -f "ray/core/src/ray/gcs/gcs_server"; pkill -9 -f "ray/core/src/ray/raylet/raylet"; pkill -9 -f "ray/dashboard"; pkill -9 -f "runtime_env/agent"; true'
 for ip in "$HEAD_IP" "${WORKERS[@]}"; do
+    # `ray stop --force` itself can hang (observed waiting past 90s against a node
+    # whose previous session died mid-start), so it gets its own short budget rather
+    # than sharing the outer timeout -- otherwise a hung `ray stop` eats the whole
+    # budget and the pkill fallback after it never runs. The pkill commands are
+    # inlined rather than shipped as a `declare -f` function body: that round-trips
+    # through this script's own quoting, the ssh argv, and the remote shell, and the
+    # nesting is exactly the kind of thing that breaks silently rather than loudly.
     timeout 90 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -n "$ip" \
-        "${RAY_BIN} stop --force >/dev/null 2>&1; true" 2>/dev/null \
-        || "${RAY_BIN}" stop --force >/dev/null 2>&1
+        "timeout 15 ${RAY_BIN} stop --force >/dev/null 2>&1; ${KILL_CMD}" \
+        </dev/null >/dev/null 2>&1 || true
 done
-"${RAY_BIN}" stop --force > /dev/null 2>&1
+timeout 15 "${RAY_BIN}" stop --force > /dev/null 2>&1 || true
+eval "${KILL_CMD}" > /dev/null 2>&1
 sleep 5
+
+if timeout 10 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -n "$HEAD_IP" \
+        "ss -ltn 2>/dev/null | grep -q ':${PORT} '" 2>/dev/null; then
+    echo "ERROR: port ${PORT} on ${HEAD_IP} is still bound after cleanup" >&2
+    exit 1
+fi
 
 echo "=== checking network profile ==="
 # shellcheck disable=SC1090

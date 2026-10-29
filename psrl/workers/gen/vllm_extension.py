@@ -260,7 +260,13 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         participants = None
         if allowed is not None:
             plan = self.nixl_storage_client.comm_plan
-            peers = {w for groups in plan.peer_groups.values() for wanters in groups.values() for w in wanters}
+            peers = {
+                w
+                for per_key in plan.peer_groups.values()
+                for per_shard in per_key.values()
+                for wanters in per_shard.values()
+                for w in wanters
+            }
             participants = {name for name in peers if gen_client_instance(name) in allowed}
             participants.add(self.nixl_storage_client.client_name)
         try:

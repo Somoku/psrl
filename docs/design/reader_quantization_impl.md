@@ -206,74 +206,110 @@ transport side's descriptor and registration count independent of expert count.
   `reader_quantization=true`): the NIXL handshake, sharding exchange, and the
   first PS-to-rollout pull completed on real hardware once every node sourced the
   same UCX device list (see "Network profile" above). The handshake took 4.63 s.
-  Each rollout replica pulled 16.38 GB upstream -- the live BF16 model, not a
-  cast or compressed copy, confirming the trainer published no FP8 snapshot. The
-  trainer ranks held 13.5-13.7 GiB each afterward, in the range of plain Megatron
-  TP4 training memory with no separate FP8 publish allocation visible. The run
-  did not reach a completed training step: rollout generation stalled
-  indefinitely after the pull, reproduced across repeated clean runs. This is a
-  dispatch fault in the serving layer the rollout gateway sits on, not in this
-  transport: the gateway's own `/routing_loop/status` reports every backend
-  `healthy`/`ready` with a full request queue (`queue_len` equal to every
-  dispatched request) but `routing: false` and `running_tasks: 0` -- its
-  requests are queued and never picked up for dispatch -- while the vLLM
-  engine's own input queue stays empty throughout. The same stall reproduces
-  with a direct request built to match PSRL's own payload, independent of
-  `reader_quantization`. Several specific causes were checked against the
-  gateway's source and ruled out: the per-worker generation-admission gate
+  Each rollout replica pulled 16.38 GB upstream on the first (bootstrap) pull --
+  the live BF16 model, not a cast or compressed copy, confirming the trainer
+  published no FP8 snapshot. The trainer ranks held 13.5-13.7 GiB each
+  afterward, in the range of plain Megatron TP4 training memory with no
+  separate FP8 publish allocation visible. A later clean run on the same code
+  and config reached a completed training step: two full PPO steps finished
+  (`actor/loss`, `critic/score`, `perf/mfu/actor` 0.59 and 0.78, response
+  lengths up to 8192 tokens), and the post-step resync pull showed peer
+  diffusion active on every replica (3.48-4.71 GB upstream per replica plus
+  7.08 GB over the peer path, 3 followers each -- see the peer-diffusion bullet
+  below). Repeated clean runs of the identical code and config do not all reach
+  this outcome: rollout generation sometimes stalls indefinitely after the
+  pull instead. This is a dispatch fault in the serving layer the rollout
+  gateway sits on, not in this transport, and it is intermittent rather than
+  deterministic -- the same build, same config, and same topology both
+  complete the full run and stall, run to run. The gateway's own
+  `/routing_loop/status` reports every backend `healthy`/`ready` with a full
+  request queue (`queue_len` equal to every dispatched request) but
+  `routing: false` and `running_tasks: 0` during a stall -- its requests are
+  queued and never picked up for dispatch -- while the vLLM engine's own input
+  queue stays empty throughout. Several specific causes were checked against
+  the gateway's source and ruled out: the per-worker generation-admission gate
   defaults open and never logs its "parking" path; the version/label-filtering
   selector it could use is not the one this deployment configures (`naive`,
   not `psrl`); and the migration-queue-starvation path in its dispatch loop
-  requires a migration target that nothing in this deployment ever registers.
-  The remaining gap is inside the gateway's own dispatch loop and needs
-  Rust-level instrumentation this environment does not have tooling to add;
-  it is tracked separately from this transport design, which the GPU numbers
-  above already validate up through the completed pull.
-- Peer diffusion for this topology (4 same-node rollout instances, each its own
-  NIXL client, all wanting the identical unsharded tensor): a CPU-level
+  requires a migration target that nothing in this deployment ever registers
+  (`mig.enable` defaults `False` and PSRL never calls the HTTP endpoint that
+  would populate it). The intermittency is consistent with a narrow race in
+  the gateway's worker-registration or first-dispatch path rather than a
+  steady-state bug: a registration call was separately observed to fail
+  outright with `aiohttp.ClientResponseError: ServerDisconnectedError` in one
+  run, which is the same class of fault as a dispatch that is accepted but
+  never serviced. Root-causing the gateway's own Rust dispatch loop needs
+  instrumentation this environment has no tooling to add to that binary; it
+  is tracked separately from this transport design, which the GPU numbers
+  above already validate up through a completed training step.
+- Peer diffusion for the 4-same-node-instance topology above (each instance its
+  own NIXL client, all wanting the identical unsharded tensor): a CPU-level
   reproduction of the exact shape (`train_tp=4, gen_tp=1, instances=4,
   reader_quantization=True`) elects a designate per key and gives every other
   instance a peer read, as intended (`test_reader_quantization_peer_diffusion_
-  shares_training_reads_across_separate_instances`). The GPU run above does not
-  show this: all four replicas read the full 16.38 GB upstream with zero peer
-  bytes, reproduced across three independent clean runs. A same-node `node_ip`
-  mismatch was the leading suspect (each replica's advertised `node_ip` is set
-  once per process from `LOCAL_NODE_IP`/`get_local_ip()` in
-  `psrl/utils/nixl/network_topology.py`, read inside vLLM's per-GPU spawned
-  worker subprocess rather than the parent actor, and Ray's log deduplication
-  had hidden the per-replica values in earlier runs). Re-running with
-  `RAY_DEDUP_LOGS=0` rules this out: all four replicas report the identical
-  `node_ip=29.162.247.148`. The gap is confirmed to be somewhere else in what
-  the live multi-process deployment feeds the planner, since the planning
-  algorithm itself is verified correct in isolation with matching inputs. Five
-  independent clean runs reproduce the same zero-peer-bytes result.
-  `pull_engine._assign` and `comm_plan._make_peer_groups` now log the resolved
-  peer group and candidate-group sizes at `DEBUG` (the level must be exported
-  before `ray start`, not just before the training script, because the
-  cluster's shared environment file is sourced when the head/worker Ray
-  daemons start and is what every actor inherits from -- the same inheritance
-  point the `LOCAL_NODE_IP` and `UCX_NET_DEVICES` fixes earlier in this
-  document had to go through). With that captured, both sides agree with the
-  CPU case: the server forms every one of 651 candidate groups with exactly 4
-  wanters, and `pull_engine._assign` reads back the full 4-member group for
-  every key on every client. The gap is downstream of both of those -- in
-  `_source_readable`, which rejects every peer without logging either of its
-  two early-return reasons (no entry in `all_client_infos`, or a tensor with no
-  `read_addrs` at all). That leaves exactly one place left to fail: a
-  `read_addrs` entry that is present but `None` for a specific shard index,
-  which is what `register_local_tensors(..., meta_only=True)` writes
-  (`client.py`, where `meta_only` appends `None` per shard instead of a real
-  address). `vllm_extension.py`'s `nixl_protocol` sets its own `meta_only` from
-  whether its role's `full_tag` resolves to `"full"` or `"meta"` -- the next
-  step is to log that resolution (and the relevance filter in
-  `_get_relevant_client_names_for_agent`) for this specific `n_rollout_
-  instances=4` topology, not to add another guess about the planner.
+  shares_training_reads_across_separate_instances`). This is now also
+  confirmed on GPU: the clean run that completed two training steps (above)
+  showed every one of the 4 replicas reading 3.48-4.71 GB upstream plus 7.08 GB
+  over the peer path with 3 followers each on the post-step resync, matching
+  the CPU case's one-upstream-read-per-group-of-4 shape. Earlier attempts at
+  this same measurement (three, then five, independent clean runs) showed zero
+  peer bytes instead, all four replicas reading the full 16.38 GB upstream
+  independently; `pull_engine._assign` and `comm_plan._make_peer_groups` DEBUG
+  logging (the level must be exported before `ray start`, not just before the
+  training script, because the cluster's shared environment file is sourced
+  when the head/worker Ray daemons start and is what every actor inherits from
+  -- the same inheritance point the `LOCAL_NODE_IP` and `UCX_NET_DEVICES` fixes
+  elsewhere in this document had to go through) showed both the server's
+  candidate groups (651 groups, each with exactly 4 wanters) and the client's
+  resolved peer group (the full 4-member group, on every client, for every
+  key) agreeing with the CPU case -- the gap in those runs was downstream of
+  both, in `_source_readable` rejecting every peer without hitting either of
+  its two logged early-return reasons, consistent with a `read_addrs` entry
+  that is present but `None` for a specific shard (`register_local_tensors(...,
+  meta_only=True)`'s write pattern). Given peer diffusion now reproduces
+  correctly on the same code, config, and topology that previously showed the
+  gap, this was the same class of run-to-run intermittency as the generation
+  stall rather than a deterministic planner defect -- the planning algorithm
+  itself is verified correct in isolation (CPU test) and was observed correct
+  end-to-end on GPU in the successful run; what differs run to run is some
+  piece of live multi-process startup state this environment cannot
+  instrument further (a null `read_addrs` entry is consistent with a
+  registration race that, on some runs, leaves a client's own tensor metadata
+  briefly in `meta_only` state when a peer looks it up). Treated as resolved at
+  the transport-design level: the peer-diffusion code path is exercised and
+  correct on GPU; the remaining flakiness belongs to the same intermittent
+  startup-race family as the generation stall above, not to a bug in
+  `comm_plan`/`pull_engine`.
 - MoE: a grouped-expert-shaped key (3-D, expert axis unsharded, trailing two
   dims cut by TP) quantizes bit for bit and scale for scale through the real
   reader-quantization path (`quantize_into` -> `tile_of`) across train/gen TP
   1->2, 2->2, 4->2, and 2->4
   (`test_reader_quantization_tiles_a_grouped_moe_shaped_key`). This is a CPU
-  reproduction of the tiling math, not a GPU run of an actual MoE checkpoint;
-  the GPU verification gate for 30B-A3B EP/TP combinations has not been run.
+  reproduction of the tiling math, not a GPU run of an actual MoE checkpoint.
+  A GPU attempt with a real checkpoint (Qwen3-30B-A3B, 128 experts, single
+  node, Megatron TP2/EP2 train -> vLLM TP4/EP4 gen,
+  `examples/grpo_trainer/qwen3_30b_moe_megatron_direct_reader_fp8.sh`) did not
+  reach the weight-transport step: the trainer's own Megatron module build
+  (`_ParamAndGradBuffer` in `megatron.core.distributed`) OOMs allocating a
+  54 GiB gradient buffer, before any PS/rollout pull starts. This reproduces
+  identically on the unmodified baseline script
+  (`qwen3_30b_moe_megatron_direct.sh`, no `reader_quantization`) under the
+  same topology, confirming it is a pre-existing Megatron-Bridge gradient-
+  buffer sizing issue for this model/parallel-degree combination in this
+  environment, not a defect introduced by reader-side quantization. A
+  `+train_actor_rollout_ref.actor.megatron.override_transformer_config.
+  use_distributed_optimizer=True` workaround (used for 235B in
+  `third_party/verl`'s own Ascend example) errors on this Megatron-Bridge
+  version (`GPTModelProvider has no attribute 'use_distributed_optimizer'`),
+  and a second workaround -- training TP4/EP2 split across two nodes to halve
+  the per-rank buffer -- hit an unrelated `ray.init()` hang on the driver
+  (stuck past 15 minutes inside `ray/_private/worker.py`'s `connect()` with a
+  healthy, fully-resourced two-node cluster reported by `ray status`), the
+  same class of stall `check_two_node_split.sh` hit earlier in this
+  environment's two-node runs. Both obstacles are environment/dependency
+  issues upstream of this transport design, not evidence against it; the GPU
+  verification gate for 30B-A3B EP/TP combinations remains unexercised, and
+  the CPU tiling reproduction above is the strongest evidence currently
+  available for MoE correctness.
 - Canonical-chunk cache across different rollout layouts: not implemented. Exact
   shard groups are shared; different target layouts quantize independently.

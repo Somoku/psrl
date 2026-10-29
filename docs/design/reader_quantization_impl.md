@@ -11,9 +11,12 @@ parameters and quantizes into its own FP8 parameters. Readers may retry when a
 write gate preempts them. The existing per-shard version stamps and torn detection
 remain the correctness boundary.
 
-This is the first phase of design 7.2. It implements reader-side quantization with
-the existing per-shard sharding algebra. The canonical-chunk peer cache (cross-layout
-sharing of one FP8 chunk) is phase 2.
+This is design 7.2 in two phases. Phase 1 implements reader-side quantization with
+the existing per-shard sharding algebra. Phase 2 adds cross-layout sharing (one
+finest shard's quantized bytes reused by readers of a different TP/EP degree, not
+only readers with an identical whole shard set); both phases are implemented, see
+"Phase 2: peer diffusion / canonical chunks" below for what it covers and how it was
+validated.
 
 ## Why phase 1 is correct
 
@@ -100,7 +103,7 @@ quantizes the weight, and writes its scale. A follower reads the designate's FP8
 and derived `_scale_inv` over NVLink. The scale key shares its weight key's wave. This
 removes the repeated BF16 read and quantization for identical target shards. Different
 target layouts form different groups and still quantize independently; the
-layout-independent canonical-chunk cache is phase 2.
+layout-independent canonical-chunk cache is phase 2 (implemented, see below).
 
 ## Version and failure behavior
 
@@ -114,20 +117,90 @@ layout-independent canonical-chunk cache is phase 2.
 
 ## Phase 2: peer diffusion / canonical chunks
 
-Phase 1 shares quantized results only across readers with identical target shards. Phase 2 will
-add the canonical-chunk relay described in design 7.2:
+Phase 1 shared quantized results only across readers whose whole shard set for a key
+matched exactly -- the same TP/EP degree. Phase 2 shares across readers whose shard
+sets never match as wholes but overlap on individual shards, the gap a mixed
+deployment (or elastic scaling mid-run) leaves open: a node running vLLM TP4 and TP2
+rollouts for the same model re-read and re-quantized BF16 independently under phase 1
+even though the TP4 instance's one shard is literally part of what the TP2 instance
+needs.
 
-- Group readers by `(version, logical chunk, scale scheme)` instead of exact shard sets.
-- Let the first reader quantize a layout-independent FP8 chunk into a bounded cache.
-- Followers read the cached FP8 chunk and slice their target layout.
-- The cache is bounded (K chunks), evicts, and is version/generation tagged.
-- No designate process is added; the first holder is the existing peer planner's
-  first reader for that chunk.
+The abstract sketch this section used to carry ("group by logical chunk... a bounded
+cache... followers slice their target layout") turned out not to need a new mechanism
+at all. The server's `_unify_role` already runs every client's sharding through
+`NIXLSharding.find_finest_shard_mesh` / `refactor_based_on_finer_shard_mesh`
+(`nixl_spec.py`) before planning -- unconditionally, for every direct-supply pull, not
+only when peer diffusion or reader quantization is on. So every client already
+expresses its shard needs in one global finest-mesh coordinate system, and "logical
+chunk" is simply **one individual finest-mesh shard**. "The bounded cache" is simply
+**the designate's own already-resident local FP8 shard** for that one finest index:
+bounded by construction (same size class as any reader's own shard) and already
+living exactly as long as the designate instance does, so no separate cache data
+structure or eviction policy was needed either.
 
-Phase 1 shares the designate's derived scale through the same peer wave as its
-weight. A follower whose target shard differs cannot reuse it; that is the case the
-canonical-chunk cache will cover. Version stamps on rollout holders are the existing
-peer-diffusion semantics; the designate writes the scale before the wave is signalled.
+What changed:
+
+- `comm_plan.CommunicationPlanner._make_peer_groups` groups wanters per individual
+  finest-mesh shard instead of per a reader's whole shard set. Shards that happen to
+  share the *identical* wanter set (the common case: every shard of a key, same
+  readers throughout -- what phase 1's whole-key grouping always was) are first
+  re-coalesced into one election unit, so the greedy load balancer cannot split a
+  byte-identical pair across two different designates purely from processing order --
+  that would fragment one peer read into two for no cross-layout benefit. A shard
+  whose wanter set genuinely differs (the phase 2 case) is still elected independently.
+  `NIXLCommPlan.peer_groups` is now `{client: {key: {shard: designate_tuple}}}`; the
+  2-arg `get_peer_group(client, key)` became the required-shard 3-arg
+  `get_peer_group(client, key, shard)`, with `get_peer_shards` and
+  `peer_group_members` added for the two call sites that only needed flattened
+  membership, not shard precision.
+- `pull_engine.NIXLPullEngine._assign` elects a designate per shard via a shared
+  `_elect` helper (collapsing three near-duplicate branches -- scale key, reader-quant
+  weight key, plain key -- into one). `peer`'s shape changed from `{designate: [key,
+  ...]}` to `{key: {source: shards}}`, made symmetric with `upstream`'s existing
+  shape, so one key's shards can come from a mix of upstream and one or more
+  different peer designates in the same assignment. `_prepare_pool` and `_pull`'s
+  wave construction and late/lost-designate fallbacks were updated to the same shape;
+  the fallback paths re-fetch a whole key upstream when any of its shards' designates
+  is late or dies mid-read (simple and safe, at the cost of possibly re-reading a
+  shard whose own designate was in fact fine), rather than the more intricate
+  precise-per-shard rerouting.
+- A derived scale key has no election of its own: for each shard, it defers entirely
+  to its weight key's designate at that same shard coordinate (the server deep-copies
+  the weight's already-unified sharding onto the scale key, so the coordinate spaces
+  agree) -- matching the existing "the designate writes the scale before the wave is
+  signalled" invariant, now per shard instead of per whole key.
+- `registration_policy.sources_by_reader` moves one shard at a time from its
+  upstream-derived source to its peer designate, rather than blanket-replacing a
+  key's whole source map with one designate; `descriptor_readers_by_source` adds a
+  descriptor reader under every distinct designate a key's shards resolve to, since
+  that can now be more than one.
+
+What stayed out of scope, deliberately: `_pick_holder` and `_repair_after_preempt`
+(post-preemption fault recovery) still look for one same-node holder whose shard set
+*fully covers* what a reader needs, not an assembly from several partial holders.
+This is a rare, latency-sensitive path whose existing fallback ("no holder, wait for
+the next version") is already safe; extending it to per-shard assembly is deferred
+until production telemetry shows it actually missing holders that assembly would
+have found.
+
+**Measured.** A new CPU unit test
+(`test_different_target_layouts_share_an_individual_shard`,
+`tests/nixl/test_peer_diffusion_plan.py`) pins the core claim directly: two same-node
+clients with different TP degrees for one key share a designate for the individual
+shard they overlap on, even though their whole shard sets never match. A new CPU
+integration test (`test_reader_quantization_shares_across_different_gen_layouts_on_one_
+node`, `tests/nixl/test_pull_engine.py`) runs the real reader-quantization path with
+three same-node layout groups (vLLM TP4, TP2, TP2) against one train_tp=4 trainer:
+every quantized byte and scale checked bit-exact, every group's instances show
+`peer_keys > 0`, and total upstream bytes across the node measure less than the
+model's own size times the number of layouts (3x independent vs 1x shared, since the
+4 distinct finest shards are each read upstream exactly once regardless of how many
+layouts want a piece of them). The full `tests/unit` (97 passed, 1 skipped) and
+CPU-marked `tests/nixl` (815 passed, 7 skipped, 641 deselected GPU/other) suites pass
+unchanged alongside it -- phase 2's shape is a strict refinement of phase 1's, and
+every existing single-layout test still exercises the same grouping it always did.
+GPU verification of this phase (a real mixed-TP deployment on one node) has not been
+run; the CPU integration test above is the strongest evidence of correctness so far.
 
 ## Supported matrix (phase 1)
 
@@ -357,5 +430,7 @@ transport side's descriptor and registration count independent of expert count.
   verification gate for 30B-A3B EP/TP combinations remains unexercised, and
   the CPU tiling reproduction above is the strongest evidence currently
   available for MoE correctness.
-- Canonical-chunk cache across different rollout layouts: not implemented. Exact
-  shard groups are shared; different target layouts quantize independently.
+- Canonical-chunk cache across different rollout layouts (phase 2): implemented and
+  CPU-validated -- see "Phase 2: peer diffusion / canonical chunks" above for the
+  mechanics and the measured result. GPU verification with a real mixed-TP
+  deployment on one node has not been run.

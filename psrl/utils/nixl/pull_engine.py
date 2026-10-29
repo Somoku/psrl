@@ -1025,7 +1025,7 @@ class NIXLPullEngine:
                 moved += 1
         return out, moved, missing
 
-    def _prepare_pool(self, upstream: dict[str, dict[str, list]], peer: dict[str, list[str]]) -> None:
+    def _prepare_pool(self, upstream: dict[str, dict[str, list]], peer: dict[str, dict[str, list]]) -> None:
         """Allocate the staging pool for the largest item this pull can plan.
 
         Building every planned spec up front is cheap (they are cached by `(source, key)`)
@@ -1033,7 +1033,6 @@ class NIXLPullEngine:
         through mid-pull take-over can still ask for more; that path keeps the in-flight
         handle protection in `_ensure_pool`.
         """
-        tensors = self.client.local_client_info.tensor_infos
         need = 0
 
         def consider(source: str, key: str, shards: list) -> None:
@@ -1042,15 +1041,16 @@ class NIXLPullEngine:
             for item in spec.staged:
                 need = max(need, _aligned(item.nbytes))
 
-        for key, per_source in upstream.items():
-            for source, shards in per_source.items():
-                consider(source, key, shards)
-        for source, keys in peer.items():
-            for key in keys:
-                local = tensors.get(key)
-                if local is None:
-                    continue
-                consider(source, key, list(local.sharding.shard_indices))
+        # `peer` has the same `{key: {source: shards}}` shape as `upstream` now that
+        # designates are elected per shard rather than per whole key, so one loop
+        # considers both -- and, critically, both read the shard list from the mapping
+        # itself rather than re-deriving it, which is what keeps every call site that
+        # can reach the same `(source, key)` pair (`_spec`'s cache key) agreeing on
+        # exactly the same shards for that pair.
+        for mapping in (upstream, peer):
+            for key, per_source in mapping.items():
+                for source, shards in per_source.items():
+                    consider(source, key, shards)
         if need:
             self._ensure_pool(need)
 
@@ -1168,7 +1168,32 @@ class NIXLPullEngine:
             repaired=True,
         )
 
-    def _assign(self, participates) -> tuple[dict[str, dict[str, list]], dict[str, list[str]], set[str]]:
+    def _elect(
+        self,
+        me: str,
+        plan,
+        participates,
+        group_key: str,
+        shard: tuple[int, ...],
+        read_key: str,
+    ) -> tuple[str | None, list[str]]:
+        """Live, readable designate for one shard's peer group, and the live members.
+
+        `group_key` is the key the peer group is attached to (a derived scale key defers
+        to its weight key's group at the same shard). `read_key` is the key
+        `_source_readable` checks readability against -- the key whose bytes are
+        actually about to be read from the candidate, which differs from `group_key`
+        exactly for a scale key (the group lives under the weight key; the read is of
+        the scale key). Returns ``(None, [])`` when there are fewer than 2 live
+        members, so the caller must fall back to reading this shard upstream itself.
+        """
+        live = [w for w in plan.get_peer_group(me, group_key, shard) if w == me or participates(w)]
+        if len(live) < 2:
+            return None, []
+        readable = [w for w in live if w == me or self._source_readable(w, read_key, [shard])]
+        return (readable[0] if readable else None), live
+
+    def _assign(self, participates) -> tuple[dict[str, dict[str, list]], dict[str, dict[str, list]], set[str]]:
         """Split this client's keys into upstream reads and reads from a designate.
 
         A peer is only eligible as the designate when this client holds its **full**
@@ -1176,60 +1201,58 @@ class NIXLPullEngine:
         make them readers (E4), and a sync over a participant subset can elect a different
         designate from the same peer group. Electing one whose addresses this client never
         loaded produces a read with no target and must fall back upstream instead.
+
+        Designates are elected per individual finest-mesh shard (phase 2's canonical
+        chunk), not per whole key: two readers whose whole shard sets for a key never
+        match (different TP/EP layouts) can still share a designate for the individual
+        shards they happen to overlap on. `peer`'s shape mirrors `upstream`'s exactly
+        (`{key: {source: shards}}`) so one key's shards can come from a mix of upstream
+        and one or more different peer designates in the same assignment.
         """
         me = self.client.client_name
         plan = self.client.comm_plan
         assert plan is not None, f"{me} has no communication plan."
         tensors = self.client.local_client_info.tensor_infos
         upstream: dict[str, dict[str, list]] = {}
-        peer: dict[str, list[str]] = defaultdict(list)
+        peer: dict[str, dict[str, list]] = {}
         followers: set[str] = set()
         reader_quantization = self.client._reader_quantization
         quantizer = self.client._quantizer
         for key, per_source in plan.rollout_pull_from_ps_plan.get(me, {}).items():
             local = tensors.get(key)
-            if reader_quantization and quantizer is not None:
-                base = quantizer.base_of_scale_key(key)
-                if base is not None:
-                    # `_scale_inv` has no upstream source. It is computed by the reader
-                    # that quantizes the weight. Followers read the designate's scale;
-                    # the designate skips both upstream and peer for this key.
-                    group_key = base if plan.get_peer_group(me, base) else key
-                    live = [w for w in plan.get_peer_group(me, group_key) if w == me or participates(w)]
-                    if len(live) >= 2 and local is not None:
-                        shards = list(local.sharding.shard_indices)
-                        readable = [w for w in live if w == me or self._source_readable(w, key, shards)]
-                        if readable and readable[0] != me:
-                            peer[readable[0]].append(key)
-                    continue
-                # A weight key uses the ordinary peer grouping. The designate reads
-                # BF16 upstream and quantizes; a follower reads its FP8 output.
-                psrl_logger.debug(
-                    f"{me}: peer group for {key!r} is {plan.get_peer_group(me, key)!r}."
-                )
-                live = [w for w in plan.get_peer_group(me, key) if w == me or participates(w)]
-                if len(live) >= 2 and local is not None:
-                    shards = list(local.sharding.shard_indices)
-                    readable = [w for w in live if w == me or self._source_readable(w, key, shards)]
-                    if readable:
-                        designate = readable[0]
-                        if designate != me:
-                            peer[designate].append(key)
-                            continue
-                        followers.update(w for w in live if w != me)
-                upstream[key] = per_source
+            base = quantizer.base_of_scale_key(key) if (reader_quantization and quantizer is not None) else None
+            if local is None:
+                if base is None:
+                    upstream[key] = per_source
                 continue
-            if len(live := [w for w in plan.get_peer_group(me, key) if w == me or participates(w)]) >= 2 and local is not None:
-                shards = list(local.sharding.shard_indices)
-                readable = [w for w in live if w == me or self._source_readable(w, key, shards)]
-                if readable:
-                    designate = readable[0]
+            shard_source = {shard: source for source, shards in per_source.items() for shard in shards}
+            if base is not None:
+                # `_scale_inv` has no upstream source. It is computed by the reader
+                # that quantizes the weight. A scale shard shards exactly like its
+                # weight (the server deep-copies the weight's already-unified sharding
+                # onto the scale key), so it defers entirely to the weight's own
+                # designate election at that shard coordinate -- no independent
+                # `_source_readable` call or ordering of its own.
+                for shard in local.sharding.shard_indices:
+                    designate, _live = self._elect(me, plan, participates, base, shard, key)
+                    if designate is not None and designate != me:
+                        peer.setdefault(key, {}).setdefault(designate, []).append(shard)
+                    # No live peer: `me` produces this shard's scale locally while
+                    # quantizing its own weight shard. Nothing to add to upstream or peer.
+                continue
+            # An ordinary weight (or non-reader-quantization) key: the designate reads
+            # this shard upstream (and quantizes it, if applicable); a follower reads
+            # the designate's output instead.
+            psrl_logger.debug(f"{me}: peer shards for {key!r} are {plan.get_peer_shards(me, key)!r}.")
+            for shard in local.sharding.shard_indices:
+                designate, live = self._elect(me, plan, participates, key, shard, key)
+                if designate is not None:
                     if designate != me:
-                        peer[designate].append(key)
+                        peer.setdefault(key, {}).setdefault(designate, []).append(shard)
                         continue
                     followers.update(w for w in live if w != me)
-            upstream[key] = per_source
-        return upstream, dict(peer), followers
+                upstream.setdefault(key, {}).setdefault(shard_source[shard], []).append(shard)
+        return upstream, peer, followers
 
     def _source_readable(self, source: str, key: str, shards: list) -> bool:
         """Whether ``source`` exposes an address for every one of ``shards`` of ``key``.
@@ -1369,7 +1392,7 @@ class NIXLPullEngine:
         self._quantize_pending = {}
         self._accounted_phases = set()
         upstream, peer, followers = self._assign(lambda c: participants is None or c in participants)
-        self._pull_keys = set(upstream) | {key for keys in peer.values() for key in keys}
+        self._pull_keys = set(upstream) | set(peer)
         # D1 version-aware source selection: keep only trainer sources that have published
         # target_version.  An empty holder set (startup, or non-direct-supply mode) is treated
         # as "no filter" so the caller never has to check whether filtering is applicable.
@@ -1393,13 +1416,10 @@ class NIXLPullEngine:
         if missing:
             raise ChunkUnavailable(self.client.client_name, missing, set(self.unavailable))
         publisher, waiter = self.client.chunk_completion_channel()
-        all_keys = list(upstream) + [key for keys in peer.values() for key in keys]
+        all_keys = list(set(upstream) | set(peer))
         wave_of = self._waves_of(all_keys)
         up_waves = [{k: v for k, v in upstream.items() if wave_of[k] == w} for w in range(self.waves)]
-        peer_waves = [
-            {d: [k for k in keys if wave_of[k] == w] for d, keys in peer.items() if any(wave_of[k] == w for k in keys)}
-            for w in range(self.waves)
-        ]
+        peer_waves = [{k: v for k, v in peer.items() if wave_of[k] == w} for w in range(self.waves)]
         # Size the staging pool before posting anything. The old lazy allocation could
         # grow the pool in a later wave, which invalidated the prepared-handle cache while
         # peer reads were in flight; pre-sizing makes that a take-over-only path.
@@ -1441,14 +1461,20 @@ class NIXLPullEngine:
 
         def peer_wave(w: int) -> tuple[list[_Handle], list]:
             """Wait for this wave's designates, start reading them, and read any late designate's keys upstream."""
-            wanted = peer_waves[w]
+            wanted = peer_waves[w]  # {key: {source: shards}}
             if not wanted:
                 return [], []
-            ready = self._await(waiter, epoch, _READY + w, set(wanted))
+            designates = {source for per_source in wanted.values() for source in per_source}
+            ready = self._await(waiter, epoch, _READY + w, designates)
+            # Read shards straight from `wanted`, not re-derived from this client's own
+            # full shard list for the key: a key's shards can now come from more than
+            # one designate, and `_spec` is cached by `(source, key)` alone, so every
+            # call site touching the same pair must agree on exactly the same shards.
             specs = [
-                self._spec(d, key, list(self.client.local_client_info.tensor_infos[key].sharding.shard_indices))
-                for d in sorted(ready)
-                for key in wanted[d]
+                self._spec(source, key, shards)
+                for key, per_source in sorted(wanted.items())
+                for source, shards in per_source.items()
+                if source in ready
             ]
             handles, copies = [], []
             if specs:
@@ -1459,14 +1485,17 @@ class NIXLPullEngine:
                 handles, copy = self._start(phase)
                 if copy is not None:
                     copies.append(copy)
-            late = set(wanted) - ready
+            late = designates - ready
             if late:
                 psrl_logger.warning(
                     f"{self.client.client_name}: designates {sorted(late)} were not ready after "
                     f"{self.peer_timeout_s}s in epoch {epoch}, reading their keys upstream."
                 )
                 plan = self.client.comm_plan.rollout_pull_from_ps_plan[self.client.client_name]
-                keys = {key: plan[key] for d in late for key in wanted[d]}
+                # Whole-key re-fetch when any of its designates is late (rather than
+                # precise per-shard-only rerouting): simple and safe, at the cost of
+                # possibly re-reading a shard whose own designate was in fact ready.
+                keys = {key: plan[key] for key, per_source in wanted.items() if late & set(per_source)}
                 stats["fallback"] += len(keys)
                 fallback = self._phase(self._upstream_specs(keys))
                 versions.update(fallback.versions)
@@ -1500,10 +1529,13 @@ class NIXLPullEngine:
         pending_peer += handles
         pending_copies += copies
         self._finish(pending_peer, pending_copies)
-        lost_designates = self.failed.intersection(peer)
+        lost_designates = self.failed.intersection(
+            {source for per_source in peer.values() for source in per_source}
+        )
         if lost_designates:
             plan = self.client.comm_plan.rollout_pull_from_ps_plan[self.client.client_name]
-            keys = {key: plan[key] for d in lost_designates for key in peer[d]}
+            # Whole-key re-fetch, same scoping as the late-designate path in `peer_wave`.
+            keys = {key: plan[key] for key, per_source in peer.items() if lost_designates & set(per_source)}
             psrl_logger.warning(
                 f"{self.client.client_name}: designates {sorted(lost_designates)} failed mid read, "
                 f"reading their {len(keys)} key(s) upstream."
@@ -1532,7 +1564,7 @@ class NIXLPullEngine:
             upstream_seconds=upstream_done - start,
             peer_seconds=end - upstream_done,
             upstream_keys=len(upstream),
-            peer_keys=sum(len(v) for v in peer.values()),
+            peer_keys=len(peer),
             fallback_keys=stats["fallback"],
             upstream_bytes=stats["upstream_bytes"],
             peer_bytes=stats["peer_bytes"],

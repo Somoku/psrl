@@ -336,6 +336,13 @@ def test_peer_reads_are_one_descriptor_per_key():
     reports = cluster.pull(epoch=1)
     for name, report in reports.items():
         if report.peer_keys:
+            tensor_infos = cluster.clients[name].local_client_info.tensor_infos
+
+            def is_designate(k):
+                shard = tensor_infos[k].sharding.shard_indices[0]
+                group = cluster.plan.get_peer_group(name, k, shard)
+                return not group or group[0] == name
+
             peer_only = (
                 report.descriptors
                 - cluster.engines[name]
@@ -344,7 +351,7 @@ def test_peer_reads_are_one_descriptor_per_key():
                         {
                             k: v
                             for k, v in cluster.plan.rollout_pull_from_ps_plan[name].items()
-                            if cluster.plan.get_peer_group(name, k)[0] == name
+                            if is_designate(k)
                         }
                     )
                 )
@@ -503,6 +510,96 @@ def _fp8_cluster(
                 cluster.states[name][key] = fp8
 
     # The server derives the trainer's scale shardings, so run its unification rather than a copy of it.
+    from psrl.utils.nixl.server import NIXLMetaServer
+
+    server = NIXLMetaServer.__new__(NIXLMetaServer)
+    server.client_sharding_dicts = {n: copy.deepcopy(d) for n, d in cluster.declared.items()}
+    server.client_unified_sharding_dicts, server.finest_shard_meshes = {}, {}
+    from psrl.utils.nixl.handshake_notif import NotifKind
+
+    server._agents_reported = {kind: set() for kind in NotifKind}
+    server._agents_reported[NotifKind.SHARDING] = set(cluster.declared)
+    server.make_unified_sharding()
+    unified = server.client_unified_sharding_dicts
+
+    cluster.clients = {}
+    for name, kind in kinds.items():
+        client = NIXLStorageClient(
+            client_name=name,
+            server_name="server",
+            use_gpu=False,
+            client_type=kind,
+            nixl_config=CONFIG,
+            binded_agent=MemcpyAgent(name, cluster.bus),
+        )
+        if kind is NIXLClientType.PUSH_SIDE:
+            client.set_publish_cast(train_dtype, torch.bfloat16)
+            client.set_publish_quantization(FP8_PLAN, reader_quantization=reader_quantization)
+        elif reader_quantization:
+            client.set_reader_quantization(FP8_PLAN)
+        client.register_local_tensors(cluster.states[name], unified[name])
+        cluster.clients[name] = client
+    if peer_diffusion:
+        _train_ranks_remote(cluster.clients)
+    infos = {name: c.local_client_info for name, c in cluster.clients.items()}
+    plan = CommunicationPlanner(peer_diffusion=peer_diffusion).make_comm_plan(infos)
+    for client in cluster.clients.values():
+        client._all_client_infos = dict(infos)
+        client._comm_plan = plan
+    cluster.plan = plan
+    cluster.gen = [n for n in cluster.clients if n.startswith("NIXLGenClient")]
+    cluster.engines = {
+        n: NIXLPullEngine(cluster.clients[n], staging_bytes=1 << 16, peer_timeout_s=5.0) for n in cluster.gen
+    }
+    return cluster
+
+
+def _fp8_cluster_mixed_layout(
+    train_tp,
+    layouts,
+    peer_diffusion,
+    train_dtype=torch.bfloat16,
+    scale_tile=BLOCK,
+    reader_quantization=True,
+):
+    """Like `_fp8_cluster`, but `layouts` gives one gen_tp per instance group instead of
+    a single uniform `gen_tp` -- the phase 2 scenario where different target layouts
+    for the same model share a node and must still find a designate per shard, even
+    though their whole shard sets never match."""
+    cluster = Cluster.__new__(Cluster)
+    cluster.bus = NotifBus()
+    cluster.declared, cluster.states = {}, {}
+    kinds = {}
+    for r in range(train_tp):
+        name = f"NIXLTrainClient_{r}"
+        kinds[name] = NIXLClientType.PUSH_SIDE
+        cluster.states[name] = _locals(MODEL, train_tp, train_dtype)
+        cluster.declared[name] = {k: _sharding(d, train_tp, r) for k, (s, d) in MODEL.items()}
+    for group, gen_tp in enumerate(layouts):
+        for r in range(gen_tp):
+            name = f"NIXLGenClient_L{group}_R{r}"
+            kinds[name] = NIXLClientType.PULL_SIDE
+            state = _locals(MODEL, gen_tp)
+            declared = {k: _sharding(d, gen_tp, r) for k, (s, d) in MODEL.items()}
+            for key in FP8_KEYS:
+                state[key] = torch.zeros(state[key].shape, dtype=torch.float8_e4m3fn)
+                padded_tile = (1,) * (state[key].dim() - 2) + tuple(scale_tile)
+                state[key + "_scale_inv"] = torch.zeros(
+                    scale_shape(state[key].shape, padded_tile), dtype=torch.float32
+                )
+                declared[key + "_scale_inv"] = copy.deepcopy(declared[key])
+                declared[key + "_scale_inv"].scale_tile = scale_tile
+            cluster.states[name], cluster.declared[name] = state, declared
+
+    def tile_of(t):
+        return (1,) * (t.dim() - 2) + BLOCK
+
+    for r in range(train_tp):
+        name = f"NIXLTrainClient_{r}"
+        fill_fp8_exact(cluster.states[name], cluster.declared[name], FP8_KEYS, tile_of, version=7)
+        rest = {k: v for k, v in cluster.states[name].items() if k not in FP8_KEYS}
+        fill_by_layout(rest, cluster.declared[name], version=7, wire_dtype=torch.bfloat16)
+
     from psrl.utils.nixl.server import NIXLMetaServer
 
     server = NIXLMetaServer.__new__(NIXLMetaServer)
@@ -987,6 +1084,38 @@ def test_reader_quantization_peer_diffusion_shares_training_reads():
     # have two shard sets each, and the norm has one => 7 upstream keys. Scales are derived.
     assert sum(r.upstream_keys for r in reports.values()) == 7
     assert sum(r.peer_keys for r in reports.values()) > 0
+
+
+def test_reader_quantization_shares_across_different_gen_layouts_on_one_node():
+    """Phase 2: a gen_tp=4 instance's one finest shard is reused by gen_tp=2 instances'
+    matching half, even though the layouts' whole shard sets never match.
+
+    train_tp=4 makes the finest mesh 4 shards per key. Three same-node layout groups
+    (TP4, TP2, TP2) each read their own shards independently without peer diffusion --
+    3x the model's worth of upstream bytes, one full copy per layout. With peer
+    diffusion, every one of the 4 distinct finest shards is read upstream exactly once
+    (by whichever rank, across any layout, is elected its designate) and shared with
+    every other rank -- in any layout -- that also needs it: 1x, not 3x.
+    """
+    cluster = _fp8_cluster_mixed_layout(
+        train_tp=4, layouts=[4, 2, 2], peer_diffusion=True, reader_quantization=True
+    )
+    reports = cluster.pull(epoch=1)
+    _judge_fp8(cluster, version=7)
+    assert sum(r.peer_keys for r in reports.values()) > 0
+    # At least one coarser-layout (L1/L2, gen_tp=2) instance got part of a key shared
+    # with a finer-layout (L0, gen_tp=4) or the other coarse layout's instance -- the
+    # whole point of phase 2, since L1/L2's whole shard sets never match L0's.
+    coarse_names = [n for n in cluster.gen if not n.startswith("NIXLGenClient_L0")]
+    assert any(reports[n].peer_keys > 0 for n in coarse_names)
+
+    def _single_layout_upstream_bytes(gen_tp):
+        single = _fp8_cluster(4, gen_tp, instances=1, peer_diffusion=False, reader_quantization=True)
+        return sum(r.upstream_bytes for r in single.pull(epoch=1).values())
+
+    independent_bytes = sum(_single_layout_upstream_bytes(gt) for gt in [4, 2, 2])
+    actual_bytes = sum(r.upstream_bytes for r in reports.values())
+    assert actual_bytes < independent_bytes
 
 
 @pytest.mark.parametrize("train_tp,gen_tp", [(1, 2), (2, 2), (4, 2), (2, 4)])

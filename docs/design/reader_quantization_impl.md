@@ -63,6 +63,19 @@ control message is delivered. The PSManager then raises `NIXL_ERR_NOT_FOUND`.
 start on a mismatch. On rail-isolated clusters, pass one list for all nodes through
 `PSRL_UCX_NET_DEVICES`; do not configure the head by hand.
 
+Concretely, on this cluster `bond1` (and its RDMA counterpart) is the only device
+that routes across racks; `bond2`-`bond9` are per-rack RoCE subnets that differ by
+rack even though every node names them identically, so two nodes in different racks
+are simply unreachable on every device but `bond1` (confirmed with `ping` -- 0%
+loss on `bond1`, 100% loss on every other bond between a cross-rack pair, 0% loss on
+all of them between a same-rack pair). The full device list still works most of the
+time because UCX's device choice for a given connection is not pinned to a specific
+one, but a cross-rack pair can hit the unreachable case on any run; see "Measured
+status" below for a reproduction. `UCX_NET_DEVICES=bond1,mlx5_bond_1:1` is the safe
+setting for a known cross-rack pair; it trades the other 15 candidate devices'
+aggregate bandwidth for determinism, so prefer a same-rack pair when both are
+available and bandwidth matters.
+
 ## Data flow
 
 ```text
@@ -202,6 +215,39 @@ transport side's descriptor and registration count independent of expert count.
   `tests/nixl` suites (8 skipped, 668 deselected GPU/other tests).
 - GPU FP8 quantizer: 46 tests pass, including bit and scale equality with vLLM's
   block quantizer and the full quantize/requantize round trip.
+- Quantitative trainer-memory comparison against the publisher baseline (same
+  8B, Megatron TP4 x2 DP -> vLLM TP1 x4 topology, `qwen3_8b_megatron_direct_
+  fp8gen.sh`, unmodified, no `reader_quantization`): before the first sync the
+  publisher's trainer ranks held 13.3-13.6 GiB each -- the same BF16+optimizer
+  baseline reader-quantization measures. Right after the first PS-to-rollout
+  pull completed, every rank's usage rose to 15.18-15.42 GiB and stayed there
+  through the rest of the run -- a stable **+1.8 GiB/rank** increment, which is
+  the FP8 publish copy this mode allocates and reader-quantization does not.
+  (The pull itself also differs as expected: the publisher's rollout replicas
+  pulled 9.44 GB upstream each, the already-quantized FP8 bytes, versus reader-
+  quantization's 16.38 GB of live BF16 -- the publisher trades a smaller wire
+  transfer for a persistent per-rank GPU allocation; reader-quantization trades
+  a larger wire transfer, paid once per sync, for zero persistent allocation.)
+  This reproduces the exact `NIXL_ERR_NOT_FOUND` failure the two-node run below
+  describes, on the identical node pair (`29.162.247.148` <-> `29.162.224.39`)
+  that run used successfully: these two nodes are in different racks (`ping`
+  across every non-`bond1` device times out both ways; only `bond1` and its
+  RDMA counterpart route across racks), yet earlier runs on this exact pair
+  with the full, unrestricted device list completed the handshake and a full
+  training step. Fixing it this time took setting `UCX_NET_DEVICES=bond1,
+  mlx5_bond_1:1` before `ray start` on both nodes (see "Network profile"
+  above) rather than the full rail-isolated list. The two outcomes on the same
+  unrestricted node pair point at UCX's own device selection for this specific
+  control notification being non-deterministic across runs -- sometimes it
+  lands on the one cross-rack-routable device, sometimes on one of the
+  rack-local ones that times out -- which is also a plausible contributor to
+  the intermittent generation-stall and peer-diffusion-gap observations
+  elsewhere in this document, not only a cause on its own. Restricting the
+  device list removes the nondeterminism for a known cross-rack pair at the
+  cost of collapsing from 16 candidate NIC/RDMA devices to one, which is a
+  real bandwidth cost this snapshot's pull-timing numbers do not reflect (they
+  were measured unrestricted); a same-rack pair would not need the
+  restriction at all.
 - GPU two-node weight transport (8B, Megatron TP4 x2 DP -> vLLM TP1 x4 instances,
   `reader_quantization=true`): the NIXL handshake, sharding exchange, and the
   first PS-to-rollout pull completed on real hardware once every node sourced the

@@ -1332,12 +1332,37 @@ tokens took 0.56 ms in the owner-aware builder and 0.57 ms in the legacy path.
 The builder is linear in tokens; the ownership checks add no measurable cost at
 this scale.
 
-**Not exercised live.** Routed-expert capture needs a model with experts. The
-dense models above cannot produce it. The assembler is covered by unit tests
-for gaps, overlap, out-of-range starts, metadata mismatch, and zero-fill; a
-live MoE episode is the remaining check before production. Compaction is
-covered by the classification and policy tests and by the existing TITO
-branching tests, but the live harness episodes did not force a compaction.
+**Live MoE routed experts.** Qwen3-30B-A3B-Instruct-2507 on one H20 with the
+same vLLM + SMG + SessionRouter stack. The model returns 48 layers and top-8
+experts. `main_only` produced a main row with routed experts `(78, 48, 8)` for
+a 19-token prompt and 59-token response, mask 45. `all` produced a main row
+`(76, 48, 8)`, mask 43, and a subagent row `(94, 48, 8)`, mask 24. Every
+trained token position sampled in the check had a nonzero expert row. This is
+the live check the dense Qwen2.5-0.5B episodes could not perform.
+
+**Live parallel, nested, and compaction.** Qwen2.5-0.5B on a second node. The
+main agent spawned two parallel subagents and one of them spawned a nested
+subagent; the main context was then compacted and resumed. The snapshot showed
+`sub-a` and `sub-b` with parent `main-1`, `sub-c` with parent `sub-a`, and a
+live `compaction` trajectory with agent `main-1`. `main_only` selected the
+compaction main row, `all` selected main plus all three subagents, and
+`selected` selected main plus `sub-a` and `sub-c`. This covers the v1
+parallel/nested/compaction integration path.
+
+**Trainer smoke.** A training harness in `tests/integration/` drives a real
+main + subagent episode through the live SessionRouter and returns normal
+`TokenOutput` rows. The local stack reached actor and NIXL initialization with
+two vLLM engines, the FSDP actor, and the SessionRouter; the AgentLoopManager
+then waited for a training buffer that did not fill in that environment. No
+optimizer update completed, so a full TransferQueue-to-trainer step remains
+unverified. The advantage, session-loss, and per-row weight math is covered by
+the 11 `test_session_loss.py` tests; the smoke's own loop and dataset are in
+`tests/integration/`.
+
+**Not exercised live.** The p3b sandbox fleet with a real harness process was
+not run; the Codex and Claude Code episodes used the CLIs directly against the
+live stack. A full optimizer update and a full sandbox episode remain the
+integration checks before production.
 
 The live synthetic check is reproducible with `tests/tito/live_subagent_e2e.py`.
 It expects a vLLM gRPC worker on port 51051 unless

@@ -8,9 +8,9 @@ experiment_name=GRPO-Qwen-4B-swe_smith-codex-subagent-megatron-staleness_${stale
 source ${PSRL_WORKSPACE}/env/env.sh
 
 # Read-only harness runtime trees (native Claude Code / Codex, no Node).
-# The Codex tree is prepared once on the shared filesystem; each sandbox mounts
-# <root>/codex read-only at the harness runtime_mount.
-export PSRL_HARNESS_RUNTIME_ROOT=${PSRL_HARNESS_RUNTIME_ROOT:-/apdcephfs_zwfy10_303541817/share_303541817/ls/docker_images/harness-runtimes}
+# The p3b nodes allowlist this root for host mounts; the Codex tree is mounted
+# read-only at the harness runtime_mount.
+export PSRL_HARNESS_RUNTIME_ROOT=${PSRL_HARNESS_RUNTIME_ROOT:-/shared/psrl/harness-runtimes}
 
 export SWE_STRICT_NO_TEST_PATCH=1
 export SWE_STRICT_NO_CONFIG_PATCH=1

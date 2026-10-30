@@ -89,7 +89,7 @@ async def test_grader_preparation_overlaps_rollout_without_allocating_a_grader(h
     # Isolation is a prompt convention; this scheduling test only needs a no-op.
     loop.harness_config = SimpleNamespace(
         callback_base_url=None,
-        isolate_prompt=lambda workdir: "",
+        task_prompt=lambda prompt, workdir: prompt,
     )
     loop.model_config = SimpleNamespace(path="model")
     loop.compaction_budget = None

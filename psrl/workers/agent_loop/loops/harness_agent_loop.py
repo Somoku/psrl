@@ -424,7 +424,7 @@ class HarnessAgentLoop(SessionAgentLoop):
             agent_deadline_s = self.episode_budget.remaining_s() if self.keeps_partial_on_timeout else None
             harness_started = time.perf_counter()
             try:
-                prompt = task.prompt + self.harness_config.isolate_prompt(harness_runtime.workdir)
+                prompt = self.harness_config.task_prompt(task.prompt, harness_runtime.workdir)
                 harness_result = await harness.run(prompt, harness_runtime, deadline_s=agent_deadline_s)
             except TimeoutError as downstream:
                 # A call inside the episode timed out. That is the sandbox or the daemon

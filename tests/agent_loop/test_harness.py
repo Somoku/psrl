@@ -848,6 +848,19 @@ def test_example_config_selects_both_harnesses() -> None:
     assert runtime.sandbox_config.environment.cwd == "/testbed"
 
 
+def test_subagent_example_config_enables_delegation_without_training_it() -> None:
+    path = Path(__file__).parents[2] / "examples/mini_swe/config/swebench_harness_config_codex_subagent.yaml"
+    configs = OmegaConf.load(path)
+
+    assert [item.name for item in configs] == ["mini_swe_codex_subagent"]
+    harness = HarnessConfig.from_value(configs[0].harness)
+    assert harness.kind == "codex"
+    assert harness.subagents_enabled is True
+    assert harness.workspace_isolation == "logical"
+    assert "delegate" in harness.prompt_suffix.lower()
+    assert configs[0].sandbox_config.environment.cwd == "/testbed"
+
+
 def test_task_context_only_enables_compatible_clean_snapshot() -> None:
     state_policy = SandboxStatePolicy(enabled=True)
     runtime_mount = MountSpec("/host/runtimes/claude_code", "/opt/harness", read_only=True)
@@ -1033,6 +1046,27 @@ def test_logical_workspace_isolation_creates_the_agent_root_and_states_the_rule(
     assert probes and "/workspace/agents" in probes[0]
     assert "/testbed" in harness.config.isolate_prompt("/testbed")
     assert "/workspace/agents" in harness.config.isolate_prompt("/testbed")
+
+
+def test_task_prompt_appends_the_suffix_before_the_isolation_rule() -> None:
+    config = HarnessConfig(
+        kind="codex",
+        executable="codex",
+        prompt_suffix="\n\nDelegate one investigation to a subagent.",
+        workspace_isolation="logical",
+    )
+
+    prompt = config.task_prompt("fix the bug", "/testbed")
+
+    assert prompt.startswith("fix the bug\n\nDelegate one investigation to a subagent.")
+    assert prompt.index("Delegate one investigation") < prompt.index("Workspace isolation")
+    assert config.task_prompt("fix the bug", "/testbed").count("fix the bug") == 1
+
+
+def test_task_prompt_without_suffix_or_isolation_is_the_plain_prompt() -> None:
+    config = HarnessConfig(kind="codex", executable="codex")
+
+    assert config.task_prompt("fix the bug", "/testbed") == "fix the bug"
 
 
 def test_logical_workspace_isolation_is_invalid_with_a_relative_root() -> None:

@@ -107,6 +107,9 @@ class HarnessConfig:
     disable_prompt_caching: bool = False
     disable_experimental_betas: bool = False
     subagents_enabled: bool = True
+    # Optional task-level instruction appended to every episode prompt. Use it for
+    # experiment-specific guidance that should not become a system prompt.
+    prompt_suffix: str = ""
     # `none` keeps the historical shared workspace. `logical` makes the task
     # workdir the main artifact and sends each subagent to its own directory.
     workspace_isolation: str = "none"
@@ -154,6 +157,10 @@ class HarnessConfig:
         in without competing with the agent's own scratch space.
         """
         return str(PurePosixPath(self.home_dir) / ".psrl-harness")
+
+    def task_prompt(self, prompt: str, workdir: str) -> str:
+        """Return the task prompt with the configured suffix and isolation rule."""
+        return f"{prompt}{self.prompt_suffix}{self.isolate_prompt(workdir)}"
 
     def isolate_prompt(self, workdir: str) -> str:
         """Return the prompt suffix that states the logical workspace convention."""

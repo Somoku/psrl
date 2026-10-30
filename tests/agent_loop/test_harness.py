@@ -8,12 +8,12 @@ import json
 import logging
 import shutil
 import subprocess
-import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import tomllib
 from examples.mini_swe.config import build_runtime_config
 from examples.mini_swe.utils.harness_task import (
     _HARNESS_DIAG_NAME,
@@ -1012,3 +1012,73 @@ async def test_claude_code_disabled_subagents_keep_the_agent_deny_rule() -> None
 
     settings = json.loads(sandbox.writes["/root/.claude/settings.json"])
     assert settings["permissions"]["deny"] == ["Agent"]
+
+
+def test_logical_workspace_isolation_creates_the_agent_root_and_states_the_rule() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(
+        HarnessConfig(
+            kind="codex",
+            executable="codex",
+            workspace_isolation="logical",
+            agent_workspace_root="/workspace/agents",
+        ),
+        sandbox,
+    )
+
+    import asyncio
+
+    asyncio.run(harness.prepare(_runtime()))
+    probes = [command for command, _, _ in sandbox.commands if command.startswith("mkdir -p /root/.psrl-harness")]
+    assert probes and "/workspace/agents" in probes[0]
+    assert "/testbed" in harness.config.isolate_prompt("/testbed")
+    assert "/workspace/agents" in harness.config.isolate_prompt("/testbed")
+
+
+def test_logical_workspace_isolation_is_invalid_with_a_relative_root() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="agent_workspace_root"):
+        HarnessConfig(
+            kind="codex",
+            executable="codex",
+            workspace_isolation="logical",
+            agent_workspace_root="agents",
+        )
+
+
+def test_claude_episode_reports_live_background_subagents() -> None:
+    from psrl.workers.agent_loop.harness.episode import CLAUDE_CODE_STREAM_JSON, episode_summary
+
+    event = {
+        "type": "result",
+        "num_turns": 2,
+        "terminal_reason": "success",
+        "subagent_stats": {
+            "started_in_background": 2,
+            "completed": 1,
+            "failed": 0,
+            "killed": {"parent": 0, "user": 0, "system": 0},
+        },
+    }
+    summary = episode_summary(CLAUDE_CODE_STREAM_JSON, json.dumps(event).encode())
+
+    assert summary is not None
+    assert summary.background_subagents == 1
+
+
+def test_codex_episode_reports_agents_still_live_at_main_close() -> None:
+    from psrl.workers.agent_loop.harness.episode import CODEX_JSONL, episode_summary
+
+    completed = {
+        "type": "item.completed",
+        "item": {
+            "type": "collab_tool_call",
+            "tool": "wait",
+            "agents_states": {"a": {"status": "completed"}, "b": {"status": "running"}},
+        },
+    }
+    summary = episode_summary(CODEX_JSONL, json.dumps(completed).encode())
+
+    assert summary is not None
+    assert summary.background_subagents == 1

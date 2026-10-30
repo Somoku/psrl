@@ -833,6 +833,8 @@ Harness settings live under `harness` in `swebench_harness_config.yaml`:
 | `permission_mode` | CLI permission mode (`acceptEdits`; Claude rejects `bypassPermissions` as root). |
 | `system_prompt` / `system_prompt_mode` | `none` keeps the CLI's stock system prompt; `append` / `replace` inject or replace it. |
 | `subagents_enabled` | `false` denies the Claude `Agent` tool and background tasks. |
+| `workspace_isolation` | `none` keeps the shared task root. `logical` states the main root and per-agent directory convention in the prompt, creates the agent root, and exports `PSRL_MAIN_WORKSPACE` / `PSRL_AGENT_WORKSPACE_ROOT`. It is advisory, not a filesystem boundary. |
+| `agent_workspace_root` | In-sandbox root for `workspace_isolation: logical` (default `/workspace/agents`); must be absolute. |
 | `compaction.compact_percent` | Share of the rollout `max_model_len` at which the CLI auto-compacts (same threshold drives the `x-smg-prompt-too-long-limit` header). |
 | `trajectory_format` | Integrity-scan dispatch key: `claude_code_stream_json`, `codex_jsonl`, `auto`, or `plain_text`. |
 | `runtime_mount` | In-sandbox path of the read-only runtime tree; executable resolves to `<runtime_mount>/bin/<executable>` (default `/opt/harness`). |

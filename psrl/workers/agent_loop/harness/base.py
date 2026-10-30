@@ -107,6 +107,10 @@ class HarnessConfig:
     disable_prompt_caching: bool = False
     disable_experimental_betas: bool = False
     subagents_enabled: bool = True
+    # `none` keeps the historical shared workspace. `logical` makes the task
+    # workdir the main artifact and sends each subagent to its own directory.
+    workspace_isolation: str = "none"
+    agent_workspace_root: str = "/workspace/agents"
     compaction: HarnessCompactionConfig = field(default_factory=HarnessCompactionConfig)
     trajectory_format: str = "auto"
 
@@ -132,6 +136,14 @@ class HarnessConfig:
                 f"Unsupported harness trajectory_format {self.trajectory_format!r}; "
                 f"expected one of {SUPPORTED_TRAJECTORY_FORMATS}."
             )
+        if self.workspace_isolation not in ("none", "logical"):
+            raise ValueError(
+                f"Harness workspace_isolation must be 'none' or 'logical', got {self.workspace_isolation!r}."
+            )
+        if not self.agent_workspace_root.startswith("/"):
+            raise ValueError(
+                f"Harness agent_workspace_root must be absolute, got {self.agent_workspace_root!r}."
+            )
 
     def state_dir(self) -> str:
         """The harness's own directory inside the sandbox.
@@ -142,6 +154,18 @@ class HarnessConfig:
         in without competing with the agent's own scratch space.
         """
         return str(PurePosixPath(self.home_dir) / ".psrl-harness")
+
+    def isolate_prompt(self, workdir: str) -> str:
+        """Return the prompt suffix that states the logical workspace convention."""
+        if self.workspace_isolation != "logical":
+            return ""
+        return (
+            "\n\nWorkspace isolation: the main task root is "
+            f"{workdir!r}; the main artifact is collected from that directory. "
+            "When you delegate, require every subagent to write only under "
+            f"{self.agent_workspace_root!r}/<agent-id>/ and never modify the main task root. "
+            "Do not write outside those directories."
+        )
 
     def resolved_trajectory_format(self) -> str:
         """Return the concrete format the integrity scanner should dispatch on."""
@@ -290,6 +314,8 @@ class Harness(ABC):
         """
         exe = executable_path(self.config.runtime_mount, self.config.executable)
         directories = [self._log_dir, self.config_dir()]
+        if self.config.workspace_isolation == "logical":
+            directories.append(self.config.agent_workspace_root)
         mkdir = "mkdir -p " + " ".join(shlex.quote(d) for d in directories if d)
         check = await self.sandbox.exec(f"{mkdir} && test -x {shlex.quote(exe)}", timeout_s=60)
         if check.exit_code != 0:
@@ -374,11 +400,15 @@ class Harness(ABC):
         command = (
             f"{shlex.join([str(item) for item in argv])} > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}"
         )
+        env = dict(self.build_env(runtime))
+        if self.config.workspace_isolation == "logical":
+            env["PSRL_AGENT_WORKSPACE_ROOT"] = self.config.agent_workspace_root
+            env["PSRL_MAIN_WORKSPACE"] = runtime.workdir
         task = asyncio.create_task(
             self.sandbox.exec(
                 command,
                 cwd=runtime.workdir,
-                env=self.build_env(runtime),
+                env=env,
             )
         )
         self._active_exec = task

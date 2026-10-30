@@ -8,6 +8,7 @@ from psrl.utils.common.http_utils import SESSION_TURN_BUDGET_HEADER, delete, get
 from psrl.utils.rollout.vision_utils import normalize_messages
 from psrl.utils.sampler_distribution import SamplerCapture, configure_capture
 from psrl.utils.subagent_training import SubagentTrainingPolicy
+from psrl.utils.tito.snapshot import SUPPORTED_FORMATS, normalize_session_snapshot
 from psrl.utils.tito.training_data import build_training_data
 from psrl.utils.tito.trajectory_selection import select_trainable_trajectories
 from psrl.workers.agent_loop.agent_data import AgentData
@@ -43,9 +44,20 @@ class SessionAgentLoop(AgentLoopBase):
         self.subagent_training = SubagentTrainingPolicy.from_mapping(
             self.config.psrl.agentic_rl.get("subagent_training", {})
         )
+        self.tito_snapshot_format = str(
+            self.config.psrl.rollout_gateway.get("tito_snapshot_format", "compact")
+        ).lower()
+        if self.tito_snapshot_format not in SUPPORTED_FORMATS:
+            raise ValueError(
+                f"psrl.rollout_gateway.tito_snapshot_format must be one of {SUPPORTED_FORMATS}, "
+                f"got {self.tito_snapshot_format!r}."
+            )
         self.session_snapshot = None  # TITO session snapshot for offline analysis
         self._capture_sessions: set[str] = set()
         self._validation_sessions: set[str] = set()
+        self._created_sessions: set[str] = set()
+        self._main_closed_sessions: set[str] = set()
+        self._background_subagent_counts: dict[str, int] = {}
 
     def get_generate_fields(self) -> list[str]:
         fields = super().get_generate_fields()
@@ -97,6 +109,11 @@ class SessionAgentLoop(AgentLoopBase):
             headers=headers,
         )
         session_id = response["session_id"]
+        created = getattr(self, "_created_sessions", None)
+        if created is None:
+            created = set()
+            self._created_sessions = created
+        created.add(session_id)
         if request.get("validate", False):
             self._validation_sessions.add(session_id)
         if (
@@ -111,12 +128,48 @@ class SessionAgentLoop(AgentLoopBase):
         """Delete one TITO session after its requests have drained."""
         self._capture_sessions.discard(session_id)
         self._validation_sessions.discard(session_id)
+        getattr(self, "_created_sessions", set()).discard(session_id)
+        getattr(self, "_main_closed_sessions", set()).discard(session_id)
+        getattr(self, "_background_subagent_counts", {}).pop(session_id, None)
         response = await delete(f"{self.session_router_url}/sessions/{session_id}")
         psrl_logger.debug("Deleted TITO session %r with status %r.", session_id, response.status)
 
-    async def get_session_data(self, session_id: str) -> dict:
-        """Fetch one TITO session snapshot."""
-        return await get(f"{self.session_router_url}/sessions/{session_id}")
+    async def get_session_data(self, session_id: str, *, format: str | None = None) -> dict:
+        """Fetch one TITO session snapshot in the requested wire format."""
+        return await get(
+            f"{self.session_router_url}/sessions/{session_id}",
+            params={"format": format or self.tito_snapshot_format},
+        )
+
+    async def mark_main_close(self, session_id: str) -> int:
+        """Mark the main episode closed and return the live background count.
+
+        The router never waits for background work here; it only observes the
+        in-flight subagents at the boundary. A session created outside this loop
+        (a test or an external caller) has no router state to close.
+        """
+        if session_id not in getattr(self, "_created_sessions", set()):
+            return 0
+        counts = getattr(self, "_background_subagent_counts", None)
+        if counts is None:
+            counts = {}
+            self._background_subagent_counts = counts
+        if session_id in getattr(self, "_main_closed_sessions", set()):
+            return counts.get(session_id, 0)
+        summary = getattr(self, "_episode_summary", None)
+        reported = getattr(summary, "background_subagents", None)
+        payload = {} if reported is None else {"background_subagents": int(reported)}
+        response = await post(
+            f"{self.session_router_url}/sessions/{session_id}/main-close",
+            payload=payload,
+        )
+        count = int((response or {}).get("background_live_count", 0))
+        counts[session_id] = count
+        self._main_closed_sessions.add(session_id)
+        psrl_logger.info(
+            "TITO session %r main close: background_live_count=%d.", session_id, count
+        )
+        return count
 
     @asynccontextmanager
     async def session_scope(self, request: dict) -> AsyncIterator[str]:
@@ -184,7 +237,10 @@ class SessionAgentLoop(AgentLoopBase):
         async with self.session_scope(request) as session_id:
             result = await self.run_session(request, self.session_api_url(session_id))
             training_data = await self.get_training_data(session_id)
-            if not training_data or any(item["num_turns"] == 0 or not item["response_ids"] for item in training_data):
+            if not training_data or any(
+                item.get("trainable_turns", item["num_turns"]) == 0 or not item["response_ids"]
+                for item in training_data
+            ):
                 return None, TerminateReason.ROLLOUT_ERROR
 
             outputs = [self.build_token_output(item, extra_fields=result.extra_fields) for item in training_data]
@@ -284,7 +340,8 @@ class SessionAgentLoop(AgentLoopBase):
 
     async def get_training_data(self, session_id: str, *, validate: bool | None = None) -> list[dict]:
         """Fetch and convert the trainable trajectories in a TITO session snapshot."""
-        session_data = await self.get_session_data(session_id)
+        background_count = await self.mark_main_close(session_id)
+        session_data = normalize_session_snapshot(await self.get_session_data(session_id))
         self.session_snapshot = session_data
         trajectories = session_data.get("trajectories")
         if not isinstance(trajectories, list):
@@ -312,6 +369,8 @@ class SessionAgentLoop(AgentLoopBase):
                     "capture": selection.capture,
                     "session_primary": selection.is_primary,
                     "loss_weight": selection.loss_weight,
+                    "trainable_turns": item.get("trainable_turns", item["num_turns"]),
+                    "background_subagent_count": background_count,
                 }
             )
             training_data.append(item)
@@ -436,6 +495,8 @@ class SessionAgentLoop(AgentLoopBase):
             "capture",
             "session_primary",
             "loss_weight",
+            "trainable_turns",
+            "background_subagent_count",
         ):
             if field_name in training_data:
                 trajectory_fields[field_name] = training_data[field_name]

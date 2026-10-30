@@ -4,6 +4,7 @@ import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -127,8 +128,17 @@ class SessionState:
     # Whether a main call has been seen. A later main-labeled call with a different
     # native id is a second thread, not a second artifact.
     main_agent_seen: bool = False
-    # Stable fallback identity for a subagent whose harness emits no agent id.
+    # Fallback identity for one unidentified subagent call. Without a native id,
+    # concurrent calls cannot be grouped into one agent.
     synthetic_agent_index: int = 0
+    # Whether the main episode has closed. Later subagent turns are background.
+    main_closed: bool = False
+    # In-flight model calls per (role, agent id).
+    agent_inflight: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Live background subagents observed at the main-close boundary.
+    background_live_count: int = 0
+    # Set when no main-path request is in flight; background work is ignored.
+    main_drained: asyncio.Event = field(default_factory=asyncio.Event)
 
     def __post_init__(self) -> None:
         if self.inflight == 0:
@@ -137,6 +147,7 @@ class SessionState:
             self.drained.clear()
         # A fresh session is running: allow it to proceed.
         self.continue_event.set()
+        self.main_drained.set()
 
     @property
     def status(self) -> str:
@@ -163,6 +174,33 @@ class SessionState:
             self.subagent_turns += 1
         else:
             self.main_turns += 1
+
+    def is_background(self, role: str, agent_id: str | None) -> bool:
+        """Whether this in-flight call is background work after main close."""
+        if not self.main_closed:
+            return False
+        if role == "subagent":
+            return True
+        if role == "compaction":
+            return agent_id not in (None, "", "main", self.main_agent_id)
+        return False
+
+    @property
+    def main_inflight(self) -> int:
+        """Model calls on the main path; background work is excluded."""
+        background = sum(
+            count
+            for (role, agent_id), count in self.agent_inflight.items()
+            if count > 0 and self.is_background(role, agent_id)
+        )
+        return max(0, self.inflight - background)
+
+    def refresh_main_drained(self) -> None:
+        """Update the event the delete path waits on."""
+        if self.main_inflight == 0:
+            self.main_drained.set()
+        else:
+            self.main_drained.clear()
 
 
 class SessionRouter:
@@ -195,6 +233,7 @@ class SessionRouter:
     def setup_routes(self):
         self.app.post("/sessions")(self.create_session)
         self.app.get("/sessions/{sid}")(self.get_session)
+        self.app.post("/sessions/{sid}/main-close")(self.main_close)
         self.app.delete("/sessions/{sid}")(self.delete_session)
         self.app.post("/sessions/{sid}/v1/chat/completions")(self.session_chat_completions)
         self.app.post("/sessions/{sid}/v1/responses")(self.session_responses)
@@ -369,6 +408,7 @@ class SessionRouter:
                 if agent_id:
                     state.main_agent_id = agent_id
                 state.main_agent_seen = True
+                state.main_closed = False
                 agent_id = state.main_agent_id
                 parent_agent_id = None
         if role == "compaction" and agent_id in (None, "", state.main_agent_id):
@@ -442,8 +482,12 @@ class SessionRouter:
             headers={"content-type": "application/json", "x-smg-error-code": SESSION_TURN_BUDGET_ERROR_CODE},
         )
 
-    async def get_session(self, sid: str) -> Response:
-        result = await self._request_upstream("GET", f"{TITO_SESSIONS_PATH}/{sid}")
+    async def get_session(self, sid: str, request: Request) -> Response:
+        path = f"{TITO_SESSIONS_PATH}/{sid}"
+        snapshot_format = request.query_params.get("format")
+        if snapshot_format:
+            path = f"{path}?format={quote(snapshot_format, safe='')}"
+        result = await self._request_upstream("GET", path)
         state = self.states.get(sid)
         if state is not None:
             async with state.lock:
@@ -453,6 +497,43 @@ class SessionRouter:
                     result.headers["x-target-dp-rank"] = state.target_dp_rank
                 result = self.with_session_state(result, state)
         return self.build_response(result)
+
+    async def main_close(self, sid: str, request: Request) -> Response:
+        """Close the main episode and count live background subagents.
+
+        This is an observation boundary, not a drain: it never waits for a
+        subagent. The count is a lower bound from in-flight calls unless the
+        caller reports a harness lifecycle count in the body.
+        """
+        state = await self._ensure_state(sid)
+        reported: int | None = None
+        raw_body = await request.body()
+        if raw_body:
+            try:
+                body = json.loads(raw_body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                body = None
+            if isinstance(body, dict) and body.get("background_subagents") is not None:
+                try:
+                    reported = max(0, int(body["background_subagents"]))
+                except (TypeError, ValueError):
+                    reported = None
+        async with state.lock:
+            state.main_closed = True
+            observed = sum(
+                1
+                for (role, agent_id), count in state.agent_inflight.items()
+                if count > 0 and state.is_background(role, agent_id)
+            )
+            state.background_live_count = max(
+                observed, reported if reported is not None else 0
+            )
+            state.refresh_main_drained()
+            count = state.background_live_count
+        psrl_logger.info(
+            "TITO session %r main closed with %d live background subagent(s).", sid, count
+        )
+        return JSONResponse(content={"background_live_count": count})
 
     @staticmethod
     def with_session_state(result: HttpResponse, state: SessionState) -> HttpResponse:
@@ -494,7 +575,14 @@ class SessionRouter:
             state.marked_for_hang = False
             state.continue_event.set()
 
-        await state.drained.wait()
+        # Wait only for the main path. Background work cannot contribute a
+        # training row, and waiting for it would hold the session open.
+        while True:
+            async with state.lock:
+                if state.main_inflight == 0:
+                    break
+                main_drained = state.main_drained
+            await main_drained.wait()
 
         result = await self._request_upstream("DELETE", f"{TITO_SESSIONS_PATH}/{sid}")
 
@@ -689,9 +777,12 @@ class SessionRouter:
             agent_identity = getattr(request.state, "psrl_agent", None)
             if agent_identity is None:
                 agent_identity = self.resolve_agent_identity(state, request.headers)
+            role, agent_id, parent_agent_id, capture = agent_identity
+            agent_key = (role, agent_id or "")
+            state.agent_inflight[agent_key] = state.agent_inflight.get(agent_key, 0) + 1
             state.inflight += 1
             state.drained.clear()
-        role, agent_id, parent_agent_id, capture = agent_identity
+            state.refresh_main_drained()
 
         headers = self.add_session_headers(request, session_headers)
         headers["accept"] = "application/json"
@@ -748,8 +839,14 @@ class SessionRouter:
             # and, on success, advance the trajectory's turn counter.
             async with state.lock:
                 state.inflight = max(0, state.inflight - 1)
+                remaining = state.agent_inflight.get(agent_key, 0) - 1
+                if remaining > 0:
+                    state.agent_inflight[agent_key] = remaining
+                else:
+                    state.agent_inflight.pop(agent_key, None)
                 if state.inflight == 0:
                     state.drained.set()
+                state.refresh_main_drained()
                 if result is not None and result.status < 400:
                     base_worker_id = result.headers.get("x-base-worker-id")
                     target_dp_rank = result.headers.get("x-target-dp-rank")
@@ -821,6 +918,8 @@ class SessionRouter:
                         "total_tokens": state.total_tokens,
                         "marked_for_hang": state.marked_for_hang,
                         "closing": state.closing,
+                        "main_closed": state.main_closed,
+                        "background_live_count": state.background_live_count,
                     }
                 )
         return JSONResponse(content={"sessions": sessions})

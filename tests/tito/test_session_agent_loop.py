@@ -251,7 +251,7 @@ async def test_get_training_data_rejects_legacy_flat_snapshot():
         return {"session_id": session_id, "accumulated_token_ids": [], "records": []}
 
     loop.get_session_data = get_session_data
-    with pytest.raises(RuntimeError, match="expected a trajectories list"):
+    with pytest.raises(ValueError, match="trajectories list"):
         await loop.get_training_data("sid")
 
 
@@ -587,3 +587,83 @@ def test_context_mode_masks_a_shared_owned_turn():
     )
 
     assert built["response_mask"] == [0]
+
+
+@pytest.mark.asyncio
+async def test_mark_main_close_records_the_router_count(monkeypatch):
+    captured = {}
+
+    async def fake_post(url, payload, max_retries=5, headers=None, **kwargs):
+        del max_retries, headers, kwargs
+        captured["url"] = url
+        captured["payload"] = payload
+        return {"background_live_count": 2}
+
+    monkeypatch.setattr(module, "post", fake_post)
+    loop = _bare_loop()
+    loop._created_sessions = {"sid"}
+    loop._main_closed_sessions = set()
+
+    assert await loop.mark_main_close("sid") == 2
+    assert loop._background_subagent_counts == {"sid": 2}
+    assert captured["url"].endswith("/sessions/sid/main-close")
+
+
+@pytest.mark.asyncio
+async def test_mark_main_close_keeps_counts_per_session(monkeypatch):
+    counts = {"a": 2, "b": 0}
+
+    async def fake_post(url, payload, max_retries=5, headers=None, **kwargs):
+        del payload, max_retries, headers, kwargs
+        return {"background_live_count": counts[url.rsplit("/", 2)[-2]]}
+
+    monkeypatch.setattr(module, "post", fake_post)
+    loop = _bare_loop()
+    loop._created_sessions = {"a", "b"}
+    loop._main_closed_sessions = set()
+
+    assert await loop.mark_main_close("a") == 2
+    assert await loop.mark_main_close("b") == 0
+    assert await loop.mark_main_close("a") == 2
+
+
+@pytest.mark.asyncio
+async def test_mark_main_close_uses_the_harness_lifecycle_count(monkeypatch):
+    captured = {}
+
+    async def fake_post(url, payload, max_retries=5, headers=None, **kwargs):
+        del url, max_retries, headers, kwargs
+        captured["payload"] = payload
+        return {"background_live_count": 1}
+
+    monkeypatch.setattr(module, "post", fake_post)
+    loop = _bare_loop()
+    loop._created_sessions = {"sid"}
+    loop._main_closed_sessions = set()
+    loop._episode_summary = SimpleNamespace(background_subagents=1)
+
+    assert await loop.mark_main_close("sid") == 1
+    assert captured["payload"] == {"background_subagents": 1}
+
+
+@pytest.mark.asyncio
+async def test_get_training_data_attaches_the_background_count(monkeypatch):
+    async def fake_post(url, payload, max_retries=5, headers=None, **kwargs):
+        del url, payload, max_retries, headers, kwargs
+        return {"background_live_count": 2}
+
+    monkeypatch.setattr(module, "post", fake_post)
+    loop = _bare_loop("auto")
+    session = _subagent_session()
+    loop._created_sessions = {"sid"}
+    loop._main_closed_sessions = set()
+
+    async def get_session_data(session_id, *, format=None):
+        assert session_id == "sid"
+        return session
+
+    loop.get_session_data = get_session_data
+    training_data = await loop.get_training_data("sid")
+
+    assert training_data
+    assert all(item["background_subagent_count"] == 2 for item in training_data)

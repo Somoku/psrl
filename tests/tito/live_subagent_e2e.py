@@ -28,6 +28,7 @@ import time
 import httpx
 import uvicorn
 from psrl.utils.subagent_training import SubagentTrainingPolicy
+from psrl.utils.tito.snapshot import normalize_session_snapshot
 from psrl.utils.tito.training_data import build_training_data
 from psrl.utils.tito.trajectory_selection import select_trainable_trajectories
 from psrl.workers.gen.session_router import SessionRouter
@@ -191,11 +192,9 @@ def drive(client: httpx.Client, sid: str) -> None:
     base = [{"role": "user", "content": "Think of a short plan. Reply with one sentence."}]
     first = turn(client, sid, base, {"thread_source": "user", "thread_id": "main-1"})
     assistant = first["choices"][0]["message"]
-    followup = base + [assistant, {"role": "user", "content": "Add one more detail."}]
-    turn(client, sid, followup, {"thread_source": "user", "thread_id": "main-1"})
 
-    # A subagent branches after the first main turn. Its own two turns share that
-    # prefix with the main trajectory.
+    # A subagent branches after the first main turn. Its two turns complete before
+    # the main agent closes, so they remain causally eligible.
     sub_base = base + [assistant, {"role": "user", "content": "Act as a reviewer and answer briefly."}]
     sub_first = turn(
         client,
@@ -212,6 +211,9 @@ def drive(client: httpx.Client, sid: str) -> None:
         {"thread_source": "subagent", "thread_id": "sub-1", "parent_thread_id": "main-1"},
     )
 
+    followup = base + [assistant, {"role": "user", "content": "Add one more detail."}]
+    turn(client, sid, followup, {"thread_source": "user", "thread_id": "main-1"})
+
 
 def assert_snapshot(snapshot: dict, *, mode: str) -> None:
     trajectories = snapshot["trajectories"]
@@ -227,6 +229,11 @@ def assert_snapshot(snapshot: dict, *, mode: str) -> None:
     assert any(record["owner_trajectory_id"] == sub["trajectory_id"] for record in sub["records"])
     assert snapshot["main_agent_id"] == "main-1", snapshot.get("main_agent_id")
     assert snapshot["subagent_training"]["mode"] == mode
+    assert all(
+        "sequence" in record
+        for trajectory in trajectories
+        for record in trajectory.get("records", [])
+    ), trajectories
 
     policy = SubagentTrainingPolicy.from_mapping(snapshot["subagent_training"])
     selections = select_trainable_trajectories(snapshot, policy)
@@ -283,9 +290,54 @@ def main() -> None:
             )
             sid = create_session(client, policy)
             drive(client, sid)
-            snapshot = client.get(f"/sessions/{sid}").json()
+            expanded_raw = client.get(f"/sessions/{sid}").json()
+            compact_raw = client.get(f"/sessions/{sid}", params={"format": "compact"}).json()
+            snapshot = normalize_session_snapshot(expanded_raw)
+            compact = normalize_session_snapshot(compact_raw)
+            print(
+                f"mode={mode} snapshot bytes expanded={len(json.dumps(expanded_raw))} "
+                f"compact={len(json.dumps(compact_raw))}",
+                flush=True,
+            )
             assert_snapshot(snapshot, mode=mode)
-            print(f"mode={mode} snapshot OK", flush=True)
+            assert_snapshot(compact, mode=mode)
+            expanded_rows = [
+                (item["trajectory_id"], item["accumulated_token_ids"], item["records"])
+                for item in snapshot["trajectories"]
+            ]
+            compact_rows = [
+                (item["trajectory_id"], item["accumulated_token_ids"], item["records"])
+                for item in compact["trajectories"]
+            ]
+            assert expanded_rows == compact_rows
+            print(f"mode={mode} expanded/compact snapshot OK", flush=True)
+
+        # A subagent that runs after the main agent closes is post-main. It must
+        # remain in the snapshot but never produce a trainable row.
+        post_policy = SubagentTrainingPolicy.from_mapping({"mode": "all"})
+        post_sid = create_session(client, post_policy)
+        post_base = [{"role": "user", "content": "Answer with one word."}]
+        post_main = turn(client, post_sid, post_base, {"thread_source": "user", "thread_id": "main-9"})
+        post_assistant = post_main["choices"][0]["message"]
+        turn(
+            client,
+            post_sid,
+            post_base + [post_assistant, {"role": "user", "content": "Now delegate."}],
+            {"thread_source": "subagent", "thread_id": "sub-9", "parent_thread_id": "main-9"},
+        )
+        post_snapshot = normalize_session_snapshot(client.get(f"/sessions/{post_sid}").json())
+        post_rows = select_trainable_trajectories(post_snapshot, post_policy)
+        assert [row.thread_source for row in post_rows] == ["main"]
+        sub_trajectory = next(
+            trajectory for trajectory in post_snapshot["trajectories"]
+            if trajectory["thread_source"] == "subagent"
+        )
+        assert all(
+            record.get("contributes_to_session") is False
+            for record in sub_trajectory["records"]
+            if record.get("owner_trajectory_id") == sub_trajectory["trajectory_id"]
+        )
+        print("mode=all post-main subagent excluded OK", flush=True)
 
     server.should_exit = True
     thread.join(timeout=10)

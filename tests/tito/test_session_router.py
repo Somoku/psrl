@@ -19,7 +19,8 @@ async def mock_create():
 
 
 @mock_smg.get("/tito/sessions/{sid}")
-async def mock_get(sid: str):
+async def mock_get(sid: str, request: Request):
+    captured["get_query"] = dict(request.query_params)
     return {
         "session_id": sid,
         "max_trim_tokens": 0,
@@ -681,3 +682,58 @@ async def test_a_second_thread_with_a_parent_is_a_subagent(client, router):
     assert headers["x-psrl-agent-id"] == "child-2"
     assert headers["x-psrl-parent-agent-id"] == "main-1"
     assert headers["x-psrl-tito-capture"] == "full"
+
+
+@pytest.mark.asyncio
+async def test_get_session_forwards_the_snapshot_format(client):
+    resp = await client.get("/sessions/my-session?format=compact")
+
+    assert resp.status_code == 200
+    assert captured["get_query"] == {"format": "compact"}
+
+
+@pytest.mark.asyncio
+async def test_main_close_counts_distinct_inflight_background_agents(client, router):
+    state = await router._ensure_state("sid-bg")
+    async with state.lock:
+        state.inflight = 3
+        state.agent_inflight = {
+            ("main", "main"): 1,
+            ("subagent", "sub-a"): 1,
+            ("subagent", "sub-b"): 1,
+        }
+
+    resp = await client.post("/sessions/sid-bg/main-close")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"background_live_count": 2}
+    assert state.background_live_count == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_does_not_wait_for_background_inflight(client, router):
+    state = await router._ensure_state("sid-bg-delete")
+    async with state.lock:
+        state.main_closed = True
+        state.inflight = 1
+        state.agent_inflight = {("subagent", "sub-a"): 1}
+
+    resp = await client.delete("/sessions/sid-bg-delete")
+
+    assert resp.status_code == 204
+    assert "sid-bg-delete" not in router.states
+
+
+@pytest.mark.asyncio
+async def test_main_close_uses_a_harness_reported_count(client, router):
+    state = await router._ensure_state("sid-reported")
+    async with state.lock:
+        state.inflight = 0
+
+    resp = await client.post(
+        "/sessions/sid-reported/main-close",
+        json={"background_subagents": 3},
+    )
+
+    assert resp.json() == {"background_live_count": 3}
+    assert state.background_live_count == 3

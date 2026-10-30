@@ -8,9 +8,9 @@ experiment_name=GRPO-Qwen-4B-swe_smith-codex-subagent-megatron-staleness_${stale
 source ${PSRL_WORKSPACE}/env/env.sh
 
 # Read-only harness runtime trees (native Claude Code / Codex, no Node).
-# The p3b nodes allowlist this root for host mounts; the Codex tree is mounted
-# read-only at the harness runtime_mount.
-export PSRL_HARNESS_RUNTIME_ROOT=${PSRL_HARNESS_RUNTIME_ROOT:-/shared/psrl/harness-runtimes}
+# The canonical trees live on the shared filesystem and the p3b nodes allowlist
+# this exact path; each sandbox mounts <root>/codex read-only.
+export PSRL_HARNESS_RUNTIME_ROOT=${PSRL_HARNESS_RUNTIME_ROOT:-/apdcephfs_zwfy10_303541817/share_303541817/ls/harness_runtimes}
 
 export SWE_STRICT_NO_TEST_PATCH=1
 export SWE_STRICT_NO_CONFIG_PATCH=1
@@ -254,7 +254,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.rollout_gateway.tito_debug=false \
     psrl.rollout_gateway.tool_call_parser=qwen_xml \
     \
-    gen_actor_rollout_ref.rollout.agent.sandbox.backends.p3b.endpoint=28.49.198.250:9000 \
+    gen_actor_rollout_ref.rollout.agent.sandbox.backends.p3b.endpoint=${P3B_ENDPOINT:-29.162.247.148:9000} \
     gen_actor_rollout_ref.rollout.agent.overlong_filtering=True \
     \
     gen_actor_rollout_ref.rollout.agent.default_agent_loop=mini_swe_codex_subagent \

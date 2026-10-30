@@ -146,6 +146,7 @@ def build_training_data(
             "routed_experts": None,
             "sampler_distribution": None,
             "num_turns": 0,
+            "trainable_turns": 0,
         }
 
     first_record = 0
@@ -177,6 +178,23 @@ def build_training_data(
         for record in processed_records
         if _record_owner(record, trainable_trajectory_id) == trainable_trajectory_id
     )
+    trainable_turns = sum(
+        1
+        for record in processed_records
+        if _record_owner(record, trainable_trajectory_id) == trainable_trajectory_id
+        and record.get("contributes_to_session", True)
+    )
+    if trainable_trajectory_id is not None and trainable_turns == 0:
+        return {
+            "prompt_ids": [],
+            "response_ids": [],
+            "response_mask": [],
+            "logprobs": [],
+            "routed_experts": None,
+            "sampler_distribution": None,
+            "num_turns": 0,
+            "trainable_turns": 0,
+        }
 
     all_response_ids: list[int] = []
     all_response_mask: list[int] = []
@@ -194,7 +212,13 @@ def build_training_data(
         capture = _record_capture(record)
         is_owned = trainable_trajectory_id is None or owner == trainable_trajectory_id
         shared = bool(record.get("shared", False))
-        train_here = is_owned and capture == _CAPTURE_FULL and (shared_prefix == "owner" or not shared)
+        contributes = bool(record.get("contributes_to_session", True))
+        train_here = (
+            is_owned
+            and contributes
+            and capture == _CAPTURE_FULL
+            and (shared_prefix == "owner" or not shared)
+        )
 
         distribution = None
         if capture_distribution:
@@ -319,4 +343,5 @@ def build_training_data(
         "routed_experts": routed_experts,
         "sampler_distribution": sampler_distribution,
         "num_turns": owned_turns if trainable_trajectory_id is not None else len(records),
+        "trainable_turns": trainable_turns if trainable_trajectory_id is not None else len(records),
     }

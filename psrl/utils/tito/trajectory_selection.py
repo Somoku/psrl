@@ -88,6 +88,81 @@ def _live_trajectories(trajectories: list[dict], main_agent_id: str) -> list[dic
     ]
 
 
+def annotate_session_contribution(
+    session_data: dict,
+    main_agent_id: str | None = None,
+    primary: dict | None = None,
+) -> int | None:
+    """
+    Mark each turn with whether it can contribute to the session reward.
+
+    The main-close boundary is the storage sequence of the primary main leaf's
+    last record. A subagent or subagent-compaction turn at or before that
+    sequence may contribute; a turn after it is post-main and is masked. Main and
+    main-compaction turns always contribute. A record without a sequence keeps the
+    legacy coarse behavior and is treated as contributing.
+
+    Args:
+        session_data (dict): The expanded session snapshot. Mutated in place.
+        main_agent_id (str | None): The parent agent identity, if known.
+        primary (dict | None): The primary main trajectory, if already selected.
+
+    Returns:
+        int | None: The main-close sequence, or None for a legacy snapshot or a
+            main trajectory with no sequenced records.
+    """
+    trajectories = session_data.get("trajectories")
+    if not isinstance(trajectories, list):
+        return None
+    main_agent_id = str(main_agent_id or session_data.get("main_agent_id") or "main")
+    if not any(_has_role_metadata(trajectory) for trajectory in trajectories):
+        for trajectory in trajectories:
+            for record in trajectory.get("records", []) or []:
+                record.setdefault("contributes_to_session", True)
+        session_data["main_close_sequence"] = None
+        return None
+
+    if primary is None:
+        primary = max(
+            (
+                trajectory
+                for trajectory in _live_trajectories(trajectories, main_agent_id)
+                if _is_primary_role(trajectory, main_agent_id)
+            ),
+            key=lambda trajectory: trajectory["trajectory_id"],
+            default=None,
+        )
+    sequences = (
+        []
+        if primary is None
+        else [
+            int(record["sequence"])
+            for record in _owned_records(primary)
+            if record.get("sequence") is not None
+        ]
+    )
+    boundary = max(sequences) if sequences else None
+    session_data["main_close_sequence"] = boundary
+
+    for trajectory in trajectories:
+        role = str(trajectory.get("thread_source") or "main").strip().lower()
+        agent_id = trajectory.get("agent_id")
+        is_main_role = role == "main" or (
+            role == "compaction" and agent_id in (None, "", "main", main_agent_id)
+        )
+        is_auxiliary = role == "auxiliary"
+        for record in trajectory.get("records", []) or []:
+            if boundary is None or is_main_role:
+                continues = True
+            elif is_auxiliary:
+                continues = False
+            else:
+                sequence = record.get("sequence")
+                continues = True if sequence is None else int(sequence) <= boundary
+            record["contributes_to_session"] = continues
+    return boundary
+
+
 def select_trainable_trajectories(
     session_data: dict,
     policy: SubagentTrainingPolicy,
@@ -145,6 +220,7 @@ def select_trainable_trajectories(
     )
     if primary is None:
         raise ValueError(f"TITO session {session_data.get('session_id')!r} has no main trajectory.")
+    annotate_session_contribution(session_data, main_agent_id, primary)
 
     selections: list[TrajectorySelection] = []
     for trajectory in live_trajectories:
@@ -160,10 +236,11 @@ def select_trainable_trajectories(
         ):
             continue
         owned = _owned_records(trajectory)
-        if not owned:
+        contributing = [record for record in owned if record.get("contributes_to_session", True)]
+        if not contributing:
             if is_primary:
                 raise ValueError(
-                    f"TITO session {session_data.get('session_id')!r} has no turn owned by "
+                    f"TITO session {session_data.get('session_id')!r} has no contributing turn owned by "
                     f"its main trajectory {trajectory['trajectory_id']}."
                 )
             continue
@@ -175,13 +252,13 @@ def select_trainable_trajectories(
                 )
             token_only = [
                 record
-                for record in owned
+                for record in contributing
                 if str(record.get("capture") or CAPTURE_FULL).strip().lower() != CAPTURE_FULL
             ]
             if token_only:
                 raise ValueError(
                     f"TITO trajectory {trajectory['trajectory_id']} is trainable but has "
-                    f"{len(token_only)} token-only owned turn(s)."
+                    f"{len(token_only)} token-only contributing turn(s)."
                 )
         selections.append(
             TrajectorySelection(

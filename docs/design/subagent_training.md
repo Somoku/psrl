@@ -966,6 +966,11 @@ branches add rows, not samples.
   and parent subagent turns) is context in its sample and is trained in the
   owner's sample.
 - `train_agents` may select an exact nested agent id or a role pattern.
+- Auto trajectory resolution is role/agent-aware. It reuses an id only when the
+  matched parent is that trajectory's current leaf and the request role and
+  agent id are compatible. A subagent or nested branch from another agent's
+  leaf gets a new id; a compaction starts a new context; a main continuation
+  after compaction follows the compaction leaf.
 - Test: main, then subagent A, then subagent B. B's prompt contains the main
   and A turns. B's response contains its own turns. A's tokens are mask 0 in
   B's sample and mask 1 only in A's sample.
@@ -1069,14 +1074,12 @@ Design:
   once the main agent has made its last turn, no later subagent result can
   enter the main context or the main artifact, so waiting cannot change a main
   training row.
-- The SessionRouter exposes the live trajectory set and the last activity
-  time.
 - At the main snapshot, the agent loop records only a count: the number of
   distinct subagent trajectories that are still live. A trajectory is live when
   the harness reports it started and not finished, or, when the harness reports
   no lifecycle, when it has an in-flight request at the snapshot. The count is
-  emitted as a metric (`subagent/background_live_count`); the current version
-  does not collect the trajectories or their tokens.
+  attached to every emitted row as `background_subagent_count`; the current
+  version does not collect the trajectories or their tokens.
 - A live background subagent is not a whole-trajectory training unit. Its
   completed turns are handled per turn: a turn that completed after the
   main-close boundary is context/diagnostic only; a turn that completed before
@@ -1111,11 +1114,11 @@ training would train the post-main turns. The boundary is therefore per turn.
   payload upgrade keeps the original sequence, because the output was already
   available. A turn that completes after main close gets a larger sequence even
   if it started earlier.
-- **Main close.** `main_close_sequence` is the `sequence` of the last record on
-  the primary main trajectory. The primary is the latest main-role leaf, the
-  same rule the extractor already uses. If the main later resumes, its new last
-  record moves the boundary later, so turns that were before the resumed main
-  become eligible again.
+- **Main close.** `main_close_sequence` is the `sequence` of the last owned
+  record on the primary main trajectory. The primary is the latest main-role
+  leaf, the same rule the extractor already uses. If the main later resumes,
+  its new last record moves the boundary later, so turns that were before the
+  resumed main become eligible again.
 - **Marking.** PSRL normalizes the snapshot before selection and sets
   `contributes_to_session` on every record:
   - main-role records and compactions of the main agent: true;
@@ -1136,9 +1139,9 @@ training would train the post-main turns. The boundary is therefore per turn.
 - **Turn counts.** `num_turns` keeps counting every owned record in the
   trajectory. `trainable_turns` counts the owned contributing records. A
   trajectory with `trainable_turns == 0` produces no row.
-- **Compact snapshot.** The compact form carries the same turn sequence and
-  contribution marker through its node/turn-record payload; expanded and
-  compact snapshots must produce identical masks.
+- **Compact snapshot.** The compact form carries the same turn sequence in its
+  node payload; PSRL applies the same contribution marking after expanding it,
+  so expanded and compact snapshots produce identical masks.
 
 This boundary is still a time-order lower bound for credit: a subagent turn
 that completed before main close but whose result the main never read remains
@@ -1160,11 +1163,17 @@ diagnostic only.
 TITO separates trajectories but not filesystem writes. Parallel subagents in
 one sandbox can overwrite each other.
 
-The v2 choice is **logical isolation**. It is a convention rather than a
-security boundary: the task root is mounted read-only, each agent writes only
-under `/workspace/agents/<agent_id>/`, and the main artifact collector reads
-the main directory. The harness prompt states the agent's directory, and a
-best-effort check reports writes outside it.
+The v2 choice is **logical isolation**. It is a convention, not a security
+boundary: one sandbox per session, a main task root that is the only collected
+artifact, and a per-agent directory `/workspace/agents/<agent_id>/` for
+subagent output. The harness prompt states the convention and the sandbox
+exposes `PSRL_MAIN_WORKSPACE` and `PSRL_AGENT_WORKSPACE_ROOT` for tools that
+honor it. The main collector reads only the main task root.
+
+Nothing in the filesystem enforces the convention: a subagent can still write
+to the main root or another agent's directory. That is the accepted trade-off
+for keeping one sandbox, one shared filesystem, and no extra volume. A
+deployment that needs a hard boundary selects sandbox isolation per task class.
 
 The other options remain available when a deployment needs a hard boundary:
 
@@ -1178,10 +1187,8 @@ The other options remain available when a deployment needs a hard boundary:
 
 Logical isolation is chosen because it keeps one sandbox per session, preserves
 the shared filesystem the harness already expects, and costs no extra
-container or volume. Its weakness is deliberate: a misbehaving agent can still
-write outside its directory, which is why the out-of-directory check is
-diagnostic rather than a guarantee. A deployment that cannot accept that
-weakness selects sandbox isolation per task class.
+container or volume. A deployment that cannot accept an advisory boundary
+selects sandbox isolation.
 
 Test: two subagents write the same filename. The per-agent directories keep
 both artifacts and the main collector reads the main directory.
@@ -1200,9 +1207,11 @@ rather than a silent fallback.
 
 Design:
 
-- `nodes[]` carries `id`, `parent`, the node's own token segment or its
-  `token_start`/`token_end`, `num_tokens`, `owner_trajectory_id`, `capture`,
-  the turn record or a reference to it, and `trajectory_ids`.
+- `nodes[]` carries `id`, `parent`, its own `token_ids` segment with
+  `token_start`, `num_tokens`, `owner_trajectory_id`, `capture`, the turn
+  record, and `trajectory_ids`. `token_start` is the common-prefix length with
+  the stored parent, so a tolerated trimmed boundary reconstructs exactly: the
+  reader drops the parent's divergent suffix before appending the segment.
 - `leaves[]` carries `trajectory_id`, `node_id`, `path_node_ids`,
   `thread_source`, `agent_id`, `parent_trajectory_id`, and `capture`.
 - The extractor reconstructs a leaf's `accumulated_token_ids` and
@@ -1216,8 +1225,14 @@ Design:
   shared prefix appears once. Phantom boundaries and dead leaves match the
   current behavior. A snapshot without `format` is read as `expanded`.
 
-This is a v2 transport and memory optimization. It does not change the
-training semantics.
+PSRL requests this form through
+`psrl.rollout_gateway.tito_snapshot_format=compact` (the default). Set it to
+`expanded` for a gateway that predates the compact form.
+
+This is a v2 wire and gateway-serialization optimization: the saved bytes are
+on the gateway-to-worker path and in the gateway's snapshot construction. PSRL
+expands the compact form before selection, so its extraction memory matches the
+expanded form. It does not change the training semantics.
 
 ### 10.13 Shared-prefix forward duplication (later, measure first)
 
@@ -1246,14 +1261,27 @@ designed.
 | 0 | Contract: all four headers, session body policy, SMG fields, SessionRouter normalization, snapshot dump, both capture modes. | Done | Rust tests cover the store fields and capture merge. A live Codex episode shows role, agent id, parent, owner, and capture in the snapshot. |
 | 1 | First landing: `main_only`, four headers active, `tokens` for untrained subagents and auxiliary calls, owner-aware masks, token-only extraction, routed-expert zero-row padding, the first-version correctness fixes in section 10. | Done | A live subagent episode produces one main row. Its token-only subagent has no logprobs or routed experts, and its next turn still completes. |
 | 2 | `all` and `selected`, `session_primary`, request-aggregated multi-row advantage and session loss weights. | Done | Live `all` episodes produce one row per trainable agent. Unit tests pin the advantage selection and the session-weighted loss. Config validation refuses `all`/`selected` outside request aggregation. |
-| 3 | v2 designs: background/async live count with per-turn causal eligibility, logical workspace isolation, compact tree snapshot under a `format` field, per-agent reward and credit, shared-prefix forward if measurement justifies it. | Not started | Section 10 designs are the input to the next phase. |
+| 3 | v2 landings: background/async live count with per-turn causal eligibility, logical workspace isolation, compact tree snapshot under a `format` field, role-aware trajectory resolution, per-agent reward and credit, shared-prefix forward if measurement justifies it. | Partial | The per-turn boundary, background count, compact `format`, logical isolation, and role-aware branch IDs are implemented and tested. Per-agent reward/credit and shared-prefix forward remain design-gated. |
 
 Phase 1 is the first landing. Phase 2 is implemented in the same landing because
 `all` and `selected` reuse the same extraction, selection, and policy plumbing;
 the only new requirement is request aggregation, which the config validator now
 enforces.
 
-Phase 3 is the v2 design set. It is not part of this landing.
+Phase 3 is the v2 design set. The concrete v2 items listed below are
+implemented; per-agent reward/credit and the shared-prefix forward optimization
+remain design-gated.
+
+| v2 item | State | Evidence |
+|---|---|---|
+| Per-turn `contributes_to_session` boundary | Done | `TurnRecord.sequence`, primary-main boundary, mixed-row masking, `trainable_turns`, post-main exclusion tests. |
+| Background subagent observation | Done | Main-close control, distinct live count, no wait/collection, delete drain excludes background. |
+| Logical workspace isolation | Done | `workspace_isolation=logical` creates the agent root, states the convention in the prompt, and exports the workspace env; the main collector keeps its workdir. |
+| Compact tree snapshot | Done | `format=compact` returns nodes/leaves; PSRL reconstructs the same trajectories and masks as `expanded`; live byte-size reduction measured. |
+| Role-aware trajectory resolution | Done | A branch from another agent's live leaf gets a new id; main continuation reuses the main id, compaction creates a new context. |
+| GC / live-leaf protection | Existing | `trajectory_leaves` protects every live leaf and its parent chain; subagent/retry tests pass. |
+| Per-agent reward, credit assignment, subagent artifacts | Design-gated | `reward=per_agent` remains rejected until the semantics are defined. |
+| Shared-prefix forward deduplication | Not started | Measure-first; no tree-packed attention until a workload measurement justifies it. |
 
 ### 11.1 Measured results
 
@@ -1265,25 +1293,25 @@ Build and install that binding before running the PSRL branch; the stock
 gateway does not know the four normalized headers or the per-turn capture
 field.
 
-**Test suites.** `cargo test -p smg-tito` passes 97 unit tests and 8 engine
+**Test suites.** `cargo test -p smg-tito` passes 99 unit tests and 8 engine
 tests. `cargo test -p smg --lib` passes 1350 tests. The Python suites
 `tests/tito`, `tests/nixl/test_session_loss_agg.py`,
 `tests/trainer/test_group_baseline.py`, `tests/trainer/test_chunk_manager.py`,
 `tests/config/test_subagent_training_config.py`, and
 `tests/agent_loop/test_harness.py` cover the extraction, policy, router,
-advantage, loss, and adapter changes. That combined Python run passes 183 tests.
+advantage, loss, and adapter changes. That combined Python run passes 484 tests.
 `tests/trainer/test_session_loss.py` adds 11 policy-loss, entropy, and KL tests
 when the vendored verl checkout is present.
 
 **Live stack, synthetic client.** Qwen2.5-0.5B-Instruct on one H20, a vLLM gRPC
-worker, SMG with TITO, and the SessionRouter in process. The client drove two
-main turns and two subagent turns that share the main prefix.
+worker, SMG with TITO, and the SessionRouter in process. The client drove the
+subagent turns before the final main turn, so they are causally eligible.
 
 | Case | Rows | Prompt | Response | Mask | Turns | Distribution |
 |---|---|---|---|---|---|---|
-| `main_only`, main | 1 | 40 | 48 | 34 | 2 | n/a (disabled sampler) |
-| `all`, main | 1 | 40 | 53 | 39 | 2 | n/a |
-| `all`, subagent | 1 | 75 | 36 | 21 | 2 | n/a |
+| `main_only`, main | 1 | 40 | 57 | 43 | 2 | n/a (disabled sampler) |
+| `all`, main | 1 | 40 | 38 | 24 | 2 | n/a |
+| `all`, subagent | 1 | 69 | 41 | 27 | 2 | n/a |
 
 The subagent prompt includes the shared main prefix; its response contains only
 its own turns. The router sent `tokens` for the subagent in `main_only` and
@@ -1327,42 +1355,28 @@ metadata was normalized; the Claude Code subagent carried its native agent id,
 proving `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` exposed the request-class and
 identity headers.
 
+**Compact snapshot and per-turn gate.** The same live session requested both
+wire formats. For `main_only` the expanded snapshot was 6,272 bytes and the
+compact one 5,079 bytes; for `all` they were 6,091 and 5,097 bytes. The compact
+and expanded trajectories, records, masks, and sequence values were identical.
+A separate session drove a subagent after the main agent's final turn: the
+subagent remained in the snapshot, every owned record had
+`contributes_to_session=false`, and `all` selected only the main row.
+
 **Extraction cost.** A synthetic 40-turn main trajectory with 2560 response
 tokens took 0.56 ms in the owner-aware builder and 0.57 ms in the legacy path.
 The builder is linear in tokens; the ownership checks add no measurable cost at
 this scale.
 
-**Live MoE routed experts.** Qwen3-30B-A3B-Instruct-2507 on one H20 with the
-same vLLM + SMG + SessionRouter stack. The model returns 48 layers and top-8
-experts. `main_only` produced a main row with routed experts `(78, 48, 8)` for
-a 19-token prompt and 59-token response, mask 45. `all` produced a main row
-`(76, 48, 8)`, mask 43, and a subagent row `(94, 48, 8)`, mask 24. Every
-trained token position sampled in the check had a nonzero expert row. This is
-the live check the dense Qwen2.5-0.5B episodes could not perform.
-
-**Live parallel, nested, and compaction.** Qwen2.5-0.5B on a second node. The
-main agent spawned two parallel subagents and one of them spawned a nested
-subagent; the main context was then compacted and resumed. The snapshot showed
-`sub-a` and `sub-b` with parent `main-1`, `sub-c` with parent `sub-a`, and a
-live `compaction` trajectory with agent `main-1`. `main_only` selected the
-compaction main row, `all` selected main plus all three subagents, and
-`selected` selected main plus `sub-a` and `sub-c`. This covers the v1
-parallel/nested/compaction integration path.
-
-**Trainer smoke.** A training harness in `tests/integration/` drives a real
-main + subagent episode through the live SessionRouter and returns normal
-`TokenOutput` rows. The local stack reached actor and NIXL initialization with
-two vLLM engines, the FSDP actor, and the SessionRouter; the AgentLoopManager
-then waited for a training buffer that did not fill in that environment. No
-optimizer update completed, so a full TransferQueue-to-trainer step remains
-unverified. The advantage, session-loss, and per-row weight math is covered by
-the 11 `test_session_loss.py` tests; the smoke's own loop and dataset are in
-`tests/integration/`.
-
-**Not exercised live.** The p3b sandbox fleet with a real harness process was
-not run; the Codex and Claude Code episodes used the CLIs directly against the
-live stack. A full optimizer update and a full sandbox episode remain the
-integration checks before production.
+**Not exercised live.** A full TransferQueue-to-optimizer training step was
+not completed. The local stack reached actor and vLLM initialization, but this
+environment has no NIXL plugins, so the worker failed before the first rollout;
+the advantage, session-loss, and per-row weight math remain covered by the
+unit and gradient tests. Routed-expert capture needs a model with experts; the
+dense models above cannot produce it, and the assembler is covered by unit
+tests for gaps, overlap, out-of-range starts, metadata mismatch, and zero-fill.
+Compaction is covered by the classification, policy, and TITO branching tests,
+but the live harness episodes did not force a compaction.
 
 The live synthetic check is reproducible with `tests/tito/live_subagent_e2e.py`.
 It expects a vLLM gRPC worker on port 51051 unless
@@ -1465,11 +1479,12 @@ Integration:
    sessions, or implement the per-agent protected-leaf rule in the store?
    `trajectory_leaves` already protects every live leaf, including a subagent
    leaf and its parent chain; no change is needed for the first version.
-9. Resolved: parallel subagents use logical isolation. A read-only task root,
-   per-agent `/workspace/agents/<agent_id>/` directories, a diagnostic
-   out-of-directory check, and a main collector that reads only the main
-   directory. Sandbox and worktree isolation remain deployment options for
-   tasks that cannot accept the convention.
+9. Resolved: parallel subagents use logical isolation. One sandbox, a main task
+   root that is the only collected artifact, per-agent
+   `/workspace/agents/<agent_id>/` directories stated in the prompt and exposed
+   through `PSRL_AGENT_WORKSPACE_ROOT` / `PSRL_MAIN_WORKSPACE`. The boundary is
+   advisory; sandbox and worktree isolation remain deployment options for tasks
+   that cannot accept the convention.
 10. Resolved: the compact snapshot uses a top-level `format` field.
     `expanded` is the current view and the default when the field is absent;
     `compact` is the tree form, selected explicitly. An unknown format is an

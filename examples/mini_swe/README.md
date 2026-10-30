@@ -551,7 +551,7 @@ actually leak (see §2).
 ### 1. Harness runtime trees (host-side, read-only mount)
 
 The harness executables are **self-contained native binaries** — Claude Code
-2.1.233 (linux-x64) and Codex 0.154.0 (linux-x64). There is no Node, no npm and
+2.1.295 (linux-x64) and Codex 0.164.0 (linux-x64). There is no Node, no npm and
 no in-sandbox installation. Each sandbox binds one runtime tree read-only; the
 mount path is the harness config's `runtime_mount` (default `/opt/harness`) and
 the executable resolves to `<runtime_mount>/bin/<executable>`.
@@ -651,7 +651,7 @@ docker run --rm "$tag" bash -lc \
 
 | Aspect | mini-SWE-agent | `claude_code` harness |
 |--------|----------------|------------------------|
-| CLI / agent location | Host-side Python library (`pip install mini-swe-agent`), imported by the runner | **Sandbox-resident CLI**: a self-contained native binary (Claude Code 2.1.233 / Codex 0.154.0), bind-mounted read-only from the host runtime tree — no Node, no npm |
+| CLI / agent location | Host-side Python library (`pip install mini-swe-agent`), imported by the runner | **Sandbox-resident CLI**: a self-contained native binary (Claude Code 2.1.295 / Codex 0.164.0), bind-mounted read-only from the host runtime tree — no Node, no npm |
 | Per-sandbox install | None (pure Python on the host) | **None** — a single `<runtime_mount>/bin/<executable> --version` probe; the executable is mounted read-only |
 | Network dependency | None at rollout time | None at rollout time: the runtime tree is built ahead of time (`build_harness_runtimes.sh`) |
 | System prompt / tools | Native mini-SWE-agent template | Keeps Claude Code's stock system prompt (`system_prompt_mode: none`) and full default tool catalog (`tools: null`); task + integrity rules ride in the user message, and safety is enforced post-hoc by the integrity scan |
@@ -833,6 +833,8 @@ Harness settings live under `harness` in `swebench_harness_config.yaml`:
 | `permission_mode` | CLI permission mode (`acceptEdits`; Claude rejects `bypassPermissions` as root). |
 | `system_prompt` / `system_prompt_mode` | `none` keeps the CLI's stock system prompt; `append` / `replace` inject or replace it. |
 | `subagents_enabled` | `false` denies the Claude `Agent` tool and background tasks. |
+| `workspace_isolation` | `none` keeps the shared task root. `logical` states the main root and per-agent directory convention in the prompt, creates the agent root, and exports `PSRL_MAIN_WORKSPACE` / `PSRL_AGENT_WORKSPACE_ROOT`. It is advisory, not a filesystem boundary. |
+| `agent_workspace_root` | In-sandbox root for `workspace_isolation: logical` (default `/workspace/agents`); must be absolute. |
 | `compaction.compact_percent` | Share of the rollout `max_model_len` at which the CLI auto-compacts (same threshold drives the `x-smg-prompt-too-long-limit` header). |
 | `trajectory_format` | Integrity-scan dispatch key: `claude_code_stream_json`, `codex_jsonl`, `auto`, or `plain_text`. |
 | `runtime_mount` | In-sandbox path of the read-only runtime tree; executable resolves to `<runtime_mount>/bin/<executable>` (default `/opt/harness`). |

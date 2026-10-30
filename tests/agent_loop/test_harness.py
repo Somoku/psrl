@@ -8,12 +8,12 @@ import json
 import logging
 import shutil
 import subprocess
-import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import tomllib
 from examples.mini_swe.config import build_runtime_config
 from examples.mini_swe.utils.harness_task import (
     _HARNESS_DIAG_NAME,
@@ -267,6 +267,7 @@ async def test_claude_code_uses_session_root_and_bounded_process_output() -> Non
     assert settings["permissions"]["allow"] == ["Bash(*)", "Read(*)", "Edit(*)"]
     assert settings["permissions"]["deny"] == []
     assert "defaultMode" not in settings["permissions"]
+    assert settings["env"]["CLAUDE_CODE_GATEWAY_HINT_HEADERS"] == "1"
     cli_command, cwd, env = next(item for item in sandbox.commands if "--output-format" in item[0])
     assert "--output-format stream-json" in cli_command
     assert "--permission-mode acceptEdits" in cli_command
@@ -729,7 +730,9 @@ async def test_codex_writes_responses_provider_config_and_uses_session_as_key() 
     assert "enabled = false" in codex_config  # analytics / feedback disabled
     # Hosted web_search must be off: the gateway rejects its schema and the task
     # forbids fetching the solution from the web. Must be a top-level key.
-    assert tomllib.loads(codex_config)["web_search"] == "disabled"
+    parsed = tomllib.loads(codex_config)
+    assert parsed["web_search"] == "disabled"
+    assert parsed["features"]["multi_agent"] is True
     assert harness.build_env(_runtime())["OPENAI_API_KEY"] == "session-1"
     command = harness.build_command("fix", _runtime())
     assert command[0] == "/opt/harness/bin/codex"
@@ -756,6 +759,7 @@ async def test_codex_catalog_enables_apply_patch_and_carries_base_instructions()
     assert entry["apply_patch_tool_type"] == "freeform"
     assert entry["shell_type"] == "unified_exec"
     assert entry["default_reasoning_level"] == "high"
+    assert entry["multi_agent_version"] == "v1"
     assert entry["model_messages"]["instructions_template"] == _base_instructions()
     assert _base_instructions().strip() != ""
 
@@ -978,3 +982,103 @@ def test_the_abort_path_can_name_a_dict_request() -> None:
 
     assert _request_id_of({"uid": 7}) == "7"
     assert _request_id_of({}) == "N/A"
+
+
+@pytest.mark.asyncio
+async def test_codex_disabled_subagents_emit_no_multi_agent_surface() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(
+        HarnessConfig(kind="codex", executable="codex", subagents_enabled=False),
+        sandbox,
+    )
+
+    await harness.prepare(_runtime())
+
+    catalog = json.loads(sandbox.writes["/root/.codex/model_catalog.json"])
+    assert catalog["models"][0]["multi_agent_version"] is None
+    config = tomllib.loads(sandbox.writes["/root/.codex/config.toml"].decode())
+    assert "features" not in config
+
+
+@pytest.mark.asyncio
+async def test_claude_code_disabled_subagents_keep_the_agent_deny_rule() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(
+        HarnessConfig(kind="claude_code", executable="claude", subagents_enabled=False),
+        sandbox,
+    )
+
+    await harness.prepare(_runtime())
+
+    settings = json.loads(sandbox.writes["/root/.claude/settings.json"])
+    assert settings["permissions"]["deny"] == ["Agent"]
+
+
+def test_logical_workspace_isolation_creates_the_agent_root_and_states_the_rule() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(
+        HarnessConfig(
+            kind="codex",
+            executable="codex",
+            workspace_isolation="logical",
+            agent_workspace_root="/workspace/agents",
+        ),
+        sandbox,
+    )
+
+    import asyncio
+
+    asyncio.run(harness.prepare(_runtime()))
+    probes = [command for command, _, _ in sandbox.commands if command.startswith("mkdir -p /root/.psrl-harness")]
+    assert probes and "/workspace/agents" in probes[0]
+    assert "/testbed" in harness.config.isolate_prompt("/testbed")
+    assert "/workspace/agents" in harness.config.isolate_prompt("/testbed")
+
+
+def test_logical_workspace_isolation_is_invalid_with_a_relative_root() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="agent_workspace_root"):
+        HarnessConfig(
+            kind="codex",
+            executable="codex",
+            workspace_isolation="logical",
+            agent_workspace_root="agents",
+        )
+
+
+def test_claude_episode_reports_live_background_subagents() -> None:
+    from psrl.workers.agent_loop.harness.episode import CLAUDE_CODE_STREAM_JSON, episode_summary
+
+    event = {
+        "type": "result",
+        "num_turns": 2,
+        "terminal_reason": "success",
+        "subagent_stats": {
+            "started_in_background": 2,
+            "completed": 1,
+            "failed": 0,
+            "killed": {"parent": 0, "user": 0, "system": 0},
+        },
+    }
+    summary = episode_summary(CLAUDE_CODE_STREAM_JSON, json.dumps(event).encode())
+
+    assert summary is not None
+    assert summary.background_subagents == 1
+
+
+def test_codex_episode_reports_agents_still_live_at_main_close() -> None:
+    from psrl.workers.agent_loop.harness.episode import CODEX_JSONL, episode_summary
+
+    completed = {
+        "type": "item.completed",
+        "item": {
+            "type": "collab_tool_call",
+            "tool": "wait",
+            "agents_states": {"a": {"status": "completed"}, "b": {"status": "running"}},
+        },
+    }
+    summary = episode_summary(CODEX_JSONL, json.dumps(completed).encode())
+
+    assert summary is not None
+    assert summary.background_subagents == 1

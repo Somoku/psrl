@@ -731,7 +731,9 @@ bash examples/mini_swe/megatron_qwen_4b_swe_codex_subagent.sh
 
 In the run, confirm that the Codex trajectory contains a subagent spawn and that
 the emitted rows are main-only; the subagent's calls should use `tokens` capture
-and never appear as a separate training row.
+and never appear as a separate training row. `SWE_GYM_293_ROOT` overrides the
+shared parquet directory and `PSRL_HARNESS_RUNTIME_ROOT` overrides the shared
+runtime-tree root; both defaults point at the cluster's shared filesystem.
 
 **Generic (any model/dataset, FSDP).** Point the trainer at the harness config
 and a parquet whose `agent_name` selects the harness. Harness mode requires TITO

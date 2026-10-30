@@ -8,8 +8,9 @@ experiment_name=GRPO-Qwen-4B-swe_smith-codex-subagent-megatron-staleness_${stale
 source ${PSRL_WORKSPACE}/env/env.sh
 
 # Read-only harness runtime trees (native Claude Code / Codex, no Node).
-# Build once with examples/mini_swe/prepare/docker_scripts/build_harness_runtimes.sh.
-export PSRL_HARNESS_RUNTIME_ROOT="/shared/psrl/harness-runtimes"
+# The Codex tree is prepared once on the shared filesystem; each sandbox mounts
+# <root>/codex read-only at the harness runtime_mount.
+export PSRL_HARNESS_RUNTIME_ROOT=${PSRL_HARNESS_RUNTIME_ROOT:-/apdcephfs_zwfy10_303541817/share_303541817/ls/docker_images/harness-runtimes}
 
 export SWE_STRICT_NO_TEST_PATCH=1
 export SWE_STRICT_NO_CONFIG_PATCH=1
@@ -78,8 +79,10 @@ HF_MODEL_PATH=/apdcephfs_zwfy_303760348/share_303760348/ls/models/Qwen3.5-4B
 
 # --- Data ---
 # Both splits are SkyRL-v0-293: 293 train and 23 validation SWE-bench Verified rows.
-TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_gym_293/train.parquet
-TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_gym_293/val.parquet
+# The parquets live on the shared filesystem so every worker resolves the same paths.
+SWE_GYM_293_ROOT=${SWE_GYM_293_ROOT:-/apdcephfs_zwfy10_303541817/share_303541817/ls/docker_images/swe_gym_293}
+TRAIN_FILE=${SWE_GYM_293_ROOT}/train.parquet
+TEST_FILE=${SWE_GYM_293_ROOT}/val.parquet
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: Training data not found at $TRAIN_FILE"
